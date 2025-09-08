@@ -2,17 +2,14 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
 
-# 로그 설정
+# Designate log path
 LOG_DIR=${LOG_DIR:-"logs"}
 mkdir -p "${LOG_DIR}"
 SCRIPT_LOG="${LOG_DIR}/script_$(date +%Y%m%d_%H%M%S).log"
 
-# 모든 출력을 로그 파일에도 저장
+# Save log files
 exec > >(tee -a "${SCRIPT_LOG}")
 exec 2>&1
-
-# stata109's 8 GPUs
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
 project_name='DAPO'
 exp_name='DAPO-ReactionReasoner-lora32'
@@ -27,10 +24,10 @@ kl_loss_coef=0.0
 clip_ratio_low=0.2
 clip_ratio_high=0.28
 
-max_prompt_length=$((1024 * 2))
-max_response_length=$((1024 * 20))
+max_prompt_length=$((1024 * 1)) # 1024
+max_response_length=$((1024 * 4)) # 4096
 enable_overlong_buffer=True
-overlong_buffer_len=$((1024 * 4))
+overlong_buffer_len=$((1024 * 2)) # 2048
 overlong_penalty_factor=1.0
 
 loss_agg_mode="token-mean"
@@ -48,14 +45,16 @@ RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
 WORKING_DIR=${WORKING_DIR:-"${PWD}"}
 RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/verl/trainer/runtime_env.yaml"}
 NNODES=${NNODES:-1}
+N_GPUS_PER_NODE=${N_GPUS_PER_NODE:-8}
+
 # Paths
 HOME="/data" ##
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
 MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/ReactionReasoner_stage123_lora_merged"}
 MODEL_LORA_PATH=${MODEL_LORA_PATH:-"${RAY_DATA_HOME}/models/ReactionReasoner_lora_adapter"} ##
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
-TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/dapo-math-17k.parquet"}
-TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/aime-2024.parquet"}
+TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/syntheticreact_8k_train.parquet"}
+TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/syntheticreact_1k_test.parquet"}
 
 # Algorithm
 temperature=1.0
@@ -64,12 +63,12 @@ top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
 val_top_p=0.7
 
 # Performance Related Parameter
-sp_size=8
+sp_size=${N_GPUS_PER_NODE:-8}
 use_dynamic_bsz=True
 actor_ppo_max_token_len=$((max_prompt_length + max_response_length))
 infer_ppo_max_token_len=$((max_prompt_length + max_response_length))
 offload=True
-gen_tp=8
+gen_tp=${N_GPUS_PER_NODE:-8}
 
 ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     --working-dir "${WORKING_DIR}" \
@@ -139,7 +138,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     trainer.logger='["console","wandb"]' \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
-    trainer.n_gpus_per_node=8 \
+    trainer.n_gpus_per_node=${n_gpus_per_node} \
     trainer.nnodes="${NNODES}" \
     trainer.val_before_train=True \
     trainer.test_freq=5 \

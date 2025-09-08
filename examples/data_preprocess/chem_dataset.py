@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Preprocess the GSM8k dataset to parquet format
+Preprocess the syntheticreact dataset to parquet format
 """
 
 import argparse
@@ -30,11 +30,14 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    if not os.path.exists(args.local_dir):
+        os.makedirs(args.local_dir)
+
     data_source = "chem_dapo"
 
-    dataset = datasets.load_from_disk("/data/llm-reaction-reasoning/data/orderly/main_training/data_dir/chem_dapo", "main")
+    dataset = datasets.load_from_disk("/data/llm-reaction-reasoning/data/orderly/main_training/chem_dapo", "main")
 
-    train_dataset, test_dataset = dataset.train_test_split(test_size=0.1).values()
+    train_dataset, test_dataset = dataset.train_test_split(test_size=0.12).values()
 
     # add a row to each data item that represents a unique id
     def make_map_fn(split):
@@ -64,8 +67,8 @@ if __name__ == "__main__":
     local_dir = args.local_dir
     hdfs_dir = args.hdfs_dir
 
-    train_dataset.to_parquet(os.path.join(local_dir, "train.parquet"))
-    test_dataset.to_parquet(os.path.join(local_dir, "test.parquet"))
+    train_dataset.to_parquet(os.path.join(local_dir, "syntheticreact_8k_train.parquet"))
+    test_dataset.to_parquet(os.path.join(local_dir, "syntheticreact_1k_test.parquet"))
 
     if hdfs_dir is not None:
         makedirs(hdfs_dir)
