@@ -1,6 +1,7 @@
-from datasets import load_from_disk, concatenate_datasets
+from datasets import load_dataset, load_from_disk, concatenate_datasets
 import argparse
-import re
+import os, json, re
+from glob import glob
 
 system_prompt_template = "You are a chemist."
 
@@ -8,7 +9,6 @@ user_prompt_template = {
     "forward": "[SMILES] Given the precursor, what is the expected product of the chemical reaction?",
     "retro": "Given the product [SMILES], what are some likely reactants that could have been used in its synthesis?",
     "reagent": "Please suggest some possible reagents that could have been used in the following chemical reaction [SMILES].",
-    "solvent": "[SMILES] Please propose potential solvents that might have been utilized in the provided chemical reaction."
 }
 
 task_ids_map = {
@@ -71,18 +71,22 @@ def map_messages(x):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--local_dir", default="/data/llm-reaction-reasoning/data/orderly/main_training/data_dir")
+    parser.add_argument("--local_dir", default="/data/llm-reaction-reasoning/data/orderly/main_training")
     args = parser.parse_args()
     
     concatenated = []
 
     tasks = ["forward", "retro", "reagent"]
     for task in tasks:
-        dataset = load_from_disk(f"{args.local_dir}/{task}")
+        task_path = f"{args.local_dir}/{task}"
+        dataset_paths = sorted(glob(os.path.join(f"{args.local_dir}/{task}", "*.json")))
+        
+        dataset = concatenate_datasets([load_dataset("json", data_files=dataset_path, split="train", keep_in_memory=False) for dataset_path in dataset_paths])
+        # dataset = load_from_disk(f"{args.local_dir}/{task}")
         dataset = dataset.add_column("task_ids", [task_ids_map[task]] * len(dataset))
         dataset = dataset.map(map_messages, load_from_cache_file=False)
 
-        dataset = dataset.filter(lambda x: x["filtered"] == False, load_from_cache_file=False)
+        dataset = dataset.filter(lambda x: x["filtered"] == True, load_from_cache_file=False)
         print(f"Task {task} has {len(dataset)} filtered False examples")
         
         dataset = dataset.shuffle(seed=42)
