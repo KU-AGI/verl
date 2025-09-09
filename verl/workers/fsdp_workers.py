@@ -396,7 +396,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 }
                 actor_module = get_peft_model(actor_module, LoraConfig(**lora_config))
                 if self.config.model.lora_path:
-                    actor_module.load_adapter(self.config.model.lora_path)
+                    actor_module.load_adapter(self.config.model.lora_path, "adapter")
         
         torch.distributed.barrier()
 
@@ -1222,7 +1222,7 @@ class CriticWorker(Worker, DistProfilerExtension):
             }
             critic_module = get_peft_model(critic_module, LoraConfig(**lora_config))
             if self.config.model.lora_path:
-                critic_module.load_adapter(self.config.model.lora_path)
+                critic_module.load_adapter(self.config.model.lora_path, "adapter")
 
         if self.rank == 0:
             print_model_size(critic_module)
