@@ -9,7 +9,8 @@ init-container:
 	-v /data:/data \
 	-v /home:/home \
 	-v /data/.cache:/root/.cache \
-	--shm-size=32g \
+	--shm-size=10g \
+	--ulimit memlock=1 \
 	--name $(CONTAINER_NAME) \
 	$(IMAGE_NAME_TAG) \
 	tail -f /dev/null
