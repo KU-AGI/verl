@@ -44,6 +44,7 @@ class HFModelConfig(BaseConfig):
     }
 
     path: str = MISSING
+    lora_path: Optional[str] = None
     local_path: Optional[str] = None
     hf_config_path: Optional[str] = None
     local_hf_config_path: Optional[str] = None
