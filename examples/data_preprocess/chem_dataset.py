@@ -21,12 +21,11 @@ import re
 
 import datasets
 
-from verl.utils.hdfs_io import copy, makedirs
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--local_dir", default="/data/verl/data")
-    parser.add_argument("--hdfs_dir", default=None)
+    parser.add_argument("--local_dir", default="/data/verl/data/chem_dapo")
+    parser.add_argument("--train", action="store_true")
+    parser.add_argument("--test", action="store_true")
 
     args = parser.parse_args()
 
@@ -35,9 +34,12 @@ if __name__ == "__main__":
 
     data_source = "chem_dapo"
 
-    dataset = datasets.load_from_disk("/data/llm-reaction-reasoning/data/orderly/main_training/chem_dapo", "main")
-
-    train_dataset, test_dataset = dataset.train_test_split(test_size=0.12).values()
+    if args.train:
+        dataset = datasets.load_from_disk(f"{args.local_dir}/train", "main")
+    elif args.test:
+        dataset = datasets.load_from_disk(f"{args.local_dir}/test", "main")
+    else:
+        raise ValueError("Either --train or --test must be specified")
 
     # add a row to each data item that represents a unique id
     def make_map_fn(split):
@@ -61,16 +63,9 @@ if __name__ == "__main__":
 
         return process_fn
 
-    train_dataset = train_dataset.map(function=make_map_fn("train"), with_indices=True, load_from_cache_file=False)
-    test_dataset = test_dataset.map(function=make_map_fn("test"), with_indices=True, load_from_cache_file=False)
-
-    local_dir = args.local_dir
-    hdfs_dir = args.hdfs_dir
-
-    train_dataset.to_parquet(os.path.join(local_dir, "syntheticreact_8k_train.parquet"))
-    test_dataset.to_parquet(os.path.join(local_dir, "syntheticreact_1k_test.parquet"))
-
-    if hdfs_dir is not None:
-        makedirs(hdfs_dir)
-
-        copy(src=local_dir, dst=hdfs_dir)
+    if args.train:
+        dataset = dataset.map(function=make_map_fn("train"), with_indices=True, load_from_cache_file=False)
+        dataset.to_parquet(os.path.join(args.local_dir, "syntheticreact_9k_train.parquet"))
+    elif args.test:
+        dataset = dataset.map(function=make_map_fn("test"), with_indices=True, load_from_cache_file=False)
+        dataset.to_parquet(os.path.join(args.local_dir, "syntheticreact_3k_test.parquet"))
