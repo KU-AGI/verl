@@ -97,6 +97,7 @@ class vLLMRollout(BaseRollout):
         super().__init__(config, model_config, device_mesh)
 
         model_path = model_config.local_path
+        lora_path = model_config.lora_path
         tokenizer = model_config.tokenizer
         model_hf_config = model_config.hf_config
         trust_remote_code = model_config.trust_remote_code
@@ -201,6 +202,17 @@ class vLLMRollout(BaseRollout):
             **self.lora_kwargs,
             **engine_kwargs,
         )
+
+        if lora_path:
+            lora_int_id = int(time.time_ns() % 0x7FFFFFFF)
+            self.lora_int_id = lora_int_id
+            lora_request = LoRARequest(
+                lora_name=f"{lora_int_id}",
+                lora_int_id=lora_int_id,
+                lora_path=lora_path,
+            )
+            self.inference_engine.llm_engine.add_lora(lora_request)
+            logger.info(f"[vLLMRollout] Loaded LoRA from {lora_path} with int_id {lora_int_id}")
 
         kwargs = dict(
             n=1,
@@ -320,7 +332,7 @@ class vLLMRollout(BaseRollout):
             }
 
         lora_requests = None
-        if self.lora_kwargs:
+        if self.lora_kwargs and self.lora_int_id is not None:
             lora_int_ids = list(self.inference_engine.llm_engine.list_loras())
             if len(lora_int_ids) > 0:
                 lora_int_id = lora_int_ids[0]
