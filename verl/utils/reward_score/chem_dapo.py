@@ -21,7 +21,7 @@ ANSWER_TAG = r"<ANSWER>(.*?)</ANSWER>"
 
 
 def exact_match(ot_smi, gt_smi):
-    """SMILES 정확 매치 검사"""
+    """SMILES exact match"""
     try:
         m_out = Chem.MolFromSmiles(ot_smi)
         m_gt = Chem.MolFromSmiles(gt_smi)
