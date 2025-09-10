@@ -72,22 +72,30 @@ def map_messages(x):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--local_dir", default="/data/llm-reaction-reasoning/data/orderly/main_training")
+    parser.add_argument("--output_dir", default="/data/verl/data")
+    parser.add_argument("--train", action="store_true")
+    parser.add_argument("--test", action="store_true")
     args = parser.parse_args()
     
     concatenated = []
 
     tasks = ["forward", "retro", "reagent"]
     for task in tasks:
-        task_path = f"{args.local_dir}/{task}"
-        dataset_paths = sorted(glob(os.path.join(f"{args.local_dir}/{task}", "*.json")))
-        
+        if args.train:
+            dataset_paths = sorted(glob(os.path.join(f"{args.local_dir}/{task}", "*.json")))
+        elif args.test:
+            dataset_paths = sorted(glob(os.path.join(f"{args.local_dir}", f"excluded_{task}_test_v10_required.json")))
+        else:
+            raise ValueError("Either --train or --test must be specified")
+
         dataset = concatenate_datasets([load_dataset("json", data_files=dataset_path, split="train", keep_in_memory=False) for dataset_path in dataset_paths])
-        # dataset = load_from_disk(f"{args.local_dir}/{task}")
+
         dataset = dataset.add_column("task_ids", [task_ids_map[task]] * len(dataset))
         dataset = dataset.map(map_messages, load_from_cache_file=False)
 
-        dataset = dataset.filter(lambda x: x["filtered"] == True, load_from_cache_file=False)
-        print(f"Task {task} has {len(dataset)} filtered False examples")
+        if args.train:
+            dataset = dataset.filter(lambda x: x["filtered"] == True, load_from_cache_file=False)
+            print(f"Task {task} has {len(dataset)} filtered False examples")
         
         dataset = dataset.shuffle(seed=42)
         dataset = dataset.select(range(min(3000, len(dataset))))
@@ -95,4 +103,8 @@ if __name__ == "__main__":
         concatenated.append(dataset)
 
     concatenated = concatenate_datasets(concatenated)
-    concatenated.save_to_disk(f"{args.local_dir}/chem_dapo")
+
+    if args.train:
+        concatenated.save_to_disk(f"{args.output_dir}/chem_dapo/train")
+    elif args.test:
+        concatenated.save_to_disk(f"{args.output_dir}/chem_dapo/test")
