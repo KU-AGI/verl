@@ -11,6 +11,16 @@ SCRIPT_LOG="${LOG_DIR}/script_$(date +%Y%m%d_%H%M%S).log"
 exec > >(tee -a "${SCRIPT_LOG}")
 exec 2>&1
 
+# Fix FlashInfer CUDA architecture detection issue
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+export VLLM_DISABLE_FLASHINFER=1
+export VLLM_USE_FLASHINFER=0
+export VLLM_ATTENTION_BACKEND=FLASH_ATTN
+export TORCH_CUDA_ARCH_LIST="8.0"
+export FLASHINFER_DISABLE=1
+export VLLM_SAMPLING_BACKEND=TORCH
+
 project_name='DAPO'
 exp_name='DAPO-ReactionReasoner-lora32'
 
@@ -136,6 +146,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     reward_model.overlong_buffer.len=${overlong_buffer_len} \
     reward_model.overlong_buffer.penalty_factor=${overlong_penalty_factor} \
     trainer.logger='["console","wandb"]' \
+    trainer.log_val_generations=10 \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
     trainer.n_gpus_per_node=${N_GPUS_PER_NODE} \
