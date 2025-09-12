@@ -12,7 +12,7 @@ exec > >(tee -a "${SCRIPT_LOG}")
 exec 2>&1
 
 project_name='DAPO'
-exp_name='DAPO-ReactionReasoner-lora-merged-realtest-1e-7'
+exp_name='DAPO-ReactionReasoner-lora-merged-realtest'
 
 adv_estimator=grpo
 
@@ -103,7 +103,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
-    actor_rollout_ref.actor.optim.lr=1e-7 \
+    actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
     actor_rollout_ref.actor.optim.weight_decay=0.1 \
     actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
