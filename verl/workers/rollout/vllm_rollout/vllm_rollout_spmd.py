@@ -203,16 +203,19 @@ class vLLMRollout(BaseRollout):
             **engine_kwargs,
         )
 
-        if lora_path:
-            lora_int_id = int(time.time_ns() % 0x7FFFFFFF)
-            self.lora_int_id = lora_int_id
+        if model_config.lora_path:
+            self.lora_path = model_config.lora_path
+            self.lora_int_id = int(time.time_ns() % 0x7FFFFFFF)
             lora_request = LoRARequest(
-                lora_name=f"{lora_int_id}",
-                lora_int_id=lora_int_id,
-                lora_path=lora_path,
+                lora_name=str(self.lora_int_id),
+                lora_int_id=self.lora_int_id,
+                lora_path=self.lora_path,
             )
             self.inference_engine.llm_engine.add_lora(lora_request)
-            logger.info(f"[vLLMRollout] Loaded LoRA from {lora_path} with int_id {lora_int_id}")
+            logger.info(f"[vLLMRollout] Loaded initial LoRA from {self.lora_path} with int_id {self.lora_int_id}")
+        else:
+            self.lora_path = None
+            self.lora_int_id = None
 
         kwargs = dict(
             n=1,
@@ -333,12 +336,13 @@ class vLLMRollout(BaseRollout):
 
         lora_requests = None
         if self.lora_kwargs and self.lora_int_id is not None:
-            lora_int_ids = list(self.inference_engine.llm_engine.list_loras())
-            if len(lora_int_ids) > 0:
-                lora_int_id = lora_int_ids[0]
-                lora_requests = [
-                    LoRARequest(lora_name=f"{lora_int_id}", lora_int_id=lora_int_id, lora_path="/simon-stub-path")
-                ] * batch_size
+            lora_requests = [
+                LoRARequest(
+                    lora_name=str(self.lora_int_id),
+                    lora_int_id=self.lora_int_id,
+                    lora_path=self.lora_path,
+                )
+            ] * batch_size
 
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
@@ -440,16 +444,16 @@ class vLLMRollout(BaseRollout):
         """
         peft_config, base_sync_done = kwargs.get("peft_config", None), kwargs.get("base_sync_done", False)
         if peft_config and base_sync_done:
-            lora_int_id = int(time.time_ns() % 0x7FFFFFFF)
-            lora_reqest = TensorLoRARequest(
-                lora_name=f"{lora_int_id}",
-                lora_int_id=lora_int_id,
+            self.lora_int_id = int(time.time_ns() % 0x7FFFFFFF)
+            lora_request = TensorLoRARequest(
+                lora_name=str(self.lora_int_id),
+                lora_int_id=self.lora_int_id,
                 lora_path="simon_lora_path",
                 peft_config=asdict(peft_config),
                 lora_tensors=weights,
             )
-            self.inference_engine.llm_engine.add_lora(lora_reqest)
-            logger.info(f"vLLM load weights, loaded_params: {len(weights)}")
+            self.inference_engine.llm_engine.add_lora(lora_request)
+            logger.info(f"vLLM load weights, Loaded TensorLoRA with int_id {self.lora_int_id}, total_params: {len(weights)}")
         else:
             from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
 
