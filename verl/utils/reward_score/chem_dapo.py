@@ -15,7 +15,9 @@
 
 import re
 from typing import Optional
-from rdkit import Chem
+from rdkit import Chem, RDLogger
+RDLogger.DisableLog('rdApp.*')
+
 
 ANSWER_TAG = r"<ANSWER>(.*?)</ANSWER>"
 
