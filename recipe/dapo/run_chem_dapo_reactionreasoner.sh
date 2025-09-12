@@ -11,18 +11,8 @@ SCRIPT_LOG="${LOG_DIR}/script_$(date +%Y%m%d_%H%M%S).log"
 exec > >(tee -a "${SCRIPT_LOG}")
 exec 2>&1
 
-# Fix FlashInfer CUDA architecture detection issue
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-export CUDA_DEVICE_ORDER=PCI_BUS_ID
-export VLLM_DISABLE_FLASHINFER=1
-export VLLM_USE_FLASHINFER=0
-export VLLM_ATTENTION_BACKEND=FLASH_ATTN
-export TORCH_CUDA_ARCH_LIST="8.0"
-export FLASHINFER_DISABLE=1
-export VLLM_SAMPLING_BACKEND=TORCH
-
 project_name='DAPO'
-exp_name='DAPO-ReactionReasoner-lora32'
+exp_name='DAPO-ReactionReasoner-lora-merged-realtest-1e-7'
 
 adv_estimator=grpo
 
@@ -45,10 +35,10 @@ loss_agg_mode="token-mean"
 enable_filter_groups=True
 filter_groups_metric=acc
 max_num_gen_batches=10
-train_prompt_bsz=32 # 512
-gen_prompt_bsz=$((train_prompt_bsz * 4))
+train_prompt_bsz=64 # 512
+gen_prompt_bsz=$((train_prompt_bsz * 2))
 n_resp_per_prompt=16 # 16
-train_prompt_mini_bsz=2 # 32 # <= train_prompt_bsz // n_resp_per_prompt
+train_prompt_mini_bsz=4 # 32
 
 # Ray
 RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
@@ -60,11 +50,12 @@ N_GPUS_PER_NODE=${N_GPUS_PER_NODE:-8}
 # Paths
 HOME="/data" ##
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
-MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/ReactionReasoner_stage123_lora_merged"}
-MODEL_LORA_PATH=${MODEL_LORA_PATH:-"${RAY_DATA_HOME}/models/ReactionReasoner_lora_adapter"} ##
+# MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/ReactionReasoner_stage123_lora_merged"}
+# MODEL_LORA_PATH=${MODEL_LORA_PATH:-"${RAY_DATA_HOME}/models/ReactionReasoner_lora_adapter"} ##
+MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/ReactionReasoner_stage123_lora_adapter_merged"}
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
-TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/syntheticreact_8k_train.parquet"}
-TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/syntheticreact_1k_test.parquet"}
+TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/chem_dapo/syntheticreact_9k_train.parquet"}
+TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/chem_dapo/syntheticreact_3k_test.parquet"}
 
 # Algorithm
 temperature=1.0
@@ -111,11 +102,8 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
-    actor_rollout_ref.model.lora_path="${MODEL_LORA_PATH}" \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
-    actor_rollout_ref.model.lora_rank=32 \
-    actor_rollout_ref.model.lora_alpha=64 \
-    actor_rollout_ref.actor.optim.lr=1e-6 \
+    actor_rollout_ref.actor.optim.lr=1e-7 \
     actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
     actor_rollout_ref.actor.optim.weight_decay=0.1 \
     actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
@@ -138,6 +126,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
     actor_rollout_ref.rollout.name=vllm \
+    actor_rollout_ref.rollout.free_cache_engine=True \
     actor_rollout_ref.ref.fsdp_config.param_offload=${offload} \
     actor_rollout_ref.ref.ulysses_sequence_parallel_size=${sp_size} \
     actor_rollout_ref.actor.fsdp_config.fsdp_size=-1 \
@@ -153,7 +142,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     trainer.nnodes="${NNODES}" \
     trainer.val_before_train=True \
     trainer.test_freq=5 \
-    trainer.save_freq=5 \
+    trainer.save_freq=50 \
     trainer.total_epochs=1 \
     trainer.default_local_dir="${CKPTS_DIR}" \
     trainer.resume_mode=auto
