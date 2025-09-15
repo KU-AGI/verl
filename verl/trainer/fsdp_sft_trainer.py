@@ -261,8 +261,6 @@ class FSDPSFTTrainer:
                     "bias": "none",
                 }
                 self.model = get_peft_model(self.model, LoraConfig(**lora_config))
-                if self.config.model.lora_path:
-                    self.model.load_adapter(self.config.model.lora_path, "adapter")
                 self.model = self.model.to(torch_dtype)
 
         if self.config.model.enable_gradient_checkpointing:

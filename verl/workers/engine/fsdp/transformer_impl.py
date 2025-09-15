@@ -252,8 +252,6 @@ class FSDPEngine(BaseEngine):
             "bias": "none",
         }
         module = get_peft_model(module, LoraConfig(**lora_config))
-        if self.model_config.lora_path:
-            module.load_adapter(self.model_config.lora_path, "adapter")
         return module
 
     def _build_fsdp_module(self, module):
