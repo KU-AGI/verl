@@ -476,7 +476,7 @@ class RayPPOTrainer:
 
         print(f"Dumped generations to {filename}")
 
-    def _maybe_log_val_generations(self, inputs, outputs, scores, mode):
+    def _maybe_log_val_generations(self, inputs, outputs, scores, mode, sort=False, shuffle=False):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
 
         generations_to_log = self.config.trainer.log_val_generations
@@ -486,13 +486,19 @@ class RayPPOTrainer:
 
         import numpy as np
 
-        # Create tuples of (input, output, score) and sort by input text
+        # Create tuples of (input, output, score) and sort by input text if sort is True
         samples = list(zip(inputs, outputs, scores, strict=True))
-        samples.sort(key=lambda x: x[0])  # Sort by input text
+        if sort:
+            samples.sort(key=lambda x: x[0])  # Sort by input text
 
-        # Use fixed random seed for deterministic shuffling
-        rng = np.random.RandomState(42)
-        rng.shuffle(samples)
+        # Use fixed random seed for deterministic shuffling if shuffle is True
+        if shuffle:
+            rng = np.random.RandomState(42)
+            rng.shuffle(samples)
+
+        # log all generations if generations_to_log is -1
+        if generations_to_log == -1:
+            generations_to_log = len(inputs)
 
         # Take first N samples after shuffling
         samples = samples[:generations_to_log]
