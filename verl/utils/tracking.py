@@ -309,33 +309,32 @@ def _flatten_dict(raw: dict[str, Any], *, sep: str) -> dict[str, Any]:
 class ValidationGenerationsLogger:
     project_name: str = None
     experiment_name: str = None
-    mode: str = "val"  # "val" or "test"
 
-    def log(self, loggers, samples, step):
+    def log(self, loggers, samples, step, mode):
         if "wandb" in loggers:
-            self.log_generations_to_wandb(samples, step, self.mode)
+            self.log_generations_to_wandb(samples, step, mode)
         if "swanlab" in loggers:
-            self.log_generations_to_swanlab(samples, step, self.mode)
+            self.log_generations_to_swanlab(samples, step, mode)
         if "mlflow" in loggers:
-            self.log_generations_to_mlflow(samples, step)
+            self.log_generations_to_mlflow(samples, step, mode)
 
         if "clearml" in loggers:
-            self.log_generations_to_clearml(samples, step, self.mode)
+            self.log_generations_to_clearml(samples, step, mode)
         if "tensorboard" in loggers:
-            self.log_generations_to_tensorboard(samples, step)
+            self.log_generations_to_tensorboard(samples, step, mode)
 
         if "vemlp_wandb" in loggers:
-            self.log_generations_to_vemlp_wandb(samples, step, self.mode)
+            self.log_generations_to_vemlp_wandb(samples, step, mode)
 
-    def log_generations_to_vemlp_wandb(self, samples, step):
+    def log_generations_to_vemlp_wandb(self, samples, step, mode):
         from volcengine_ml_platform import wandb as vemlp_wandb
 
-        self._log_generations_to_wandb(samples, step, vemlp_wandb)
+        self._log_generations_to_wandb(samples, step, vemlp_wandb, mode)
 
     def log_generations_to_wandb(self, samples, step, mode):
         import wandb
 
-        self._log_generations_to_wandb(samples, step, wandb)
+        self._log_generations_to_wandb(samples, step, wandb, mode)
 
     def _log_generations_to_wandb(self, samples, step, wandb, mode):
         """Log samples to wandb as a table"""
@@ -425,7 +424,7 @@ class ValidationGenerationsLogger:
         logger = task.get_logger()
         logger.report_table(
             series=f"{mode.capitalize()} generations",
-            title=f"{mode.capitalize()} generations",
+            title=f"{mode.capitalize()}",
             table_plot=pd.DataFrame.from_records(table),
             iteration=step,
         )
