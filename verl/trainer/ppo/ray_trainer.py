@@ -295,6 +295,7 @@ class RayPPOTrainer:
         val_reward_fn=None,
         train_dataset: Optional[Dataset] = None,
         val_dataset: Optional[Dataset] = None,
+        test_dataset: Optional[Dataset] = None,
         collate_fn=None,
         train_sampler: Optional[Sampler] = None,
         device_name=None,
@@ -314,6 +315,7 @@ class RayPPOTrainer:
             val_reward_fn: Function for computing rewards during validation.
             train_dataset (Optional[Dataset], optional): Training dataset. Defaults to None.
             val_dataset (Optional[Dataset], optional): Validation dataset. Defaults to None.
+            test_dataset (Optional[Dataset], optional): Test dataset. Defaults to None.
             collate_fn: Function to collate data samples into batches.
             train_sampler (Optional[Sampler], optional): Sampler for the training dataset. Defaults to None.
             device_name (str, optional): Device name for training (e.g., "cuda", "cpu"). Defaults to None.
@@ -352,9 +354,9 @@ class RayPPOTrainer:
         if self.config.algorithm.use_kl_in_reward:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
-        self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+        self._create_dataloader(train_dataset, val_dataset, test_dataset, collate_fn, train_sampler)
 
-    def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
+    def _create_dataloader(self, train_dataset, val_dataset, test_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
         Creates the train and validation dataloaders.
         """
@@ -369,7 +371,11 @@ class RayPPOTrainer:
             val_dataset = create_rl_dataset(
                 self.config.data.val_files, self.config.data, self.tokenizer, self.processor
             )
-        self.train_dataset, self.val_dataset = train_dataset, val_dataset
+        if test_dataset is None:
+            test_dataset = create_rl_dataset(
+                self.config.data.test_files, self.config.data, self.tokenizer, self.processor
+            )
+        self.train_dataset, self.val_dataset, self.test_dataset = train_dataset, val_dataset, test_dataset
 
         if train_sampler is None:
             train_sampler = create_rl_sampler(self.config.data, self.train_dataset)
@@ -393,6 +399,10 @@ class RayPPOTrainer:
         if val_batch_size is None:
             val_batch_size = len(self.val_dataset)
 
+        test_batch_size = self.config.data.test_batch_size  # Prefer config value if set
+        if test_batch_size is None:
+            test_batch_size = len(self.test_dataset)
+
         self.val_dataloader = StatefulDataLoader(
             dataset=self.val_dataset,
             batch_size=val_batch_size,
@@ -402,12 +412,22 @@ class RayPPOTrainer:
             collate_fn=collate_fn,
         )
 
+        self.test_dataloader = StatefulDataLoader(
+            dataset=self.test_dataset,
+            batch_size=test_batch_size,
+            num_workers=num_workers,
+            shuffle=False, # not supported for test data
+            drop_last=False,
+            collate_fn=collate_fn,
+        )
+
         assert len(self.train_dataloader) >= 1, "Train dataloader is empty!"
         assert len(self.val_dataloader) >= 1, "Validation dataloader is empty!"
+        assert len(self.test_dataloader) >= 1, "Test dataloader is empty!"
 
         print(
             f"Size of train dataloader: {len(self.train_dataloader)}, Size of val dataloader: "
-            f"{len(self.val_dataloader)}"
+            f"{len(self.val_dataloader)}, Size of test dataloader: {len(self.test_dataloader)}"
         )
 
         total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
@@ -456,7 +476,7 @@ class RayPPOTrainer:
 
         print(f"Dumped generations to {filename}")
 
-    def _maybe_log_val_generations(self, inputs, outputs, scores):
+    def _maybe_log_val_generations(self, inputs, outputs, scores, mode):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
 
         generations_to_log = self.config.trainer.log_val_generations
@@ -478,7 +498,7 @@ class RayPPOTrainer:
         samples = samples[:generations_to_log]
 
         # Log to each configured logger
-        self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
+        self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps, mode=mode)
 
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
         reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
@@ -595,7 +615,7 @@ class RayPPOTrainer:
 
             data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
 
-        self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
+        self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores, mode="val")
 
         # dump generations
         val_data_dir = self.config.trainer.get("validation_data_dir", None)

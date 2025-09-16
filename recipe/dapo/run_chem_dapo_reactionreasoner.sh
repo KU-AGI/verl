@@ -12,7 +12,7 @@ exec > >(tee -a "${SCRIPT_LOG}")
 exec 2>&1
 
 project_name='DAPO'
-exp_name='DAPO-ReactionReasoner-lora-merged-realtest'
+exp_name='DAPO-ReactionReasoner-lora-merged-realtest-val-test'
 
 adv_estimator=grpo
 
@@ -76,6 +76,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     -- python3 -m recipe.dapo.main_dapo \
     data.train_files="${TRAIN_FILE}" \
     data.val_files="${TEST_FILE}" \
+    data.test_files="${TEST_FILE}" \
     data.prompt_key=prompt \
     data.truncation='left' \
     data.max_prompt_length=${max_prompt_length} \
@@ -135,7 +136,9 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     reward_model.overlong_buffer.len=${overlong_buffer_len} \
     reward_model.overlong_buffer.penalty_factor=${overlong_penalty_factor} \
     trainer.logger='["console","wandb"]' \
-    trainer.log_val_generations=10 \
+    trainer.log_val_generations=-1 \
+    trainer.validation_data_dir="${CKPTS_DIR}/validation" \
+    trainer.test_data_dir="${CKPTS_DIR}/test" \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
     trainer.n_gpus_per_node=${N_GPUS_PER_NODE} \

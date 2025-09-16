@@ -11,7 +11,10 @@ use_shm: False
 train_files: ~/data/rlhf/gsm8k/train.parquet
 
 # Validation parquet. Can be a list or a single file.
-val_files: ~/data/rlhf/gsm8k/test.parquet
+val_files: ~/data/rlhf/gsm8k/val.parquet
+
+# test parquet. Can be a list or a single file.
+test_files: ~/data/rlhf/gsm8k/test.parquet
 
 # The field in the dataset where the prompt is located. Default is 'prompt'.
 prompt_key: prompt
@@ -33,6 +36,9 @@ train_batch_size: 1024
 
 # Batch size used during validation. Can be null.
 val_batch_size: null
+
+# Batch size used during test. Can be null.
+test_batch_size: null
 
 # Whether to return the original input_ids without adding chat template.
 # This is used when the reward model's chat template differs from the policy.
