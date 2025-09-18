@@ -347,16 +347,56 @@ class ValidationGenerationsLogger:
         if not hasattr(self, "validation_table"):
             # Initialize the table on first call
             self.validation_table = wandb.Table(columns=columns)
+            self.max_samples_per_row = len(samples)
+            existing_data = []
+        else:
+            # Check if we need to expand the table structure
+            if len(samples) > self.max_samples_per_row:
+                # Expand columns to accommodate more samples
+                additional_columns = sum(
+                    [[f"input_{i + 1}", f"output_{i + 1}", f"score_{i + 1}"] 
+                     for i in range(self.max_samples_per_row, len(samples))], []
+                )
+                columns = self.validation_table.columns + additional_columns
+                self.max_samples_per_row = len(samples)
+                
+                # Migrate existing data to new column structure
+                existing_data = []
+                for row in self.validation_table.data:
+                    # Pad existing rows with empty strings to match new column count
+                    padded_row = list(row) + [""] * len(additional_columns)
+                    existing_data.append(padded_row)
+                
+                # Create new table with expanded columns
+                self.validation_table = wandb.Table(columns=columns)
+            else:
+                # Ensure existing data matches current column structure
+                existing_data = []
+                for row in self.validation_table.data:
+                    # Convert to list and ensure it matches current column count
+                    row_list = list(row)
+                    # Pad or truncate to match current column count
+                    if len(row_list) < len(columns):
+                        row_list.extend([""] * (len(columns) - len(row_list)))
+                    elif len(row_list) > len(columns):
+                        row_list = row_list[:len(columns)]
+                    existing_data.append(row_list)
 
         # Create a new table with same columns and existing data
         # Workaround for https://github.com/wandb/wandb/issues/2981#issuecomment-1997445737
-        new_table = wandb.Table(columns=columns, data=self.validation_table.data)
+        new_table = wandb.Table(columns=columns, data=existing_data)
 
         # Add new row with all data
         row_data = []
-        row_data.append(step)
+        row_data.append(str(step))  # Convert step to string
         for sample in samples:
-            row_data.extend(sample)
+            # Convert all sample values to strings
+            row_data.extend([str(item) for item in sample])
+        
+        # Pad row_data to match the expected number of columns
+        expected_columns = len(columns)
+        while len(row_data) < expected_columns:
+            row_data.append("")  # Pad with empty strings
 
         new_table.add_data(*row_data)
 
