@@ -63,6 +63,9 @@ dataloader_num_workers: 8
 # Whether to shuffle the validation set.
 validation_shuffle: False
 
+# Whether to shuffle the test set.
+test_shuffle: False
+
 # Whether to filter overlong prompts.
 filter_overlong_prompts: False
 

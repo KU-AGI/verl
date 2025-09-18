@@ -416,7 +416,7 @@ class RayPPOTrainer:
             dataset=self.test_dataset,
             batch_size=test_batch_size,
             num_workers=num_workers,
-            shuffle=False, # not supported for test data
+            shuffle=self.config.data.get("test_shuffle", False),
             drop_last=False,
             collate_fn=collate_fn,
         )
