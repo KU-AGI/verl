@@ -12,7 +12,7 @@ exec > >(tee -a "${SCRIPT_LOG}")
 exec 2>&1
 
 project_name='DAPO'
-exp_name='DAPO-ReactionReasoner-lora-merged-realtest-val-test'
+exp_name='DAPO-ReactionReasoner-lora-merged-realtest-stage123-clip-low'
 
 adv_estimator=grpo
 
@@ -22,7 +22,7 @@ use_kl_loss=False
 kl_loss_coef=0.0
 
 clip_ratio_low=0.2
-clip_ratio_high=0.28
+clip_ratio_high=0.2
 
 max_prompt_length=$((1024 * 1)) # 1024
 max_response_length=$((1024 * 4)) # 4096
@@ -35,10 +35,10 @@ loss_agg_mode="token-mean"
 enable_filter_groups=True
 filter_groups_metric=acc
 max_num_gen_batches=10
-train_prompt_bsz=64 # 512
-gen_prompt_bsz=$((train_prompt_bsz * 2))
-n_resp_per_prompt=16 # 16
-train_prompt_mini_bsz=4 # 32
+train_prompt_bsz=16 # 512
+gen_prompt_bsz=16 # $((train_prompt_bsz * 2))
+n_resp_per_prompt=8 # 16
+train_prompt_mini_bsz=16 # 32
 
 # Ray
 RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
@@ -50,12 +50,11 @@ N_GPUS_PER_NODE=${N_GPUS_PER_NODE:-8}
 # Paths
 HOME="/data" ##
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
-# MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/ReactionReasoner_stage123_lora_merged"}
-# MODEL_LORA_PATH=${MODEL_LORA_PATH:-"${RAY_DATA_HOME}/models/ReactionReasoner_lora_adapter"} ##
-MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/ReactionReasoner_stage123_lora_adapter_merged"}
+MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/ReactionReasoner_stage123_lora_adapter_merged"} ##
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
-TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/chem_dapo/syntheticreact_9k_train.parquet"}
-TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/chem_dapo/syntheticreact_3k_test.parquet"}
+TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/chem_dapo_30k/syntheticreact_30k_train.parquet"}
+VAL_FILE=${VAL_FILE:-"${RAY_DATA_HOME}/data/chem_dapo_30k/syntheticreact_300_val.parquet"}
+TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/chem_dapo_30k/syntheticreact_3k_test.parquet"}
 
 # Algorithm
 temperature=1.0
@@ -75,8 +74,9 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     --working-dir "${WORKING_DIR}" \
     -- python3 -m recipe.dapo.main_dapo \
     data.train_files="${TRAIN_FILE}" \
-    data.val_files="${TEST_FILE}" \
+    data.val_files="${VAL_FILE}" \
     data.test_files="${TEST_FILE}" \
+    data.task_extra_info_key=task \
     data.prompt_key=prompt \
     data.truncation='left' \
     data.max_prompt_length=${max_prompt_length} \
@@ -137,7 +137,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     reward_model.overlong_buffer.penalty_factor=${overlong_penalty_factor} \
     trainer.logger='["console","wandb"]' \
     trainer.log_val_generations=-1 \
-    trainer.validation_data_dir="${CKPTS_DIR}/validation" \
+    trainer.validation_data_dir="${CKPTS_DIR}/val" \
     trainer.test_data_dir="${CKPTS_DIR}/test" \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
