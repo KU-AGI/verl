@@ -22,6 +22,9 @@ prompt_key: prompt
 # The field used to select the reward function (if using different ones per example).
 reward_fn_key: data_source
 
+# The field in the dataset where the task is located. Default is 'None'.
+task_extra_info_key: null
+
 # Maximum prompt length. All prompts will be left-padded to this length.
 # An error will be reported if the length is too long.
 # oc.select: default val for rollout.prompt_length
