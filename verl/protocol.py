@@ -560,7 +560,27 @@ class DataProto:
 
         selected_non_tensor = {}
         for key, val in self.non_tensor_batch.items():
-            selected_non_tensor[key] = val[idxs_np]
+            # Add bounds checking to prevent IndexError while maintaining consistent lengths
+            if len(val) > 0:
+                # Ensure indices are within bounds
+                max_idx = len(val) - 1
+                valid_idxs = idxs_np[idxs_np <= max_idx]
+                
+                if len(valid_idxs) > 0:
+                    # Get the valid values
+                    valid_values = val[valid_idxs]
+                    # Create a new array with the same length as idxs_np, padding with None for invalid indices
+                    result = np.full(len(idxs_np), None, dtype=object)
+                    # Fill in the valid values at their corresponding positions
+                    valid_positions = idxs_np <= max_idx
+                    result[valid_positions] = valid_values
+                    selected_non_tensor[key] = result
+                else:
+                    # If no valid indices, create array of None values with same length as idxs_np
+                    selected_non_tensor[key] = np.full(len(idxs_np), None, dtype=object)
+            else:
+                # If val is empty, create array of None values with same length as idxs_np
+                selected_non_tensor[key] = np.full(len(idxs_np), None, dtype=object)
 
         return type(self)(batch=selected_batch, non_tensor_batch=selected_non_tensor, meta_info=self.meta_info)
 
