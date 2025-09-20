@@ -11,13 +11,19 @@ use_shm: False
 train_files: ~/data/rlhf/gsm8k/train.parquet
 
 # Validation parquet. Can be a list or a single file.
-val_files: ~/data/rlhf/gsm8k/test.parquet
+val_files: ~/data/rlhf/gsm8k/val.parquet
+
+# test parquet. Can be a list or a single file.
+test_files: ~/data/rlhf/gsm8k/test.parquet
 
 # The field in the dataset where the prompt is located. Default is 'prompt'.
 prompt_key: prompt
 
 # The field used to select the reward function (if using different ones per example).
 reward_fn_key: data_source
+
+# The field in the dataset where the task is located. Default is 'None'.
+task_extra_info_key: null
 
 # Maximum prompt length. All prompts will be left-padded to this length.
 # An error will be reported if the length is too long.
@@ -33,6 +39,9 @@ train_batch_size: 1024
 
 # Batch size used during validation. Can be null.
 val_batch_size: null
+
+# Batch size used during test. Can be null.
+test_batch_size: null
 
 # Whether to return the original input_ids without adding chat template.
 # This is used when the reward model's chat template differs from the policy.
@@ -53,6 +62,9 @@ dataloader_num_workers: 8
 
 # Whether to shuffle the validation set.
 validation_shuffle: False
+
+# Whether to shuffle the test set.
+test_shuffle: False
 
 # Whether to filter overlong prompts.
 filter_overlong_prompts: False

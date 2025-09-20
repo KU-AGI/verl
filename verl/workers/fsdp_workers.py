@@ -410,9 +410,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     "bias": "none",
                 }
                 actor_module = get_peft_model(actor_module, LoraConfig(**lora_config))
-                if self.config.model.lora_path:
-                    actor_module.load_adapter(self.config.model.lora_path, "adapter")
-        
 
         self.use_orig_params = fsdp_config.get("use_orig_params", False)
         if self.config.actor.get("freeze_vision_tower", False):
@@ -1258,8 +1255,6 @@ class CriticWorker(Worker, DistProfilerExtension):
                 "bias": "none",
             }
             critic_module = get_peft_model(critic_module, LoraConfig(**lora_config))
-            if self.config.model.lora_path:
-                critic_module.load_adapter(self.config.model.lora_path, "adapter")
 
         if self.rank == 0:
             print_model_size(critic_module)

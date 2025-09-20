@@ -23,8 +23,10 @@ import datasets
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--local_dir", default="/data/verl/data/chem_dapo")
+    parser.add_argument("--local_dir", default="/data/verl/data")
+    parser.add_argument("--dir_name", default="chem_dapo")
     parser.add_argument("--train", action="store_true")
+    parser.add_argument("--val", action="store_true")
     parser.add_argument("--test", action="store_true")
 
     args = parser.parse_args()
@@ -35,20 +37,23 @@ if __name__ == "__main__":
     data_source = "chem_dapo"
 
     if args.train:
-        dataset = datasets.load_from_disk(f"{args.local_dir}/train", "main")
+        dataset = datasets.load_from_disk(f"{args.local_dir}/{args.dir_name}/train", "main")
+    elif args.val:
+        dataset = datasets.load_from_disk(f"{args.local_dir}/{args.dir_name}/val", "main")
     elif args.test:
-        dataset = datasets.load_from_disk(f"{args.local_dir}/test", "main")
+        dataset = datasets.load_from_disk(f"{args.local_dir}/{args.dir_name}/test", "main")
     else:
-        raise ValueError("Either --train or --test must be specified")
+        raise ValueError("Either --train or --val or --test must be specified")
 
     # add a row to each data item that represents a unique id
     def make_map_fn(split):
         def process_fn(example, idx):
             messages = example.pop("messages")
-            solution = example.pop("answers")
+            # solution = example.pop("answers")
+            solution = example.pop("rationale")
             
             # Choose extra columns
-            extra_columns = ["rxn_str", "reactants", "reagents", "products", "solvent", "yields", "class_name"]
+            extra_columns = ["task", "rxn_str", "reactants", "reagents", "products", "solvent", "yields", "class_name"]
             
             data = {
                 "data_source": data_source,
@@ -65,7 +70,10 @@ if __name__ == "__main__":
 
     if args.train:
         dataset = dataset.map(function=make_map_fn("train"), with_indices=True, load_from_cache_file=False)
-        dataset.to_parquet(os.path.join(args.local_dir, "syntheticreact_9k_train.parquet"))
+        dataset.to_parquet(os.path.join(args.local_dir, f"{args.dir_name}", "syntheticreact_30k_train.parquet"))
+    elif args.val:
+        dataset = dataset.map(function=make_map_fn("val"), with_indices=True, load_from_cache_file=False)
+        dataset.to_parquet(os.path.join(args.local_dir, f"{args.dir_name}", "syntheticreact_300_val.parquet"))
     elif args.test:
         dataset = dataset.map(function=make_map_fn("test"), with_indices=True, load_from_cache_file=False)
-        dataset.to_parquet(os.path.join(args.local_dir, "syntheticreact_3k_test.parquet"))
+        dataset.to_parquet(os.path.join(args.local_dir, f"{args.dir_name}", "syntheticreact_3k_test.parquet"))

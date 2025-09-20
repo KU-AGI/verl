@@ -310,33 +310,33 @@ class ValidationGenerationsLogger:
     project_name: str = None
     experiment_name: str = None
 
-    def log(self, loggers, samples, step):
+    def log(self, loggers, samples, step, mode):
         if "wandb" in loggers:
-            self.log_generations_to_wandb(samples, step)
+            self.log_generations_to_wandb(samples, step, mode)
         if "swanlab" in loggers:
-            self.log_generations_to_swanlab(samples, step)
+            self.log_generations_to_swanlab(samples, step, mode)
         if "mlflow" in loggers:
-            self.log_generations_to_mlflow(samples, step)
+            self.log_generations_to_mlflow(samples, step, mode)
 
         if "clearml" in loggers:
-            self.log_generations_to_clearml(samples, step)
+            self.log_generations_to_clearml(samples, step, mode)
         if "tensorboard" in loggers:
-            self.log_generations_to_tensorboard(samples, step)
+            self.log_generations_to_tensorboard(samples, step, mode)
 
         if "vemlp_wandb" in loggers:
-            self.log_generations_to_vemlp_wandb(samples, step)
+            self.log_generations_to_vemlp_wandb(samples, step, mode)
 
-    def log_generations_to_vemlp_wandb(self, samples, step):
+    def log_generations_to_vemlp_wandb(self, samples, step, mode):
         from volcengine_ml_platform import wandb as vemlp_wandb
 
-        self._log_generations_to_wandb(samples, step, vemlp_wandb)
+        self._log_generations_to_wandb(samples, step, vemlp_wandb, mode)
 
-    def log_generations_to_wandb(self, samples, step):
+    def log_generations_to_wandb(self, samples, step, mode):
         import wandb
 
-        self._log_generations_to_wandb(samples, step, wandb)
+        self._log_generations_to_wandb(samples, step, wandb, mode)
 
-    def _log_generations_to_wandb(self, samples, step, wandb):
+    def _log_generations_to_wandb(self, samples, step, wandb, mode):
         """Log samples to wandb as a table"""
 
         # Create column names for all samples
@@ -347,24 +347,64 @@ class ValidationGenerationsLogger:
         if not hasattr(self, "validation_table"):
             # Initialize the table on first call
             self.validation_table = wandb.Table(columns=columns)
+            self.max_samples_per_row = len(samples)
+            existing_data = []
+        else:
+            # Check if we need to expand the table structure
+            if len(samples) > self.max_samples_per_row:
+                # Expand columns to accommodate more samples
+                additional_columns = sum(
+                    [[f"input_{i + 1}", f"output_{i + 1}", f"score_{i + 1}"] 
+                     for i in range(self.max_samples_per_row, len(samples))], []
+                )
+                columns = self.validation_table.columns + additional_columns
+                self.max_samples_per_row = len(samples)
+                
+                # Migrate existing data to new column structure
+                existing_data = []
+                for row in self.validation_table.data:
+                    # Pad existing rows with empty strings to match new column count
+                    padded_row = list(row) + [""] * len(additional_columns)
+                    existing_data.append(padded_row)
+                
+                # Create new table with expanded columns
+                self.validation_table = wandb.Table(columns=columns)
+            else:
+                # Ensure existing data matches current column structure
+                existing_data = []
+                for row in self.validation_table.data:
+                    # Convert to list and ensure it matches current column count
+                    row_list = list(row)
+                    # Pad or truncate to match current column count
+                    if len(row_list) < len(columns):
+                        row_list.extend([""] * (len(columns) - len(row_list)))
+                    elif len(row_list) > len(columns):
+                        row_list = row_list[:len(columns)]
+                    existing_data.append(row_list)
 
         # Create a new table with same columns and existing data
         # Workaround for https://github.com/wandb/wandb/issues/2981#issuecomment-1997445737
-        new_table = wandb.Table(columns=columns, data=self.validation_table.data)
+        new_table = wandb.Table(columns=columns, data=existing_data)
 
         # Add new row with all data
         row_data = []
-        row_data.append(step)
+        row_data.append(str(step))  # Convert step to string
         for sample in samples:
-            row_data.extend(sample)
+            # Convert all sample values to strings
+            row_data.extend([str(item) for item in sample])
+        
+        # Pad row_data to match the expected number of columns
+        expected_columns = len(columns)
+        while len(row_data) < expected_columns:
+            row_data.append("")  # Pad with empty strings
 
         new_table.add_data(*row_data)
 
         # Update reference and log
-        wandb.log({"val/generations": new_table}, step=step)
+        wandb.log({f"{mode}/generations": new_table}, step=step)
         self.validation_table = new_table
 
-    def log_generations_to_swanlab(self, samples, step):
+    def log_generations_to_swanlab(self, samples, step, mode):
         """Log samples to swanlab as text"""
         import swanlab
 
@@ -377,9 +417,9 @@ class ValidationGenerationsLogger:
         swanlab_table.add(headers=headers, rows=swanlab_row_list)
 
         # Log to swanlab
-        swanlab.log({"val/generations": swanlab_table}, step=step)
+        swanlab.log({f"{mode}/generations": swanlab_table}, step=step)
 
-    def log_generations_to_mlflow(self, samples, step):
+    def log_generations_to_mlflow(self, samples, step, mode):
         """Log validation generation to mlflow as artifacts"""
         # https://mlflow.org/docs/latest/api_reference/python_api/mlflow.html?highlight=log_artifact#mlflow.log_artifact
 
@@ -401,7 +441,7 @@ class ValidationGenerationsLogger:
         except Exception as e:
             print(f"WARNING: save validation generation file to mlflow failed with error {e}")
 
-    def log_generations_to_clearml(self, samples, step):
+    def log_generations_to_clearml(self, samples, step, mode):
         """Log validation generation to clearml as table"""
 
         import clearml
@@ -423,13 +463,13 @@ class ValidationGenerationsLogger:
 
         logger = task.get_logger()
         logger.report_table(
-            series="Validation generations",
-            title="Validation",
+            series=f"{mode.capitalize()} generations",
+            title=f"{mode.capitalize()}",
             table_plot=pd.DataFrame.from_records(table),
             iteration=step,
         )
 
-    def log_generations_to_tensorboard(self, samples, step):
+    def log_generations_to_tensorboard(self, samples, step, mode):
         """Log samples to tensorboard as text"""
         # Initialize tensorboard writer if not exists
         if not hasattr(self, "writer"):
@@ -465,6 +505,6 @@ class ValidationGenerationsLogger:
             text_content += "---\n\n"
 
         # Log to tensorboard as text
-        self.writer.add_text("val/generations", text_content, step)
+        self.writer.add_text(f"{mode}/generations", text_content, step)
         # Flush to ensure data is written
         self.writer.flush()
