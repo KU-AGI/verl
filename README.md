@@ -37,16 +37,22 @@
     ```
     
 - Install
-    
-    ```bash
-    cd /verl
-    pip install --no-deps -e .
-    
-    # Post-install
-    pip3 install -e .[vllm]
-    ...
+
+    ```
+    bash scripts/install_vllm_sglang_mcore.sh
+    ```
     ```
     
+## Ray clustering
+
+```python
+cluster  
+  ├── ray_master.sh
+  └── ray_worker.sh
+```
+
+- For head node, run `ray_master.sh`
+- For worker node, run `ray_worker.sh`
 
 ## Using conda
 
