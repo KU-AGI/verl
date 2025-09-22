@@ -11,8 +11,8 @@ SCRIPT_LOG="${LOG_DIR}/script_$(date +%Y%m%d_%H%M%S).log"
 exec > >(tee -a "${SCRIPT_LOG}")
 exec 2>&1
 
-project_name='DAPO'
-exp_name='DAPO-ReactionReasoner-lora-merged-realtest-stage123-clip-low'
+project_name="verl-dapo" # 'DAPO'
+exp_name='DAPO-ReactionReasoner-lora-merged-stage12-n32-bsz32-clip-low-sampling-fsdp2'
 
 adv_estimator=grpo
 
@@ -35,10 +35,10 @@ loss_agg_mode="token-mean"
 enable_filter_groups=True
 filter_groups_metric=acc
 max_num_gen_batches=10
-train_prompt_bsz=16 # 512
-gen_prompt_bsz=16 # $((train_prompt_bsz * 2))
-n_resp_per_prompt=8 # 16
-train_prompt_mini_bsz=16 # 32
+train_prompt_bsz=32 # 512
+gen_prompt_bsz=32 # $((train_prompt_bsz * 2))
+n_resp_per_prompt=32 # 16
+train_prompt_mini_bsz=32 # 32
 
 # Ray
 RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
@@ -50,17 +50,17 @@ N_GPUS_PER_NODE=${N_GPUS_PER_NODE:-8}
 # Paths
 HOME="/data" ##
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
-MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/ReactionReasoner_stage123_lora_adapter_merged"} ##
+MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/ReactionReasoner_stage12_lora_adapter_merged"} ##
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
 TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/chem_dapo_30k/syntheticreact_30k_train.parquet"}
 VAL_FILE=${VAL_FILE:-"${RAY_DATA_HOME}/data/chem_dapo_30k/syntheticreact_300_val.parquet"}
 TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/chem_dapo_30k/syntheticreact_3k_test.parquet"}
 
 # Algorithm
-temperature=1.0
-top_p=1.0
-top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
-val_top_p=0.7
+temperature=0.8
+top_p=0.95
+top_k=50 # 0 for HF rollout, -1 for vLLM rollout
+val_top_p=0.95
 
 # Performance Related Parameter
 sp_size=${N_GPUS_PER_NODE:-8}
@@ -70,6 +70,13 @@ infer_ppo_max_token_len=$((max_prompt_length + max_response_length))
 offload=True
 gen_tp=${N_GPUS_PER_NODE:-8}
 
+rollout_name="vllm" # sglang or vllm
+rollout_mode="sync"
+if [ "$rollout_mode" = "async" ]; then
+    export VLLM_USE_V1=1
+    return_raw_chat="True"
+fi
+
 ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     --working-dir "${WORKING_DIR}" \
     -- python3 -m recipe.dapo.main_dapo \
@@ -77,6 +84,8 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     data.val_files="${VAL_FILE}" \
     data.test_files="${TEST_FILE}" \
     data.task_extra_info_key=task \
+    data.validation_shuffle=True \
+    data.test_shuffle=True \
     data.prompt_key=prompt \
     data.truncation='left' \
     data.max_prompt_length=${max_prompt_length} \
@@ -126,7 +135,8 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     actor_rollout_ref.rollout.val_kwargs.top_k=${top_k} \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
-    actor_rollout_ref.rollout.name=vllm \
+    actor_rollout_ref.rollout.name=${rollout_name} \
+    actor_rollout_ref.rollout.mode=${rollout_mode} \
     actor_rollout_ref.rollout.free_cache_engine=True \
     actor_rollout_ref.ref.fsdp_config.param_offload=${offload} \
     actor_rollout_ref.ref.ulysses_sequence_parallel_size=${sp_size} \
@@ -148,4 +158,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     trainer.save_freq=50 \
     trainer.total_epochs=1 \
     trainer.default_local_dir="${CKPTS_DIR}" \
-    trainer.resume_mode=auto
+    trainer.resume_mode=auto \
+    actor_rollout_ref.ref.strategy=fsdp2 \
+    actor_rollout_ref.actor.strategy=fsdp2 \
+    reward_model.strategy=fsdp2
