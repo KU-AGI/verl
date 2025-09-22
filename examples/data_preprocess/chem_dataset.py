@@ -49,9 +49,12 @@ if __name__ == "__main__":
     def make_map_fn(split):
         def process_fn(example, idx):
             messages = example.pop("messages")
-            # solution = example.pop("answers")
-            solution = example.pop("rationale")
+            answer = example.pop("answers")
+            rationale = example.pop("rationale")
             
+            solution = ["<think>\n" + rationale + "</think>\n\n" + "<ANSWER>\n" + answer + "\n</ANSWER>"]
+            solution = "".join(solution)
+
             # Choose extra columns
             extra_columns = ["task", "rxn_str", "reactants", "reagents", "products", "solvent", "yields", "class_name"]
             
