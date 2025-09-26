@@ -41,7 +41,6 @@
     ```
     bash scripts/install_vllm_sglang_mcore.sh
     ```
-    ```
     
 ## Ray clustering
 
