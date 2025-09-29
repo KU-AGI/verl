@@ -79,7 +79,7 @@ fi
 
 ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     --working-dir "${WORKING_DIR}" \
-    -- python3 -m recipe.dapo.main_dapo \
+    -- python3 -m recipe.dapo.main_chem_dapo \
     data.train_files="${TRAIN_FILE}" \
     data.val_files="${VAL_FILE}" \
     data.test_files="${TEST_FILE}" \
