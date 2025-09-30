@@ -42,6 +42,7 @@ class StepData:
     original: str
     reflection: Optional[str] = None
     verify: bool = False
+    metadata: Optional[Dict[str, Any]] = None
 
 @dataclass
 class EvaluationResult:
@@ -85,16 +86,17 @@ class TextProcessor:
         return match.group(1).strip() if match else text.strip()
     
     @staticmethod
-    def parse_step_content(step_text: str, step_id: str) -> StepData:
+    def parse_step_content(step_text: str, step_id: str, metadata: Optional[Dict[str, Any]] = None) -> StepData:
         """Parse step content including reflections."""
         reflection_match = re.search(Tags.REFLECTION, step_text)
         reflection = reflection_match.group(1).strip() if reflection_match else None
-        
+
         return StepData(
             step_id=step_id,
             original=step_text.strip(),
             reflection=reflection,
-            verify=reflection is not None
+            verify=reflection is not None,
+            metadata=metadata
         )
 
 class StepParser:
@@ -104,7 +106,7 @@ class StepParser:
         decomposed_dict = {}
         
         # Extract reasoning part (before answer tag)
-        reasoning_steps = rationale.split("<ANSWER>")[0]
+        reasoning_steps, answer = rationale.split("<ANSWER>")[0], rationale.split("<ANSWER>")[-1].replace("</ANSWER>", "").strip()
         
         # extract <think> tag
         match =re.search(r'<think>(.*?)</think>', reasoning_steps, re.DOTALL)
@@ -120,7 +122,7 @@ class StepParser:
                 continue
                 
             step_id_str = step_id_match.group(1)
-            step_data = TextProcessor.parse_step_content(step_content, step_id_str)
+            step_data = TextProcessor.parse_step_content(step_content, step_id_str, metadata={"answer": answer})
             decomposed_dict[f"step_{step_id_str}"] = step_data
         
         return decomposed_dict
@@ -160,7 +162,7 @@ class ForwardStep4Evaluator(BaseStepEvaluator):
         content = self._get_content(step)
         
         if step.verify and step.reflection:
-            highlighted_smiles = content.split("It should be")[-1].split("\n")[-1].strip()
+            highlighted_smiles = content.split("It should be")[-1].split("\n")[-1].strip().rstrip(".")
         else:
             highlighted_smiles = content.split("`**[atom]:[number]**` as follows.")[-1].split("\n")[-1].strip()
         
@@ -237,7 +239,7 @@ class ForwardStep6Evaluator(BaseStepEvaluator):
         content = self._get_content(step)   
         
         if step.verify and step.reflection:
-            product_smiles = content.split("The product should be")[-1].split("\n")[-1].strip()
+            product_smiles = content.split("The product should be")[-1].split("\n")[-1].strip().rstrip(".")
         else:
             tagged_smiles = content.split("we get the following")[-1].strip().split("\n")[-1].strip()
             product_smiles = self.apply_edit_tags(tagged_smiles)
@@ -263,7 +265,7 @@ class RetroStep5Evaluator(BaseStepEvaluator):
             if "it does not appear that" in content:
                 return {"bond_disconnections_set": set()}
             else:
-                bond_disconnections = content
+                bond_disconnections = content.split("it is expected that the following bonds would have been formed.")[-1].strip()
 
         bond_disconnections_set = set()
         if bond_disconnections:
@@ -276,7 +278,7 @@ class RetroStep5Evaluator(BaseStepEvaluator):
                     if len(parts) != 3:  # Skip lines that don't have exactly 3 parts
                         continue
                     atom1, atom2, bond_type = parts
-                    atom1, atom2, bond_type = int(atom1), int(atom2), bond_type
+                    atom1, atom2, bond_type = int(atom1), int(atom2), bond_type.strip()
                     bond_disconnections_set.add((atom1, atom2, bond_type))
                 except (ValueError, IndexError):  # Skip lines that can't be parsed
                     continue
@@ -350,12 +352,12 @@ class ReagentStep6Evaluator(BaseStepEvaluator):
             if m:
                 candidate_blocks_set.add(m.group(1).strip())
         
-        return {"candidate_blocks_set": candidate_blocks_set}
+        return {"candidate_blocks_set": candidate_blocks_set, "answer": set(step.metadata["answer"])}
     
     def evaluate_step(self, pred_parsed: Dict[str, Any], gt_parsed: Dict[str, Any]) -> Dict[str, int]:
         return {
             # pred_parsed set is a subset of gt_parsed set
-            "reagent/step6/has_correct_reagent_numberials": 1 if pred_parsed["candidate_blocks_set"] <= gt_parsed["candidate_blocks_set"] else 0,
+            "reagent/step6/has_correct_reagent_numberials": 1 if gt_parsed["answer"] <= pred_parsed["candidate_blocks_set"] else 0,
         }
 
 
