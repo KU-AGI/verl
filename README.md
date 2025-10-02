@@ -40,6 +40,8 @@
 
     ```
     bash scripts/install_vllm_sglang_mcore.sh
+    # https://github.com/ranaroussi/quantstats/issues/365
+    pip install numpy==1.24.4
     ```
     
 ## Ray clustering
