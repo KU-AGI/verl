@@ -61,6 +61,20 @@ cluster
 
 # Core Code
 
+### Load pretrained model 
+
+- With LoRA trained
+
+    ```python
+    python -m utils.model_merge_and_save.py --{args}
+    ```
+
+- Full-fine tuned model
+
+    ```python
+    python -m utils.model_loader.py --{args}
+    ```
+
 ### Data Preprocess
 
 - https://verl.readthedocs.io/en/latest/preparation/prepare_data.html
@@ -70,7 +84,7 @@ cluster
         - style “rule” : exact match (math) ← X model base
         - reward model base면 컬럼 없애기 → [참조](https://www.notion.so/verl-Recipe-26b7e0e795c9807b8de0e225f12bf94c?pvs=21)
 - example/data_preprocess
-    - chem_dataset.py
+    - chem_dataset.py (after warm up from chem_select.py)
         
         ```python
         """
@@ -364,3 +378,11 @@ cluster
         
             return result
         ```
+
+### Save pretrained model 
+
+- FSDP
+
+    ```bash
+    bash utils/model_merge.sh
+    ```
