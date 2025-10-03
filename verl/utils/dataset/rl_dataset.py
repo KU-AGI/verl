@@ -19,7 +19,7 @@ import logging
 import os
 import re
 from collections import defaultdict
-from typing import Optional
+from typing import List, Union, Optional
 
 import datasets
 import numpy as np
@@ -30,6 +30,8 @@ from transformers import PreTrainedTokenizer, ProcessorMixin
 
 import verl.utils.torch_functional as verl_F
 from verl.utils.model import compute_position_id_with_mask
+from datasets import load_dataset, load_from_disk, concatenate_datasets
+
 
 logger = logging.getLogger(__name__)
 
@@ -377,3 +379,379 @@ class RLHFDataset(Dataset):
             return state
 
         return self.__dict__.copy()
+
+
+class JanusTextOnlyRLHFDataset(Dataset):
+    """
+    We assume the dataset contains a column that contains prompts and other information
+    """
+    def __init__(self,
+                 parquet_files: Union[str, List[str]],
+                 tokenizer: PreTrainedTokenizer,
+                 processor: Optional[ProcessorMixin] = None,
+                 prompt_key=None,
+                 image_key=None,
+                 max_prompt_length=1024,
+                 filter_prompts=True,
+                 cache_dir=None,
+                 chat_template_func=None,
+                 return_raw_chat=False,
+                 truncation='error',
+                 filter_overlong_prompts=False,
+                 system_prompt="",
+                 prompt_template=None,
+                 cot_generate=False,
+                 ):
+        if not isinstance(parquet_files, (List, ListConfig)):
+            parquet_files = [parquet_files]
+
+        self.parquet_files = copy.deepcopy(parquet_files)
+        self.tokenizer = tokenizer
+        self.processor = processor
+
+        self.prompt_key = prompt_key
+        self.image_key = image_key
+        self.max_prompt_length = max_prompt_length
+        self.filter_prompts = filter_prompts
+
+        self.return_raw_chat = return_raw_chat
+        self.chat_template_func = chat_template_func
+        self.truncation = truncation
+        self.filter_overlong_prompts = filter_overlong_prompts
+        self.system_prompt = system_prompt
+        self.cot_generate = cot_generate
+        self.prompt_template = prompt_template
+        self.data_source_list = []
+        if self.prompt_template is None:
+            self.prompt_template = "A photo of {}."
+        
+        self.prompts = []
+        for i, parquet_file in enumerate(parquet_files):
+            self.parquet_files[i] = os.path.expanduser(parquet_file)
+            file_name = os.path.basename(self.parquet_files[i]).replace('.txt', '')
+            if self.parquet_files[i].endswith('.txt'):
+                with open(self.parquet_files[i], 'r') as f:
+                    prompts = f.readlines()
+                for prompt in prompts:
+                    if self.filter_overlong_prompts:
+                        if len(tokenizer.encode(prompt, add_special_tokens=False))+10 > self.max_prompt_length: # +5 for <user>, <assistant>, <img_start>, etc..
+                            continue
+                    self.prompts.append(prompt.strip())
+                    self.data_source_list.append(file_name)
+                        
+                # self.prompts.extend([prompt.strip() for prompt in prompts])
+                # self.data_source_list.extend([file_name] * len(prompts))
+            else:
+                raise ValueError(f"Unsupported file format: {self.parquet_files[i]}")
+        
+    def __len__(self):
+        return len(self.prompts)
+
+    def __getitem__(self, item):
+        """
+        Note that we also return the raw_input_ids so that it can be combined with other chat template
+        """
+        row_dict = {}
+
+        chat = [
+            {
+                "role": "<|User|>",
+                "content": self.prompt_template.format(self.prompts[item]),
+            },
+            {"role": "<|Assistant|>", "content": ""},
+        ]
+        
+        sft_format = self.processor.apply_sft_template_for_multi_turn_prompts(
+            conversations=chat,
+            sft_format=self.processor.sft_format,
+            system_prompt=self.system_prompt,
+        )
+        
+        if not self.cot_generate:
+            prompt = sft_format + self.processor.image_start_tag
+        else:
+            prompt = sft_format
+        
+        raw_prompt = prompt
+
+        is_multi_modal = False
+        assert not is_multi_modal, "JanusTextOnlyRLHFDataset only supports t2i data"
+        
+        input_ids, attention_mask = verl_F.tokenize_and_postprocess_data(prompt=prompt,
+                                                                         tokenizer=self.tokenizer,
+                                                                         max_length=self.max_prompt_length,
+                                                                         pad_token_id=self.tokenizer.pad_token_id,
+                                                                         left_pad=True,
+                                                                         truncation=self.truncation)
+
+        input_ids = input_ids[0]
+        attention_mask = attention_mask[0]
+        sentence_start_token, image_start_token = self.tokenizer.encode(self.processor.image_start_tag)
+        input_ids = torch.cat([torch.LongTensor([self.tokenizer.pad_token_id]), input_ids])
+        attention_mask = torch.cat([torch.LongTensor([0]), attention_mask])
+
+        num_pad = torch.sum(input_ids == self.tokenizer.pad_token_id, dim=-1)
+        last_pad_idx = num_pad - 1
+        
+        input_ids[last_pad_idx] = sentence_start_token
+        attention_mask[last_pad_idx] = 1
+        
+        position_ids = compute_position_id_with_mask(attention_mask)
+        
+        row_dict['input_ids'] = input_ids
+        row_dict['attention_mask'] = attention_mask
+        row_dict['position_ids'] = position_ids
+        row_dict['raw_prompt_ids'] = self.tokenizer.encode(raw_prompt, add_special_tokens=False)
+        row_dict['data_source'] = self.data_source_list[item]
+
+        # encode prompts without chat template
+        if self.return_raw_chat:
+            row_dict['raw_prompt'] = self.prompts[item]
+
+        # add index for each prompt
+        index = row_dict.get("extra_info", {}).get("index", 0)
+        row_dict["index"] = index
+
+        return row_dict
+
+    def __getstate__(self):
+        if not self.serialize_dataset:
+            state = self.__dict__.copy()
+
+            if 'dataframe' in state:
+                del state['dataframe']
+            return state
+        return self.__dict__.copy()
+    
+    
+class DummyJanusDPORLHFDataset(Dataset):
+    """
+    We assume the dataset contains a column that contains prompts and other information
+    """
+    def __init__(self,
+                 parquet_files: Union[str, List[str]],
+                 tokenizer: PreTrainedTokenizer,
+                 processor: Optional[ProcessorMixin] = None,
+                 prompt_key='prompt',
+                 image_key='images',
+                 max_prompt_length=1024,
+                 filter_prompts=True,
+                 cache_dir='~/.cache/verl/rlhf',
+                 chat_template_func=None,
+                 return_raw_chat=False,
+                 truncation='error',
+                 filter_overlong_prompts=False,
+                 system_prompt="",
+                 prompt_template=None,
+                 cot_generate=False,
+                 ):
+        if not isinstance(parquet_files, (List, ListConfig)):
+            parquet_files = [parquet_files]
+
+        self.parquet_files = copy.deepcopy(parquet_files)
+        self.original_parquet_files = copy.deepcopy(parquet_files)  # use for resume
+        self.cache_dir = os.path.expanduser(cache_dir)
+        self.tokenizer = tokenizer
+        self.processor = processor
+
+        self.prompt_key = prompt_key
+        self.image_key = image_key
+        self.max_prompt_length = max_prompt_length
+        self.filter_prompts = filter_prompts
+
+        self.return_raw_chat = return_raw_chat
+        self.chat_template_func = chat_template_func
+        self.truncation = truncation
+        self.filter_overlong_prompts = filter_overlong_prompts
+        self.system_prompt = system_prompt
+        self.cot_generate = cot_generate
+        self.prompt_template = prompt_template
+        self.dummy_prompts = [
+            'One apple and two bananas on a plate',
+            'A plate on the left of the cup',
+            'A lamp on the left side of the bed, and a clock on the right',
+            'A red apple on the left and a green apple on the right, both on a plate with a blue rim',
+            'a plant in front of a jar',
+            'a person above a leaf',
+            'three suitcases and one bottle'
+            'one screen and two watchs',
+            'A dog lying on a rug in front of a fireplace',
+            'two wines and two eggs',
+            'A white mug in front of a green notebook on a desk',
+            'a green bed and a khaki dish',
+            'a brown bag and a pink car',
+            'A pencil and an eraser beside an open notebook',
+            'A cat sitting on the windowsill with a plant to its left',
+            'A white book on top of a black book, which is on top of a red book',
+            'A teddy bear on the right side of the pillow on a bed'
+        ]
+        
+    def __len__(self):
+        return 32
+
+    def __getitem__(self, item):
+        """
+        Note that we also return the raw_input_ids so that it can be combined with other chat template
+        """
+        row_dict = {}
+
+        chat = [
+            {
+                "role": "<|User|>",
+                "content": self.prompt_template.format(self.dummy_prompts[item%len(self.dummy_prompts)]),
+            },
+            {"role": "<|Assistant|>", "content": ""},
+        ]
+        
+        sft_format = self.processor.apply_sft_template_for_multi_turn_prompts(
+            conversations=chat,
+            sft_format=self.processor.sft_format,
+            system_prompt=self.system_prompt,
+        )
+        if not self.cot_generate:
+            prompt = sft_format + self.processor.image_start_tag
+        else:
+            prompt = sft_format
+        
+        raw_prompt = prompt
+
+        is_multi_modal = False
+        assert not is_multi_modal, "JanusRLHFDataset only supports t2i data"
+        
+        input_ids, attention_mask = verl_F.tokenize_and_postprocess_data(prompt=prompt,
+                                                                         tokenizer=self.tokenizer,
+                                                                         max_length=self.max_prompt_length,
+                                                                         pad_token_id=self.tokenizer.pad_token_id,
+                                                                         left_pad=True,
+                                                                         truncation=self.truncation)
+
+        input_ids = input_ids[0]
+        attention_mask = attention_mask[0]
+        sentence_start_token, image_start_token = self.tokenizer.encode(self.processor.image_start_tag)
+        input_ids = torch.cat([torch.LongTensor([self.tokenizer.pad_token_id]), input_ids, torch.LongTensor([image_start_token])])
+        attention_mask = torch.cat([torch.LongTensor([0]), attention_mask, torch.LongTensor([1])])
+
+        num_pad = torch.sum(input_ids == self.tokenizer.pad_token_id, dim=-1)
+        last_pad_idx = num_pad - 1
+        
+        input_ids[last_pad_idx] = sentence_start_token
+        attention_mask[last_pad_idx] = 1
+        
+        position_ids = compute_position_id_with_mask(attention_mask)
+        
+        row_dict['input_ids'] = input_ids
+        row_dict['attention_mask'] = attention_mask
+        row_dict['position_ids'] = position_ids
+        row_dict['raw_prompt_ids'] = self.tokenizer.encode(raw_prompt, add_special_tokens=False)
+
+        # encode prompts without chat template
+        if self.return_raw_chat:
+            row_dict['raw_prompt'] = chat
+
+        # add index for each prompt
+        index = row_dict.get("extra_info", {}).get("index", 0)
+        row_dict["index"] = index
+
+        return row_dict
+
+    def __getstate__(self):
+        if not self.serialize_dataset:
+            state = self.__dict__.copy()
+
+            if 'dataframe' in state:
+                del state['dataframe']
+            return state
+        return self.__dict__.copy()
+
+class InterleaveDataset():
+    def __init__(self, data_dir:str, split:str=None):
+        self.data_dir = data_dir
+        self.datasets = {}
+        self.dataset_names = []  # keep track of the order of datasets
+        self.test_datasets = {}
+        self.split = split
+        self.debug = False
+        
+        self.load_datasets()
+        self.lengths = {name: len(dataset) for name, dataset in self.datasets.items()}
+        self.total_length = sum(self.lengths.values())
+        self.dataset_start_idx = {name: sum([self.lengths[n] for n in self.dataset_names[:i]]) for i, name in enumerate(self.dataset_names)}
+        
+    def load_single_dataset(self, data_path):
+        if "@" in data_path:
+            data_path, data_split = data_path.split("@")
+        else:
+            data_split = "train"
+            
+        def load(data_path):
+            try:
+                dataset = load_dataset(data_path, split=data_split)
+                print(f"loading dataset: {data_path}")
+            except Exception as e:
+                print(f"loading dataset from disk: {data_path}")
+                dataset = load_from_disk(data_path)
+            return dataset
+        
+        if 'batch_0' in os.listdir(data_path): # if the dataset is splited into batches
+            datasets = []
+            for batch in os.listdir(data_path):
+                path = os.path.join(data_path, batch)
+                datasets.append(load(path))
+            dataset = concatenate_datasets(datasets)
+        else:
+            dataset = load(data_path)
+        
+        return dataset
+    
+    def split_for_test(self):
+        test_datasets = {}
+        for dataset_name in self.dataset_names:
+            dataset = self.datasets[dataset_name]
+            dataset = dataset.train_test_split(
+                test_size=0.9,
+                shuffle=False,
+                seed=0,
+            )
+            test_datasets[dataset_name] = dataset['test']
+            self.datasets[dataset_name] = dataset['train']
+            if self.debug:
+                print("Debugging dataset")
+                test_datasets[dataset_name] = test_datasets[dataset_name].select(range(8))
+                self.datasets[dataset_name] = self.datasets[dataset_name].select(range(8))
+        return self.datasets, test_datasets
+        
+    def load_datasets(self):
+        if '@' in self.data_dir:
+            data_path = self.data_dir.split('@')[0]
+            name = os.path.basename(data_path)
+            self.datasets[name] = self.load_single_dataset(data_path)
+            self.dataset_names = [name]
+            return
+        
+        sub_dirs = os.listdir(self.data_dir)
+        json_files = [f for f in sub_dirs if f.endswith('.json')]
+        if len(json_files) > 0:
+            self.datasets[self.data_dir] = self.load_single_dataset(self.data_dir)
+            self.dataset_names = [os.path.basename(self.data_dir)]
+        else:
+            for dataset_name in os.listdir(self.data_dir):
+                data_path = os.path.join(self.data_dir, dataset_name)
+                self.datasets[dataset_name] = self.load_single_dataset(data_path)
+                self.dataset_names.append(dataset_name)
+            if self.split is not None:
+                self.datasets, self.test_datasets = self.split_for_test()
+            if self.split == 'test':
+                self.datasets = self.test_datasets
+            
+    def __len__(self):
+        return self.total_length
+    
+    def __getitem__(self, index):
+        for dataset_name in self.dataset_names:
+            if index < self.lengths[dataset_name]:
+                item = self.datasets[dataset_name][index]
+                item['data_source'] = dataset_name
+                return item
+            else:
+                index -= self.lengths[dataset_name]
+        raise IndexError("Index out of range")
