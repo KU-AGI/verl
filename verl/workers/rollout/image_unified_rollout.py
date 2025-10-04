@@ -47,18 +47,23 @@ class ImageUnifiedRollout(BaseRollout):
         self.generation_mode = config.get("generation_mode", "text") # text or image
         self.feedback_system_prompt = config.get("feedback_system_prompt", "You should give me a feedback on the image generation.")
         self.refine_system_prompt = config.get("refine_system_prompt", "You should refine the image generation.")
+        self.generation_config = None
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         batch_size = prompts.batch.batch_size[0]
         num_chunks = max(batch_size // self.config.get('micro_batch_size', batch_size), 1)
         batch_prompts = prompts.chunk(chunks=num_chunks)
-        output = [self._generate_minibatch_image_generation(p) for p in batch_prompts]
-        output = [self._generate_minibatch_text_generation(o) for o in output]
-        output = [self._generate_minibatch_refine_image_generation(o) for o in output]
+        
+        # set generation config
+        self.set_generation_config(batch_prompts[0])
+        
+        output = [self._generate_minibatch_image_generation(p) for p in batch_prompts] # task 1
+        output = [self._generate_minibatch_text_generation(o) for o in output] # task 2
+        output = [self._generate_minibatch_refine_image_generation(o) for o in output] # task 3
         output = DataProto.concat(output)
         return output
     
-    def process_config(self, prompts: DataProto):
+    def set_generation_config(self, prompts: DataProto):
         # make sampling args can be overridden by inputs
         do_sample = prompts.meta_info.get("do_sample", self.config.do_sample)
         is_validate = prompts.meta_info.get("validate", False)
@@ -98,15 +103,10 @@ class ImageUnifiedRollout(BaseRollout):
             }
 
         # make config according to generate mode
-        generation_config = GenerationConfig(**kwargs)
-
-        return kwargs, generation_config
+        self.generation_config = GenerationConfig(**kwargs)
 
     @torch.no_grad()
     def _generate_minibatch_image_generation(self, prompts: DataProto) -> TensorDict:
-
-        kwargs, generation_config = self.process_config(prompts)
-
         idx = prompts.batch['input_ids']  # (bs, prompt_length)
         attention_mask = prompts.batch['attention_mask']  # left-padded attention_mask
         position_ids = prompts.batch['position_ids']
@@ -127,20 +127,14 @@ class ImageUnifiedRollout(BaseRollout):
             param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=False)
         with param_ctx:
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                if self.generation_mode == "image":
-                    output = self.module.generate(
-                        input_ids=idx,
-                        attention_mask=attention_mask,
-                        generation_mode="image",
-                        do_sample=generation_config.do_sample,
-                        max_new_tokens=kwargs.get("response_length", self.generation_config.response_length),
-                        eos_token_id=kwargs.get("eos_token_id", self.generation_config.eos_token_id),
-                        pad_token_id=kwargs.get("pad_token_id", self.generation_config.pad_token_id),
-                        image_start_token_id=kwargs.get("image_start_token_id", self.generation_config.image_start_token_id),
-                        generation_config=generation_config,
-                        output_scores=False,  # this is potentially very large
-                        return_dict_in_generate=True,
-                        use_cache=True)
+                output = self.module.generate(
+                    input_ids=idx,
+                    attention_mask=attention_mask,
+                    generation_mode="image",
+                    generation_config=self.generation_config,
+                    output_scores=False,  # this is potentially very large
+                    return_dict_in_generate=True,
+                    use_cache=True)
 
         # TODO: filter out the seq with no answers like ds-chat
         seq = output.sequences
@@ -160,7 +154,7 @@ class ImageUnifiedRollout(BaseRollout):
         assert seq.shape[1] == sequence_length
 
         # make necessary reputations if num_return_sequences > 1
-        num_return_sequences = kwargs.get("num_return_sequences", 1)
+        num_return_sequences = self.generation_config.get("num_return_sequences", 1)
         if num_return_sequences > 1:
             position_ids = position_ids.repeat_interleave(num_return_sequences, dim=0)
             attention_mask = attention_mask.repeat_interleave(num_return_sequences, dim=0)
@@ -258,30 +252,21 @@ class ImageUnifiedRollout(BaseRollout):
             message, add_generation_prompt=True, tokenize=True, return_dict=True, return_tensors="pt"
         ).to(self.module.device, dtype=torch.bfloat16)
 
-        # Get generation parameters from config
-        do_sample = self.config.get("do_sample", True)
-        response_length = self.config.get("response_length", 512)
-        eos_token_id = self.config.get("eos_token_id", self.processor.tokenizer.eos_token_id)
-        pad_token_id = self.config.get("pad_token_id", self.processor.tokenizer.pad_token_id)
-        
-        # Create generation config
-        generation_config = GenerationConfig(
-            do_sample=do_sample,
-            max_new_tokens=response_length,
-            eos_token_id=eos_token_id,
-            pad_token_id=pad_token_id,
-        )
-
-        output = self.module.generate(
-            input_ids=input_ids,
-            attention_mask=input_ids.attention_mask,
-            position_ids=self.build_position_ids(input_ids.attention_mask),
-            generation_mode="text",
-            generation_config=generation_config,
-            output_scores=False,  # this is potentially very large
-            return_dict_in_generate=True,
-            use_cache=True,
-        )
+        if isinstance(self.module, FSDP):
+            # recurse need to set to False according to https://github.com/pytorch/pytorch/issues/100069
+            param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=False)
+        with param_ctx:
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                output = self.module.generate(
+                    input_ids=input_ids,
+                    attention_mask=input_ids.attention_mask,
+                    position_ids=self.build_position_ids(input_ids.attention_mask),
+                    generation_mode="text",
+                    generation_config=self.generation_config,
+                    output_scores=False,  # this is potentially very large
+                    return_dict_in_generate=True,
+                    use_cache=True,
+                )
 
         decoded_text = self.processor.decode(output.sequences[0], skip_special_tokens=True)
 
@@ -323,30 +308,20 @@ class ImageUnifiedRollout(BaseRollout):
             message, add_generation_prompt=True, tokenize=True, return_dict=True, return_tensors="pt"
         ).to(self.module.device, dtype=torch.bfloat16)
 
-        # Get generation parameters from config
-        do_sample = self.config.get("do_sample", True)
-        response_length = self.config.get("response_length", 512)
-        eos_token_id = self.config.get("eos_token_id", self.processor.tokenizer.eos_token_id)
-        pad_token_id = self.config.get("pad_token_id", self.processor.tokenizer.pad_token_id)
-        
-        # Create generation config
-        generation_config = GenerationConfig(
-            do_sample=do_sample,
-            max_new_tokens=response_length,
-            eos_token_id=eos_token_id,
-            pad_token_id=pad_token_id,
-        )
-
-        output = self.module.generate(
-            input_ids=input_ids,
-            attention_mask=input_ids.attention_mask,
-            position_ids=self.build_position_ids(input_ids.attention_mask),
-            generation_mode="image",
-            generation_config=generation_config,
-            output_scores=False,  # this is potentially very large
-            return_dict_in_generate=True,
-            use_cache=True,
-        )
+        if isinstance(self.module, FSDP):
+            # recurse need to set to False according to https://github.com/pytorch/pytorch/issues/100069
+            param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=False)
+        with param_ctx:
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                output = self.module.generate(
+                    input_ids=input_ids,
+                    attention_mask=input_ids.attention_mask,
+                    generation_mode="image",
+                    generation_config=self.generation_config,
+                    output_scores=False,  # this is potentially very large
+                    return_dict_in_generate=True,
+                    use_cache=True,
+                )
 
         decoded_image = self.module.decode_image_tokens(output)
         refined_gen_img = self.processor.postprocess(list(decoded_image.float()), return_tensors="PIL.Image.Image")
