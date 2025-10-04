@@ -14,7 +14,7 @@
 """
 Note that we don't combine the main with ray_trainer as ray_trainer is used by other main.
 """
-from verl.trainer.ppo.ray_image_generation_trainer import RayImageGenerationTrainer
+from .ray_image_generation_trainer import RayImageGenerationTrainer
 
 import os
 import socket
@@ -281,8 +281,8 @@ class TaskRunner:
         # processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
 
         ### Custom tokenizer and processor
-        from janus.models import MultiModalityCausalLM, VLChatProcessor
-        processor: VLChatProcessor = VLChatProcessor.from_pretrained(local_path)
+        from transformers import JanusProcessor
+        processor: JanusProcessor = JanusProcessor.from_pretrained(local_path)
         tokenizer = processor.tokenizer
         
         # Load the reward manager for training and validation.

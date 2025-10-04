@@ -52,17 +52,37 @@ class ImageGenerationRewardManager:
         
     def save_img(self, data: DataProto):
         gen_img = data.batch['gen_img']
+        feedback_text = data.batch['feedback_text']
+        refined_gen_img = data.batch['refined_gen_img']
         gen_img = gen_img.to('cpu').numpy() if isinstance(gen_img, torch.Tensor) else gen_img
+        refined_gen_img = refined_gen_img.to('cpu').numpy() if isinstance(refined_gen_img, torch.Tensor) else refined_gen_img
+        feedback_text = feedback_text.to('cpu').numpy() if isinstance(feedback_text, torch.Tensor) else feedback_text
         step_dir = os.path.join(self.save_path, str(self.steps))
         os.makedirs(step_dir, exist_ok=True)
         with open(os.path.join(step_dir, "texts.txt"), 'a') as f:
             f.write("Prompts:\n")
             for i in range(min(len(gen_img), self.save_num)):
+                f.write("="*40 + "\n")
+                f.write("Image:\n")
                 save_path = os.path.join(step_dir, "img_{}.jpg".format(i))
                 PIL.Image.fromarray(gen_img[i]).save(save_path)
                 prompt = data.batch['prompts'][i]
                 f.write(f'{self.tokenizer.decode(prompt, skip_special_tokens=True)}\n\n')
-            
+ 
+            if feedback_text is not None:
+                f.write("="*40 + "\n")
+                f.write("Feedback Text:\n")
+                for i in range(min(len(feedback_text), self.save_num)):
+                    f.write(f'{feedback_text[i]}\n\n')
+  
+            if refined_gen_img is not None:
+                f.write("="*40 + "\n")
+                f.write("Refined Image:\n")
+                for i in range(min(len(refined_gen_img), self.save_num)):
+                    save_refined_path = os.path.join(step_dir, "refined_img_{}.jpg".format(i))
+                    PIL.Image.fromarray(refined_gen_img[i]).save(save_refined_path)
+                    f.write(f'{feedback_text[i]}\n\n')
+
             if 'rm_text' in data.non_tensor_batch:
                 f.write("="*40 + "\n")
                 f.write("RM Text:\n")

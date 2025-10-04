@@ -330,6 +330,19 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         self.generation_config = get_generation_config(local_path, trust_remote_code=trust_remote_code)
 
+        # patch for janus
+        if getattr(actor_model_config, "model_type", None) == "janus":
+            from transformers import JanusProcessor
+            self.processor = JanusProcessor.from_pretrained(local_path)
+            self.tokenizer = self.processor.tokenizer
+            self.generation_config = get_generation_config(local_path, trust_remote_code=trust_remote_code)
+            self.generation_config.pad_token_id = self.tokenizer.pad_token_id
+            self.generation_config.eos_token_id = self.tokenizer.eos_token_id
+            self.generation_config.cfg_weight = self.config.model.get('cfg_weight', 1.0)
+            OmegaConf.set_struct(self.config.rollout, True)
+            with open_dict(self.config.rollout):
+                self.config.rollout.cfg_weight = self.config.model.get('cfg_weight', 1.0)
+
         override_config_kwargs = {
             "bos_token_id": self.tokenizer.bos_token_id,
             "eos_token_id": self.tokenizer.eos_token_id,

@@ -286,7 +286,8 @@ class RayImageGenerationTrainer(object):
         processor=None,
         reward_fn=None,
         val_reward_fn=None,
-        # dataloader
+        train_dataset: Optional[Dataset] = None,
+        val_dataset: Optional[Dataset] = None,
         collate_fn=None,
         train_sampler: Optional[Sampler] = None,
         device_name=None,
@@ -304,7 +305,8 @@ class RayImageGenerationTrainer(object):
             processor: Optional data processor, used for multimodal data
             reward_fn: Function for computing rewards during training.
             val_reward_fn: Function for computing rewards during validation.
-            # dataloader
+            train_dataset (Optional[Dataset], optional): Training dataset. Defaults to None.
+            val_dataset (Optional[Dataset], optional): Validation dataset. Defaults to None.
             collate_fn: Function to collate data samples into batches.
             train_sampler (Optional[Sampler], optional): Sampler for the training dataset. Defaults to None.
             device_name (str, optional): Device name for training (e.g., "cuda", "cpu"). Defaults to None.
@@ -343,11 +345,27 @@ class RayImageGenerationTrainer(object):
         if self.config.algorithm.use_kl_in_reward:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
-        self._create_dataloader(collate_fn, train_sampler)
+        self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
-    def _create_dataloader(self, collate_fn, train_sampler: Optional[Sampler]):
+    def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
+        """
+        Creates the train and validation dataloaders.
+        """
         # TODO: we have to make sure the batch size is divisible by the dp size
+        from verl.trainer.main_ppo import create_rl_dataset, create_rl_sampler
 
+        if train_dataset is None:
+            train_dataset = create_rl_dataset(
+                self.config.data.train_files, self.config.data, self.tokenizer, self.processor
+            )
+        if val_dataset is None:
+            val_dataset = create_rl_dataset(
+                self.config.data.val_files, self.config.data, self.tokenizer, self.processor
+            )
+        self.train_dataset, self.val_dataset = train_dataset, val_dataset
+
+        if train_sampler is None:
+            train_sampler = create_rl_sampler(self.config.data, self.train_dataset)
         if collate_fn is None:
             from verl.utils.dataset.rl_dataset import collate_fn as default_collate_fn
 
@@ -355,93 +373,53 @@ class RayImageGenerationTrainer(object):
 
         num_workers = self.config.data["dataloader_num_workers"]
 
-        self.train_dataset = JanusTextOnlyRLHFDataset(
-            parquet_files=self.config.data.train_files,
-            tokenizer=self.tokenizer,
-            processor=self.processor,
-            prompt_key=self.config.data.prompt_key,
-            image_key=self.config.data.get('image_key', 'images'),
-            max_prompt_length=self.config.data.max_prompt_length,
-            filter_prompts=True,
-            return_raw_chat=self.config.data.get('return_raw_chat', False),
-            truncation=self.config.data.get('truncation', 'error'),
-            filter_overlong_prompts=self.config.data.filter_overlong_prompts,
-            cot_generate=self.config.actor_rollout_ref.rollout.cot_generate,
-            prompt_template=self.config.data.prompt_template,
-        )
-        assert self.train_dataset.truncation == self.config.data.get(
-            'truncation', 'error'
-        ), f'dataset truncation {self.train_dataset.truncation} must be the same as config {self.config.data.get("truncation", "error")}'
-        # use sampler for better ckpt resume
-        if train_sampler is None and self.config.data.shuffle:
-            train_dataloader_generator = torch.Generator()
-            train_dataloader_generator.manual_seed(self.config.data.get('seed', 1))
-            train_sampler = RandomSampler(data_source=self.train_dataset, generator=train_dataloader_generator)
-        else:
-            train_sampler = SequentialSampler(data_source=self.train_dataset)
-
         self.train_dataloader = StatefulDataLoader(
             dataset=self.train_dataset,
-            batch_size=self.config.data.train_batch_size,
+            batch_size=self.config.data.get("gen_batch_size", self.config.data.train_batch_size),
             num_workers=num_workers,
             drop_last=True,
             collate_fn=collate_fn,
-            sampler=train_sampler
+            sampler=train_sampler,
         )
 
-        self.val_dataset = JanusTextOnlyRLHFDataset(
-            parquet_files=self.config.data.val_files,
-            tokenizer=self.tokenizer,
-            processor=self.processor,
-            prompt_key=self.config.data.prompt_key,
-            image_key=self.config.data.get('image_key', 'images'),
-            max_prompt_length=self.config.data.max_prompt_length,
-            filter_prompts=True,
-            return_raw_chat=self.config.data.get('return_raw_chat', False),
-            truncation=self.config.data.get('truncation', 'error'),
-            filter_overlong_prompts=self.config.data.filter_overlong_prompts,
-            cot_generate=self.config.actor_rollout_ref.rollout.cot_generate,
-            prompt_template=self.config.data.prompt_template,
-        )
-        assert self.val_dataset.truncation == self.config.data.get(
-            'truncation', 'error'
-        ), f'dataset truncation {self.val_dataset.truncation} must be the same as config {self.config.data.get("truncation", "error")}'
-        subset_rng = np.random.RandomState(self.config.data.get('seed', 1))
-        sub_sample_indices = subset_rng.choice(len(self.val_dataset), size=self.config.data.num_val_samples, replace=False).tolist()
-        self.val_dataset = Subset(self.val_dataset, sub_sample_indices)
-        
+        val_batch_size = self.config.data.val_batch_size  # Prefer config value if set
+        if val_batch_size is None:
+            val_batch_size = len(self.val_dataset)
+
         self.val_dataloader = StatefulDataLoader(
             dataset=self.val_dataset,
-            # Validation datasets are sent to inference engines as a whole batch,
-            # which will schedule the memory themselves.
-            batch_size=len(self.val_dataset),
+            batch_size=val_batch_size,
             num_workers=num_workers,
-            shuffle=False,
+            shuffle=self.config.data.get("validation_shuffle", True),
             drop_last=False,
-            collate_fn=collate_fn
+            collate_fn=collate_fn,
         )
 
-        assert len(self.train_dataloader) >= 1
-        assert len(
-            self.val_dataloader
-        ) == 1, "Validation dataloader must have a single batch, which inference engines will schedule the memory themselves."
+        assert len(self.train_dataloader) >= 1, "Train dataloader is empty!"
+        assert len(self.val_dataloader) >= 1, "Validation dataloader is empty!"
 
-        print(f'Size of train dataloader: {len(self.train_dataloader)}')
+        print(
+            f"Size of train dataloader: {len(self.train_dataloader)}, Size of val dataloader: "
+            f"{len(self.val_dataloader)}"
+        )
 
-        # inject total_training_steps to actor/critic optim_config. This is hacky.
         total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
 
         if self.config.trainer.total_training_steps is not None:
             total_training_steps = self.config.trainer.total_training_steps
 
         self.total_training_steps = total_training_steps
-        self.total_training_steps = min(self.total_training_steps, self.config.trainer.max_steps)
-        print(f'Total training steps: {self.total_training_steps}')
+        print(f"Total training steps: {self.total_training_steps}")
 
-        OmegaConf.set_struct(self.config, True)
-        with open_dict(self.config):
-            self.config.actor_rollout_ref.actor.optim.total_training_steps = total_training_steps
-            self.config.critic.optim.total_training_steps = total_training_steps
+        try:
+            OmegaConf.set_struct(self.config, True)
+            with open_dict(self.config):
+                if OmegaConf.select(self.config, "actor_rollout_ref.actor.optim"):
+                    self.config.actor_rollout_ref.actor.optim.total_training_steps = total_training_steps
+                if OmegaConf.select(self.config, "critic.optim"):
+                    self.config.critic.optim.total_training_steps = total_training_steps
+        except Exception as e:
+            print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
