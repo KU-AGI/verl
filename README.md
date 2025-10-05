@@ -381,7 +381,7 @@ cluster
 
 ### Save pretrained model 
 
-- FSDP
+- FSDP & Megatron
 
     ```bash
     bash utils/model_merge.sh
