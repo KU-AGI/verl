@@ -20,6 +20,8 @@ import torch
 import os
 import PIL
 import datetime
+from typing import Any
+from collections import defaultdict
 
 @register("image_generation")
 class ImageGenerationRewardManager:
@@ -31,24 +33,18 @@ class ImageGenerationRewardManager:
         num_examine, 
         compute_score=None, 
         reward_fn_key="data_source", 
-        eval=False, 
-        img_saving_args={}
+        **reward_kwargs
     ) -> None:
         self.tokenizer = tokenizer
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
         self.compute_score = compute_score or _default_compute_score
         self.steps = 0
         self.reward_fn_key = reward_fn_key
-        self.save_freq = img_saving_args.save_freq
-        self.save_num = img_saving_args.num
-        self.save_path = img_saving_args.path
+        self.save_freq = reward_kwargs.get("img_saving", {}).get("save_freq", 0)
+        self.save_num = reward_kwargs.get("img_saving", {}).get("num", 0)
+        self.save_path = reward_kwargs.get("img_saving", {}).get("path", "")
         time_stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        self.save_path = os.path.join(self.save_path, f"{img_saving_args.experiment_name}_{time_stamp}")
-        self.eval = eval
-        if eval:
-            self.save_path = os.path.join(self.save_path, "eval")
-        else:
-            self.save_path = os.path.join(self.save_path, "train")
+        self.save_path = os.path.join(self.save_path, f"{reward_kwargs.get('img_saving', {}).get('experiment_name', '')}_{time_stamp}")
         
     def save_img(self, data: DataProto):
         gen_img = data.batch['gen_img']
@@ -97,33 +93,77 @@ class ImageGenerationRewardManager:
                     text_tokens = data.batch['text_tokens'][i]
                     f.write(f'{self.tokenizer.decode(text_tokens, skip_special_tokens=True)}\n\n')
 
-    def __call__(self, data: DataProto):
+    def verify(self, data):
+        prompt_ids = data.batch["prompts"]
+
+        prompt = self.tokenizer.decode(prompt_ids, skip_special_tokens=True)
+
+        gen_img = data.batch["gen_img"]
+        feedback_text = data.batch["feedback_text"]
+        refined_gen_img = data.batch["refined_gen_img"]
+
+        ground_truths = [item.non_tensor_batch["reward_model"].get("ground_truth", None) for item in data]
+        extras = data.non_tensor_batch.get("extra_info", [{} for _ in range(len(data))])
+
+        scores = self.compute_score(
+            prompt=prompt,
+            gen_img=gen_img,
+            feedback_text=feedback_text,
+            refined_gen_img=refined_gen_img,
+            ground_truths=ground_truths,
+            extra_infos=extras,
+            **self.reward_kwargs,
+        )
+
+        return scores
+
+    def __call__(self, data: DataProto, return_dict: bool = False, eval: bool = False):
         """We will expand this function gradually based on the available datasets"""
 
         # save generated images
         if self.steps % self.save_freq == 0:
             self.save_img(data)
-        if not self.eval:
+        if not eval:
             self.steps += 1
             
         print("Images saved to 'generated_samples' folder")
-        
+
         # If there is rm score, we directly return rm score. Otherwise, we compute via rm_score_fn
-        if 'rm_scores' in data.batch.keys():
-            return data.batch['rm_scores']
+        if "rm_scores" in data.batch.keys():
+            if return_dict:
+                reward_extra_keys = data.meta_info.get("reward_extra_keys", [])
+                reward_extra_info = {key: data.non_tensor_batch[key] for key in reward_extra_keys}
+                return {"reward_tensor": data.batch["rm_scores"], "reward_extra_info": reward_extra_info}
+            else:
+                return data.batch["rm_scores"]
 
-        reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
+        reward_tensor = torch.zeros_like(data.batch["gen_img"], dtype=torch.float32)
+        reward_extra_info = defaultdict(list)
+        prompt_ids = data.batch["prompt"]
+        data_sources = data.non_tensor_batch[self.reward_fn_key]
+
+        scores = self.verify(data)
+        rewards = []
+        already_printed: dict[str, Any] = {}
+
         for i in range(len(data)):
-            data_item = data[i]  # DataProtoItem
-            prompt_ids = data_item.batch['prompts']
+            reward = scores[i]["score"]
+            reward_extra_info.update(scores[i]["reward_extra_info"])
 
-            prompt_length = prompt_ids.shape[-1]
+            rewards.append(reward)
 
-            valid_prompt_length = data_item.batch['attention_mask'][:prompt_length].sum()
-            valid_prompt_ids = prompt_ids[-valid_prompt_length:]
-            response_ids = data_item.batch['responses']
-            valid_response_length = data_item.batch['attention_mask'][prompt_length:].sum()
-            valid_response_ids = response_ids[:valid_response_length]
-            reward_tensor[i, valid_response_length - 1] = torch.randint(0, 2, (1,)).float()
-        
-        return reward_tensor
+            data_source = data_sources[i]
+            if already_printed.get(data_source, 0) < self.num_examine:
+                prompt_str = self.tokenizer.decode(data.batch["prompt"][i]["content"], skip_special_tokens=True)
+                ground_truth = data[i].non_tensor_batch["reward_model"]["ground_truth"]
+                print("[prompt]", prompt_str)
+                print("[ground_truth]", ground_truth)
+                print("[score]", scores[i])
+                already_printed[data_source] = already_printed.get(data_source, 0) + 1
+
+        data.batch["acc"] = torch.tensor(rewards, dtype=torch.float32, device=prompt_ids.device)
+
+        if return_dict:
+            return {"reward_tensor": reward_tensor, "reward_extra_info": reward_extra_info}
+        else:
+            return reward_tensor

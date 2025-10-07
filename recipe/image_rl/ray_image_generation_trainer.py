@@ -59,8 +59,6 @@ from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.dataset.rl_dataset import (
-    DummyJanusDPORLHFDataset,
-    JanusTextOnlyRLHFDataset,
     RLHFDataset,
     collate_fn,
 )
@@ -515,7 +513,7 @@ class RayImageGenerationTrainer(object):
                 test_batch = test_batch.union(reward_tensor)
 
             # evaluate using reward_function
-            reward_tensor = self.val_reward_fn(test_batch)
+            reward_tensor = self.val_reward_fn(test_batch, eval=True)
 
             # Store scores
             scores = reward_tensor.sum(-1).cpu().tolist()

@@ -24,30 +24,48 @@ from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 from verl import DataProto
-from verl.utils.torch_functional import get_eos_mask
 from .base import BaseRollout
 
 from transformers import GenerationConfig
 import numpy as np
-from typing import Union, List, Any
+from typing import Union, List, Any, Optional
 from transformers.processing_utils import ProcessorMixin
 import base64
 from io import BytesIO
-import PIL.Image
+import PIL
+from verl.utils.torch_functional import get_response_mask
 
 __all__ = ['ImageUnifiedRollout']
 
 class ImageUnifiedRollout(BaseRollout):
 
-    def __init__(self, module: nn.Module, processor: ProcessorMixin, config):
-        super().__init__()
-        self.config = config
-        self.module = module
-        self.processor = processor
-        self.generation_mode = config.get("generation_mode", "text") # text or image
-        self.feedback_system_prompt = config.get("feedback_system_prompt", "You should give me a feedback on the image generation.")
-        self.refine_system_prompt = config.get("refine_system_prompt", "You should refine the image generation.")
+    def __init__(self, config, model_config, device_mesh):
+        super().__init__(config=config, model_config=model_config, device_mesh=device_mesh)
+        # The underlying module/processor should be initialized and populated via update_weights
+        # or external wiring before generate is called.
+        self.module: Optional[nn.Module] = None
+        self.processor: Optional[ProcessorMixin] = None
+        self.generation_mode = getattr(config, "generation_mode", None)
+        self.feedback_system_prompt = getattr(config, "feedback_system_prompt", "")
+        self.refine_system_prompt = getattr(config, "refine_system_prompt", "")
         self.generation_config = None
+
+    async def resume(self, tags: list[str]):
+        # No-op for now; this rollout does not manage an external engine.
+        return None
+
+    async def release(self):
+        # Best-effort release of CUDA cache
+        with contextlib.suppress(Exception):
+            torch.cuda.empty_cache()
+        return None
+
+    async def update_weights(self, weights, **kwargs):
+        # Placeholder hook to consume the generator to avoid backpressure when not used.
+        # A concrete implementation should map incoming tensors to self.module parameters.
+        for _ in weights:
+            pass
+        return None
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         batch_size = prompts.batch.batch_size[0]
@@ -138,6 +156,7 @@ class ImageUnifiedRollout(BaseRollout):
 
         # TODO: filter out the seq with no answers like ds-chat
         seq = output.sequences
+        generated_batch_size = seq.size(0)  # bs * num_return_sequences
         seq_img_mask = output.seq_img_mask
 
         # huggingface generate will stop generating when all the batch reaches [EOS].
@@ -158,22 +177,20 @@ class ImageUnifiedRollout(BaseRollout):
         if num_return_sequences > 1:
             position_ids = position_ids.repeat_interleave(num_return_sequences, dim=0)
             attention_mask = attention_mask.repeat_interleave(num_return_sequences, dim=0)
-            seq = seq.repeat_interleave(num_return_sequences, dim=0)
-            seq_img_mask = seq_img_mask.repeat_interleave(num_return_sequences, dim=0)
 
-        prompt = seq[:, :prompt_length]  # (bs, prompt_length)
-        response = seq[:, prompt_length:]  # (bs, response_length)
+        prompt = seq[:, :prompt_length]  # (generated_batch_size, prompt_length)
+        response = seq[:, prompt_length:]  # (generated_batch_size, response_length)
 
         response_length = response.size(1)
         delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
-        delta_position_id = delta_position_id.unsqueeze(0).repeat(batch_size, 1)
+        delta_position_id = delta_position_id.unsqueeze(0).repeat(generated_batch_size, 1)
 
         response_position_ids = position_ids[:, -1:] + delta_position_id
         position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
 
-        response_attention_mask = get_eos_mask(response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype)
-        if delta_length > 0:
-            response_attention_mask[..., -delta_length:] = 0
+        response_attention_mask = get_response_mask(
+            response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype
+        )
         attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
 
         decoded_image = self.module.decode_image_tokens(output)
@@ -192,40 +209,17 @@ class ImageUnifiedRollout(BaseRollout):
 
         return batch
 
-    def convert_gen_img_to_base64(self, gen_img) -> str:
-        """Convert gen_img to base64 string for message passing."""
-        if gen_img is not None:
-            # Handle both single image and list of images
-            if isinstance(gen_img, list):
-                # If it's a list, take the first image
-                img = gen_img[0] if len(gen_img) > 0 else None
-            else:
-                img = gen_img
-            
-            if img is not None:
-                # Convert to PIL Image if it's a tensor or numpy array
-                if isinstance(img, torch.Tensor):
-                    # Convert tensor to numpy array
-                    if img.is_cuda:
-                        img = img.cpu()
-                    img = img.numpy()
-                
-                if isinstance(img, np.ndarray):
-                    # Convert numpy array to PIL Image
-                    if img.dtype != np.uint8:
-                        # Normalize to 0-255 range if needed
-                        img = (img * 255).astype(np.uint8)
-                    img = PIL.Image.fromarray(img)
-                
-                # Convert PIL Image to base64
-                buffer = BytesIO()
-                img.save(buffer, format='PNG')
-                img_base64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
-                return f"data:image/png;base64,{img_base64}"
-            else:
-                return None
-        else:
-            return None
+    def convert_gen_img_to_base64(self, gen_img: PIL.Image.Image) -> Optional[str]:
+        """Convert gen_img to base64 data URL."""
+        if not isinstance(gen_img, PIL.Image.Image):
+            raise TypeError(f"Unsupported image type: {type(gen_img)}")
+
+        # Convert PIL.Image → base64 data URL
+        buffer = BytesIO()
+        gen_img.save(buffer, format="PNG")
+        img_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+        return f"data:image/png;base64,{img_base64}"
 
     def parse_feedback_text(self, decoded_text: str) -> str:
         pass
