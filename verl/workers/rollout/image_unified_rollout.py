@@ -37,14 +37,13 @@ from verl.utils.torch_functional import get_response_mask
 
 __all__ = ['ImageUnifiedRollout']
 
-class ImageUnifiedRollout(BaseRollout):
-
-    def __init__(self, config, model_config, device_mesh):
-        super().__init__(config=config, model_config=model_config, device_mesh=device_mesh)
-        # The underlying module/processor should be initialized and populated via update_weights
-        # or external wiring before generate is called.
-        self.module: Optional[nn.Module] = None
-        self.processor: Optional[ProcessorMixin] = None
+class ImageUnifiedRollout:
+    def __init__(self, module: nn.Module, config, model_config): 
+        self.config = config
+        self.module = module
+        from transformers import JanusProcessor
+        processor = JanusProcessor.from_pretrained(model_config.local_path)
+        self.processor = processor
         self.generation_mode = getattr(config, "generation_mode", None)
         self.feedback_system_prompt = getattr(config, "feedback_system_prompt", "")
         self.refine_system_prompt = getattr(config, "refine_system_prompt", "")
@@ -122,6 +121,36 @@ class ImageUnifiedRollout(BaseRollout):
 
         # make config according to generate mode
         self.generation_config = GenerationConfig(**kwargs)
+        
+        # Add boi_token_id for Janus model
+        if hasattr(self.module, 'config') and getattr(self.module.config, 'model_type', None) == 'janus':
+            # Get boi_token_id and eoi_token_id from tokenizer
+            if hasattr(self.processor, 'tokenizer'):
+                boi_token_id = self.processor.tokenizer.convert_tokens_to_ids('<begin_of_image>')
+                eoi_token_id = self.processor.tokenizer.convert_tokens_to_ids('<end_of_image>')
+                
+                if boi_token_id is not None:
+                    # Add boi_token_id to generation_config as generation_kwargs
+                    if not hasattr(self.generation_config, 'generation_kwargs'):
+                        self.generation_config.generation_kwargs = {}
+                    self.generation_config.generation_kwargs['boi_token_id'] = boi_token_id
+                    
+                if eoi_token_id is not None:
+                    self.generation_config.generation_kwargs['eoi_token_id'] = eoi_token_id
+                    
+                # Set pad_token_id if not set
+                if self.generation_config.pad_token_id is None:
+                    pad_token_id = self.processor.tokenizer.pad_token_id
+                    if pad_token_id is not None:
+                        self.generation_config.pad_token_id = pad_token_id
+                    else:
+                        # Use eos_token_id as fallback
+                        eos_token_id = self.processor.tokenizer.eos_token_id
+                        if eos_token_id is not None:
+                            self.generation_config.pad_token_id = eos_token_id
+                            
+                print(f"DEBUG: boi_token_id: {boi_token_id}, eoi_token_id: {eoi_token_id}")
+                print(f"DEBUG: generation_kwargs: {self.generation_config.generation_kwargs}")
 
     @torch.no_grad()
     def _generate_minibatch_image_generation(self, prompts: DataProto) -> TensorDict:
@@ -132,7 +161,6 @@ class ImageUnifiedRollout(BaseRollout):
         # used to construct attention_mask
         eos_token_id = prompts.meta_info['eos_token_id']
         pad_token_id = prompts.meta_info['pad_token_id']
-        image_start_token_id = prompts.meta_info['image_start_token_id']
 
         batch_size = idx.size(0)
         prompt_length = idx.size(1)
@@ -152,7 +180,8 @@ class ImageUnifiedRollout(BaseRollout):
                     generation_config=self.generation_config,
                     output_scores=False,  # this is potentially very large
                     return_dict_in_generate=True,
-                    use_cache=True)
+                    use_cache=True,
+                    max_new_tokens=512)  # Add max_new_tokens for image generation
 
         # TODO: filter out the seq with no answers like ds-chat
         seq = output.sequences

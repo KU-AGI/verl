@@ -75,6 +75,7 @@ class AlgoConfig(BaseConfig):
         filter_groups (Optional[FilterGroupsConfig]): Filter groups configuration, used in DAPO and Entropy
     """
 
+    max_token_start: int = -1
     gamma: float = 1.0
     lam: float = 1.0
     adv_estimator: str = "gae"
