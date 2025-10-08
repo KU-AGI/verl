@@ -1,8 +1,9 @@
 set -x
 
 # export VLLM_ATTENTION_BACKEND=XFORMERS
+export CUDA_VISIBLE_DEVICES=6,7
 
-GPUS=4 # `nvidia-smi -L | wc -l`
+GPUS=2 # `nvidia-smi -L | wc -l`
 MODEL_PATH=deepseek-community/Janus-Pro-7B
 RM_MODEL_PATH=OpenGVLab/InternVL3_5-38B
 RUN_NAME=test
@@ -18,8 +19,8 @@ python3 -m recipe.image_rl.main_image_generation_rl \
     data.val_files="/data/mllm/data/val.parquet" \
     data.image_key=images \
     data.train_batch_size=32 \
-    data.max_prompt_length=2048 \
-    data.max_response_length=2048 \
+    data.max_prompt_length=8096 \
+    data.max_response_length=8096 \
     data.filter_overlong_prompts=True \
     data.truncation='right' \
     actor_rollout_ref.model.path=$MODEL_PATH \
@@ -47,9 +48,11 @@ python3 -m recipe.image_rl.main_image_generation_rl \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
+    +algorithm.max_token_start=-1 \
     algorithm.kl_ctrl.kl_coef=0.000 \
     algorithm.filter_groups.enable=True \
     algorithm.filter_groups.max_num_gen_batches=8 \
+    +trainer.start_step=0 \
     trainer.critic_warmup=0 \
     trainer.logger=['console'] \
     trainer.val_before_train=False \
