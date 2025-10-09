@@ -38,11 +38,11 @@ from verl.utils.torch_functional import get_response_mask
 __all__ = ['ImageUnifiedRollout']
 
 class ImageUnifiedRollout:
-    def __init__(self, module: nn.Module, config, model_config): 
+    def __init__(self, module: nn.Module, config): 
         self.config = config
         self.module = module
         from transformers import JanusProcessor
-        processor = JanusProcessor.from_pretrained(model_config.local_path)
+        processor = JanusProcessor.from_pretrained("deepseek-community/Janus-Pro-7B")
         self.processor = processor
         self.generation_mode = getattr(config, "generation_mode", None)
         self.feedback_system_prompt = getattr(config, "feedback_system_prompt", "")
