@@ -105,6 +105,10 @@ class RolloutConfig(BaseConfig):
     n: int = 1
 
     cfg_weight: float = 1.0
+    feedback_system_prompt : Optional[str] = None
+    refine_system_prompt : Optional[str] = None
+    saving: bool = False
+    save_dir: Optional[str] = None
 
     # Early termination threshold for multi-turn rollout in sglang.
     # Abort remaining requests when (1 - over_sample_rate) * total_requests are completed.

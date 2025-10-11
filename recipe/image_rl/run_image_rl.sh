@@ -1,9 +1,9 @@
 set -x
 
 # export VLLM_ATTENTION_BACKEND=XFORMERS
-export CUDA_VISIBLE_DEVICES=6,7
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 
-GPUS=2 # `nvidia-smi -L | wc -l`
+GPUS=4 # `nvidia-smi -L | wc -l`
 MODEL_PATH=deepseek-community/Janus-Pro-7B
 RM_MODEL_PATH=OpenGVLab/InternVL3_5-38B
 RUN_NAME=test
@@ -11,42 +11,55 @@ PROJ_NAME="verl_janus_test"
 SAVE_DIR=/data/verl/ckpts/janus_rl/$PROJ_NAME/$RUN_NAME
 
 export HYDRA_FULL_ERROR=1
+export CUDA_LAUNCH_BLOCKING=1
+export TORCH_USE_CUDA_DSA=1
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+export NCCL_CUMEM_ENABLE=0
+export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:256
 
 # if [ "$RANK" -eq 0 ]; then
+# ray job submit --no-wait \
+#     --working-dir "${WORKING_DIR}" \
+#     -- 
 python3 -m recipe.image_rl.main_image_generation_rl \
     algorithm.adv_estimator=grpo \
     data.train_files="/data/mllm/data/train.parquet" \
     data.val_files="/data/mllm/data/val.parquet" \
-    data.image_key=images \
-    data.train_batch_size=32 \
-    data.max_prompt_length=8096 \
-    data.max_response_length=8096 \
-    data.filter_overlong_prompts=True \
+    data.prompt_key=prompt \
+    data.train_batch_size=4 \
+    data.max_prompt_length=2048 \
+    data.max_response_length=2048 \
+    data.filter_overlong_prompts=False \
     data.truncation='right' \
     actor_rollout_ref.model.path=$MODEL_PATH \
     actor_rollout_ref.actor.optim.lr=5e-6 \
+    actor_rollout_ref.actor.fsdp_config.model_dtype=bf16 \
     actor_rollout_ref.model.use_remove_padding=False \
     actor_rollout_ref.actor.ppo_mini_batch_size=16 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.actor.use_kl_loss=False \
     actor_rollout_ref.actor.kl_loss_coef=0.00 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     actor_rollout_ref.actor.entropy_coeff=-0.00 \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
-    actor_rollout_ref.actor.fsdp_config.param_offload=True \
-    actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
+    actor_rollout_ref.actor.fsdp_config.use_orig_params=True \
+    actor_rollout_ref.actor.fsdp_config.param_offload=False \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
     actor_rollout_ref.actor.fsdp_config.wrap_policy.min_num_params=100000000 \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
+    actor_rollout_ref.actor.fsdp_config.reshard_after_forward=False \
+    actor_rollout_ref.actor.fsdp_config.fsdp_size=-1 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=image_unified \
     actor_rollout_ref.rollout.mode=sync \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
-    actor_rollout_ref.rollout.n=8 \
-    +generation_mode=image \
-    +feedback_system_prompt="You should give me a feedback on the image generation." \
-    +refine_system_prompt="You should refine the image generation." \
-    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
-    actor_rollout_ref.ref.fsdp_config.param_offload=True \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.4 \
+    actor_rollout_ref.rollout.n=4 \
+    +actor_rollout_ref.rollout.feedback_system_prompt="You should give me a feedback on the image generation." \
+    +actor_rollout_ref.rollout.refine_system_prompt="You should refine the image generation." \
+    +actor_rollout_ref.rollout.saving=True \
+    +actor_rollout_ref.rollout.save_dir="./output/rollout" \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.ref.fsdp_config.param_offload=False \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     +algorithm.max_token_start=-1 \
     algorithm.kl_ctrl.kl_coef=0.000 \
@@ -60,8 +73,8 @@ python3 -m recipe.image_rl.main_image_generation_rl \
     trainer.experiment_name=$RUN_NAME \
     trainer.n_gpus_per_node=$GPUS \
     trainer.nnodes=1 \
-    trainer.save_freq=100 \
-    trainer.test_freq=25 \
+    trainer.save_freq=1 \
+    trainer.test_freq=1 \
     trainer.total_epochs=1 \
     trainer.resume_mode=disable \
     trainer.default_local_dir=$SAVE_DIR \

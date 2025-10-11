@@ -612,7 +612,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         log_gpu_memory_usage(f"Before building {self.config.rollout.name} rollout", logger=logger)
         if rollout_name == 'image_unified':
             from verl.workers.rollout import ImageUnifiedRollout
-            self.rollout = ImageUnifiedRollout(module=self.actor_module_fsdp, config=self.config.rollout, model_config=model_config)
+            self.rollout = ImageUnifiedRollout(module=self.actor_module_fsdp, config=self.config.rollout)
             # TODO: a sharding manager that do nothing?
         else:
             self.rollout = get_rollout_class(rollout_config.name, rollout_config.mode)(

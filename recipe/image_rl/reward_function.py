@@ -11,7 +11,7 @@ from typing import Optional
 from verl.utils.dataset.vision_utils import process_image
 from verl.utils.reward_score.math_reward import last_boxed_only_string, remove_boxed
 
-BASE_URL = "http://localhost:8006"
+BASE_URL = "http://218.238.5.120:8006"
 API_KEY = "EMPTY"
 MAX_RETRIES = 3
 BASE_DELAY = 2
