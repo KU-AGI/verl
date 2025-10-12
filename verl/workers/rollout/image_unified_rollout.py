@@ -160,24 +160,36 @@ class ImageUnifiedRollout:
                         if eos_token_id is not None:
                             self.generation_config.pad_token_id = eos_token_id
 
+    def extract_prompts(self, input_ids: torch.Tensor, pad_token_id: int, eos_token_id: int,tokenizer) -> List[str]:
+        ids = input_ids
+
+        ids = ids[ids != pad_token_id]
+
+        if eos_token_id in ids:
+            eos_idx = (ids == eos_token_id).nonzero(as_tuple=True)[0][0]
+            ids = ids[:eos_idx]
+
+        text = tokenizer.decode(ids, skip_special_tokens=True).strip()
+        return text
+
     @torch.no_grad()
     def _generate_minibatch_image_generation(self, prompts: DataProto) -> DataProto:
-        idx = prompts.batch['input_ids']
+        input_ids = prompts.batch['input_ids']
         attention_mask = prompts.batch['attention_mask']
         position_ids = prompts.batch['position_ids']
 
         eos_token_id = prompts.meta_info['eos_token_id']
         pad_token_id = prompts.meta_info['pad_token_id']
 
-        batch_size = idx.size(0)
-        prompt_length = idx.size(1)
+        batch_size = input_ids.size(0)
+        prompt_length = input_ids.size(1)
         n = self.generation_config.num_return_sequences
         
         print(f"[IMG_GEN] Input batch_size: {batch_size}, prompt_length: {prompt_length}, n={n}")
         print(f"[IMG_GEN] Will generate {batch_size * n} total sequences")
 
         if attention_mask is None:
-            attention_mask = torch.ones_like(idx, dtype=torch.long)
+            attention_mask = torch.ones_like(input_ids, dtype=torch.long)
 
         self.module.eval()
         param_ctx = contextlib.nullcontext()
@@ -188,7 +200,7 @@ class ImageUnifiedRollout:
         with param_ctx:
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                 output = self.module.generate(
-                    input_ids=idx,
+                    input_ids=input_ids,
                     attention_mask=attention_mask,
                     generation_mode="image",
                     generation_config=self.generation_config,
@@ -197,47 +209,12 @@ class ImageUnifiedRollout:
                     use_cache=True,
                     max_new_tokens=512)
 
-        seq = output.sequences
-        generated_batch_size = seq.size(0)
+        sequences = output.sequences
+        generated_batch_size = sequences.size(0)
         
-        print(f"[IMG_GEN] Generated sequences shape: {seq.shape}")
+        print(f"[IMG_GEN] Generated sequences shape: {sequences.shape}")
         print(f"[IMG_GEN] generated_batch_size: {generated_batch_size} (expected: {batch_size * n})")
 
-        sequence_length = prompt_length + self.config.response_length
-        delta_length = sequence_length - seq.shape[1]
-
-        if delta_length > 0:
-            delta_tokens = torch.ones(size=(generated_batch_size, delta_length), device=seq.device, dtype=seq.dtype)
-            delta_tokens = pad_token_id * delta_tokens
-            seq = torch.cat((seq, delta_tokens), dim=1)
-        assert seq.shape[1] == sequence_length
-
-        prompt = seq[:, :prompt_length]
-        response = seq[:, prompt_length:]
-
-        # Expand position_ids and attention_mask to match generated batch size
-        if generated_batch_size != batch_size:
-            # Repeat each prompt n times
-            position_ids = position_ids.repeat_interleave(n, dim=0)
-            attention_mask_expanded = attention_mask.repeat_interleave(n, dim=0)
-        else:
-            attention_mask_expanded = attention_mask
-
-        response_length = response.size(1)
-        delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
-        delta_position_id = delta_position_id.unsqueeze(0).repeat(generated_batch_size, 1)
-
-        response_position_ids = position_ids[:, -1:] + delta_position_id
-        position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
-
-        response_attention_mask = get_response_mask(
-            response_id=response, eos_token=eos_token_id, dtype=attention_mask_expanded.dtype
-        )
-        attention_mask = torch.cat((attention_mask_expanded, response_attention_mask), dim=-1)
-
-        image_tokens = self.extract_image_tokens(response)
-        print(f"[IMG_GEN] Extracted image_tokens shape: {image_tokens.shape}")
-        
         param_ctx = contextlib.nullcontext()
         if isinstance(self.module, FSDP):
             param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=True)
@@ -245,7 +222,7 @@ class ImageUnifiedRollout:
         # Batch decode all images at once
         with param_ctx:
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                decoded_images = self.module.decode_image_tokens(image_tokens)
+                decoded_images = self.module.decode_image_tokens(sequences)
         
         print(f"[IMG_GEN] Decoded images shape: {decoded_images.shape}, dtype: {decoded_images.dtype}")
         
@@ -264,23 +241,22 @@ class ImageUnifiedRollout:
             gen_img_list = [result] if not isinstance(result, list) else result
         
         print(f"[IMG_GEN] Processed {len(gen_img_list)} images")
-        
+        print(f"[IMG_GEN] Tensors: input_ids {input_ids.shape}, attention_mask {attention_mask.shape}, position_ids {position_ids.shape}")
+
         batch = TensorDict(
             {
-                'prompts': prompt,
-                'responses': response,
-                'input_ids': seq,
+                'input_ids': input_ids,
                 'attention_mask': attention_mask,
                 'position_ids': position_ids,
             },
-            batch_size=generated_batch_size)
+            batch_size=batch_size)
         
-        # 🔥 FIX: Create DataProto and store images in non_tensor_batch
+        # Create DataProto and store images in meta_info
         data_proto = DataProto(batch=batch, meta_info=prompts.meta_info)
-        data_proto.non_tensor_batch['gen_img_list'] = gen_img_list
+        data_proto.meta_info['gen_img_list'] = gen_img_list
     
         print(f"[IMG_GEN] Created DataProto with batch_size: {batch.batch_size}")
-        print(f"[IMG_GEN] Stored {len(gen_img_list)} images in non_tensor_batch")
+        print(f"[IMG_GEN] Stored {len(gen_img_list)} images in meta_info")
 
         return data_proto
 
@@ -338,10 +314,10 @@ class ImageUnifiedRollout:
         print(f"[TEXT_GEN] Input batch_size: {batch_size}")
         print(f"[TEXT_GEN] Starting feedback generation for {batch_size} images...")
         
-        # 🔥 FIX: Get images from non_tensor_batch
-        gen_img_list = data_proto.non_tensor_batch.get('gen_img_list', [])
+        # Get images from meta_info
+        gen_img_list = data_proto.meta_info.get('gen_img_list', [])
         if not gen_img_list:
-            raise ValueError("No images found in non_tensor_batch['gen_img_list']")
+            raise ValueError("No images found in meta_info['gen_img_list']")
         
         # Prepare all messages in batch
         messages_batch = []
@@ -349,13 +325,9 @@ class ImageUnifiedRollout:
             img_url = self.convert_gen_img_to_base64(gen_img)
             message = [
                 {
-                    "role": "system", "content": [
-                        {"type": "text", "text": self.feedback_system_prompt}
-                    ]
-                },
-                {
                     "role": "user", "content": [
                         {"type": "image", "url": img_url},
+                        {"type": "text", "text": self.feedback_system_prompt}
                     ]
                 }
             ]
@@ -368,9 +340,9 @@ class ImageUnifiedRollout:
         
         print(f"[TEXT_GEN] All feedback texts generated: {len(feedback_texts)} total")
         
-        # 🔥 FIX: Store in non_tensor_batch
-        data_proto.non_tensor_batch["feedback_texts"] = feedback_texts
-        print(f"[TEXT_GEN] Stored feedback_texts in non_tensor_batch (count={len(feedback_texts)})")
+        # Store in meta_info
+        data_proto.meta_info["feedback_texts"] = feedback_texts
+        print(f"[TEXT_GEN] Stored feedback_texts in meta_info (count={len(feedback_texts)})")
         
         print(f"[TEXT_GEN] Text generation complete!")
         return data_proto
@@ -431,7 +403,7 @@ class ImageUnifiedRollout:
         print(f"[BATCH_FEEDBACK] Batched input shapes - input_ids: {batched_input_ids.shape}, "
             f"attention_mask: {batched_attention_mask.shape}")
         
-        # **FIX: Create a text-specific generation config with num_return_sequences=1**
+        # Create a text-specific generation config with num_return_sequences=1
         text_gen_config = GenerationConfig(
             do_sample=self.generation_config.do_sample,
             num_beams=1,
@@ -486,14 +458,14 @@ class ImageUnifiedRollout:
         batch_size = data_proto.batch.batch_size[0]
         print(f"[REFINE] Input batch_size: {batch_size}")
 
-        # 🔥 FIX: Get data from non_tensor_batch
-        gen_img_list = data_proto.non_tensor_batch.get('gen_img_list', [])
-        feedback_texts = data_proto.non_tensor_batch.get('feedback_texts', [])
+        # Get data from meta_info
+        gen_img_list = data_proto.meta_info.get('gen_img_list', [])
+        feedback_texts = data_proto.meta_info.get('feedback_texts', [])
         
         if not gen_img_list:
-            raise ValueError("No images found in non_tensor_batch['gen_img_list']")
+            raise ValueError("No images found in meta_info['gen_img_list']")
         
-        print(f"[REFINE] Loaded {len(gen_img_list)} images and {len(feedback_texts)} feedback_texts from non_tensor_batch")
+        print(f"[REFINE] Loaded {len(gen_img_list)} images and {len(feedback_texts)} feedback_texts from meta_info")
 
         # Prepare all messages for batch processing
         messages_batch = []
@@ -523,8 +495,8 @@ class ImageUnifiedRollout:
         
         print(f"[REFINE] Generated {len(refined_images)} refined images")
 
-        # 🔥 FIX: Store refined images in non_tensor_batch
-        data_proto.non_tensor_batch['refined_gen_img_list'] = refined_images
+        # Store refined images in meta_info
+        data_proto.meta_info['refined_gen_img_list'] = refined_images
 
         torch.cuda.empty_cache()
         print(f"[REFINE] Completed refinement")
@@ -613,24 +585,6 @@ class ImageUnifiedRollout:
         else:
             sequences = output
 
-        # Extract generated parts (after input)
-        all_generated_sequences = []
-        for i, orig_len in enumerate(original_lengths):
-            generated_seq = sequences[i, max_length:]  # Skip entire padded input
-            all_generated_sequences.append(generated_seq)
-        
-        # Stack and extract image tokens
-        max_gen_len = max(len(s) for s in all_generated_sequences)
-        stacked_sequences = torch.stack([
-            torch.nn.functional.pad(seq, (0, max_gen_len - len(seq)), value=pad_token_id) 
-            for seq in all_generated_sequences
-        ])
-        
-        print(f"[BATCH_REFINE] Generated sequences shape: {stacked_sequences.shape}")
-        
-        image_tokens = self.extract_image_tokens(stacked_sequences)
-        print(f"[BATCH_REFINE] Extracted image_tokens shape: {image_tokens.shape}")
-        
         # Batch decode all images
         param_ctx = contextlib.nullcontext()
         if isinstance(self.module, FSDP):
@@ -638,7 +592,7 @@ class ImageUnifiedRollout:
         
         with param_ctx:
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                decoded_images = self.module.decode_image_tokens(image_tokens)
+                decoded_images = self.module.decode_image_tokens(sequences)
         
         print(f"[BATCH_REFINE] Decoded images shape: {decoded_images.shape}, dtype: {decoded_images.dtype}")
         
@@ -665,12 +619,11 @@ class ImageUnifiedRollout:
             try:
                 batch_size = output.batch.batch_size[0]
                 
-                # 🔥 FIX: Get lists from non_tensor_batch
-                gen_img_list = output.non_tensor_batch.get('gen_img_list', [])
-                refined_img_list = output.non_tensor_batch.get('refined_gen_img_list', [])
-                feedback_texts = output.non_tensor_batch.get('feedback_texts', [])
+                # Get lists from meta_info
+                gen_img_list = output.meta_info.get('gen_img_list', [])
+                refined_img_list = output.meta_info.get('refined_gen_img_list', [])
+                feedback_texts = output.meta_info.get('feedback_texts', [])
                 
-                # 디버그 출력
                 print(f"[SAVE] batch_size: {batch_size}")
                 print(f"[SAVE] gen_img_list length: {len(gen_img_list)}")
                 print(f"[SAVE] refined_img_list length: {len(refined_img_list)}")

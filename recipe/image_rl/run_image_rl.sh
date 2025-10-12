@@ -1,9 +1,8 @@
 set -x
 
 # export VLLM_ATTENTION_BACKEND=XFORMERS
-export CUDA_VISIBLE_DEVICES=0,1,2,3
 
-GPUS=4 # `nvidia-smi -L | wc -l`
+GPUS=`nvidia-smi -L | wc -l`
 MODEL_PATH=deepseek-community/Janus-Pro-7B
 RM_MODEL_PATH=OpenGVLab/InternVL3_5-38B
 RUN_NAME=test
@@ -26,7 +25,7 @@ python3 -m recipe.image_rl.main_image_generation_rl \
     data.train_files="/data/mllm/data/train.parquet" \
     data.val_files="/data/mllm/data/val.parquet" \
     data.prompt_key=prompt \
-    data.train_batch_size=4 \
+    data.train_batch_size=8 \
     data.max_prompt_length=2048 \
     data.max_response_length=2048 \
     data.filter_overlong_prompts=False \
@@ -53,7 +52,7 @@ python3 -m recipe.image_rl.main_image_generation_rl \
     actor_rollout_ref.rollout.name=image_unified \
     actor_rollout_ref.rollout.mode=sync \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.4 \
-    actor_rollout_ref.rollout.n=4 \
+    actor_rollout_ref.rollout.n=8 \
     +actor_rollout_ref.rollout.feedback_system_prompt="You should give me a feedback on the image generation." \
     +actor_rollout_ref.rollout.refine_system_prompt="You should refine the image generation." \
     +actor_rollout_ref.rollout.saving=True \
