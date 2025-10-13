@@ -1,0 +1,3 @@
+[submodule "verl/third_party/transformers"]
+	path = verl/third_party/transformers
+	url = https://github.com/huggingface/transformers.git
