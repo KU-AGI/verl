@@ -483,6 +483,8 @@ class RayImageGenerationTrainer(object):
             test_gen_batch.meta_info = {
                 'eos_token_id': self.tokenizer.eos_token_id,
                 'pad_token_id': self.tokenizer.pad_token_id,
+                'boi_token_id': self.processor.boi_token_id,
+                'eoi_token_id': self.processor.eoi_token_id,
                 'recompute_log_prob': False,
                 'do_sample': self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
                 'validate': True,
@@ -501,8 +503,8 @@ class RayImageGenerationTrainer(object):
             # output_ids = test_output_gen_batch.batch['responses']
             # output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
             # sample_outputs.extend(output_texts)
-            output_imgs = test_output_gen_batch.batch['gen_img']
-            output_imgs = output_imgs.to('cpu').numpy() if isinstance(output_imgs, torch.Tensor) else output_imgs
+            output_imgs = test_output_gen_batch.batch.meta_info['gen_img_list']
+            output_imgs = [output_img.to('cpu').numpy() if isinstance(output_img, torch.Tensor) else output_img for output_img in output_imgs]
             output_img_list = [wandb.Image(PIL.Image.fromarray(img), caption=input_texts[i]) for i, img in enumerate(output_imgs)]
             sample_outputs.extend(output_img_list)
 
