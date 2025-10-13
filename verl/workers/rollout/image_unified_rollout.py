@@ -133,7 +133,7 @@ class ImageUnifiedRollout:
                 "top_p": top_p,
                 "top_k": top_k,
                 "temperature": temperature,
-                "num_return_sequences": n,  # Use n for parallel generation
+                "num_return_sequences": 1,  # Use n for parallel generation
             }
 
         self.generation_config = GenerationConfig(**kwargs)
@@ -260,43 +260,6 @@ class ImageUnifiedRollout:
 
         return data_proto
 
-    def extract_image_tokens(self, sequences: torch.Tensor) -> torch.Tensor:
-        """Extract image tokens between boi_token_id and eoi_token_id from sequences."""
-        if not hasattr(self.processor, 'tokenizer'):
-            raise ValueError("Tokenizer not available")
-        
-        boi_token_id = self.processor.tokenizer.convert_tokens_to_ids('<begin_of_image>')
-        eoi_token_id = self.processor.tokenizer.convert_tokens_to_ids('<end_of_image>')
-        
-        if boi_token_id is None or eoi_token_id is None:
-            raise ValueError("BOI or EOI token IDs not found")
-        
-        batch_size = sequences.shape[0]
-        image_tokens_list = []
-        
-        for i in range(batch_size):
-            seq = sequences[i]
-            boi_positions = torch.where(seq == boi_token_id)[0]
-            eoi_positions = torch.where(seq == eoi_token_id)[0]
-            
-            if len(boi_positions) == 0 or len(eoi_positions) == 0:
-                image_tokens = torch.zeros(576, dtype=torch.long, device=seq.device)
-            else:
-                start_idx = boi_positions[0] + 1
-                end_idx = eoi_positions[0]
-                image_tokens = seq[start_idx:end_idx]
-                
-                if len(image_tokens) < 576:
-                    padding = torch.zeros(576 - len(image_tokens), dtype=torch.long, device=seq.device)
-                    image_tokens = torch.cat([image_tokens, padding])
-                elif len(image_tokens) > 576:
-                    image_tokens = image_tokens[:576]
-            
-            image_tokens_list.append(image_tokens)
-        
-        result = torch.stack(image_tokens_list)
-        return result
-
     def convert_gen_img_to_base64(self, gen_img: PIL.Image.Image) -> Optional[str]:
         """Convert gen_img to base64 data URL."""
         if not isinstance(gen_img, PIL.Image.Image):
@@ -403,17 +366,17 @@ class ImageUnifiedRollout:
         print(f"[BATCH_FEEDBACK] Batched input shapes - input_ids: {batched_input_ids.shape}, "
             f"attention_mask: {batched_attention_mask.shape}")
         
-        # Create a text-specific generation config with num_return_sequences=1
-        text_gen_config = GenerationConfig(
-            do_sample=self.generation_config.do_sample,
-            num_beams=1,
-            top_p=self.generation_config.top_p,
-            top_k=self.generation_config.top_k,
-            temperature=self.generation_config.temperature,
-            num_return_sequences=1,  # Always 1 for text generation
-            pad_token_id=self.generation_config.pad_token_id,
-            eos_token_id=self.generation_config.eos_token_id,
-        )
+        # # Create a text-specific generation config with num_return_sequences=1
+        # text_gen_config = GenerationConfig(
+        #     do_sample=self.generation_config.do_sample,
+        #     num_beams=1,
+        #     top_p=self.generation_config.top_p,
+        #     top_k=self.generation_config.top_k,
+        #     temperature=self.generation_config.temperature,
+        #     num_return_sequences=1,  # Always 1 for text generation
+        #     pad_token_id=self.generation_config.pad_token_id,
+        #     eos_token_id=self.generation_config.eos_token_id,
+        # )
         
         # Generate in batch
         param_ctx = contextlib.nullcontext()
@@ -430,7 +393,7 @@ class ImageUnifiedRollout:
                 output = self.module.generate(
                     batched_input_ids,
                     generation_mode="text",
-                    generation_config=text_gen_config,  # Use text-specific config
+                    generation_config=self.generation_config, # text_gen_config,  # Use text-specific config
                     return_dict_in_generate=True,
                     **model_kwargs
                 )
@@ -515,6 +478,7 @@ class ImageUnifiedRollout:
                 message, add_generation_prompt=True, generation_mode="image", 
                 tokenize=True, return_dict=True, return_tensors="pt"
             )
+            print(f"[BATCH_REFINE] Input ids: {inputs.input_ids}, attention_mask: {inputs.attention_mask}")
             
             if hasattr(inputs, 'input_ids'):
                 input_ids = inputs.input_ids
@@ -571,13 +535,14 @@ class ImageUnifiedRollout:
         with param_ctx:
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                 output = self.module.generate(
-                    batched_input_ids,
+                    input_ids=batched_input_ids,
                     attention_mask=batched_attention_mask,
                     generation_mode="image",
                     generation_config=self.generation_config,
-                    max_new_tokens=512,
+                    output_scores=False,
                     return_dict_in_generate=True,
-                )
+                    use_cache=True,
+                    max_new_tokens=512)
 
         # Handle both dict and tensor returns
         if isinstance(output, dict) or hasattr(output, 'sequences'):

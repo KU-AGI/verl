@@ -86,9 +86,10 @@ def get_messages(prompt, gen_img, feedback_text, refined_gen_img, ground_truth, 
         system_prompt = TASK2_FEEDBACK_GENERATOR_PROMPT_TEMPLATE.format(question=prompt, feedback=feedback_text)
         messages = [
             {"role": "system", "content": system_prompt},
-            # {"role": "user", "content": [
-            #     {"type": "text", "text": feedback_text},
-            # ]}
+            {"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": convert_gen_img_to_base64(gen_img)}},
+                {"type": "text", "text": feedback_text},
+            ]}
         ]
         return messages
     elif task_id == 3:
