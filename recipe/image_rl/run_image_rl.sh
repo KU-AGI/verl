@@ -26,7 +26,7 @@ python3 -m recipe.image_rl.main_image_generation_rl \
     data.train_files="/data/mllm/data/train.parquet" \
     data.val_files="/data/mllm/data/val.parquet" \
     data.prompt_key=prompt \
-    data.train_batch_size=1 \
+    data.train_batch_size=4 \
     data.max_prompt_length=1024 \
     data.max_response_length=1024 \
     data.filter_overlong_prompts=False \

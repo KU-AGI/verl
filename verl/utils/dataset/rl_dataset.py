@@ -240,6 +240,7 @@ class RLHFDataset(Dataset):
             raw_prompt = self.processor.apply_chat_template(
                 messages, add_generation_prompt=True, tokenize=False, **self.apply_chat_template_kwargs
             )
+            print(f"[IMAGE_GEN] Prompt: {raw_prompt}")
             model_inputs = self.processor(text=raw_prompt, generation_mode="image", return_tensors="pt")
             input_ids = model_inputs.pop("input_ids")
             attention_mask = model_inputs.pop("attention_mask")

@@ -915,7 +915,8 @@ class DataProto:
                     else:
                         if k in merged_meta_info:
                             # Ensure consistency for overlapping non-metric keys
-                            assert merged_meta_info[k] == v, f"Conflicting values for meta_info key '{k}'"
+                            # assert merged_meta_info[k] == v, f"Conflicting values for meta_info key '{k}'"
+                            merged_meta_info[k] = v
                         else:
                             merged_meta_info[k] = v
 

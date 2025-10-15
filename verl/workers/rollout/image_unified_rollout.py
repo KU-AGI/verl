@@ -111,7 +111,7 @@ class ImageUnifiedRollout:
             kwargs = {
                 "do_sample": False,
                 "num_beams": 1,
-                "num_return_sequences": 1,
+                "num_return_sequences": 1,  # Set to 1 for for-loop processing
             }
         elif is_validate:
             kwargs = {
@@ -120,7 +120,7 @@ class ImageUnifiedRollout:
                 "top_k": max(0, self.config.val_kwargs.top_k),
                 "top_p": self.config.val_kwargs.top_p,
                 "temperature": self.config.val_kwargs.temperature,
-                "num_return_sequences": 1,
+                "num_return_sequences": 1,  # Set to 1 for for-loop processing
             }
         else:
             kwargs = {
@@ -129,7 +129,7 @@ class ImageUnifiedRollout:
                 "top_p": top_p,
                 "top_k": top_k,
                 "temperature": temperature,
-                "num_return_sequences": n,  # Use n for parallel generation
+                "num_return_sequences": 1,  # Set to 1 for for-loop processing
             }
 
         self.generation_config = GenerationConfig(**kwargs)
@@ -167,8 +167,9 @@ class ImageUnifiedRollout:
 
         batch_size = input_ids.size(0)
         prompt_length = input_ids.size(1)
-        n = self.generation_config.num_return_sequences
+        n = self.config.get('n', 1)
         
+        print(f"[IMG_GEN] Input ids: {input_ids}")
         print(f"[IMG_GEN] Input batch_size: {batch_size}, prompt_length: {prompt_length}, n={n}")
         print(f"[IMG_GEN] Will generate {batch_size * n} total sequences")
 
@@ -228,15 +229,10 @@ class ImageUnifiedRollout:
             )
             
             # Extract pixel_values from BatchFeature
-            if hasattr(result, 'data') and 'pixel_values' in result.data:
-                gen_img_list = result.data['pixel_values']
-            elif isinstance(result, dict) and 'pixel_values' in result:
-                gen_img_list = result['pixel_values']
-            else:
-                gen_img_list = [result] if not isinstance(result, list) else result
-            
-            all_gen_imgs.extend(gen_img_list)
-            print(f"[IMG_GEN] Generated {len(gen_img_list)} images in this iteration (total: {len(all_gen_imgs)})")
+            gen_img = result['pixel_values']
+
+            all_gen_imgs.extend(gen_img)
+            print(f"[IMG_GEN] Generated {len(gen_img)} images in this iteration (total: {len(all_gen_imgs)})")
             
             # Clear cache between generations
             torch.cuda.empty_cache()
@@ -246,19 +242,21 @@ class ImageUnifiedRollout:
         replicated_attention_mask = attention_mask.repeat_interleave(n, dim=0)
         replicated_position_ids = position_ids.repeat_interleave(n, dim=0)
         
+        print(f"[IMG_GEN] Replicated input_ids shape: {replicated_input_ids.shape}")
+        
         batch = TensorDict(
             {
                 'input_ids': replicated_input_ids,
                 'attention_mask': replicated_attention_mask,
                 'position_ids': replicated_position_ids,
             },
-            batch_size=batch_size * n)
-        
+            batch_size=batch_size * n) # batch_size is the number of generated images
+
         # Create DataProto and store images in meta_info
         data_proto = DataProto(batch=batch, meta_info=prompts.meta_info)
         data_proto.meta_info['gen_img_list'] = all_gen_imgs
 
-        print(f"[IMG_GEN] Created DataProto with batch_size: {batch.batch_size}")
+        print(f"[IMG_GEN] Created DataProto with batch_size: {batch_size * n}")
         print(f"[IMG_GEN] Stored {len(all_gen_imgs)} images in meta_info")
 
         return data_proto
@@ -276,26 +274,25 @@ class ImageUnifiedRollout:
 
     def _generate_minibatch_text_generation(self, data_proto: DataProto) -> DataProto:
         batch_size = data_proto.batch.batch_size[0]
-        n = self.generation_config.num_return_sequences
-        
-        print(f"[TEXT_GEN] Input batch_size: {batch_size}")
-        print(f"[TEXT_GEN] Starting feedback generation for {batch_size} images...")
+        n = self.config.get('n', 1)
+
+        print(f"[TEXT_GEN] Input batch_size: {batch_size}, n={n}")
+        print(f"[TEXT_GEN] Starting feedback generation for {batch_size * n} images...")
         
         # Get images from meta_info
         gen_img_list = data_proto.meta_info.get('gen_img_list', [])
         if not gen_img_list:
             raise ValueError("No images found in meta_info['gen_img_list']")
         
-        # Process in smaller batches to avoid OOM
-        micro_batch_size = self.config.get('micro_batch_size', 2)
+        # Process in iterations
         all_feedback_texts = []
         
-        for i in range(0, n):
+        for i in range(n):
             gen_img = gen_img_list[i]
             
             print(f"[TEXT_GEN] Processing feedback {i+1}/{n}")
             
-            # Prepare messages for this micro-batch
+            # Prepare messages for this image
             messages_batch = []
             img_url = self.convert_gen_img_to_base64(gen_img)
             message = [
@@ -308,11 +305,11 @@ class ImageUnifiedRollout:
             ]
             messages_batch.append(message)
             
-            # Generate feedback for this micro-batch
+            # Generate feedback for this image
             feedback_texts = self._batch_generate_feedback(messages_batch)
             all_feedback_texts.extend(feedback_texts)
             
-            # Clear cache between micro-batches
+            # Clear cache between iterations
             torch.cuda.empty_cache()
         
         print(f"[TEXT_GEN] All feedback texts generated: {len(all_feedback_texts)} total")
@@ -327,16 +324,31 @@ class ImageUnifiedRollout:
     def _batch_generate_feedback(self, messages_batch: List) -> List[str]:
         """Generate feedback for multiple images in batch."""
         print(f"[BATCH_FEEDBACK] Processing {len(messages_batch)} messages")
-        
+       
+        # Create a text-specific generation config with num_return_sequences=1
+        text_gen_config = GenerationConfig(
+            do_sample=self.generation_config.do_sample,
+            num_beams=1,
+            top_p=self.generation_config.top_p,
+            top_k=self.generation_config.top_k,
+            temperature=self.generation_config.temperature,
+            num_return_sequences=1,  # Always 1 for text generation
+            pad_token_id=self.generation_config.pad_token_id,
+            eos_token_id=self.generation_config.eos_token_id,
+        )
+         
         # Process all messages to get input tensors
         all_input_ids = []
         all_attention_masks = []
+        prompt_lengths = []
         
         for message in messages_batch:
-            inputs = self.processor.apply_chat_template(
+            prompt = self.processor.apply_chat_template(
                 message, add_generation_prompt=True, generation_mode="text", 
-                tokenize=True, return_dict=True, return_tensors="pt"
+                tokenize=False
             )
+            print(f"[BATCH_FEEDBACK] Prompt: {prompt}")
+            inputs = self.processor(text=prompt, generation_mode="text", return_tensors="pt")
 
             if hasattr(inputs, 'input_ids'):
                 input_ids = inputs.input_ids
@@ -349,16 +361,16 @@ class ImageUnifiedRollout:
             
             all_input_ids.append(input_ids)
             all_attention_masks.append(attention_mask)
-        
+            prompt_lengths.append(len(prompt))
+
         # Pad to same length and stack
-        max_length = max(ids.shape[1] for ids in all_input_ids)
         pad_token_id = self.processor.tokenizer.pad_token_id or self.processor.tokenizer.eos_token_id
         
         padded_input_ids = []
         padded_attention_masks = []
         
-        for input_ids, attention_mask in zip(all_input_ids, all_attention_masks):
-            pad_length = max_length - input_ids.shape[1]
+        for i, (input_ids, attention_mask) in enumerate(zip(all_input_ids, all_attention_masks)):
+            pad_length = prompt_lengths[i] - input_ids.shape[1]
             if pad_length > 0:
                 # Pad on the left
                 input_ids = torch.cat([
@@ -380,18 +392,6 @@ class ImageUnifiedRollout:
         print(f"[BATCH_FEEDBACK] Batched input shapes - input_ids: {batched_input_ids.shape}, "
             f"attention_mask: {batched_attention_mask.shape}")
         
-        # # Create a text-specific generation config with num_return_sequences=1
-        # text_gen_config = GenerationConfig(
-        #     do_sample=self.generation_config.do_sample,
-        #     num_beams=1,
-        #     top_p=self.generation_config.top_p,
-        #     top_k=self.generation_config.top_k,
-        #     temperature=self.generation_config.temperature,
-        #     num_return_sequences=1,  # Always 1 for text generation
-        #     pad_token_id=self.generation_config.pad_token_id,
-        #     eos_token_id=self.generation_config.eos_token_id,
-        # )
-        
         # Generate in batch
         param_ctx = contextlib.nullcontext()
         if isinstance(self.module, FSDP):
@@ -407,7 +407,7 @@ class ImageUnifiedRollout:
                 output = self.module.generate(
                     batched_input_ids,
                     generation_mode="text",
-                    generation_config=self.generation_config, # text_gen_config,  # Use text-specific config
+                    generation_config=text_gen_config,
                     return_dict_in_generate=True,
                     **model_kwargs
                 )
@@ -420,9 +420,10 @@ class ImageUnifiedRollout:
         
         # Decode all at once
         feedback_texts = []
-        for seq in sequences:
+        for i, seq in enumerate(sequences):
             decoded_text = self.processor.decode(seq, skip_special_tokens=True)
-            feedback_texts.append(decoded_text)
+            print(f"[BATCH_FEEDBACK] Decoded text: {decoded_text[prompt_lengths[i]:]}")
+            feedback_texts.append(decoded_text[prompt_lengths[i]:])
         
         print(f"[BATCH_FEEDBACK] Generated {len(feedback_texts)} feedback texts")
         return feedback_texts
@@ -433,10 +434,10 @@ class ImageUnifiedRollout:
 
     def _generate_minibatch_refine_image_generation(self, data_proto: DataProto) -> DataProto:
         batch_size = data_proto.batch.batch_size[0]
-        n = self.generation_config.num_return_sequences
+        n = self.config.get('n', 1)
 
-        print(f"[REFINE] Input batch_size: {batch_size}")
-        print(f"[REFINE] Starting image refinement for {batch_size} images...")
+        print(f"[REFINE] Input batch_size: {batch_size}, n={n}")
+        print(f"[REFINE] Starting image refinement for {batch_size * n} images...")
 
         # Get data from meta_info
         gen_img_list = data_proto.meta_info.get('gen_img_list', [])
@@ -450,22 +451,17 @@ class ImageUnifiedRollout:
         # Process in smaller batches to avoid OOM
         all_refined_images = []
         
-        for i in range(0, n):
+        for i in range(n):
             gen_img = gen_img_list[i]
             fb_txt = feedback_texts[i]
             
             print(f"[REFINE] Processing refine {i+1}/{n}")
 
-            # Prepare messages for this micro-batch
+            # Prepare messages for this image
             messages_batch = []
             img_url = self.convert_gen_img_to_base64(gen_img)
             
             message = [
-                {
-                    "role": "system", "content": [
-                        {"type": "text", "text": self.refine_system_prompt}
-                    ]
-                },
                 {
                     "role": "user", "content": [
                         {"type": "image", "url": img_url},
@@ -475,11 +471,11 @@ class ImageUnifiedRollout:
             ]
             messages_batch.append(message)
             
-            # Refine images for this micro-batch
+            # Refine images for this image
             refined_images = self._batch_refine_images(messages_batch)
             all_refined_images.extend(refined_images)
             
-            # Clear cache between micro-batches
+            # Clear cache between iterations
             torch.cuda.empty_cache()
         
         print(f"[REFINE] Generated {len(all_refined_images)} refined images")
@@ -498,13 +494,15 @@ class ImageUnifiedRollout:
         # Process all messages to get input tensors
         all_input_ids = []
         all_attention_masks = []
+        prompt_lengths = []
         
         for message in messages_batch:
-            inputs = self.processor.apply_chat_template(
+            prompt = self.processor.apply_chat_template(
                 message, add_generation_prompt=True, generation_mode="image", 
-                tokenize=True, return_dict=True, return_tensors="pt"
+                tokenize=False
             )
-            print(f"[BATCH_REFINE] Input ids: {inputs.input_ids}, attention_mask: {inputs.attention_mask}")
+            print(f"[BATCH_REFINE] Prompt: {prompt}")
+            inputs = self.processor(text=prompt, generation_mode="image", return_tensors="pt")
             
             if hasattr(inputs, 'input_ids'):
                 input_ids = inputs.input_ids
@@ -517,19 +515,19 @@ class ImageUnifiedRollout:
             
             all_input_ids.append(input_ids)
             all_attention_masks.append(attention_mask)
-        
+            prompt_lengths.append(len(prompt))
+
         # Find max length
-        max_length = max(ids.shape[1] for ids in all_input_ids)
         pad_token_id = self.processor.tokenizer.pad_token_id or self.processor.tokenizer.eos_token_id
         
         padded_input_ids = []
         padded_attention_masks = []
         original_lengths = []
         
-        for input_ids, attention_mask in zip(all_input_ids, all_attention_masks):
+        for i, (input_ids, attention_mask) in enumerate(zip(all_input_ids, all_attention_masks)):
             original_length = input_ids.shape[1]
             original_lengths.append(original_length)
-            pad_length = max_length - original_length
+            pad_length = prompt_lengths[i] - original_length
             
             if pad_length > 0:
                 # Pad on the left
@@ -576,7 +574,7 @@ class ImageUnifiedRollout:
                     return_dict_in_generate=True,
                     use_cache=True,
                     max_new_tokens=512)
-                    # logit_processor=[cfg_processor])
+                    # logits_processor=[cfg_processor])
 
         # Handle both dict and tensor returns
         if isinstance(output, dict) or hasattr(output, 'sequences'):
@@ -602,98 +600,95 @@ class ImageUnifiedRollout:
         )
         
         # Extract pixel_values from BatchFeature
-        if hasattr(result, 'data') and 'pixel_values' in result.data:
-            refined_img_list = result.data['pixel_values']
-        elif isinstance(result, dict) and 'pixel_values' in result:
-            refined_img_list = result['pixel_values']
-        else:
-            refined_img_list = [result] if not isinstance(result, list) else result
+        refined_img_list = result['pixel_values']
         
         print(f"[BATCH_REFINE] Processed {len(refined_img_list)} refined images")
         
         return refined_img_list
 
     def _save_generation(self, output: DataProto, prompts: DataProto):
-            """Save generated images and metadata."""
-            try:
-                batch_size = output.batch.batch_size[0]
+        """Save generated images and metadata."""
+        try:            
+            batch_size = output.batch.batch_size[0]
+            n = self.config.get('n', 1)
+
+            print(f"[SAVE] batch_size: {batch_size}, n={n}")
+            # Get lists from meta_info
+            gen_img_list = output.meta_info.get('gen_img_list', [])
+            refined_img_list = output.meta_info.get('refined_gen_img_list', [])
+            feedback_texts = output.meta_info.get('feedback_texts', [])
+            
+            print(f"[SAVE] gen_img_list length: {len(gen_img_list)}")
+            print(f"[SAVE] refined_img_list length: {len(refined_img_list)}")
+            print(f"[SAVE] feedback_texts length: {len(feedback_texts)}")
+            
+            if not gen_img_list:
+                print(f"[SAVE] No images in gen_img_list, skipping save")
+                return
+
+            for i in range(n):
+                gen_id = self.generation_counter
+                self.generation_counter += 1
+
+                gen_dir = Path(self.save_dir) / f"gen_{gen_id:06d}"
+                gen_dir.mkdir(parents=True, exist_ok=True)
+
+                # Get items for this index
+                gen_img = gen_img_list[i] if i < len(gen_img_list) else None
+                refined_img = refined_img_list[i] if i < len(refined_img_list) else None
+                feedback_text = feedback_texts[i] if i < len(feedback_texts) else ""
                 
-                # Get lists from meta_info
-                gen_img_list = output.meta_info.get('gen_img_list', [])
-                refined_img_list = output.meta_info.get('refined_gen_img_list', [])
-                feedback_texts = output.meta_info.get('feedback_texts', [])
+                # Get input_ids - handle the case where we have more outputs than original prompts
+                # due to num_return_sequences
+                input_ids = output.batch["input_ids"][i]
+
+                # Decode input prompt
+                try:
+                    input_text = self.processor.decode(input_ids, skip_special_tokens=True)
+                except:
+                    input_text = "Failed to decode input"
                 
-                print(f"[SAVE] batch_size: {batch_size}")
-                print(f"[SAVE] gen_img_list length: {len(gen_img_list)}")
-                print(f"[SAVE] refined_img_list length: {len(refined_img_list)}")
-                print(f"[SAVE] feedback_texts length: {len(feedback_texts)}")
+                # Save original generated image
+                if gen_img is not None and isinstance(gen_img, PIL.Image.Image):
+                    gen_img.save(gen_dir / "generated_image.png")
+                    print(f"[SAVE] Saved generated image to {gen_dir / 'generated_image.png'}")
                 
-                if not gen_img_list:
-                    print(f"[SAVE] No images in gen_img_list, skipping save")
-                    return
-
-                for i in range(batch_size):
-                    gen_id = self.generation_counter
-                    self.generation_counter += 1
-
-                    gen_dir = Path(self.save_dir) / f"gen_{gen_id:06d}"
-                    gen_dir.mkdir(parents=True, exist_ok=True)
-
-                    # Get items for this index
-                    gen_img = gen_img_list[i] if i < len(gen_img_list) else None
-                    refined_img = refined_img_list[i] if i < len(refined_img_list) else None
-                    feedback_text = feedback_texts[i] if i < len(feedback_texts) else ""
-                    
-                    # Get input_ids - handle the case where we have more outputs than original prompts
-                    # due to num_return_sequences
-                    original_batch_size = prompts.batch["input_ids"].shape[0]
-                    prompt_idx = i % original_batch_size  # Map back to original prompt
-                    input_ids = prompts.batch["input_ids"][prompt_idx]
-
-                    # Decode input prompt
-                    try:
-                        input_text = self.processor.decode(input_ids.tolist(), skip_special_tokens=True)
-                    except:
-                        input_text = "Failed to decode input"
-                    
-                    # Save original generated image
-                    if gen_img is not None and isinstance(gen_img, PIL.Image.Image):
-                        gen_img.save(gen_dir / "generated_image.png")
-                        print(f"[SAVE] Saved generated image to {gen_dir / 'generated_image.png'}")
-                    
-                    # Save refined image
-                    if refined_img is not None and isinstance(refined_img, PIL.Image.Image):
-                        refined_img.save(gen_dir / "refined_image.png")
-                        print(f"[SAVE] Saved refined image to {gen_dir / 'refined_image.png'}")
-                    
-                    # Save metadata
-                    metadata = {
-                        'generation_id': gen_id,
-                        'input_prompt': input_text,
-                        'feedback_text': feedback_text,
-                        'feedback_system_prompt': self.feedback_system_prompt,
-                        'refine_system_prompt': self.refine_system_prompt,
-                        'generation_config': {
-                            'do_sample': bool(self.generation_config.do_sample) if self.generation_config.do_sample is not None else None,
-                            'temperature': float(self.generation_config.temperature) if self.generation_config.temperature is not None else None,
-                            'top_p': float(self.generation_config.top_p) if self.generation_config.top_p is not None else None,
-                            'top_k': int(self.generation_config.top_k) if self.generation_config.top_k is not None else None,
-                            'num_return_sequences': int(self.generation_config.num_return_sequences) if self.generation_config.num_return_sequences is not None else None,
-                        }
+                # Save refined image
+                if refined_img is not None and isinstance(refined_img, PIL.Image.Image):
+                    refined_img.save(gen_dir / "refined_image.png")
+                    print(f"[SAVE] Saved refined image to {gen_dir / 'refined_image.png'}")
+                
+                # Save metadata
+                metadata = {
+                    'generation_id': gen_id,
+                    'input_prompt': input_text,
+                    'feedback_text': feedback_text,
+                    'feedback_system_prompt': self.feedback_system_prompt,
+                    'refine_system_prompt': self.refine_system_prompt,
+                    'generation_config': {
+                        'do_sample': bool(self.generation_config.do_sample) if self.generation_config.do_sample is not None else None,
+                        'temperature': float(self.generation_config.temperature) if self.generation_config.temperature is not None else None,
+                        'top_p': float(self.generation_config.top_p) if self.generation_config.top_p is not None else None,
+                        'top_k': int(self.generation_config.top_k) if self.generation_config.top_k is not None else None,
+                        'num_return_sequences': int(self.generation_config.num_return_sequences) if self.generation_config.num_return_sequences is not None else None,
                     }
-                    
-                    with open(gen_dir / "metadata.json", 'w', encoding='utf-8') as f:
-                        json.dump(metadata, f, indent=2, ensure_ascii=False, default=str)
-                    print(f"[SAVE] Saved metadata to {gen_dir / 'metadata.json'}")
-                    
-                    # Save text files for easy viewing
-                    with open(gen_dir / "input_prompt.txt", 'w', encoding='utf-8') as f:
-                        f.write(input_text)
-                    
-                    with open(gen_dir / "feedback.txt", 'w', encoding='utf-8') as f:
-                        f.write(feedback_text)
-                    
-            except Exception as e:
-                print(f"[SAVE] Error saving generation: {e}")
-                import traceback
-                traceback.print_exc()
+                }
+                
+                with open(gen_dir / "metadata.json", 'w', encoding='utf-8') as f:
+                    json.dump(metadata, f, indent=2, ensure_ascii=False, default=str)
+                print(f"[SAVE] Saved metadata to {gen_dir / 'metadata.json'}")
+                
+                # Save text files for easy viewing
+                with open(gen_dir / "input_prompt.txt", 'w', encoding='utf-8') as f:
+                    f.write(input_text)
+                
+                with open(gen_dir / "feedback.txt", 'w', encoding='utf-8') as f:
+                    f.write(feedback_text)
+            
+            import time
+            time.sleep(100)
+        
+        except Exception as e:
+            print(f"[SAVE] Error saving generation: {e}")
+            import traceback
+            traceback.print_exc()

@@ -133,7 +133,7 @@ class CFGEmbeddingLogitsProcessor(LogitsProcessor):
         elif task == 3:
             # Task 3: <end_of_image>\n to <|Assistant|> masking
             self.start_marker = torch.tensor([100593], device=device)  # <end_of_image>
-            self.end_marker = torch.tensor([100602], device=device)          # <|Assistant|>
+            self.end_marker = torch.tensor([100602], device=device)    # <|Assistant|>
             self.mask_offset = (1, 2)  # content_start_index, content_end_index offset
         
         # State management

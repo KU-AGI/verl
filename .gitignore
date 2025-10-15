@@ -125,4 +125,5 @@ ENV/
 logs
 log
 outputs
+output
 .history

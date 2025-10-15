@@ -87,9 +87,9 @@ class ImageGenerationRewardManager:
                         f.write(f"Generated Image: img_{i}.png\n")
                 
                 # Save prompt
-                if i < len(data.batch['prompts']):
-                    prompt = data.batch['prompts'][i]
-                    prompt_text = self.tokenizer.decode(prompt, skip_special_tokens=True)
+                if i < len(data.batch['input_ids']):
+                    prompt = data.batch['input_ids'][i]
+                    prompt_text = self.processor.decode(prompt, skip_special_tokens=True)
                     f.write(f"Prompt: {prompt_text}\n\n")
                 
                 # Save feedback text
