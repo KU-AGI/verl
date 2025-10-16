@@ -17,11 +17,13 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NCCL_CUMEM_ENABLE=0
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:256
 
-# if [ "$RANK" -eq 0 ]; then
-# ray job submit --no-wait \
-#     --working-dir "${WORKING_DIR}" \
-#     -- 
-python3 -m recipe.image_rl.main_image_generation_rl \
+RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8266"}
+WORKING_DIR=${WORKING_DIR:-"${PWD}"}
+RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/verl/trainer/runtime_env.yaml"}
+
+ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
+    --working-dir "${WORKING_DIR}" \
+    -- python3 -m recipe.image_rl.main_image_generation_rl \
     algorithm.adv_estimator=grpo \
     data.train_files="/data/mllm/data/train.parquet" \
     data.val_files="/data/mllm/data/val.parquet" \
@@ -57,7 +59,7 @@ python3 -m recipe.image_rl.main_image_generation_rl \
     +actor_rollout_ref.rollout.feedback_system_prompt="You should give me a feedback on the image generation." \
     +actor_rollout_ref.rollout.refine_system_prompt="You should refine the image generation." \
     +actor_rollout_ref.rollout.saving=True \
-    +actor_rollout_ref.rollout.save_dir="./output/rollout" \
+    +actor_rollout_ref.rollout.save_dir="/verl/output/rollout" \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.ref.fsdp_config.param_offload=False \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
