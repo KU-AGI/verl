@@ -56,27 +56,28 @@ class ImageGenerationRewardManager:
         if not hasattr(data, "meta_info"):
             print("[SAVE] No meta_info found, skipping save")
             return
-            
+        
+        input_texts = data.meta_info.get('input_text', [])
         gen_img_list = data.meta_info.get('gen_img_list', [])
         refined_img_list = data.meta_info.get('refined_gen_img_list', [])
         feedback_texts = data.meta_info.get('feedback_texts', [])
-        
-        if not gen_img_list:
-            print("[SAVE] No images in gen_img_list, skipping save")
-            return
-        
+
         step_dir = os.path.join(self.save_path, str(self.steps))
         os.makedirs(step_dir, exist_ok=True)
         
         print(f"[SAVE] Saving {min(len(gen_img_list), self.save_num)} images to {step_dir}")
         
         with open(os.path.join(step_dir, "texts.txt"), 'w', encoding='utf-8') as f:
-            f.write("Prompts and Generated Content\n")
+            f.write("Input Texts and Generated Content\n")
             f.write("=" * 80 + "\n\n")
             
             for i in range(min(len(gen_img_list), self.save_num)):
                 f.write(f"Sample {i}\n")
                 f.write("=" * 40 + "\n")
+                
+                # Save input text
+                if i < len(input_texts):
+                    f.write(f"Input Text: {input_texts[i]}\n")
                 
                 # Save generated image
                 if i < len(gen_img_list):
@@ -85,12 +86,6 @@ class ImageGenerationRewardManager:
                         save_path = os.path.join(step_dir, f"img_{i}.png")
                         gen_img.save(save_path)
                         f.write(f"Generated Image: img_{i}.png\n")
-                
-                # Save prompt
-                if i < len(data.batch['input_ids']):
-                    prompt = data.batch['input_ids'][i]
-                    prompt_text = self.processor.decode(prompt, skip_special_tokens=True)
-                    f.write(f"Prompt: {prompt_text}\n\n")
                 
                 # Save feedback text
                 if i < len(feedback_texts):
@@ -122,6 +117,7 @@ class ImageGenerationRewardManager:
     def verify(self, data: DataProto) -> List[dict]:
         """Verify and compute scores for batch."""
         # Get lists from meta_info
+        input_texts = data.meta_info.get('input_text', [])
         gen_img_list = data.meta_info.get('gen_img_list', [])
         refined_img_list = data.meta_info.get('refined_gen_img_list', [])
         feedback_texts = data.meta_info.get('feedback_texts', [])
@@ -132,9 +128,7 @@ class ImageGenerationRewardManager:
         # Prepare batch data for scoring
         prompts = []
         for i in range(batch_size):
-            prompt_ids = data.batch["prompts"][i]
-            prompt_text = self.tokenizer.decode(prompt_ids, skip_special_tokens=True)
-            prompts.append(prompt_text)
+            prompts.append(input_texts[i])
         
         # Get ground truths and extras
         ground_truths = []
@@ -182,17 +176,18 @@ class ImageGenerationRewardManager:
                 return data.batch["rm_scores"]
 
         # Get batch size from meta_info
+        input_texts = data.meta_info.get('input_text', [])
         gen_img_list = data.meta_info.get('gen_img_list', [])
         batch_size = len(gen_img_list)
         
         if batch_size == 0:
             print("[REWARD] Warning: No images in gen_img_list")
-            batch_size = data.batch["prompts"].shape[0]
+            batch_size = len(input_texts)
         
         print(f"[REWARD] Computing rewards for batch_size={batch_size}")
         
         # Initialize reward tensor
-        device = data.batch["prompts"].device
+        device = data.batch["input_ids"].device
         reward_tensor = torch.zeros(batch_size, dtype=torch.float32, device=device)
         reward_extra_info = defaultdict(list)
         
