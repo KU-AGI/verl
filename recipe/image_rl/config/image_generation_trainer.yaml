@@ -9,6 +9,17 @@ defaults:
 data:
   gen_batch_size: ${data.train_batch_size}
 
+actor_rollout_ref:
+  rollout:
+    _target_: recipe.image_rl.image_unified_rollout.ImageUnifiedRollout
+    name: image_unified
+    mode: sync
+    feedback_system_prompt: "You should give me a feedback on the image generation."
+    refine_system_prompt: "You should refine the image generation."
+    saving: false
+    save_dir: null
+
+
 reward_model:
   reward_manager: image_generation
   overlong_buffer: 
@@ -16,6 +27,12 @@ reward_model:
     len: 0
     penalty_factor: 0.0
     log: False
+  reward_kwargs:
+    img_saving:
+      save_freq: 1
+      num: 4
+      path: null
+      experiment_name: null
 
 algorithm:
   filter_groups:
