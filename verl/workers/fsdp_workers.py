@@ -57,6 +57,8 @@ from verl.utils.device import (
     get_device_name,
     get_nccl_backend,
     get_torch_device,
+    is_cuda_available,
+    is_npu_available,
     set_expandable_segments,
 )
 from verl.utils.flops_counter import FlopsCounter
@@ -281,13 +283,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     ):
         from torch import optim
         from torch.distributed.fsdp import CPUOffload, MixedPrecision
-        from transformers import (
-            AutoConfig,
-            AutoModel,
-            AutoModelForCausalLM,
-            AutoModelForImageTextToText,
-            AutoModelForVision2Seq,
-        )
+        from transformers import AutoConfig, AutoModel, AutoModelForCausalLM, AutoModelForVision2Seq
 
         from verl.utils.model import get_generation_config, print_model_size, update_model_config
         from verl.utils.torch_dtypes import PrecisionType
@@ -330,19 +326,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         self.generation_config = get_generation_config(local_path, trust_remote_code=trust_remote_code)
 
-        # patch for janus
-        if getattr(actor_model_config, "model_type", None) == "janus":
-            from transformers import JanusProcessor
-            self.processor = JanusProcessor.from_pretrained(local_path)
-            self.tokenizer = self.processor.tokenizer
-            self.generation_config = get_generation_config(local_path, trust_remote_code=trust_remote_code)
-            self.generation_config.pad_token_id = self.tokenizer.pad_token_id
-            self.generation_config.eos_token_id = self.tokenizer.eos_token_id
-            self.generation_config.cfg_weight = self.config.model.get('cfg_weight', 1.0)
-            OmegaConf.set_struct(self.config.rollout, True)
-            with open_dict(self.config.rollout):
-                self.config.rollout.cfg_weight = self.config.model.get('cfg_weight', 1.0)
-
         override_config_kwargs = {
             "bos_token_id": self.tokenizer.bos_token_id,
             "eos_token_id": self.tokenizer.eos_token_id,
@@ -372,8 +355,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                         actor_module_class = AutoModelForVision2Seq
                     case "AutoModelForCausalLM":
                         actor_module_class = AutoModelForCausalLM
-                    case "AutoModelForImageTextToText":
-                        actor_module_class = AutoModelForImageTextToText
                     case _:
                         actor_module_class = AutoModel
             else:
@@ -381,8 +362,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     actor_module_class = AutoModelForVision2Seq
                 elif type(actor_model_config) in AutoModelForCausalLM._model_mapping.keys():
                     actor_module_class = AutoModelForCausalLM
-                elif type(actor_model_config) in AutoModelForImageTextToText._model_mapping.keys():
-                    actor_module_class = AutoModelForImageTextToText
                 else:
                     actor_module_class = AutoModel
 
@@ -610,14 +589,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # 4. build rollout model
         log_gpu_memory_usage(f"Before building {self.config.rollout.name} rollout", logger=logger)
-        if rollout_name == 'image_unified':
-            from verl.workers.rollout import ImageUnifiedRollout
-            self.rollout = ImageUnifiedRollout(module=self.actor_module_fsdp, config=self.config.rollout)
-            # TODO: a sharding manager that do nothing?
-        else:
-            self.rollout = get_rollout_class(rollout_config.name, rollout_config.mode)(
-                config=rollout_config, model_config=model_config, device_mesh=rollout_device_mesh
-            )
+        self.rollout = get_rollout_class(rollout_config.name, rollout_config.mode)(
+            config=rollout_config, model_config=model_config, device_mesh=rollout_device_mesh
+        )
         log_gpu_memory_usage(f"After building {self.config.rollout.name} rollout", logger=logger)
 
         # Full params
@@ -696,7 +670,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         set_expandable_segments(False)
 
         if peft_config is not None and self.base_sync_done:
-            per_tensor_param = params.items() if isinstance(params, dict) else params  # Fixed: handle dict case
+            per_tensor_param = params
         else:
             device = get_device_id()  # used when fsdp2 set cpu_offload_policy
             per_tensor_param = (
@@ -920,11 +894,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         timing_generate = {}
         if self._is_actor:  # For rollout only, we do not switch context.
-            try:
-                loop = asyncio.get_event_loop()
-            except RuntimeError:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
+            loop = asyncio.get_event_loop()
             loop.run_until_complete(self.rollout_mode())
             log_gpu_memory_usage("After switch to rollout mode", logger=logger)
 
@@ -1699,7 +1669,16 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         self.reward_module = self._build_model(config=self.config)
 
     def _forward_micro_batch(self, micro_batch):
-        from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
+        if is_cuda_available:
+            from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
+        elif is_npu_available:
+            from transformers.integrations.npu_flash_attention import (
+                index_first_axis,
+                pad_input,
+                rearrange,
+                unpad_input,
+            )
+
         from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad_and_slice_inputs
 
         with torch.no_grad(), torch.autocast(device_type=device_name, dtype=torch.bfloat16):
