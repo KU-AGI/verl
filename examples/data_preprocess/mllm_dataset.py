@@ -6,7 +6,7 @@ import datasets
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--root_dir", default="/data/mllm/data")
+    parser.add_argument("--root_dir", default="/data/mllm/janus_r1_sft/data")
     parser.add_argument("--data_path", default="/data/mllm/janus_r1_filter_final.json")
     parser.add_argument("--save_dir", default="/data/mllm/data")
 
@@ -23,7 +23,7 @@ if __name__ == "__main__":
         def process_fn(example, idx):
             prompt_id = example["prompt_id"]
             prompt = example["prompt"]
-            aligned_image_path = os.path.join(root_dir, example["aligned_data"][0]["img_path"])
+            aligned_image_path = os.path.join(root_dir, example["aligned_data"][0]["img_path"].lstrip("/"))
 
             data = {
                 "data_source": "image_generation",
