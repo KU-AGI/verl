@@ -87,7 +87,7 @@ from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerCon
 from verl.utils.profiler.performance import reduce_timing, topk_reduce_ratio_min_max
 from verl.utils.py_functional import convert_to_regular_types
 from verl.workers.config import FSDPCriticConfig, FSDPEngineConfig, HFModelConfig, RolloutConfig
-from verl.workers.fsdp_workers import ActorRolloutRefWorker, create_device_mesh, get_sharding_strategy, init_device_mesh
+from verl.workers.fsdp_workers import ActorRolloutRefWorker, create_device_mesh, get_sharding_strategy, init_device_mesh, get_vl_model_vision_tower
 from verl.workers.rollout import get_rollout_class
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
 

@@ -11,7 +11,8 @@ data:
 
 actor_rollout_ref:
   rollout:
-    _target_: recipe.image_rl.image_unified_rollout.ImageUnifiedRollout
+    _target_: recipe.image_rl.config.ImageGenerationRolloutConfig
+    cfg_weight: 5.0
     name: image_unified
     mode: sync
     feedback_system_prompt: "You should give me a feedback on the image generation."

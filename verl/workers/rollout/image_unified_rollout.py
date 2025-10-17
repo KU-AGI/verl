@@ -186,7 +186,7 @@ class ImageUnifiedRollout:
                 cfg_processor = CFGEmbeddingLogitsProcessor(
                     task=1,
                     pad_token_id=self.processor.tokenizer.pad_token_id,
-                    cfg_weight=5.0,
+                    cfg_weight=self.config.cfg_weight,
                     model=self.module
                 )
 
@@ -198,8 +198,8 @@ class ImageUnifiedRollout:
                     output_scores=False,
                     return_dict_in_generate=True,
                     use_cache=True,
-                    max_new_tokens=512)
-                    # logits_processor=[cfg_processor])
+                    max_new_tokens=512,
+                    logits_processor=[cfg_processor])
 
         sequences = output.sequences
         print(f"[IMG_GEN] Generated sequences shape: {sequences.shape}")
@@ -509,7 +509,7 @@ class ImageUnifiedRollout:
                 cfg_processor = CFGEmbeddingLogitsProcessor(
                     task=3,
                     pad_token_id=self.processor.tokenizer.pad_token_id,
-                    cfg_weight=3.0,
+                    cfg_weight=self.config.cfg_weight,
                     model=self.module
                 )
 
@@ -521,8 +521,8 @@ class ImageUnifiedRollout:
                     output_scores=False,
                     return_dict_in_generate=True,
                     use_cache=True,
-                    max_new_tokens=512)
-                    # logits_processor=[cfg_processor])
+                    max_new_tokens=512,
+                    logits_processor=[cfg_processor])
 
         # Handle both dict and tensor returns
         if isinstance(output, dict) or hasattr(output, 'sequences'):
