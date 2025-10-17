@@ -33,6 +33,7 @@ class ImageGenerationRewardManager:
         num_examine, 
         compute_score=None, 
         reward_fn_key="data_source", 
+        eval=False,
         **reward_kwargs
     ) -> None:
         self.tokenizer = tokenizer
@@ -49,7 +50,7 @@ class ImageGenerationRewardManager:
             self.save_path, 
             f"{reward_kwargs.get('img_saving', {}).get('experiment_name', '')}_{time_stamp}"
         )
-        
+
     def save_img(self, data: DataProto):
         """Save images from meta_info lists."""
         # Get lists from meta_info
@@ -122,18 +123,12 @@ class ImageGenerationRewardManager:
         refined_img_list = data.meta_info.get('refined_gen_img_list', [])
         feedback_texts = data.meta_info.get('feedback_texts', [])
         
-        batch_size = len(gen_img_list)
-        print(f"[VERIFY] Processing batch of {batch_size} samples")
-        
-        # Prepare batch data for scoring
-        prompts = []
-        for i in range(batch_size):
-            prompts.append(input_texts[i])
+        print(f"[VERIFY] Processing batch of {len(data)} samples")
         
         # Get ground truths and extras
         ground_truths = []
         extras = []
-        for i in range(batch_size):
+        for i in range(len(data)):
             gt = data[i].non_tensor_batch.get("reward_model", {}).get("ground_truth", None)
             ground_truths.append(gt)
             
@@ -142,9 +137,9 @@ class ImageGenerationRewardManager:
         
         # Compute scores for all samples
         scores = []
-        for i in range(batch_size):
+        for i in range(len(data)):
             score_result = self.compute_score(
-                prompt=prompts[i],
+                prompt=input_texts[i],
                 gen_img=gen_img_list[i] if i < len(gen_img_list) else None,
                 feedback_text=feedback_texts[i] if i < len(feedback_texts) else "",
                 refined_gen_img=refined_img_list[i] if i < len(refined_img_list) else None,
@@ -161,8 +156,11 @@ class ImageGenerationRewardManager:
         
         # Save generated images periodically
         if self.save_freq > 0 and self.steps % self.save_freq == 0:
+            self.save_path = os.path.join(self.save_path, "eval" if eval else "train")
+            os.makedirs(self.save_path, exist_ok=True)
             self.save_img(data)
-        
+            print(f"[SAVE] Saving images to {self.save_path}")
+
         if not eval:
             self.steps += 1
 
@@ -175,31 +173,24 @@ class ImageGenerationRewardManager:
             else:
                 return data.batch["rm_scores"]
 
-        # Get batch size from meta_info
-        input_texts = data.meta_info.get('input_text', [])
-        gen_img_list = data.meta_info.get('gen_img_list', [])
-        batch_size = len(gen_img_list)
-        
-        if batch_size == 0:
-            print("[REWARD] Warning: No images in gen_img_list")
-            batch_size = len(input_texts)
-        
-        print(f"[REWARD] Computing rewards for batch_size={batch_size}")
+        print(f"[REWARD] Computing rewards for batch_size={len(data)}")
         
         # Initialize reward tensor
         device = data.batch["input_ids"].device
-        reward_tensor = torch.zeros(batch_size, dtype=torch.float32, device=device)
+        reward_tensor = torch.zeros(len(data), dtype=torch.float32, device=device)
         reward_extra_info = defaultdict(list)
         
+        input_texts = data.meta_info.get('input_text', [])
+
         # Get data sources
-        data_sources = data.non_tensor_batch.get(self.reward_fn_key, ["unknown"] * batch_size)
+        data_sources = data.non_tensor_batch.get(self.reward_fn_key, ["unknown"] * len(data))
         
         # Compute scores
         scores = self.verify(data)
         rewards = []
         already_printed = {}
 
-        for i in range(batch_size):
+        for i in range(len(data)):
             score_dict = scores[i]
             reward = score_dict.get("score", 0.0)
             
@@ -214,16 +205,13 @@ class ImageGenerationRewardManager:
             # Print examination samples
             data_source = data_sources[i] if i < len(data_sources) else "unknown"
             if already_printed.get(data_source, 0) < self.num_examine:
-                prompt_text = self.tokenizer.decode(
-                    data.batch["prompts"][i], 
-                    skip_special_tokens=True
-                )
+                prompt_text = input_texts[i]
                 ground_truth = data[i].non_tensor_batch.get("reward_model", {}).get("ground_truth", "N/A")
                 
                 print(f"\n[EXAMINE {i}]")
                 print(f"Data Source: {data_source}")
                 print(f"Prompt: {prompt_text}")
-                print(f"Ground Truth: {ground_truth}")
+                print(f"Ground Truth: {ground_truth}") # path
                 print(f"Score: {score_dict}")
                 print("-" * 80)
                 

@@ -75,39 +75,42 @@ class ImageUnifiedRollout:
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         batch_size = prompts.batch.batch_size[0]
-        num_chunks = max(batch_size // self.config.get('micro_batch_size', batch_size), 1)
-        batch_prompts = prompts.chunk(chunks=num_chunks)
-        
-        self.set_generation_config(batch_prompts[0])
 
-        all_outputs = []
-        for p in batch_prompts:
-            output = self._generate_minibatch_image_generation(p)
-            output = self._generate_minibatch_text_generation(output)
-            output = self._generate_minibatch_refine_image_generation(output)
-            
-            # Save generated content
-            if self.save_enabled:
-                self._save_generation(output, p)
-            
-            all_outputs.append(output)
-        
-        output = DataProto.concat(all_outputs)
-        print(f"[GENERATE_SEQ] Final output batch_size: {output.batch.batch_size}")
-        return output
+        input_ids = torch.stack([prompts.batch["input_ids"][i] for i in range(batch_size)], dim=0)
+        attention_mask = torch.stack([prompts.batch["attention_mask"][i] for i in range(batch_size)], dim=0)
+        position_ids = torch.stack([prompts.batch["position_ids"][i] for i in range(batch_size)], dim=0)
+
+        self.set_generation_config(prompts[0])
+
+        batch = TensorDict(
+            {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+            },
+            batch_size=batch_size
+        )
+
+        data_proto = DataProto(batch=batch, meta_info=prompts.meta_info)
+
+        data_proto = self._generate_minibatch_image_generation(data_proto)
+        data_proto = self._generate_minibatch_text_generation(data_proto)
+        data_proto = self._generate_minibatch_refine_image_generation(data_proto)
+
+        if self.save_enabled:
+            self._save_generation(data_proto, prompts)
+
+        return data_proto
     
-    def set_generation_config(self, prompts: DataProto):
-        do_sample = prompts.meta_info.get("do_sample", self.config.do_sample)
-        is_validate = prompts.meta_info.get("validate", False)
+    def set_generation_config(self, prompt: DataProto):
+        do_sample = prompt.meta_info.get("do_sample", self.config.do_sample)
+        is_validate = prompt.meta_info.get("validate", False)
 
-        temperature = prompts.meta_info.get("temperature", self.config.temperature)
-        response_length = prompts.meta_info.get("response_length", self.config.response_length)
-        top_p = prompts.meta_info.get("top_p", self.config.get("top_p", 1.0))
-        top_k = max(0, prompts.meta_info.get("top_k", self.config.get("top_k", 0)))
+        temperature = prompt.meta_info.get("temperature", self.config.temperature)
+        response_length = prompt.meta_info.get("response_length", self.config.response_length)
+        top_p = prompt.meta_info.get("top_p", self.config.get("top_p", 1.0))
+        top_k = max(0, prompt.meta_info.get("top_k", self.config.get("top_k", 0)))
         
-        # Get n from config for num_return_sequences
-        n = self.config.get('n', 1)
-
         if not do_sample:
             kwargs = {
                 "do_sample": False,
@@ -158,32 +161,21 @@ class ImageUnifiedRollout:
                             self.generation_config.pad_token_id = eos_token_id
 
     @torch.no_grad()
-    def _generate_minibatch_image_generation(self, prompts: DataProto) -> DataProto:
-        input_ids = prompts.batch['input_ids']
-        attention_mask = prompts.batch['attention_mask']
-        position_ids = prompts.batch['position_ids']
-
-        eos_token_id = prompts.meta_info['eos_token_id']
-        pad_token_id = prompts.meta_info['pad_token_id']
+    def _generate_minibatch_image_generation(self, data_proto: DataProto) -> DataProto:
+        input_ids = data_proto.batch['input_ids']
+        attention_mask = data_proto.batch['attention_mask']
+        position_ids = data_proto.batch['position_ids']
 
         batch_size = input_ids.size(0)
         prompt_length = input_ids.size(1)
-        n = self.config.get('n', 1)
         
-        print(f"[IMG_GEN] Input batch_size: {batch_size}, prompt_length: {prompt_length}, n={n}")
-        print(f"[IMG_GEN] Will generate {batch_size * n} total sequences")
-
-        if attention_mask is None:
-            attention_mask = torch.ones_like(input_ids, dtype=torch.long)
+        print(f"[IMG_GEN] Input batch_size: {batch_size}, prompt_length: {prompt_length}")
+        print(f"[IMG_GEN] Will generate {batch_size} total sequences")
 
         self.module.eval()
         
         # Generate n images in batch
-        print(f"[IMG_GEN] Generating {n} images in batch")
-        
-        # Replicate input tensors n times for batch generation
-        replicated_input_ids = input_ids.repeat(n, 1)
-        replicated_attention_mask = attention_mask.repeat(n, 1)
+        print(f"[IMG_GEN] Generating {batch_size} images in batch")
         
         param_ctx = contextlib.nullcontext()
         if isinstance(self.module, FSDP):
@@ -199,8 +191,8 @@ class ImageUnifiedRollout:
                 )
 
                 output = self.module.generate(
-                    input_ids=replicated_input_ids,
-                    attention_mask=replicated_attention_mask,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
                     generation_mode="image",
                     generation_config=self.generation_config,
                     output_scores=False,
@@ -246,38 +238,21 @@ class ImageUnifiedRollout:
         if output_start_idx != -1:
             output_start_idx += len(start_marker)
 
-        input_text = self.processor.decode(input_ids[0][output_start_idx:output_end_idx])
-        print(f"[IMG_GEN] Input text: {input_text}")
+        all_input_texts = [self.processor.decode(input_ids[i][output_start_idx:output_end_idx]) for i in range(batch_size)]
 
-        # Replicate position_ids to match the number of generated images
-        replicated_position_ids = position_ids.repeat_interleave(n, dim=0)
-        
-        print(f"[IMG_GEN] Replicated input_ids shape: {replicated_input_ids.shape}")
-        
-        batch = TensorDict(
-            {
-                'input_ids': replicated_input_ids,
-                'attention_mask': replicated_attention_mask,
-                'position_ids': replicated_position_ids,
-            },
-            batch_size=batch_size * n) # batch_size is the number of generated images
-
-        # Create DataProto and store images in meta_info
-        data_proto = DataProto(batch=batch, meta_info=prompts.meta_info)
         data_proto.meta_info['gen_img_list'] = all_gen_imgs
-        data_proto.meta_info['input_text'] = [input_text] * n
+        data_proto.meta_info['input_text'] = all_input_texts
 
-        print(f"[IMG_GEN] Created DataProto with batch_size: {batch_size * n}")
+        print(f"[IMG_GEN] Created DataProto with batch_size: {batch_size}")
         print(f"[IMG_GEN] Stored {len(all_gen_imgs)} images in meta_info")
 
         return data_proto
 
     def _generate_minibatch_text_generation(self, data_proto: DataProto) -> DataProto:
         batch_size = data_proto.batch.batch_size[0]
-        n = self.config.get('n', 1)
 
-        print(f"[TEXT_GEN] Input batch_size: {batch_size}, n={n}")
-        print(f"[TEXT_GEN] Starting feedback generation for {n} images in batch")
+        print(f"[TEXT_GEN] Input batch_size: {batch_size}")
+        print(f"[TEXT_GEN] Starting feedback generation for {batch_size} images in batch")
         
         # Get images from meta_info
         gen_img_list = data_proto.meta_info.get('gen_img_list', [])
@@ -285,11 +260,11 @@ class ImageUnifiedRollout:
             raise ValueError("No images found in meta_info['gen_img_list']")
         
         # Process all images in batch
-        print(f"[TEXT_GEN] Processing feedback for {n} images in batch")
+        print(f"[TEXT_GEN] Processing feedback for {batch_size} images in batch")
         
         # Prepare messages for all images
         messages_batch = []
-        for i in range(n):
+        for i in range(batch_size):
             gen_img = gen_img_list[i]
             message = [
                 {
@@ -425,10 +400,9 @@ class ImageUnifiedRollout:
 
     def _generate_minibatch_refine_image_generation(self, data_proto: DataProto) -> DataProto:
         batch_size = data_proto.batch.batch_size[0]
-        n = self.config.get('n', 1)
 
-        print(f"[REFINE] Input batch_size: {batch_size}, n={n}")
-        print(f"[REFINE] Starting image refinement for {n} images in batch")
+        print(f"[REFINE] Input batch_size: {batch_size}")
+        print(f"[REFINE] Starting image refinement for {batch_size} images in batch")
 
         # Get data from meta_info
         gen_img_list = data_proto.meta_info.get('gen_img_list', [])
@@ -440,11 +414,11 @@ class ImageUnifiedRollout:
         print(f"[REFINE] Loaded {len(gen_img_list)} images and {len(feedback_texts)} feedback_texts from meta_info")
 
         # Process all images in batch
-        print(f"[REFINE] Processing refine for {n} images in batch")
+        print(f"[REFINE] Processing refine for {batch_size} images in batch")
         
         # Prepare messages for all images
         messages_batch = []
-        for i in range(n):
+        for i in range(batch_size):
             gen_img = gen_img_list[i]
             fb_txt = feedback_texts[i]
             
@@ -606,7 +580,6 @@ class ImageUnifiedRollout:
             return
             
         batch_size = output.batch.batch_size[0]
-        n = self.config.get('n', 1)
 
         # Get lists from meta_info
         input_texts = output.meta_info.get('input_text', [])
@@ -617,7 +590,7 @@ class ImageUnifiedRollout:
         if not gen_img_list:
             return
 
-        for i in range(n):
+        for i in range(batch_size):
             gen_id = self.generation_counter
             self.generation_counter += 1
 
@@ -664,4 +637,4 @@ class ImageUnifiedRollout:
             with open(gen_dir / "feedback.txt", 'w', encoding='utf-8') as f:
                 f.write(feedback_text)
         
-        print(f"[SAVE] Saved {n} generations to {self.save_dir}")
+        print(f"[SAVE] Saved {batch_size} generations to {self.save_dir}")

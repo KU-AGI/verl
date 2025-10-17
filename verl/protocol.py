@@ -914,9 +914,11 @@ class DataProto:
                                 all_metrics.append(v)
                     else:
                         if k in merged_meta_info:
-                            # Ensure consistency for overlapping non-metric keys
-                            # assert merged_meta_info[k] == v, f"Conflicting values for meta_info key '{k}'"
-                            merged_meta_info[k] = v
+                            if v is not None:
+                                if isinstance(v, list):
+                                    merged_meta_info[k].extend(v)
+                                else:
+                                    merged_meta_info[k] = v
                         else:
                             merged_meta_info[k] = v
 
