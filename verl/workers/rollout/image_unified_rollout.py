@@ -87,6 +87,7 @@ class ImageUnifiedRollout:
                 "input_ids": input_ids,
                 "attention_mask": attention_mask,
                 "position_ids": position_ids,
+                # "gen_img_response_mask": 
             },
             batch_size=batch_size
         )
@@ -189,10 +190,11 @@ class ImageUnifiedRollout:
                     cfg_weight=self.config.cfg_weight,
                     model=self.module
                 )
+                final_embeds, final_attention_mask = cfg_processor.prepare_cfg_embeds(input_ids, attention_mask)
 
                 output = self.module.generate(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
+                    inputs_embeds=final_embeds,
+                    attention_mask=final_attention_mask,
                     generation_mode="image",
                     generation_config=self.generation_config,
                     output_scores=False,
@@ -240,6 +242,8 @@ class ImageUnifiedRollout:
 
         all_input_texts = [self.processor.decode(input_ids[i][output_start_idx:output_end_idx]) for i in range(batch_size)]
 
+        # data_proto.batch['gen_img_output_imbeds'] = output... 
+        # data_proto.batch['gen_img_response_mask'] = output... # idx
         data_proto.meta_info['gen_img_list'] = all_gen_imgs
         data_proto.meta_info['input_text'] = all_input_texts
 
@@ -282,6 +286,7 @@ class ImageUnifiedRollout:
         print(f"[TEXT_GEN] All feedback texts generated: {len(all_feedback_texts)} total")
         
         # Store in meta_info
+        # data_proto.batch['response'] = output...
         data_proto.meta_info["feedback_texts"] = all_feedback_texts
         print(f"[TEXT_GEN] Stored feedback_texts in meta_info (count={len(all_feedback_texts)})")
         
@@ -512,10 +517,11 @@ class ImageUnifiedRollout:
                     cfg_weight=self.config.cfg_weight,
                     model=self.module
                 )
+                final_embeds, final_attention_mask = cfg_processor.prepare_cfg_embeds(batched_input_ids, batched_attention_mask)
 
                 output = self.module.generate(
-                    input_ids=batched_input_ids,
-                    attention_mask=batched_attention_mask,
+                    input_ids=final_embeds,
+                    attention_mask=final_attention_mask,
                     generation_mode="image",
                     generation_config=self.generation_config,
                     output_scores=False,

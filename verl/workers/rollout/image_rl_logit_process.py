@@ -124,16 +124,16 @@ class CFGEmbeddingLogitsProcessor(LogitsProcessor):
         self.device = device
         self.model = model
         
-        # Task-specific markers
+        # Task-specific markers - create with proper dtype
         if task == 1:
             # Task 1: <|User|> to <|Assistant|> masking
-            self.start_marker = torch.tensor([100601], device=device)  # <|User|>
-            self.end_marker = torch.tensor([100602], device=device)    # <|Assistant|>
+            self.start_marker = torch.tensor([100601], device=device, dtype=torch.long)  # <|User|>
+            self.end_marker = torch.tensor([100602], device=device, dtype=torch.long)    # <|Assistant|>
             self.mask_offset = (0, 2)  # content_start_index, content_end_index offset
         elif task == 3:
             # Task 3: <end_of_image>\n to <|Assistant|> masking
-            self.start_marker = torch.tensor([100593], device=device)  # <end_of_image>
-            self.end_marker = torch.tensor([100602], device=device)    # <|Assistant|>
+            self.start_marker = torch.tensor([100593], device=device, dtype=torch.long)  # <end_of_image>
+            self.end_marker = torch.tensor([100602], device=device, dtype=torch.long)    # <|Assistant|>
             self.mask_offset = (1, 2)  # content_start_index, content_end_index offset
         
         # State management
@@ -156,6 +156,12 @@ class CFGEmbeddingLogitsProcessor(LogitsProcessor):
         """
         if len(sequence) > len(tensor):
             return -1
+        
+        # Ensure both tensors are on the same device and dtype
+        if tensor.device != sequence.device:
+            sequence = sequence.to(tensor.device)
+        if tensor.dtype != sequence.dtype:
+            sequence = sequence.to(dtype=tensor.dtype)
             
         len_needle = sequence.shape[0]
         for i in range(tensor.shape[0] - len_needle + 1):
@@ -166,6 +172,7 @@ class CFGEmbeddingLogitsProcessor(LogitsProcessor):
     def prepare_cfg_embeds(
         self, 
         input_ids: torch.LongTensor, 
+        attention_mask: torch.LongTensor,
         input_embeds: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -173,18 +180,15 @@ class CFGEmbeddingLogitsProcessor(LogitsProcessor):
         
         Args:
             input_ids (`torch.LongTensor`): Input token IDs
+            attention_mask (`torch.LongTensor`): Attention mask for input_ids
             input_embeds (`torch.Tensor`, *optional*): Pre-computed input embeddings
-            
-        Returns:
-            Tuple of (final_embeds, final_attention_mask) where embeddings are doubled
-            with conditional and unconditional versions interleaved.
         """
         # Task 2: No CFG
         if self.task == 2:
             if input_embeds is not None:
-                return input_embeds, torch.ones_like(input_ids, dtype=torch.long)
+                return input_embeds, attention_mask
             else:
-                return input_ids, torch.ones_like(input_ids, dtype=torch.long)
+                return input_ids, attention_mask
         
         batch_size, seq_len = input_ids.shape
         
@@ -231,13 +235,12 @@ class CFGEmbeddingLogitsProcessor(LogitsProcessor):
         final_attention_mask = torch.zeros((batch_size * 2, seq_len), dtype=torch.long, device=input_ids.device)
         
         # Interleave conditional and unconditional
-        final_embeds[0::2] = cond_embeds    # Even indices: conditional
-        final_embeds[1::2] = uncond_embeds  # Odd indices: unconditional
+        final_embeds[0:batch_size] = cond_embeds
+        final_embeds[batch_size:] = uncond_embeds
         
         # Create attention mask (assuming all tokens are valid initially)
-        attention_mask = torch.ones_like(input_ids, dtype=torch.long)
-        final_attention_mask[0::2] = attention_mask
-        final_attention_mask[1::2] = attention_mask
+        final_attention_mask[0:batch_size] = attention_mask
+        final_attention_mask[batch_size:] = attention_mask
         
         # Store for later use
         self.conditional_embeds = cond_embeds
@@ -262,11 +265,9 @@ class CFGEmbeddingLogitsProcessor(LogitsProcessor):
             return logits
         
         # Split logits into conditional and unconditional
-        logit_cond = logits[0::2, :]    # Even indices: conditional  
-        logit_uncond = logits[1::2, :]  # Odd indices: unconditional
-        
+        cond_logits, uncond_logits = logits.split(self.batch_size, dim=0)
         # Apply CFG formula: uncond + weight * (cond - uncond)
-        cfg_logits = logit_uncond + self.cfg_weight * (logit_cond - logit_uncond)
+        cfg_logits = uncond_logits + self.cfg_weight * (cond_logits - uncond_logits)
         
         return cfg_logits
 

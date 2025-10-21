@@ -128,11 +128,11 @@ class TaskRunner:
         # download the checkpoint from hdfs
         local_path = copy_to_local(config.actor_rollout_ref.model.path)
 
-        # instantiate tokenizer
-        from verl.utils import hf_processor, hf_tokenizer
+        # instantiate tokenizer: for Janus
+        from janus.models import VLChatProcessor
 
-        tokenizer = hf_tokenizer(local_path)
-        processor = hf_processor(local_path, use_fast=True)  # used for multimodal LLM, could be none
+        processor = VLChatProcessor.from_pretrained(local_path, use_fast=True)
+        tokenizer = processor.tokenizer
 
         from verl.single_controller.ray import RayWorkerGroup
 
@@ -182,20 +182,6 @@ class TaskRunner:
                 raise NotImplementedError
             role_worker_mapping[Role.RewardModel] = ray.remote(RewardModelWorker)
             mapping[Role.RewardModel] = global_pool_id
-
-        # Instantiate the tokenizer and processor.
-        from verl.utils import hf_processor, hf_tokenizer
-
-        ### Default tokenizer and processor
-        # trust_remote_code = config.data.get("trust_remote_code", False)
-        # tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
-        # # Used for multimodal LLM, could be None
-        # processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
-
-        ### Custom tokenizer and processor
-        from transformers import JanusProcessor
-        processor: JanusProcessor = JanusProcessor.from_pretrained(local_path)
-        tokenizer = processor.tokenizer
 
         reward_fn = load_reward_manager(
             config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {})

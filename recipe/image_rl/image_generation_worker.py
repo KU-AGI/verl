@@ -254,6 +254,8 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
             AutoModelForImageTextToText,
             AutoModelForVision2Seq,
         )
+        from transformers import AutoModelForCausalLM, AutoConfig
+        from janus.models import MultiModalityCausalLM, VLChatProcessor
 
         from verl.utils.model import get_generation_config, print_model_size, update_model_config
         from verl.utils.torch_dtypes import PrecisionType
@@ -263,59 +265,27 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
         log_gpu_memory_usage(f"Before init {role} from HF AutoModel", logger=logger)
         local_path = model_path
 
-        # note that we have to create model in fp32. Otherwise, the optimizer is in bf16, which is incorrect
-        # TODO(zhangchi.usc1992): 1. support create from random initialized model. 2. Support init with FSDP directly
-        self.tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
-        self.processor = hf_processor(local_path, trust_remote_code=trust_remote_code)
-
-        if self.config.model.get("custom_chat_template", None) is not None:
-            if self.processor is not None:
-                self.processor.chat_template = self.config.model.custom_chat_template
-            else:
-                self.tokenizer.chat_template = self.config.model.custom_chat_template
-
         torch_dtype = fsdp_config.get("model_dtype", None)
         if torch_dtype is None:
             torch_dtype = torch.float32 if self._is_actor else torch.bfloat16
         else:
             torch_dtype = PrecisionType.to_dtype(torch_dtype)
 
-        # override model kwargs
-        actor_model_config = AutoConfig.from_pretrained(
-            local_path, trust_remote_code=trust_remote_code, attn_implementation="flash_attention_2"
-        )
+        # override model kwargs: for Janus
+        actor_model_config = AutoConfig.from_pretrained(local_path)
+        actor_model_config.language_config.use_flash_attention_2 = True
+        actor_model_config.language_config._attn_implementation = "flash_attention_2"
+
         # TODO: VL models use VisionAttention, which directly uses flash_attention in transformers>=4.53
         # which will be patched by _ulysses_flash_attention_forward, but errorly misses position_ids
         # Maybe support Ulysses in VisionAttention in the future and remove this patch
         if self.ulysses_sequence_parallel_size > 1 and hasattr(actor_model_config, "vision_config"):
             actor_model_config.vision_config._attn_implementation = "eager"
 
-        # patch for kimi-vl
-        if getattr(actor_model_config, "model_type", None) == "kimi_vl":
-            actor_model_config.text_config.topk_method = "greedy"
-
-        self.generation_config = get_generation_config(local_path, trust_remote_code=trust_remote_code)
-
         # patch for janus
-        if getattr(actor_model_config, "model_type", None) == "janus":
-            from transformers import JanusProcessor
-            self.processor = JanusProcessor.from_pretrained(local_path)
-            self.tokenizer = self.processor.tokenizer
-            self.generation_config = get_generation_config(local_path, trust_remote_code=trust_remote_code)
-            self.generation_config.pad_token_id = self.tokenizer.pad_token_id
-            self.generation_config.eos_token_id = self.tokenizer.eos_token_id
-            self.generation_config.cfg_weight = self.config.model.get('cfg_weight', 1.0)
-            OmegaConf.set_struct(self.config.rollout, True)
-            with open_dict(self.config.rollout):
-                self.config.rollout.cfg_weight = self.config.model.get('cfg_weight', 1.0)
+        self.processor = VLChatProcessor.from_pretrained(local_path)
+        self.tokenizer = self.processor.tokenizer
 
-        override_config_kwargs = {
-            "bos_token_id": self.tokenizer.bos_token_id,
-            "eos_token_id": self.tokenizer.eos_token_id,
-            "pad_token_id": self.tokenizer.pad_token_id,
-        }
-        override_config_kwargs.update(override_model_config)
-        update_model_config(actor_model_config, override_config_kwargs=override_config_kwargs)
         if self.rank == 0:
             print(f"Model config after override: {actor_model_config}")
 
@@ -326,33 +296,8 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
 
         with init_context(), warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            has_remote_code = hasattr(actor_model_config, "auto_map") and any(
-                actor_model_config.architectures[0] in val for val in actor_model_config.auto_map.values()
-            )
-            if has_remote_code:
-                auto_class = next(
-                    k for k, v in actor_model_config.auto_map.items() if actor_model_config.architectures[0] in v
-                )
-                match auto_class:
-                    case "AutoModelForVision2Seq":
-                        actor_module_class = AutoModelForVision2Seq
-                    case "AutoModelForCausalLM":
-                        actor_module_class = AutoModelForCausalLM
-                    case "AutoModelForImageTextToText":
-                        actor_module_class = AutoModelForImageTextToText
-                    case _:
-                        actor_module_class = AutoModel
-            else:
-                if type(actor_model_config) in AutoModelForVision2Seq._model_mapping.keys():
-                    actor_module_class = AutoModelForVision2Seq
-                elif type(actor_model_config) in AutoModelForCausalLM._model_mapping.keys():
-                    actor_module_class = AutoModelForCausalLM
-                elif type(actor_model_config) in AutoModelForImageTextToText._model_mapping.keys():
-                    actor_module_class = AutoModelForImageTextToText
-                else:
-                    actor_module_class = AutoModel
 
-            actor_module = actor_module_class.from_pretrained(
+            actor_module = AutoModelForCausalLM.from_pretrained(
                 pretrained_model_name_or_path=local_path,
                 torch_dtype=torch_dtype,
                 config=actor_model_config,
@@ -382,7 +327,8 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
             actor_module.to(torch_dtype)
 
             if enable_gradient_checkpointing:
-                actor_module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+                actor_module.language_model.config.use_cache = True
+                actor_module.language_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
             if self._is_lora:
                 print("Applying LoRA to actor module")
                 actor_module.enable_input_require_grads()
