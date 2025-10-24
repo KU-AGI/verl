@@ -1065,7 +1065,7 @@ class RayChemDAPOTrainer: # (RayPPOTrainer):
 
             # Always add reward scores to maintain consistency
             reward_extra_infos_dict["reward"].extend(scores)
-            print(f"len reward_extra_infos_dict['reward']: {len(reward_extra_infos_dict['reward'])}")
+            # print(f"len reward_extra_infos_dict['reward']: {len(reward_extra_infos_dict['reward'])}")
             
             # Get current batch size for consistency
             current_batch_size = len(scores)
@@ -1074,7 +1074,7 @@ class RayChemDAPOTrainer: # (RayPPOTrainer):
             if "reward_extra_info" in result:
                 for key, lst in result["reward_extra_info"].items():
                     reward_extra_infos_dict[key].extend(lst)
-                    print(f"len reward_extra_infos_dict['{key}']: {len(reward_extra_infos_dict[key])}")
+                    # print(f"len reward_extra_infos_dict['{key}']: {len(reward_extra_infos_dict[key])}")
             
             # Ensure all existing keys have the same length as the reward list
             # This handles cases where some keys might not be present in the current result

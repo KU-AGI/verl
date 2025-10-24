@@ -12,7 +12,7 @@ exec > >(tee -a "${SCRIPT_LOG}")
 exec 2>&1
 
 project_name="verl-dapo" # 'DAPO'
-exp_name='DAPO-ReactionReasoner-lora-merged-stage12-n8-bsz32-clip-low-sampling-megatron-tp2-pp4'
+exp_name='rl_test'
 
 adv_estimator=grpo
 
@@ -25,7 +25,7 @@ clip_ratio_low=0.2
 clip_ratio_high=0.2
 
 max_prompt_length=$((1024 * 1)) # 1024
-max_response_length=$((1024 * 4)) # 4096
+max_response_length=$((1024 * 2)) # 2048
 enable_overlong_buffer=True
 overlong_buffer_len=$((1024 * 2)) # 2048
 overlong_penalty_factor=1.0
@@ -34,10 +34,11 @@ loss_agg_mode="token-mean"
 
 enable_filter_groups=True
 filter_groups_metric=acc
-max_num_gen_batches=10
+# filter_groups_metric=seq_final_reward
+max_num_gen_batches=0
 train_prompt_bsz=32 # 512
 gen_prompt_bsz=32 # $((train_prompt_bsz * 2))
-n_resp_per_prompt=8 # 16
+n_resp_per_prompt=40 # 16
 train_prompt_mini_bsz=32 # 32
 
 # Ray
@@ -50,25 +51,28 @@ N_GPUS_PER_NODE=${N_GPUS_PER_NODE:-8}
 # Paths
 HOME="/data" ##
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
-MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/ReactionReasoner_stage12_lora_adapter_merged"} ##
+# MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/ReactionReasoner_stage12_lora_adapter_merged"} ##
+MODEL_PATH="/data/llm-reaction-reasoning/all_checkpoints/reflection_v4_fullft_all/best.ckpt/hf_model"
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
 TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/chem_dapo_30k/syntheticreact_30k_train.parquet"}
 VAL_FILE=${VAL_FILE:-"${RAY_DATA_HOME}/data/chem_dapo_30k/syntheticreact_300_val.parquet"}
 TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/chem_dapo_30k/syntheticreact_3k_test.parquet"}
 
 # Algorithm
-temperature=0.8
-top_p=0.95
+temperature=1.2
+top_p=1.0
 top_k=50 # 0 for HF rollout, -1 for vLLM rollout
-val_top_p=0.95
+val_temperature=0.0
+val_top_k=0.0
+val_top_p=1.0
 
 # Performance Related Parameter
 use_dynamic_bsz=True
 actor_ppo_max_token_len=$((max_prompt_length + max_response_length))
 infer_ppo_max_token_len=$((max_prompt_length + max_response_length))
 offload=True
-train_tp=2
-train_pp=4
+train_tp=1
+train_pp=2
 train_vpp=null
 train_cp=1
 train_ep=1
@@ -77,21 +81,19 @@ gen_tp=1
 
 rollout_name="vllm" # sglang or vllm
 rollout_mode="sync"
-if [ "$rollout_mode" = "async" ]; then
+if [ "$rollout_mode" = "async" ]; then 
     export VLLM_USE_V1=1
     return_raw_chat="True"
 fi
 
-ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
-    --working-dir "${WORKING_DIR}" \
-    -- python3 -m recipe.dapo.main_chem_dapo \
+python -m recipe.dapo.main_chem_dapo \
     --config-name="dapo_megatron_trainer" \
     data.train_files="${TRAIN_FILE}" \
     data.val_files="${VAL_FILE}" \
     data.test_files="${TEST_FILE}" \
     data.task_extra_info_key=task \
-    data.validation_shuffle=True \
-    data.test_shuffle=True \
+    data.validation_shuffle=False \
+    data.test_shuffle=False \
     data.prompt_key=prompt \
     data.truncation='left' \
     data.max_prompt_length=${max_prompt_length} \
@@ -140,10 +142,10 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     actor_rollout_ref.rollout.temperature=${temperature} \
     actor_rollout_ref.rollout.top_p=${top_p} \
     actor_rollout_ref.rollout.top_k="${top_k}" \
-    actor_rollout_ref.rollout.val_kwargs.temperature=${temperature} \
+    actor_rollout_ref.rollout.val_kwargs.temperature=${val_temperature} \
     actor_rollout_ref.rollout.val_kwargs.top_p=${val_top_p} \
-    actor_rollout_ref.rollout.val_kwargs.top_k=${top_k} \
-    actor_rollout_ref.rollout.val_kwargs.do_sample=True \
+    actor_rollout_ref.rollout.val_kwargs.top_k=${val_top_k} \
+    actor_rollout_ref.rollout.val_kwargs.do_sample=False \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
     actor_rollout_ref.rollout.name=${rollout_name} \
     actor_rollout_ref.rollout.mode=${rollout_mode} \
@@ -167,13 +169,18 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     trainer.experiment_name="${exp_name}" \
     trainer.n_gpus_per_node=${N_GPUS_PER_NODE} \
     trainer.nnodes="${NNODES}" \
-    trainer.val_before_train=True \
-    trainer.test_freq=5 \
-    trainer.save_freq=50 \
-    trainer.total_epochs=2 \
+    trainer.val_before_train=False \
+    trainer.test_freq=30 \
+    trainer.save_freq=100 \
+    trainer.total_epochs=20 \
     trainer.default_local_dir="${CKPTS_DIR}" \
     trainer.resume_mode=auto \
     actor_rollout_ref.ref.strategy=megatron \
     actor_rollout_ref.actor.strategy=megatron \
     critic.strategy=megatron \
     reward_model.strategy=megatron
+
+
+# ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
+#     --working-dir "${WORKING_DIR}" \
+#     -- python3 -m recipe.dapo.main_chem_dapo \

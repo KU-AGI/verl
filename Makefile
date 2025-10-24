@@ -1,4 +1,4 @@
-CONTAINER_NAME=verl-$(USER)
+CONTAINER_NAME=verl-hko
 IMAGE_NAME_TAG=verlai/verl:base-v4-cu126-cudnn9.8-torch2.7.1-fa2.8.0-te2.3-fi0.2.6
 
 init-container:

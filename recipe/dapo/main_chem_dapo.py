@@ -26,6 +26,8 @@ from verl.trainer.ppo.reward import load_reward_manager
 from verl.utils.device import is_cuda_available
 
 from .chem_dapo_ray_trainer import RayChemDAPOTrainer
+import wandb
+wandb.login(key="e11fd1e3a798a7dee092100ff887c08679a335fd")
 
 
 @hydra.main(config_path="config", config_name="dapo_trainer", version_base=None)
@@ -174,6 +176,7 @@ class TaskRunner:
             val_reward_fn=val_reward_fn,
         )
         trainer.init_workers()
+        # breakpoint()
         trainer.fit()
 
 
