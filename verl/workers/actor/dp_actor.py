@@ -28,7 +28,8 @@ from torch.distributed.tensor import DTensor
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
-from verl.utils.device import get_device_id, get_device_name, is_cuda_available, is_npu_available
+from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
+from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
 from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.py_functional import append_to_dict
@@ -37,20 +38,6 @@ from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
 from verl.workers.actor import BasePPOActor
 from verl.workers.config import ActorConfig
-
-if is_cuda_available:
-    from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
-elif is_npu_available:
-    try:
-        from transformers.integrations.npu_flash_attention import index_first_axis, pad_input, rearrange, unpad_input
-    except ImportError:
-        # Since transformers v4.55.1, index_first_axis, pad_input, and unpad_input
-        # have been consolidated into `transformers.modeling_flash_attention_utils`.
-        from einops import rearrange
-        from transformers.modeling_flash_attention_utils import _index_first_axis as index_first_axis
-        from transformers.modeling_flash_attention_utils import _pad_input as pad_input
-        from transformers.modeling_flash_attention_utils import _unpad_input as unpad_input
-
 
 __all__ = ["DataParallelPPOActor"]
 
@@ -91,7 +78,7 @@ class DataParallelPPOActor(BasePPOActor):
 
         self.compute_entropy_from_logits = (
             torch.compile(entropy_from_logits, dynamic=True)
-            if self.config.get("use_torch_compile", True)  #  use torch compile by default
+            if self.config.get("use_torch_compile", True)  # use torch compile by default
             else entropy_from_logits
         )
         self.device_name = get_device_name()
@@ -386,13 +373,10 @@ class DataParallelPPOActor(BasePPOActor):
         ]
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
-        if self.config.tis_imp_ratio_cap > 0:
-            assert "rollout_log_probs" in data.batch.keys(), (
-                "Truncated Importance Sampling (TIS) requires to configure "
-                "`actor_rollout_ref.rollout.calculate_log_probs=True` "
-                "and is not currently supported in Server mode (agent loop)."
-            )
-            select_keys.append("rollout_log_probs")
+        # Include pre-computed IS weights if present in batch
+        # Weights are computed centrally in trainer and added to batch when algorithm.rollout_is=True
+        if "rollout_is_weights" in data.batch.keys():
+            select_keys.append("rollout_is_weights")
 
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
@@ -425,7 +409,6 @@ class DataParallelPPOActor(BasePPOActor):
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
                     response_mask = model_inputs["response_mask"]
                     old_log_prob = model_inputs["old_log_probs"]
-                    rollout_log_probs = model_inputs["rollout_log_probs"] if self.config.tis_imp_ratio_cap > 0 else None
                     advantages = model_inputs["advantages"]
 
                     entropy_coeff = self.config.entropy_coeff
@@ -444,16 +427,32 @@ class DataParallelPPOActor(BasePPOActor):
                         model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                     )
 
-                    if on_policy:
-                        old_log_prob = log_prob.detach()
-                    else:
+                    # for fully_async_policy recipe
+                    if hasattr(self.config, "use_rollout_log_probs") and self.config.use_rollout_log_probs:
                         old_log_prob = model_inputs["old_log_probs"]
+                    else:
+                        if on_policy:
+                            old_log_prob = log_prob.detach()
+                        else:
+                            old_log_prob = model_inputs["old_log_probs"]
 
                     loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
                     # vanilla -> verl.trainer.ppo.core_algos.compute_policy_loss_vanilla
+
+                    # Extract pre-computed rollout importance sampling weights if present
+                    # Weights are computed centrally in trainer and added when algorithm.rollout_is=True
+                    rollout_is_weights = model_inputs.get("rollout_is_weights", None)
+
+                    # NOTE: Both mismatch diagnostic metrics (PPL, KL, etc.) and IS weight metrics
+                    # are computed centrally in ray_trainer.py for consistency and efficiency.
+                    # This ensures metrics are computed uniformly across all batches at the trainer level
+                    # and avoids redundant computation across workers and micro-batches.
+
                     # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
                     # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
                     policy_loss_fn = get_policy_loss_fn(loss_mode)
+
+                    # Compute policy loss (all functions return 4 values)
                     pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
                         old_log_prob=old_log_prob,
                         log_prob=log_prob,
@@ -461,7 +460,7 @@ class DataParallelPPOActor(BasePPOActor):
                         response_mask=response_mask,
                         loss_agg_mode=loss_agg_mode,
                         config=self.config,
-                        rollout_log_probs=rollout_log_probs,
+                        rollout_is_weights=rollout_is_weights,
                     )
 
                     if entropy_coeff != 0:

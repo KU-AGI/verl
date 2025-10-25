@@ -316,6 +316,10 @@ class MegatronPPOActor(BasePPOActor):
         ]
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
+        # Include pre-computed IS weights if present in batch
+        # Weights are computed centrally in trainer and added to batch when algorithm.rollout_is=True
+        if "rollout_is_weights" in data.batch.keys():
+            select_keys.append("rollout_is_weights")
         self.has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         if self.has_multi_modal_inputs:
             data = data.select(select_keys, ["multi_modal_inputs"])
@@ -419,7 +423,6 @@ class MegatronPPOActor(BasePPOActor):
             response_length = responses.size(1)
             response_mask = data["response_mask"].to(bool)
             loss_agg_mode = self.config.loss_agg_mode
-
             # compute policy loss
             log_prob = output["log_probs"][:, -response_length - 1 : -1].contiguous()
             ret_entropy = None
@@ -434,6 +437,15 @@ class MegatronPPOActor(BasePPOActor):
                 loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
 
                 policy_loss_fn = get_policy_loss_fn(loss_mode)
+
+                # Extract pre-computed rollout importance sampling weights if present
+                # Weights are computed centrally in trainer and added when algorithm.rollout_is=True
+                rollout_is_weights = data.get("rollout_is_weights", None)
+
+                # NOTE: Both mismatch diagnostic metrics (PPL, KL, etc.) and IS weight metrics
+                # are computed centrally in ray_trainer.py for consistency and efficiency.
+                # This ensures metrics are computed uniformly across all batches at the trainer level
+                # and avoids redundant computation across workers and micro-batches.
                 pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
                     old_log_prob=old_log_prob,
                     log_prob=log_prob,
@@ -441,6 +453,7 @@ class MegatronPPOActor(BasePPOActor):
                     response_mask=response_mask,
                     loss_agg_mode=loss_agg_mode,
                     config=self.config,
+                    rollout_is_weights=rollout_is_weights,
                 )
 
                 stats.update(
@@ -491,12 +504,10 @@ class MegatronPPOActor(BasePPOActor):
 
             multi_modal_inputs = {}
             if "multi_modal_inputs" in batch:
-                for key in batch["multi_modal_inputs"][0].keys():
-                    idxs = batch["multi_modal_inputs_idx"]
-                    mmi = batch["multi_modal_inputs"]
-                    multi_modal_inputs[key] = torch.cat(
-                        [mmi[idx].get(key) for idx in idxs if mmi[idx].get(key) is not None], dim=0
-                    )
+                from verl.utils.model import extract_multi_modal_inputs
+
+                indices = batch.get("multi_modal_inputs_idx", None)
+                multi_modal_inputs = extract_multi_modal_inputs(batch["multi_modal_inputs"], indices)
             responses = batch["responses"]
             response_length = responses.size(1)
             label = position_ids.clone()
@@ -515,11 +526,10 @@ class MegatronPPOActor(BasePPOActor):
                     input_ids,
                     position_ids,
                     attention_mask,
-                    sequence_parallel=self.tf_config.sequence_parallel,
-                    multi_modal_inputs=multi_modal_inputs,
-                    labels=label,
-                    labels_mask=label_mask,
-                    temperature=temperature,
+                    label,
+                    label_mask,
+                    temperature,
+                    multi_modal_inputs,
                 )
             else:
                 forward_fn = get_mcore_forward_fn(self.hf_config)
@@ -551,8 +561,7 @@ class MegatronPPOActor(BasePPOActor):
                     input_ids,
                     attention_mask,
                     position_ids,
-                    sequence_parallel=self.tf_config.sequence_parallel,
-                    multi_modal_inputs=multi_modal_inputs,
+                    multi_modal_inputs,
                     logits_processor=logits_processor,
                     logits_processor_args=logits_processor_args,
                 )
