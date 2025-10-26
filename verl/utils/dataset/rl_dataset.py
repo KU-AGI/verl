@@ -228,30 +228,9 @@ class RLHFDataset(Dataset):
         Note that we also return the raw_input_ids so that it can be combined with other chat template
         """
         row_dict: dict = self.dataframe[item]
-        # messages = self._build_messages(row_dict)
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "a photo of a bench"},
-                ]
-            }
-        ]
+        messages = self._build_messages(row_dict)
 
-        if self.processor is not None and "JanusImageProcessor" in self.processor.image_processor.__class__.__name__:
-            if self.apply_chat_template_kwargs.get("chat_template") is None:
-                assert hasattr(self.tokenizer, "chat_template"), (
-                    "chat_template should be provided in apply_chat_template_kwargs or tokenizer config, "
-                    "models like GLM can copy chat_template.jinja from instruct models"
-                )
-            raw_prompt = self.processor.apply_chat_template(
-                messages, add_generation_prompt=True, tokenize=False, **self.apply_chat_template_kwargs
-            )
-            model_inputs = self.processor(text=raw_prompt, generation_mode="image", return_tensors="pt")
-            input_ids = model_inputs.pop("input_ids")
-            attention_mask = model_inputs.pop("attention_mask")
-
-        elif self.processor is not None:
+        if self.processor is not None:
             from verl.utils.dataset.vision_utils import process_image, process_video
 
             raw_prompt = self.processor.apply_chat_template(

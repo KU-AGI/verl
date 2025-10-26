@@ -27,9 +27,7 @@ if __name__ == "__main__":
 
             data = {
                 "data_source": "image_generation",
-                "prompt": [{"role": "user", "content": [
-                    {"type": "text", "text": prompt}
-                ]}],
+                "prompt": [{"role": "<|User|>", "content": prompt}, {"role": "<|Assistant|>", "content": ""}],
                 "ability": "image_unified_generation",
                 "reward_model": {"style": "rule", "ground_truth": aligned_image_path},
                 "extra_info": {"split": split, "index": idx, "prompt_id": prompt_id},
