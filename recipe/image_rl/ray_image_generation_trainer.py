@@ -482,10 +482,11 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                 )
 
             test_gen_batch.meta_info = {
-                'eos_token_id': self.tokenizer.eos_token_id,
-                'pad_token_id': self.tokenizer.pad_token_id,
                 'boi_token_id': self.processor.boi_token_id,
                 'eoi_token_id': self.processor.eoi_token_id,
+                'bos_token_id': self.tokenizer.bos_token_id,
+                'eos_token_id': self.tokenizer.eos_token_id,
+                'pad_token_id': self.tokenizer.pad_token_id,
                 'recompute_log_prob': False,
                 'do_sample': self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
                 'validate': True,
@@ -543,6 +544,23 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             metric_dict[f'val/test_score/{data_source}'] = np.mean(rewards)
 
         return metric_dict
+
+    def _get_gen_batch(self, batch: DataProto) -> DataProto:
+        reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
+
+        # pop those keys for generation
+        batch_keys_to_pop = ["dummy_tensor"]
+        non_tensor_batch_keys_to_pop = set(batch.non_tensor_batch.keys()) - reward_model_keys
+        gen_batch = batch.pop(
+            batch_keys=batch_keys_to_pop,
+            non_tensor_batch_keys=list(non_tensor_batch_keys_to_pop),
+        )
+
+        # For agent loop, we need reward model keys to compute score.
+        if self.async_rollout_mode:
+            gen_batch.non_tensor_batch.update(batch.non_tensor_batch)
+
+        return gen_batch
 
     def fit(self):
         """
@@ -610,7 +628,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                     )
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
 
-                # add uid to batch
+                # add uid to batch <- dummy tensor in batch
                 batch.non_tensor_batch["uid"] = np.array(
                     [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
                 )
@@ -643,7 +661,6 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                             if not self.async_rollout_mode:
                                 gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
                             else:
-                                breakpoint()
                                 gen_baseline_output = self.async_rollout_manager.generate_sequences(gen_baseline_batch)
                             batch = batch.union(gen_baseline_output)
                             reward_baseline_tensor = self.reward_fn(batch)
@@ -654,10 +671,12 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                             batch.batch["reward_baselines"] = reward_baseline_tensor
 
                             del gen_baseline_batch, gen_baseline_output
+
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
 
+                    breakpoint()
                     # if "response_mask" not in batch.batch.keys():
                     #     batch.batch["response_mask"] = compute_response_mask(batch)
                     # Balance the number of valid tokens across DP ranks.
@@ -666,7 +685,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                     # but might affect the loss calculation (due to the change of mini-batching).
                     # TODO: Decouple the DP balancing and mini-batching.
                     if self.config.trainer.balance_batch:
-                        self._balance_batch(batch, metrics=metrics)
+                        self._balance_batch(batch, metrics=metrics) 
 
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()

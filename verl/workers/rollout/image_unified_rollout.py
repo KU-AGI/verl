@@ -24,7 +24,7 @@ from .base import BaseRollout
 
 from transformers import GenerationConfig
 import numpy as np
-from typing import Union, List, Any, Optional
+from typing import Union, List, Any, Optional, Dict, Tuple
 from transformers.processing_utils import ProcessorMixin
 import base64
 from io import BytesIO
@@ -34,31 +34,46 @@ import verl.utils.torch_functional as verl_F
 import os
 import json
 from pathlib import Path
-
-from .image_rl_logit_process import CFGEmbeddingLogitsProcessor
+from torch.distributed.device_mesh import DeviceMesh
+from verl.workers.config import HFModelConfig, RolloutConfig
+from recipe.image_rl.config import ImageGenerationHFModelConfig
 
 __all__ = ['ImageUnifiedRollout']
 
-class ImageUnifiedRollout:
-    def __init__(self, module: nn.Module, config): 
-        self.config = config
+class ImageUnifiedRollout(BaseRollout):
+    def __init__(
+        self,
+        module: nn.Module,
+        config: RolloutConfig,
+        model_config: HFModelConfig,
+        device_mesh: DeviceMesh,
+    ):
+        super().__init__(config, model_config, device_mesh)
+        self.tokenizer = model_config.tokenizer
+        self.processor = model_config.processor
         self.module = module
-        from transformers import JanusProcessor
-        processor = JanusProcessor.from_pretrained("deepseek-community/Janus-Pro-7B")
-        self.processor = processor
+        self.config = config
+        self.model_config = model_config
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        self.generation_config = None
+
+        self.cfg_weight = getattr(config, "cfg_weight", 5.0)
+        self.temperature = getattr(config, "temperature", 1.0)
+        self.txt_top_k = getattr(config, "txt_top_k", None)
+        self.txt_top_p = getattr(config, "txt_top_p", None)
+        self.img_top_k = getattr(config, "img_top_k", None)
+        self.img_top_p = getattr(config, "img_top_p", None)
+
+        self.img_size = 384
+        self.patch_size = 16
+
         self.generation_mode = getattr(config, "generation_mode", None)
         self.feedback_system_prompt = getattr(config, "feedback_system_prompt", "")
-        self.refine_system_prompt = getattr(config, "refine_system_prompt", "")
-        self.generation_config = None
-        
-        # Setup saving directory - force to use /verl directory
-        self.save_dir = getattr(config, "save_dir", "/verl/output/rollout")
-        self.save_enabled = getattr(config, "saving", True)
-        self.generation_counter = 0
-        
-        if self.save_enabled:
-            Path(self.save_dir).mkdir(parents=True, exist_ok=True)
-            print(f"[ROLLOUT] Saving generations to: {self.save_dir}")
+        self.regen_system_prompt = getattr(config, "regen_system_prompt", "")
+
+        self.image_token_num_per_image = getattr(config, "image_token_num_per_image", 576)
+        self.max_reflect_len = getattr(config, "max_reflect_len", 1024)
 
     async def resume(self, tags: list[str]):
         return None
@@ -73,36 +88,6 @@ class ImageUnifiedRollout:
             pass
         return None
 
-    def generate_sequences(self, prompts: DataProto) -> DataProto:
-        batch_size = prompts.batch.batch_size[0]
-
-        input_ids = torch.stack([prompts.batch["input_ids"][i] for i in range(batch_size)], dim=0)
-        attention_mask = torch.stack([prompts.batch["attention_mask"][i] for i in range(batch_size)], dim=0)
-        position_ids = torch.stack([prompts.batch["position_ids"][i] for i in range(batch_size)], dim=0)
-
-        self.set_generation_config(prompts[0])
-
-        batch = TensorDict(
-            {
-                "input_ids": input_ids,
-                "attention_mask": attention_mask,
-                "position_ids": position_ids,
-                # "gen_img_response_mask": 
-            },
-            batch_size=batch_size
-        )
-
-        data_proto = DataProto(batch=batch, meta_info=prompts.meta_info)
-
-        data_proto = self._generate_minibatch_image_generation(data_proto)
-        data_proto = self._generate_minibatch_text_generation(data_proto)
-        data_proto = self._generate_minibatch_refine_image_generation(data_proto)
-
-        if self.save_enabled:
-            self._save_generation(data_proto, prompts)
-
-        return data_proto
-    
     def set_generation_config(self, prompt: DataProto):
         do_sample = prompt.meta_info.get("do_sample", self.config.do_sample)
         is_validate = prompt.meta_info.get("validate", False)
@@ -138,509 +123,571 @@ class ImageUnifiedRollout:
             }
 
         self.generation_config = GenerationConfig(**kwargs)
+
+        boi_token_id = self.processor.tokenizer.convert_tokens_to_ids('<begin_of_image>')
+        eoi_token_id = self.processor.tokenizer.convert_tokens_to_ids('<end_of_image>')
         
-        if hasattr(self.module, 'config') and getattr(self.module.config, 'model_type', None) == 'janus':
-            if hasattr(self.processor, 'tokenizer'):
-                boi_token_id = self.processor.tokenizer.convert_tokens_to_ids('<begin_of_image>')
-                eoi_token_id = self.processor.tokenizer.convert_tokens_to_ids('<end_of_image>')
-                
-                if boi_token_id is not None:
-                    if not hasattr(self.generation_config, 'generation_kwargs'):
-                        self.generation_config.generation_kwargs = {}
-                    self.generation_config.generation_kwargs['boi_token_id'] = boi_token_id
-                    
-                if eoi_token_id is not None:
-                    self.generation_config.generation_kwargs['eoi_token_id'] = eoi_token_id
-                    
-                if self.generation_config.pad_token_id is None:
-                    pad_token_id = self.processor.tokenizer.pad_token_id
-                    if pad_token_id is not None:
-                        self.generation_config.pad_token_id = pad_token_id
-                    else:
-                        eos_token_id = self.processor.tokenizer.eos_token_id
-                        if eos_token_id is not None:
-                            self.generation_config.pad_token_id = eos_token_id
+        if boi_token_id is not None:
+            if not hasattr(self.generation_config, 'generation_kwargs'):
+                self.generation_config.generation_kwargs = {}
+            self.generation_config.generation_kwargs['boi_token_id'] = boi_token_id
+            
+        if eoi_token_id is not None:
+            self.generation_config.generation_kwargs['eoi_token_id'] = eoi_token_id
+            
+        if self.generation_config.pad_token_id is None:
+            pad_token_id = self.processor.tokenizer.pad_token_id
+            if pad_token_id is not None:
+                self.generation_config.pad_token_id = pad_token_id
+            else:
+                eos_token_id = self.processor.tokenizer.eos_token_id
+                if eos_token_id is not None:
+                    self.generation_config.pad_token_id = eos_token_id
+    
+        # Additional settings
+        self.image_start_tag = self.processor.image_start_tag
+        self.image_end_tag = self.processor.image_end_tag
+        self.image_tag = self.processor.image_tag
+
+    def get_sft_format(self, prompt):
+        sft_format = self.processor.apply_sft_template_for_multi_turn_prompts(
+            conversations=[{"role": "<|User|>", "content": prompt}, {"role": "<|Assistant|>", "content": ""}],
+            sft_format=self.processor.sft_format,
+            system_prompt="",
+        )
+        sft_format = sft_format + self.image_start_tag
+        return sft_format
+
+    def _move_dataproto_to_cpu(self, data_proto: DataProto) -> DataProto:
+        """
+        Safely move all torch.Tensors inside DataProto to CPU before returning.
+        Prevents Ray from trying to deserialize CUDA tensors on CPU-only nodes.
+        """
+        for key, value in list(data_proto.meta_info.items()):
+            if isinstance(value, torch.Tensor):
+                data_proto.meta_info[key] = value.detach().to("cpu")
+            elif isinstance(value, list):
+                # Recursively move list of tensors
+                data_proto.meta_info[key] = [
+                    v.detach().to("cpu") if isinstance(v, torch.Tensor) else v for v in value
+                ]
+        if hasattr(data_proto, "batch"):
+            for k, v in list(data_proto.batch.items()):
+                if isinstance(v, torch.Tensor):
+                    data_proto.batch[k] = v.detach().to("cpu")
+        return data_proto
+
+    @torch.inference_mode()
+    def generate_sequences(self, prompts: DataProto) -> DataProto:
+        self.module.eval()
+
+        batch_size = prompts.batch.batch_size[0]
+
+        inputs = self.processor.tokenizer(
+            prompts.non_tensor_batch["raw_prompt"].tolist(),
+            padding=True,
+            return_tensors="pt"
+        )
+
+        input_ids = inputs["input_ids"].to(self.device)
+        attention_mask = inputs["attention_mask"].to(self.device)
+
+        self.set_generation_config(prompts[0])
+
+        batch = TensorDict(
+            {
+                "task1_input_ids": input_ids,
+                "task1_attention_mask": attention_mask,
+            },
+            batch_size=batch_size,
+        )
+
+        data_proto = DataProto(batch=batch, non_tensor_batch=prompts.non_tensor_batch, meta_info=prompts.meta_info)
+
+        data_proto = self._generate_minibatch_image_generation(data_proto)
+        data_proto = self._generate_minibatch_text_generation(data_proto)
+        data_proto = self._generate_minibatch_regen_image_generation(data_proto)
+
+        data_proto = self._move_dataproto_to_cpu(data_proto)
+        return data_proto
 
     @torch.no_grad()
     def _generate_minibatch_image_generation(self, data_proto: DataProto) -> DataProto:
-        input_ids = data_proto.batch['input_ids']
-        attention_mask = data_proto.batch['attention_mask']
-        position_ids = data_proto.batch['position_ids']
-
-        batch_size = input_ids.size(0)
-        prompt_length = input_ids.size(1)
+        batch_size = data_proto.batch.batch_size[0]
         
-        print(f"[IMG_GEN] Input batch_size: {batch_size}, prompt_length: {prompt_length}")
-        print(f"[IMG_GEN] Will generate {batch_size} total sequences")
+        input_ids = data_proto.batch["task1_input_ids"]
+        attention_mask = data_proto.batch["task1_attention_mask"]
 
-        self.module.eval()
-        
+        # embedding
+        param_ctx = contextlib.nullcontext()
+        if isinstance(self.module, FSDP):
+            param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=True)
+
+        with param_ctx:
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                input_embeds = self.module.language_model.get_input_embeddings()(input_ids)
+
+        data_proto.meta_info["task1_input_ids"] = input_ids
+        data_proto.meta_info["task1_attention_mask"] = attention_mask
+        data_proto.meta_info["task1_input_embeds"] = input_embeds
+
         # Generate n images in batch
         print(f"[IMG_GEN] Generating {batch_size} images in batch")
         
-        param_ctx = contextlib.nullcontext()
-        if isinstance(self.module, FSDP):
-            param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=True)
-        
-        with param_ctx:
-            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                cfg_processor = CFGEmbeddingLogitsProcessor(
-                    task=1,
-                    pad_token_id=self.processor.tokenizer.pad_token_id,
-                    cfg_weight=self.config.cfg_weight,
-                    model=self.module
-                )
-                final_embeds, final_attention_mask = cfg_processor.prepare_cfg_embeds(input_ids, attention_mask)
+        final_embeds, final_attention_mask = self._prepare_cfg_embeds(data_proto)
+        generated_tokens = self.generate_img(final_embeds, final_attention_mask)
+        decoded_images = self._decode_image_tokens(generated_tokens)
 
-                output = self.module.generate(
-                    inputs_embeds=final_embeds,
-                    attention_mask=final_attention_mask,
-                    generation_mode="image",
-                    generation_config=self.generation_config,
-                    output_scores=False,
-                    return_dict_in_generate=True,
-                    use_cache=True,
-                    max_new_tokens=512,
-                    logits_processor=[cfg_processor])
+        print(f"[IMG_GEN] Generated sequences shape: {generated_tokens.shape}")
 
-        sequences = output.sequences
-        print(f"[IMG_GEN] Generated sequences shape: {sequences.shape}")
+        # All transformations expect numpy arrays.
+        # gen_imgs = [PIL.Image.fromarray(img_array) for i, img_array in enumerate(decoded_images)]
 
-        param_ctx = contextlib.nullcontext()
-        if isinstance(self.module, FSDP):
-            param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=True)
-        
-        # Decode images in batch
-        with param_ctx:
-            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                decoded_images = self.module.decode_image_tokens(sequences)
-        
-        print(f"[IMG_GEN] Decoded images shape: {decoded_images.shape}, dtype: {decoded_images.dtype}")
-        
-        # Postprocess images in batch
-        result = self.processor.postprocess(
-            list(decoded_images.float()), 
-            return_tensors="PIL.Image.Image"
-        )
-        
-        # Extract pixel_values from BatchFeature
-        all_gen_imgs = result['pixel_values']
-        print(f"[IMG_GEN] Generated {len(all_gen_imgs)} images in batch")
+        from torchvision import transforms
+        to_tensor = transforms.ToTensor()
 
-        # Store prompt length
-        self.prompt_length = prompt_length
+        gen_imgs = [to_tensor(PIL.Image.fromarray(img_array)).unsqueeze(0) for img_array in decoded_images]
+        gen_imgs_tensor = torch.cat(gen_imgs, dim=0).to(self.device)
+        data_proto.meta_info["gen_imgs_pixel_values"] = gen_imgs_tensor.cpu()
 
-        start_marker = torch.tensor([100601, 25]).to(self.module.device) # <|User|>:
-        end_marker = torch.tensor([100602, 25]).to(self.module.device) # <|Assistant|>:
+        print(f"[IMG_GEN] Generated {len(gen_imgs)} images in batch")
 
-        # Search in the first sequence (input_ids[0])
-        output_start_idx = self.find_sequence(input_ids[0], start_marker)
-        output_end_idx = self.find_sequence(input_ids[0], end_marker)
-
-        if output_start_idx != -1:
-            output_start_idx += len(start_marker)
-
-        all_input_texts = [self.processor.decode(input_ids[i][output_start_idx:output_end_idx]) for i in range(batch_size)]
-
-        # data_proto.batch['gen_img_output_imbeds'] = output... 
-        # data_proto.batch['gen_img_response_mask'] = output... # idx
-        data_proto.meta_info['gen_img_list'] = all_gen_imgs
-        data_proto.meta_info['input_text'] = all_input_texts
+        # data_proto.meta_info["gen_imgs_pixel_values"] = gen_imgs
+        data_proto.meta_info["gen_image_embeds"] = final_embeds
+        data_proto.meta_info["gen_attention_mask"] = final_attention_mask
+        data_proto.meta_info["gen_img_tokens"] = generated_tokens
 
         print(f"[IMG_GEN] Created DataProto with batch_size: {batch_size}")
-        print(f"[IMG_GEN] Stored {len(all_gen_imgs)} images in meta_info")
+        print(f"[IMG_GEN] Stored {len(gen_imgs)} images in meta_info")
 
         return data_proto
+
+    def expand_image_placeholders(self, input_ids_tensor, gen_imgs_pixel_values):
+        processed_sequences = []
+        all_image_start_indices = []
+        output_start_indices = []
+        images_to_batch = []
+
+        for input_ids, images in zip(input_ids_tensor, gen_imgs_pixel_values):
+
+            # Find positions of image placeholders
+            img_positions = (input_ids == self.processor.image_id).nonzero(as_tuple=True)[0]
+            num_images_in_input = len(img_positions)
+
+            # output_start_index
+            output_start_idx = len(input_ids) + num_images_in_input * (self.image_token_num_per_image - 1)
+            output_start_indices.append(output_start_idx)
+
+            # expand sequence
+            mask = (input_ids == self.processor.image_id)
+            counts = torch.where(mask, self.image_token_num_per_image, 1)
+            expanded_len = counts.sum().item()
+
+            expanded_seq = torch.empty(expanded_len, dtype=torch.long, device=self.device)
+            all_image_positions = []
+
+            pos = 0
+            for i, token in enumerate(input_ids):
+                if token == self.processor.image_id:
+                    all_image_positions.append(pos)
+                    expanded_seq[pos:pos + self.image_token_num_per_image] = self.processor.image_id
+                    pos += self.image_token_num_per_image
+                else:
+                    expanded_seq[pos] = token
+                    pos += 1
+
+            processed_sequences.append(expanded_seq)
+            all_image_start_indices.append(all_image_positions)
+            images_to_batch.append(images)
+
+        # padding
+        max_len = max(seq.size(0) for seq in processed_sequences)
+        B = len(processed_sequences)
+
+        batched_total_ids = torch.full((B, max_len), self.processor.pad_id, dtype=torch.long, device=self.device)
+        batched_attention_mask = torch.zeros((B, max_len), dtype=torch.long, device=self.device)
+
+        for i, seq in enumerate(processed_sequences):
+            seq_len = seq.size(0)
+            batched_total_ids[i, :seq_len] = seq
+            batched_attention_mask[i, :seq_len] = 1
+
+        images_to_batch = torch.cat(images_to_batch, dim=0)
+
+        return batched_total_ids, batched_attention_mask, output_start_indices, all_image_start_indices, images_to_batch
+
+    def merge_text_and_image_embeds(self, text_embeds: torch.Tensor, image_embeds: torch.Tensor, all_image_start_indices: List[List[int]]):
+
+        batch_size = text_embeds.size(0)
+        num_img = len(all_image_start_indices[0])
+        reshape_image_embeds = image_embeds.view(-1, num_img, self.image_token_num_per_image, image_embeds.size(-1))
+
+        assert text_embeds.size(0) == reshape_image_embeds.size(0) == len(all_image_start_indices)
+
+        merged_embeds = text_embeds.clone()
+
+        for i in range(batch_size):
+            for j in range(num_img):
+                start_idx = all_image_start_indices[i][j]
+                end_idx = start_idx + self.image_token_num_per_image
+                merged_embeds[i, start_idx:end_idx] = reshape_image_embeds[i, j]
+    
+        return merged_embeds
 
     def _generate_minibatch_text_generation(self, data_proto: DataProto) -> DataProto:
         batch_size = data_proto.batch.batch_size[0]
-
         print(f"[TEXT_GEN] Input batch_size: {batch_size}")
-        print(f"[TEXT_GEN] Starting feedback generation for {batch_size} images in batch")
         
         # Get images from meta_info
-        gen_img_list = data_proto.meta_info.get('gen_img_list', [])
-        if not gen_img_list:
-            raise ValueError("No images found in meta_info['gen_img_list']")
+        gen_imgs_pixel_values = data_proto.meta_info.get('gen_imgs_pixel_values', [])
+        if len(gen_imgs_pixel_values) == 0:
+            raise ValueError("No images found in meta_info['gen_imgs_pixel_values']")
         
         # Process all images in batch
-        print(f"[TEXT_GEN] Processing feedback for {batch_size} images in batch")
-        
-        # Prepare messages for all images
-        messages_batch = []
-        for i in range(batch_size):
-            gen_img = gen_img_list[i]
-            message = [
-                {
-                    "role": "user", "content": [
-                        {"type": "image", "image": gen_img},
-                        {"type": "text", "text": self.feedback_system_prompt}
-                    ]
-                }
-            ]
-            messages_batch.append(message)
-        
-        # Generate feedback for all images in batch
-        all_feedback_texts = self._batch_generate_feedback(messages_batch)
-        
-        print(f"[TEXT_GEN] All feedback texts generated: {len(all_feedback_texts)} total")
-        
-        # Store in meta_info
-        # data_proto.batch['response'] = output...
-        data_proto.meta_info["feedback_texts"] = all_feedback_texts
-        print(f"[TEXT_GEN] Stored feedback_texts in meta_info (count={len(all_feedback_texts)})")
-        
-        print(f"[TEXT_GEN] Text generation complete!")
-        return data_proto
-    
-    def _batch_generate_feedback(self, messages_batch: List) -> List[str]:
-        """Generate feedback for multiple images in batch."""
-        print(f"[BATCH_FEEDBACK] Processing {len(messages_batch)} messages")
-       
-        # Create a text-specific generation config with num_return_sequences=1
-        text_gen_config = GenerationConfig(
-            do_sample=self.generation_config.do_sample,
-            num_beams=1,
-            top_p=self.generation_config.top_p,
-            top_k=self.generation_config.top_k,
-            temperature=self.generation_config.temperature,
-            num_return_sequences=1,  # Always 1 for text generation
-            pad_token_id=self.generation_config.pad_token_id,
-            eos_token_id=self.generation_config.eos_token_id,
+        print(f"[TEXT_GEN] Processing feedback for {len(gen_imgs_pixel_values)} images in batch")
+
+        # Prepare messages for all images: '<|User|>: a photo of a bench\n\n<|Assistant|>:<begin_of_image><image_placeholder><end_of_image>'
+        input_format = [
+            prompt + self.image_tag + self.image_end_tag # Add image placeholder at the end
+            for prompt in data_proto.non_tensor_batch['raw_prompt']
+        ]
+
+        inputs = self.processor.tokenizer(
+            input_format,
+            padding=True,
+            return_tensors="pt"
         )
-         
-        # Process all messages to get input tensors
-        all_input_ids = []
-        all_attention_masks = []
-        original_lengths = []
-        
-        for message in messages_batch:
-            inputs = self.processor.apply_chat_template(
-                message, add_generation_prompt=True, generation_mode="text", 
-                tokenize=True, return_dict=True, return_tensors="pt"
-            )
 
-            if hasattr(inputs, 'input_ids'):
-                input_ids = inputs.input_ids
-                attention_mask = inputs.attention_mask
-            elif isinstance(inputs, dict):
-                input_ids = inputs['input_ids']
-                attention_mask = inputs['attention_mask']
-            else:
-                raise TypeError(f"Unexpected type from apply_chat_template: {type(inputs)}")
-            
-            all_input_ids.append(input_ids)
-            all_attention_masks.append(attention_mask)
-            original_lengths.append(input_ids.shape[1])
+        input_ids = inputs["input_ids"].to(self.device)
+        attention_mask = inputs["attention_mask"].to(self.device)
 
-        # Find max length for proper padding
-        max_length = max(tensor.shape[1] for tensor in all_input_ids)
-        pad_token_id = self.processor.tokenizer.pad_token_id or self.processor.tokenizer.eos_token_id
+        batched_total_ids, batched_attention_mask, output_start_indices, all_image_start_indices, images_to_batch = self.expand_image_placeholders(input_ids, gen_imgs_pixel_values)
 
-        padded_input_ids = []
-        padded_attention_masks = []
-        
-        for i, (input_ids, attention_mask) in enumerate(zip(all_input_ids, all_attention_masks)):
-            # Use verl_F.postprocess_data for consistent padding
-            padded_input_ids_sample, padded_attention_mask_sample = verl_F.postprocess_data(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_length=max_length,
-                pad_token_id=pad_token_id,
-                left_pad=True,
-                truncation="error"
-            )
-            
-            padded_input_ids.append(padded_input_ids_sample)
-            padded_attention_masks.append(padded_attention_mask_sample)
-        
-        # Stack into batch
-        batched_input_ids = torch.cat(padded_input_ids, dim=0).to(self.module.device)
-        batched_attention_mask = torch.cat(padded_attention_masks, dim=0).to(self.module.device)
-        
-        print(f"[BATCH_FEEDBACK] Batched input shapes - input_ids: {batched_input_ids.shape}, "
-            f"attention_mask: {batched_attention_mask.shape}")
-        
-        # Generate in batch
+        # embedding
         param_ctx = contextlib.nullcontext()
         if isinstance(self.module, FSDP):
             param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=True)
-        
-        model_kwargs = {
-            "attention_mask": batched_attention_mask,
-            "use_cache": True,
-        }
-        
+
+        gen_imgs_pixel_values = gen_imgs_pixel_values.to(self.device, dtype=torch.bfloat16)
+
         with param_ctx:
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                output = self.module.generate(
-                    batched_input_ids,
-                    generation_mode="text",
-                    generation_config=text_gen_config,
-                    return_dict_in_generate=True,
-                    **model_kwargs
-                )
-        
-        # Handle output properly
-        if isinstance(output, dict) or hasattr(output, 'sequences'):
-            sequences = output.sequences if hasattr(output, 'sequences') else output['sequences']
-        else:
-            sequences = output
-        
-        print(f"[DEBUG] Generated sequences shape: {sequences.shape}")
+                text_embeds = self.module.language_model.get_input_embeddings()(batched_total_ids)
+                image_embeds = self.module.aligner(self.module.vision_model(gen_imgs_pixel_values))
 
-        # Decode responses correctly
-        feedback_texts = []
-        for i, (seq, orig_len) in enumerate(zip(sequences, original_lengths)):
-            # Decode only the newly generated part
-            if len(seq) > orig_len:
-                new_tokens = seq[orig_len:]
-                decoded_text = self.processor.decode(new_tokens, skip_special_tokens=True)
-            else:
-                decoded_text = ""
-            
-            feedback_texts.append(decoded_text)
+        # merge text and image embeds
+        merged_embeds = self.merge_text_and_image_embeds(text_embeds, image_embeds, all_image_start_indices)
 
-        return feedback_texts
+        feedback_text = self.generate_text(merged_embeds, batched_attention_mask)
 
-    def _generate_minibatch_refine_image_generation(self, data_proto: DataProto) -> DataProto:
+        data_proto.meta_info["task2_merged_embeds"] = merged_embeds
+        data_proto.meta_info["task2_attention_mask"] = batched_attention_mask
+        data_proto.meta_info["feedback_texts"] = feedback_text
+
+        return data_proto
+
+    def _generate_minibatch_regen_image_generation(self, data_proto: DataProto) -> DataProto:
         batch_size = data_proto.batch.batch_size[0]
 
-        print(f"[REFINE] Input batch_size: {batch_size}")
-        print(f"[REFINE] Starting image refinement for {batch_size} images in batch")
+        print(f"[REGEN] Input batch_size: {batch_size}")
 
         # Get data from meta_info
-        gen_img_list = data_proto.meta_info.get('gen_img_list', [])
+        gen_imgs_pixel_values = data_proto.meta_info.get('gen_imgs_pixel_values', [])
         feedback_texts = data_proto.meta_info.get('feedback_texts', [])
         
-        if not gen_img_list:
-            raise ValueError("No images found in meta_info['gen_img_list']")
+        if len(gen_imgs_pixel_values) == 0:
+            raise ValueError("No images found in meta_info['gen_imgs_pixel_values']")
         
-        print(f"[REFINE] Loaded {len(gen_img_list)} images and {len(feedback_texts)} feedback_texts from meta_info")
+        print(f"[REGEN] Loaded {len(gen_imgs_pixel_values)} images and {len(feedback_texts)} feedback_texts from meta_info")
 
         # Process all images in batch
-        print(f"[REFINE] Processing refine for {batch_size} images in batch")
-        
-        # Prepare messages for all images
-        messages_batch = []
-        for i in range(batch_size):
-            gen_img = gen_img_list[i]
-            fb_txt = feedback_texts[i]
-            
-            message = [
-                {
-                    "role": "user", "content": [
-                        {"type": "image", "image": gen_img},
-                        {"type": "text", "text": fb_txt}
-                    ]
-                }
-            ]
-            messages_batch.append(message)
-        
-        # Refine all images in batch
-        all_refined_images = self._batch_refine_images(messages_batch)
-        
-        print(f"[REFINE] Generated {len(all_refined_images)} refined images")
+        print(f"[REGEN] Processing regen for {batch_size} images in batch")
 
-        # Store refined images in meta_info
-        data_proto.meta_info['refined_gen_img_list'] = all_refined_images
+        # Parse feedback texts
+        # feedback_texts = [self.parse_feedback(feedback) for feedback in data_proto.non_tensor_batch['feedback_texts']]
 
-        torch.cuda.empty_cache()
-        print(f"[REFINE] Completed refinement")
-        return data_proto
-        
-    def _batch_refine_images(self, messages_batch: List) -> List[PIL.Image.Image]:
-        """Refine multiple images in batch."""
-        print(f"[BATCH_REFINE] Processing {len(messages_batch)} messages")
-        
-        # Process all messages to get input tensors
-        all_input_ids = []
-        all_attention_masks = []
-        
-        for message in messages_batch:
-            prompt = self.processor.apply_chat_template(
-                message, add_generation_prompt=True, generation_mode="image", 
-                tokenize=False
-            )
-            inputs = self.processor(text=prompt, generation_mode="image", return_tensors="pt")
-            
-            if hasattr(inputs, 'input_ids'):
-                input_ids = inputs.input_ids
-                attention_mask = inputs.attention_mask
-            elif isinstance(inputs, dict):
-                input_ids = inputs['input_ids']
-                attention_mask = inputs['attention_mask']
-            else:
-                raise TypeError(f"Unexpected type from apply_chat_template: {type(inputs)}")
-            
-            all_input_ids.append(input_ids)
-            all_attention_masks.append(attention_mask)
+        # Prepare messages for all images: '<|User|>: a photo of a bench\n\n<|Assistant|>:<begin_of_image><image_placeholder><end_of_image>'
+        input_format = [
+            self.get_sft_format(self.image_start_tag + self.image_tag + self.image_end_tag + "\n" + feedback) # Add image placeholder at the end
+            for feedback in data_proto.meta_info['feedback_texts']
+        ]
 
-        # Use verl_F.postprocess_data for consistent padding
-        max_length = max(tensor.shape[1] for tensor in all_input_ids)
-        pad_token_id = self.processor.tokenizer.pad_token_id or self.processor.tokenizer.eos_token_id
-        
-        padded_input_ids = []
-        padded_attention_masks = []
-        
-        for i, (input_ids, attention_mask) in enumerate(zip(all_input_ids, all_attention_masks)):
-            # Use verl_F.postprocess_data for consistent padding
-            padded_input_ids_sample, padded_attention_mask_sample = verl_F.postprocess_data(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_length=max_length,
-                pad_token_id=pad_token_id,
-                left_pad=True,
-                truncation="error"
-            )
-            
-            padded_input_ids.append(padded_input_ids_sample)
-            padded_attention_masks.append(padded_attention_mask_sample)
-        
-        # Stack into batch
-        batched_input_ids = torch.cat(padded_input_ids, dim=0).to(self.module.device)
-        batched_attention_mask = torch.cat(padded_attention_masks, dim=0).to(self.module.device)
-        
-        # Debug output
-        print(f"[DEBUG] Refine batched attention mask shape: {batched_attention_mask.shape}")
-        
-        param_ctx = contextlib.nullcontext()
-        if isinstance(self.module, FSDP):
-            param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=True)
-
-        # Simple generation call - let model handle everything internally
-        with param_ctx:
-            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                cfg_processor = CFGEmbeddingLogitsProcessor(
-                    task=3,
-                    pad_token_id=self.processor.tokenizer.pad_token_id,
-                    cfg_weight=self.config.cfg_weight,
-                    model=self.module
-                )
-                final_embeds, final_attention_mask = cfg_processor.prepare_cfg_embeds(batched_input_ids, batched_attention_mask)
-
-                output = self.module.generate(
-                    input_ids=final_embeds,
-                    attention_mask=final_attention_mask,
-                    generation_mode="image",
-                    generation_config=self.generation_config,
-                    output_scores=False,
-                    return_dict_in_generate=True,
-                    use_cache=True,
-                    max_new_tokens=512,
-                    logits_processor=[cfg_processor])
-
-        # Handle both dict and tensor returns
-        if isinstance(output, dict) or hasattr(output, 'sequences'):
-            sequences = output.sequences if hasattr(output, 'sequences') else output['sequences']
-        else:
-            sequences = output
-
-        # Batch decode all images
-        param_ctx = contextlib.nullcontext()
-        if isinstance(self.module, FSDP):
-            param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=True)
-        
-        with param_ctx:
-            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                decoded_images = self.module.decode_image_tokens(sequences)
-        
-        print(f"[BATCH_REFINE] Decoded images shape: {decoded_images.shape}, dtype: {decoded_images.dtype}")
-        
-        # Batch postprocess all images
-        result = self.processor.postprocess(
-            list(decoded_images.float()), 
-            return_tensors="PIL.Image.Image"
+        inputs = self.processor.tokenizer(
+            input_format,
+            padding=True,
+            return_tensors="pt"
         )
-        
-        # Extract pixel_values from BatchFeature
-        refined_img_list = result['pixel_values']
-        
-        print(f"[BATCH_REFINE] Processed {len(refined_img_list)} refined images")
-        
-        return refined_img_list
 
-    def find_sequence(self, tensor: torch.Tensor, sequence: torch.Tensor) -> int:
-        """
-        Find the starting position of a sequence within a tensor.
+        input_ids = inputs["input_ids"].to(self.device)
+        attention_mask = inputs["attention_mask"].to(self.device)
+
+        batched_total_ids, batched_attention_mask, output_start_indices, all_image_start_indices, images_to_batch = self.expand_image_placeholders(input_ids, gen_imgs_pixel_values)
+
+        B, C, H, W = gen_imgs_pixel_values.shape
+
+        gen_imgs_pixel_values = gen_imgs_pixel_values.to(self.device, dtype=torch.bfloat16)
+
+        # embedding
+        param_ctx = contextlib.nullcontext()
+        if isinstance(self.module, FSDP):
+            param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=True)
+
+        with param_ctx:
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                _, _, all_image_ids = self.module.gen_vision_model.encode(gen_imgs_pixel_values)
         
-        Args:
-            tensor (`torch.Tensor`): Input tensor to search in
-            sequence (`torch.Tensor`): Sequence to find
-            
-        Returns:
-            `int`: Starting position of the sequence, or -1 if not found
-        """
-        if len(sequence) > len(tensor):
-            return -1
-            
-        len_needle = sequence.shape[0]
-        for i in range(tensor.shape[0] - len_needle + 1):
-            if torch.equal(tensor[i:i+len_needle], sequence):
-                return i
-        return -1
+                image_ids = all_image_ids[2]
+                image_ids = image_ids.view(B, -1)
 
-    def _save_generation(self, output: DataProto, prompts: DataProto):
-        """Save generated images and metadata."""
-        if not self.save_enabled:
-            return
-            
-        batch_size = output.batch.batch_size[0]
+                image_embeds = self.module.gen_aligner(self.module.gen_embed(image_ids))
+                text_embeds = self.module.language_model.get_input_embeddings()(batched_total_ids)
 
-        # Get lists from meta_info
-        input_texts = output.meta_info.get('input_text', [])
-        gen_img_list = output.meta_info.get('gen_img_list', [])
-        refined_img_list = output.meta_info.get('refined_gen_img_list', [])
-        feedback_texts = output.meta_info.get('feedback_texts', [])
+        # merge text and image embeds
+        merged_embeds = self.merge_text_and_image_embeds(text_embeds, image_embeds, all_image_start_indices)
+
+        data_proto.meta_info["task3_total_ids"] = batched_total_ids
+        data_proto.meta_info["task3_merged_embeds"] = merged_embeds
+        data_proto.meta_info["task3_attention_mask"] = batched_attention_mask
+
+        regen_final_embeds, regen_final_attention_mask = self._prepare_regen_cfg_embeds(data_proto)
+
+        regenerated_tokens = self.generate_img(regen_final_embeds, regen_final_attention_mask)
+        regen_decoded_images = self._decode_image_tokens(regenerated_tokens)
+        print(f"[REGEN] Generated sequences shape: {regenerated_tokens.shape}")
+
+        from torchvision import transforms
+        to_tensor = transforms.ToTensor()
+
+        regen_imgs = [to_tensor(PIL.Image.fromarray(img_array)).unsqueeze(0) for img_array in regen_decoded_images]
+        regen_imgs_tensor = torch.cat(regen_imgs, dim=0).to(self.device)
+        data_proto.meta_info["regen_imgs_pixel_values"] = regen_imgs_tensor.cpu()
+
+        print(f"[REGEN] Generated {len(regen_imgs)} images in batch")
+
+        # data_proto.meta_info["gen_imgs_pixel_values"] = gen_imgs
+        data_proto.meta_info["regen_image_embeds"] = regen_final_embeds
+        data_proto.meta_info["regen_attention_mask"] = regen_final_attention_mask
+        data_proto.meta_info["regen_img_tokens"] = regenerated_tokens
+
+        print(f"[REGEN] Created DataProto with batch_size: {batch_size}")
+        print(f"[REGEN] Stored {len(regen_imgs)} images in meta_info")
+
+        # torch.cuda.empty_cache()
+        print(f"[REGEN] Completed regenment")
+        return data_proto
+
+    def _prepare_cfg_embeds(self, data_proto: DataProto) -> Tuple[torch.Tensor, torch.Tensor]:
+        input_ids = data_proto.meta_info['task1_input_ids']
+        attention_mask = data_proto.meta_info['task1_attention_mask']
+        input_embeds = data_proto.meta_info['task1_input_embeds']
+
+        cond_embeds = input_embeds
+        uncond_embeds = input_embeds.clone()
+
+        pad_id = torch.tensor(self.processor.pad_id, device=input_ids.device)
+
+        param_ctx = contextlib.nullcontext()
+        if isinstance(self.module, FSDP):
+            param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=True)
         
-        if not gen_img_list:
-            return
+        with param_ctx:
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                pad_embed = self.module.language_model.get_input_embeddings()(pad_id).unsqueeze(0)
 
-        for i in range(batch_size):
-            gen_id = self.generation_counter
-            self.generation_counter += 1
+        start_marker = torch.tensor([100601], device=input_ids.device) # <|User|>
+        end_marker = torch.tensor([100602], device=input_ids.device) # <|Assistant|>
 
-            gen_dir = Path(self.save_dir) / f"gen_{gen_id:06d}"
-            gen_dir.mkdir(parents=True, exist_ok=True)
+        def find_sequence(inp_id, start_marker):
+            len_needle = start_marker.shape[0]
+            for i in range(inp_id.shape[0] - len_needle + 1):
+                if torch.equal(inp_id[i:i+len_needle], start_marker):
+                    return i # Return the starting index of the match
+            return -1 # Return -1 if not found
 
-            # Get items for this index
-            input_text = input_texts[i] if i < len(input_texts) else ""
-            gen_img = gen_img_list[i] if i < len(gen_img_list) else None
-            refined_img = refined_img_list[i] if i < len(refined_img_list) else None
-            feedback_text = feedback_texts[i] if i < len(feedback_texts) else ""
+        for i, row in enumerate(input_ids):
+            start_pos = find_sequence(row, start_marker)
+            end_pos = find_sequence(row, end_marker)
             
-            # Save original generated image
-            if gen_img is not None and isinstance(gen_img, PIL.Image.Image):
-                gen_img.save(gen_dir / "generated_image.png")
-            
-            # Save refined image
-            if refined_img is not None and isinstance(refined_img, PIL.Image.Image):
-                refined_img.save(gen_dir / "refined_image.png")
-            
-            # Save metadata
-            metadata = {
-                'generation_id': gen_id,
-                'input_prompt': input_text,
-                'feedback_text': feedback_text,
-                'feedback_system_prompt': self.feedback_system_prompt,
-                'refine_system_prompt': self.refine_system_prompt,
-                'generation_config': {
-                    'do_sample': bool(self.generation_config.do_sample) if self.generation_config.do_sample is not None else None,
-                    'temperature': float(self.generation_config.temperature) if self.generation_config.temperature is not None else None,
-                    'top_p': float(self.generation_config.top_p) if self.generation_config.top_p is not None else None,
-                    'top_k': int(self.generation_config.top_k) if self.generation_config.top_k is not None else None,
-                    'num_return_sequences': int(self.generation_config.num_return_sequences) if self.generation_config.num_return_sequences is not None else None,
-                }
-            }
-            
-            with open(gen_dir / "metadata.json", 'w', encoding='utf-8') as f:
-                json.dump(metadata, f, indent=2, ensure_ascii=False, default=str)
-            
-            # Save text files for easy viewing
-            with open(gen_dir / "input_prompt.txt", 'w', encoding='utf-8') as f:
-                f.write(input_text)
-            
-            with open(gen_dir / "feedback.txt", 'w', encoding='utf-8') as f:
-                f.write(feedback_text)
+            if start_pos != -1 and end_pos != -1 and start_pos < end_pos:
+                content_start_index = start_pos
+                content_end_index = end_pos + 2
+
+                if content_start_index < content_end_index:
+                    uncond_embeds[i, content_start_index:content_end_index] = pad_embed
         
-        print(f"[SAVE] Saved {batch_size} generations to {self.save_dir}")
+        batch_size, seq_len, embed_dim = input_embeds.shape
+        
+        final_embeds = pad_embed.expand(batch_size * 2, seq_len, embed_dim).clone()
+        final_attention_mask = torch.zeros((batch_size * 2, seq_len), dtype=torch.long, device=attention_mask.device)
+        
+        final_embeds[0::2] = cond_embeds
+        final_embeds[1::2] = uncond_embeds
+        
+        final_attention_mask[0::2] = attention_mask
+        final_attention_mask[1::2] = attention_mask 
+            
+        return final_embeds, final_attention_mask
+
+    def _decode_image_tokens(self, generated_tokens: torch.Tensor) -> np.ndarray:
+        batch_size = generated_tokens.shape[0]
+        
+        shape = [batch_size, 8, self.img_size // self.patch_size, self.img_size // self.patch_size]
+
+        param_ctx = contextlib.nullcontext()
+        if isinstance(self.module, FSDP):
+            param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=True)
+        
+        with param_ctx:
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                dec = self.module.gen_vision_model.decode_code(generated_tokens.to(dtype=torch.long), shape=shape)
+        
+        dec = dec.detach().to(torch.float32).cpu().numpy().transpose(0, 2, 3, 1)
+        dec = np.clip((dec + 1) / 2 * 255, 0, 255).astype(np.uint8)
+        return dec
+
+    def _sample_from_logits(self, logits: torch.Tensor, is_text: bool, generator: torch.Generator = None) -> torch.Tensor:
+
+        if is_text:
+            top_k = self.txt_top_k
+            top_p = self.txt_top_p
+        else:
+            top_k = self.img_top_k
+            top_p = self.img_top_p
+
+        if top_k:
+            v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+            logits[logits < v[:, [-1]]] = float("-inf")
+        
+        probs = torch.softmax(logits / self.temperature, dim=-1)
+        
+        if top_p:
+            probs_sort, probs_idx = torch.sort(probs,
+                                            dim=-1,
+                                            descending=True)
+            probs_sum = torch.cumsum(probs_sort, dim=-1)
+            mask = probs_sum - probs_sort > top_p 
+            probs_sort[mask] = 0.0
+            probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True)) # normalize
+            next_token = torch.multinomial(probs_sort, num_samples=1, generator=generator)
+            next_token = torch.gather(probs_idx, -1, next_token)
+        else:
+            next_token = torch.multinomial(probs, num_samples=1, generator=generator)
+            
+        return next_token 
+
+    @torch.inference_mode()
+    def generate_img(self, inputs_embeds: torch.Tensor, attention_masks: torch.Tensor, generator: torch.Generator = None) -> torch.Tensor:
+        batch_size = inputs_embeds.shape[0] // 2
+        generated_tokens = torch.zeros((batch_size, self.image_token_num_per_image), dtype=torch.int, device=self.device)
+
+        attention_mask = attention_masks
+        
+        param_ctx = contextlib.nullcontext()
+        if isinstance(self.module, FSDP):
+            param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=True)
+        
+        with param_ctx:
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                past_key_values = None
+                for i in range(self.image_token_num_per_image):
+                    outputs = self.module.language_model.model(
+                        inputs_embeds=inputs_embeds,
+                        attention_mask=attention_mask,
+                        past_key_values=past_key_values,
+                        use_cache=True,
+                    )
+
+                    hidden_states = outputs.last_hidden_state
+                    past_key_values = outputs.past_key_values
+
+                    logits = self.module.gen_head(hidden_states[:, -1, :])
+                    
+                    # CFG
+                    logit_cond = logits[0::2, :]
+                    logit_uncond = logits[1::2, :]
+                    
+                    logits = logit_uncond + self.cfg_weight * (logit_cond-logit_uncond)
+                    next_token = self._sample_from_logits(logits, is_text=False, generator=generator)
+                    generated_tokens[:, i] = next_token.squeeze(-1)
+
+                    next_token_pair = next_token.repeat(1, 2).view(-1)
+                    inputs_embeds = self.module.prepare_gen_img_embeds(next_token_pair).unsqueeze(1)
+
+                    attention_mask = torch.cat([attention_mask, torch.ones((attention_mask.shape[0], 1), dtype=torch.long, device=self.device)], dim=1)
+
+        return generated_tokens
+
+    @torch.inference_mode()
+    def generate_text(self, inputs_embeds: torch.Tensor, attention_masks: torch.Tensor) -> torch.Tensor:
+        param_ctx = contextlib.nullcontext()
+        if isinstance(self.module, FSDP):
+            param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=True)
+        
+        with param_ctx:
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                outputs = self.module.language_model.generate(
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=attention_masks,
+                    max_new_tokens=self.max_reflect_len,
+                    use_cache=True,
+                    do_sample=True,
+                    pad_token_id=self.processor.tokenizer.eos_token_id,
+                    eos_token_id=self.processor.tokenizer.eos_token_id,
+                    bos_token_id=self.processor.tokenizer.bos_token_id,
+                )
+
+        answer = self.processor.tokenizer.batch_decode(outputs, skip_special_tokens=True)
+
+        return answer
+
+    def _prepare_regen_cfg_embeds(self, data_proto: DataProto) -> Tuple[torch.Tensor, torch.Tensor]:
+        input_ids = data_proto.meta_info['task3_total_ids']
+        attention_mask = data_proto.meta_info['task3_attention_mask']
+        input_embeds = data_proto.meta_info['task3_merged_embeds']
+
+        cond_embeds = input_embeds
+        uncond_embeds = input_embeds.clone()
+
+        pad_id = torch.tensor(self.processor.pad_id, device=input_ids.device)
+
+        param_ctx = contextlib.nullcontext()
+        if isinstance(self.module, FSDP):
+            param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=True)
+        
+        with param_ctx:
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                pad_embed = self.module.language_model.get_input_embeddings()(pad_id).unsqueeze(0)
+
+        start_marker = torch.tensor([100593, 185], device=input_ids.device) # <end_of_image>\n
+        end_marker = torch.tensor([100602], device=input_ids.device) # <|Assistant|>
+
+        def find_sequence(inp_id, start_marker):
+            len_needle = start_marker.shape[0]
+            for i in range(inp_id.shape[0] - len_needle + 1):
+                if torch.equal(inp_id[i:i+len_needle], start_marker):
+                    return i # Return the starting index of the match
+            return -1 # Return -1 if not found
+
+        for i, row in enumerate(input_ids):
+            start_pos = find_sequence(row, start_marker)
+            end_pos = find_sequence(row, end_marker)
+            
+            if start_pos != -1 and end_pos != -1 and start_pos < end_pos:
+                content_start_index = start_pos + 1
+                content_end_index = end_pos + 2
+
+                if content_start_index < content_end_index:
+                    uncond_embeds[i, content_start_index:content_end_index] = pad_embed
+        
+        batch_size, seq_len, embed_dim = input_embeds.shape
+        
+        final_embeds = pad_embed.expand(batch_size * 2, seq_len, embed_dim).clone()
+        final_attention_mask = torch.zeros((batch_size * 2, seq_len), dtype=torch.long, device=attention_mask.device)
+        
+        final_embeds[0::2] = cond_embeds
+        final_embeds[1::2] = uncond_embeds
+        
+        final_attention_mask[0::2] = attention_mask
+        final_attention_mask[1::2] = attention_mask 
+            
+        return final_embeds, final_attention_mask

@@ -247,13 +247,6 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
     ):
         from torch import optim
         from torch.distributed.fsdp import CPUOffload, MixedPrecision
-        from transformers import (
-            AutoConfig,
-            AutoModel,
-            AutoModelForCausalLM,
-            AutoModelForImageTextToText,
-            AutoModelForVision2Seq,
-        )
         from transformers import AutoModelForCausalLM, AutoConfig
         from janus.models import MultiModalityCausalLM, VLChatProcessor
 
@@ -310,18 +303,18 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
 
                 _apply_liger_kernel_to_instance(model=actor_module)
 
-            fused_kernel_options = self.config.model.get("fused_kernel_options", None)
-            fused_kernels_backend = (
-                fused_kernel_options.get("impl_backend", None) if fused_kernel_options is not None else None
-            )
+            # fused_kernel_options = self.config.model.get("fused_kernel_options", None)
+            # fused_kernels_backend = (
+            #     fused_kernel_options.get("impl_backend", None) if fused_kernel_options is not None else None
+            # )
 
-            apply_monkey_patch(
-                model=actor_module,
-                use_remove_padding=use_remove_padding,
-                ulysses_sp_size=self.ulysses_sequence_parallel_size,
-                use_fused_kernels=use_fused_kernels,
-                fused_kernels_backend=fused_kernels_backend,
-            )
+            # apply_monkey_patch(
+            #     model=actor_module,
+            #     use_remove_padding=use_remove_padding,
+            #     ulysses_sp_size=self.ulysses_sequence_parallel_size,
+            #     use_fused_kernels=use_fused_kernels,
+            #     fused_kernels_backend=fused_kernels_backend,
+            # )
 
             # some parameters may not in torch_dtype. TODO(zhangchi.usc1992) remove this after we switch to fsdp2
             actor_module.to(torch_dtype)
@@ -491,7 +484,11 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
 
         # 1. parse rollout and huggingface model config
         rollout_config: RolloutConfig = omega_conf_to_dataclass(self.config.rollout)
-        model_config: HFModelConfig = omega_conf_to_dataclass(self.config.model, dataclass_type=HFModelConfig)
+        if self.config.rollout.name == "image_unified":
+            from recipe.image_rl.config import ImageGenerationHFModelConfig
+            model_config: ImageGenerationHFModelConfig = omega_conf_to_dataclass(self.config.model, dataclass_type=ImageGenerationHFModelConfig)
+        else:
+            model_config: HFModelConfig = omega_conf_to_dataclass(self.config.model, dataclass_type=HFModelConfig)
         self.model_config = model_config
 
         # 2. build rollout device mesh
@@ -524,8 +521,9 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
         log_gpu_memory_usage(f"Before building {self.config.rollout.name} rollout", logger=logger)
         if rollout_name == 'image_unified':
             from verl.workers.rollout import ImageUnifiedRollout
-            self.rollout = ImageUnifiedRollout(module=self.actor_module_fsdp, config=self.config.rollout)
-            # TODO: a sharding manager that do nothing?
+            self.rollout = ImageUnifiedRollout(
+                module=self.actor_module_fsdp, config=self.config.rollout, model_config=model_config, device_mesh=rollout_device_mesh
+            )
         else:
             self.rollout = get_rollout_class(rollout_config.name, rollout_config.mode)(
                 config=rollout_config, model_config=model_config, device_mesh=rollout_device_mesh
@@ -819,16 +817,6 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
         # Support all hardwares
         assert self._is_rollout
         prompts = prompts.to(get_device_id())
-
-        meta_info = {
-            "eos_token_id": self.generation_config.eos_token_id
-            if self.generation_config is not None
-            else self.tokenizer.eos_token_id,
-            "pad_token_id": self.generation_config.pad_token_id
-            if self.generation_config is not None
-            else self.tokenizer.pad_token_id,
-        }
-        prompts.meta_info.update(meta_info)
 
         timing_generate = {}
         if self._is_actor:  # For rollout only, we do not switch context.

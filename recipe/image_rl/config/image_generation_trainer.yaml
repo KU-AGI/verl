@@ -13,13 +13,17 @@ actor_rollout_ref:
   rollout:
     _target_: recipe.image_rl.config.ImageGenerationRolloutConfig
     cfg_weight: 5.0
+    temperature: 1.0
+    txt_top_k: 50
+    txt_top_p: 1.0
+    img_top_k: 4096
+    img_top_p: 1.0
     name: image_unified
     mode: sync
     feedback_system_prompt: "You should give me a feedback on the image generation."
     refine_system_prompt: "You should refine the image generation."
-    saving: false
-    save_dir: null
-
+    image_token_num_per_image: 576
+    max_reflect_len: 1024
 
 reward_model:
   reward_manager: image_generation

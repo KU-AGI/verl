@@ -15,8 +15,10 @@ export CUDA_VISIBLE_DEVICES=0,1,2,3
 export HYDRA_FULL_ERROR=1
 
 GPUS=4 # `nvidia-smi -L | wc -l`
-MODEL_PATH=deepseek-community/Janus-Pro-7B
-RM_MODEL_PATH=OpenGVLab/InternVL3_5-38B
+MODEL_PATH=/data/mllm/checkpoints/Janus-Pro-7B
+# RM_MODEL_PATH=OpenGVLab/InternVL3_5-38B
+TRAIN_FILES=/data/mllm/data/train.parquet
+VAL_FILES=/data/mllm/data/val.parquet
 RUN_NAME=debug
 PROJ_NAME=mllm_reasoning
 SAVE_DIR=/data/verl/ckpts/$PROJ_NAME/$RUN_NAME
@@ -39,14 +41,15 @@ max_response_length=$((1024 * 1)) # 1k
 #     -- 
 python3 -m recipe.image_rl.main_image_generation_rl \
     algorithm.adv_estimator=grpo \
-    data.train_files="/data/mllm/data/train.parquet" \
-    data.val_files="/data/mllm/data/val.parquet" \
+    data.train_files=$TRAIN_FILES \
+    data.val_files=$VAL_FILES \
     data.prompt_key=prompt \
     data.train_batch_size=${train_prompt_bsz} \
     data.max_prompt_length=${max_prompt_length} \
     data.max_response_length=${max_response_length} \
-    data.filter_overlong_prompts=False \
     data.truncation='right' \
+    data.custom_cls.path=recipe/image_rl/image_rl_dataset.py \
+    data.custom_cls.name=ImageRLDataset \
     actor_rollout_ref.model.path=$MODEL_PATH \
     actor_rollout_ref.model.trust_remote_code=True \
     actor_rollout_ref.actor.optim.lr=5e-6 \
@@ -74,8 +77,8 @@ python3 -m recipe.image_rl.main_image_generation_rl \
     actor_rollout_ref.rollout.n=${n_resp_per_prompt} \
     actor_rollout_ref.rollout.feedback_system_prompt="You should give me a feedback on the image generation." \
     actor_rollout_ref.rollout.refine_system_prompt="You should refine the image generation." \
-    actor_rollout_ref.rollout.saving=True \
-    actor_rollout_ref.rollout.save_dir="/verl/output/rollout" \
+    actor_rollout_ref.rollout.image_token_num_per_image=576 \
+    actor_rollout_ref.rollout.max_reflect_len=1024 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.ref.fsdp_config.param_offload=False \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
