@@ -185,8 +185,12 @@ class ImageUnifiedRollout(BaseRollout):
 
         batch_size = prompts.batch.batch_size[0]
 
+        self.set_generation_config(prompts[0])
+
+        input_format = [self.get_sft_format(prompt) for prompt in prompts.non_tensor_batch["prompt"]]
+
         inputs = self.processor.tokenizer(
-            prompts.non_tensor_batch["raw_prompt"].tolist(),
+            input_format,
             padding=True,
             return_tensors="pt"
         )
@@ -194,15 +198,15 @@ class ImageUnifiedRollout(BaseRollout):
         input_ids = inputs["input_ids"].to(self.device)
         attention_mask = inputs["attention_mask"].to(self.device)
 
-        self.set_generation_config(prompts[0])
-
         batch = TensorDict(
             {
-                "task1_input_ids": input_ids,
-                "task1_attention_mask": attention_mask,
+                "dummy_tensor": prompts.batch["dummy_tensor"]
             },
             batch_size=batch_size,
         )
+
+        prompts.meta_info["task1_input_ids"] = input_ids
+        prompts.meta_info["task1_attention_mask"] = attention_mask
 
         data_proto = DataProto(batch=batch, non_tensor_batch=prompts.non_tensor_batch, meta_info=prompts.meta_info)
 
@@ -217,8 +221,8 @@ class ImageUnifiedRollout(BaseRollout):
     def _generate_minibatch_image_generation(self, data_proto: DataProto) -> DataProto:
         batch_size = data_proto.batch.batch_size[0]
         
-        input_ids = data_proto.batch["task1_input_ids"]
-        attention_mask = data_proto.batch["task1_attention_mask"]
+        input_ids = data_proto.meta_info["task1_input_ids"]
+        attention_mask = data_proto.meta_info["task1_attention_mask"]
 
         # embedding
         param_ctx = contextlib.nullcontext()
@@ -230,8 +234,8 @@ class ImageUnifiedRollout(BaseRollout):
                 input_embeds = self.module.language_model.get_input_embeddings()(input_ids)
 
         # For computing logits: input (especially input text embedding)
-        data_proto.meta_info["task1_input_ids"] = input_ids
-        data_proto.meta_info["task1_attention_mask"] = attention_mask
+        data_proto.meta_info["task1_input_ids"] = input_ids ## TODO: remove this
+        data_proto.meta_info["task1_attention_mask"] = attention_mask ## TODO: remove this
         data_proto.meta_info["task1_input_embeds"] = input_embeds
 
         gen_final_cfg_embeds, gen_final_cfg_attention_mask = self._prepare_cfg_embeds(data_proto)
@@ -339,7 +343,7 @@ class ImageUnifiedRollout(BaseRollout):
 
         # Prepare messages for all images
         input_format = []
-        for prompt in data_proto.non_tensor_batch['raw_prompt']:
+        for prompt in data_proto.non_tensor_batch['prompt']:
             last_prompt = prompt.replace("<|User|>: ", "").replace("\n\n<|Assistant|>:<begin_of_image>", "")
             input_format.append(prompt + self.image_tag + self.image_end_tag + "\nFirst, Decompose input prompt: " + f"'{last_prompt}'" + '\n')
 
