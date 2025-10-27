@@ -53,6 +53,7 @@ python3 -m recipe.image_rl.main_image_generation_rl \
     actor_rollout_ref.model.path=$MODEL_PATH \
     actor_rollout_ref.model.trust_remote_code=True \
     actor_rollout_ref.actor.optim.lr=5e-6 \
+    actor_rollout_ref.actor.optim.warmup_style=constant \
     actor_rollout_ref.actor.fsdp_config.model_dtype=bf16 \
     actor_rollout_ref.model.use_remove_padding=False \
     actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \

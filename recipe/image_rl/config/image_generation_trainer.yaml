@@ -10,6 +10,9 @@ data:
   gen_batch_size: ${data.train_batch_size}
 
 actor_rollout_ref:
+  actor:
+    optim:
+      warmup_style: constant
   rollout:
     _target_: recipe.image_rl.config.ImageGenerationRolloutConfig
     cfg_weight: 5.0
