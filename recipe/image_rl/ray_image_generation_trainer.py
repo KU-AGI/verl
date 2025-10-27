@@ -676,9 +676,6 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
 
-                    breakpoint()
-                    # if "response_mask" not in batch.batch.keys():
-                    #     batch.batch["response_mask"] = compute_response_mask(batch)
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),
@@ -688,7 +685,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                         self._balance_batch(batch, metrics=metrics) 
 
                     # compute global_valid tokens
-                    batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+                    batch.meta_info["global_token_num"] = batch.meta_info["task1_attention_mask"].sum(dim=-1) + batch.meta_info["task2_attention_mask"].sum(dim=-1) + batch.meta_info["task3_attention_mask"].sum(dim=-1)
 
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
@@ -700,7 +697,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                             future_reward = compute_reward_async.remote(data=batch, reward_fn=self.reward_fn)
                         else:
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
-
+                    breakpoint()
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
