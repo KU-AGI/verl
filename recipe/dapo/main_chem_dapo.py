@@ -27,7 +27,7 @@ from verl.utils.device import is_cuda_available
 
 from .chem_dapo_ray_trainer import RayChemDAPOTrainer
 import wandb
-wandb.login(key="e11fd1e3a798a7dee092100ff887c08679a335fd")
+wandb.login(key="bd5d30bba682b62f7995f9f036abf12a51e7ff8a")
 
 
 @hydra.main(config_path="config", config_name="dapo_trainer", version_base=None)
@@ -39,7 +39,7 @@ def run_ppo(config) -> None:
     if not ray.is_initialized():
         # this is for local ray cluster
         default_runtime_env = {
-            "env_vars": {"TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN", "VLLM_LOGGING_LEVEL": "WARN"}
+            "env_vars": {"TOKENIZERS_PARALLELISM": "true", "VLLM_LOGGING_LEVEL": "WARN"}
         }
         ray_init_kwargs = config.ray_kwargs.get("ray_init", {})
         runtime_env_kwargs = ray_init_kwargs.get("runtime_env", {})

@@ -1,3 +1,4 @@
+
 # Main Docs
 
 - https://verl.readthedocs.io/en/latest/
@@ -8,36 +9,19 @@
 
 - docker image pull
     - https://hub.docker.com/r/verlai/verl/tags
-    
+       - 현재는 `verlai/verl:app-verl0.5-transformers4.55.4-vllm0.10.0-mcore0.13.0-te2.2` 이미지 사용하면 됨
     ```bash
-    docker pull verlai/verl:<image tag>
+    docker pull verlai/verl:app-verl0.5-transformers4.55.4-vllm0.10.0-mcore0.13.0-te2.2
     ```
     
 - docker run
     
     ```bash
-    # Makefile example
-    
-    CONTAINER_NAME=verl-$(USER)
-    IMAGE_NAME_TAG=verlai/verl:base-v4-cu126-cudnn9.8-torch2.7.1-fa2.8.0-te2.3-fi0.2.6
-    
-    init-container:
-    	docker run -d \
-    	--gpus all \
-    	--network host \
-    	-v ${PWD}:/verl \
-    	-v /data:/data \
-    	-v /home:/home \
-    	-v /data/.cache:/root/.cache \
-    	--shm-size=10g \
-    	--ulimit memlock=1 \
-    	--name $(CONTAINER_NAME) \
-    	$(IMAGE_NAME_TAG) \
-    	tail -f /dev/null
+    make init-container # single node
+    make init-container-with-infiniband # InfiniBand server
     ```
     
-- Install
-
+- ~~Install~~ (현재는 필요한 패키지들이 이미지에 이미 포함되어 있음)
     ```
     bash scripts/install_vllm_sglang_mcore.sh
     # https://github.com/ranaroussi/quantstats/issues/365
