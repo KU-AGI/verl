@@ -239,28 +239,20 @@ class ImageUnifiedRollout(BaseRollout):
         final_embeds, final_attention_mask = self._prepare_cfg_embeds(data_proto)
         generated_tokens = self.generate_img(final_embeds, final_attention_mask)
         decoded_images = self._decode_image_tokens(generated_tokens)
+        for i, img_array in enumerate(decoded_images):
+            PIL.Image.fromarray(img_array).save(f"img_gen_{i}.png")
 
         print(f"[IMG_GEN] Generated sequences shape: {generated_tokens.shape}")
 
-        # All transformations expect numpy arrays.
-        # gen_imgs = [PIL.Image.fromarray(img_array) for i, img_array in enumerate(decoded_images)]
-
-        from torchvision import transforms
-        to_tensor = transforms.ToTensor()
-
-        gen_imgs = [to_tensor(PIL.Image.fromarray(img_array)).unsqueeze(0) for img_array in decoded_images]
-        gen_imgs_tensor = torch.cat(gen_imgs, dim=0).to(self.device)
+        gen_imgs_pil_list = [PIL.Image.fromarray(img_array) for img_array in decoded_images]
+        gen_imgs_tensor = self.processor.image_processor(gen_imgs_pil_list).pixel_values
         data_proto.meta_info["gen_imgs_pixel_values"] = gen_imgs_tensor.cpu()
 
-        print(f"[IMG_GEN] Generated {len(gen_imgs)} images in batch")
-
-        # data_proto.meta_info["gen_imgs_pixel_values"] = gen_imgs
         data_proto.meta_info["gen_image_embeds"] = final_embeds
         data_proto.meta_info["gen_attention_mask"] = final_attention_mask
         data_proto.meta_info["gen_img_tokens"] = generated_tokens
 
         print(f"[IMG_GEN] Created DataProto with batch_size: {batch_size}")
-        print(f"[IMG_GEN] Stored {len(gen_imgs)} images in meta_info")
 
         return data_proto
 
@@ -410,6 +402,9 @@ class ImageUnifiedRollout(BaseRollout):
             new_all_image_start_indices.append(new_indices)
 
         feedback_text = self.generate_text(input_embeds, input_attention_mask)
+        for i, text in enumerate(feedback_text):
+            with open(f"feedback_text_{i}.txt", "w") as f:
+                f.write(text)
  
         data_proto.meta_info["task2_merged_embeds"] = merged_embeds
         data_proto.meta_info["task2_batched_attention_mask"] = batched_attention_mask
@@ -517,25 +512,19 @@ class ImageUnifiedRollout(BaseRollout):
 
         regenerated_tokens = self.generate_img(regen_final_embeds, regen_final_attention_mask)
         regen_decoded_images = self._decode_image_tokens(regenerated_tokens)
-        breakpoint()
+        for i, img_array in enumerate(regen_decoded_images):
+            PIL.Image.fromarray(img_array).save(f"img_regen_{i}.png")
         print(f"[REGEN] Generated sequences shape: {regenerated_tokens.shape}")
 
-        from torchvision import transforms
-        to_tensor = transforms.ToTensor()
-
-        regen_imgs = [to_tensor(PIL.Image.fromarray(img_array)).unsqueeze(0) for img_array in regen_decoded_images]
-        regen_imgs_tensor = torch.cat(regen_imgs, dim=0).to(self.device)
+        regen_imgs_pil_list = [PIL.Image.fromarray(img_array) for img_array in regen_decoded_images]
+        regen_imgs_tensor = self.processor.image_processor(regen_imgs_pil_list).pixel_values
         data_proto.meta_info["regen_imgs_pixel_values"] = regen_imgs_tensor.cpu()
 
-        print(f"[REGEN] Generated {len(regen_imgs)} images in batch")
-
-        # data_proto.meta_info["gen_imgs_pixel_values"] = gen_imgs
         data_proto.meta_info["regen_image_embeds"] = regen_final_embeds
         data_proto.meta_info["regen_attention_mask"] = regen_final_attention_mask
         data_proto.meta_info["regen_img_tokens"] = regenerated_tokens
 
         print(f"[REGEN] Created DataProto with batch_size: {batch_size}")
-        print(f"[REGEN] Stored {len(regen_imgs)} images in meta_info")
 
         # torch.cuda.empty_cache()
         print(f"[REGEN] Completed regenment")
@@ -700,6 +689,7 @@ class ImageUnifiedRollout(BaseRollout):
                     eos_token_id=self.processor.tokenizer.eos_token_id,
                     bos_token_id=self.processor.tokenizer.bos_token_id,
                 )
+
 
         answer = self.processor.tokenizer.batch_decode(outputs, skip_special_tokens=True)
 
