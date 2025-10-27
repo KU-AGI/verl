@@ -418,6 +418,281 @@ class TaskEvaluator:
         
         return metrics
 
+
+class StepEvaluator():
+    def __init__(self):
+        pass
+
+    def parse_reactant_reagent_in_forward(self, input_str):
+        """
+        Parses a string of the format "... reactant XX ... reagent YY" and extracts XX and YY.
+
+        Returns:
+            (reactant, reagent): tuple of strings, or (None, None) if not found.
+        """
+        reactant_match = re.search(r"reactant\s+([^\s]+)", input_str, re.IGNORECASE)
+        reagent_match = re.search(r"reagent\s+([^\s]+)", input_str, re.IGNORECASE)
+        reactant = reactant_match.group(1) if reactant_match else None
+        reagent = reagent_match.group(1) if reagent_match else None
+        
+        reactant = reactant.replace(",", "") if reactant else None
+        reagent = reagent.replace(",", "") if reagent else None
+        reactant = reactant.replace("`", "") if reactant else None
+        reagent = reagent.replace("`", "") if reagent else None
+        reactant = reactant.replace("**", "") if reactant else None
+        reagent = reagent.replace("**", "") if reagent else None
+        reactant = reactant.replace("<", "") if reactant else None
+        reagent = reagent.replace(">", "") if reagent else None
+        reactant = reactant.replace("*", "") if reactant else None
+        reagent = reagent.replace("*", "") if reagent else None
+
+        reactant = reactant.strip(".") if reactant else None
+        reagent = reagent.strip(".") if reagent else None
+        return reactant, reagent
+
+
+    def parse_reactant_product_in_reagent(self, input_str):
+        """
+        Parses a string of the format "... reactant is XX ... product is YY" and extracts XX and YY.
+
+        Returns:
+            (reactant, product): tuple of strings, or (None, None) if not found.
+        """
+        reactant_match = re.search(r"reactant\s+is\s+([^\s]+)", input_str, re.IGNORECASE)
+        product_match = re.search(r"product\s+is\s+([^\s]+)", input_str, re.IGNORECASE)
+        reactant = reactant_match.group(1) if reactant_match else None
+        product = product_match.group(1) if product_match else None
+        
+        reactant = reactant.replace(",", "") if reactant else None
+        product = product.replace(",", "") if product else None
+        reactant = reactant.replace("`", "") if reactant else None
+        product = product.replace("`", "") if product else None
+        reactant = reactant.replace("**", "") if reactant else None
+        product = product.replace("**", "") if product else None
+        reactant = reactant.replace("<", "") if reactant else None
+        product = product.replace(">", "") if product else None
+        reactant = reactant.replace("*", "") if reactant else None
+        product = product.replace("*", "") if product else None
+
+        reactant = reactant.strip(".") if reactant else None
+        product = product.strip(".") if product else None
+        return reactant, product
+
+
+    def extract_numbered_items(self, text: str) -> list:
+        pattern = re.compile(r"^\s*\d+\.\s*(.+)$", re.MULTILINE)
+        items = pattern.findall(text)
+        return [item.strip().strip('`') for item in items]
+
+
+    def parse_steps_with_reflections(self, text: str) -> List[Dict]:
+        """
+        주어진 문자열을 Step 단위로 파싱하고,
+        각 Step에 포함된 <REFLECTION> 블록을 추출한다.
+        
+        반환 형식:
+        [
+            {
+                "step": int,
+                "content": str,        # REFLECTION 제외 Step 본문
+                "reflections": [str]   # REFLECTION 블록 내용 리스트
+            },
+            ...
+        ]
+        """
+        # Step 헤더 매칭
+        step_pattern = re.compile(r"(## Step (\d+))")
+        matches = list(step_pattern.finditer(text))
+        
+        steps_data = {}
+        
+        for i, match in enumerate(matches):
+            step_header = match.group(1)
+            step_num = int(match.group(2))
+            
+            # Step 구간의 끝 위치 계산
+            start_pos = match.end()
+            end_pos = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+            step_body = text[start_pos:end_pos].strip()
+            
+            # REFLECTION 블록 추출
+            reflection_pattern = re.compile(r"<REFLECTION>(.*?)</REFLECTION>", re.DOTALL)
+            reflections = reflection_pattern.findall(step_body)
+            
+            # REFLECTION 블록 제거 후 순수 Step 본문
+            cleaned_body = reflection_pattern.sub("", step_body).strip()
+            
+            steps_data[f'step {step_num}'] = {
+                "step": step_num,
+                "content": cleaned_body,
+                "reflections": [r.strip() for r in reflections]
+            }
+        
+        return steps_data
+
+
+    def calculate_forward_rationale_metrics(self, info, predicted_rationale):
+        predicted_step4_rationale = ""
+        predicted_step5_rationale = ""
+        predicted_step6_rationale = ""
+        has_tagged_smiles = False
+        steps_data = self.parse_steps_with_reflections(predicted_rationale)
+        for step_key, step_info in steps_data.items():
+            if step_info["step"] == 4:
+                has_reflection = len(step_info["reflections"]) > 0
+                if has_reflection:
+                    predicted_step4_rationale = step_info["reflections"][-1]
+                else:
+                    predicted_step4_rationale = step_info["content"]
+            elif step_info["step"] == 5:
+                has_reflection = len(step_info["reflections"]) > 0
+                if has_reflection:
+                    predicted_step5_rationale = step_info["reflections"][-1]
+                else:
+                    predicted_step5_rationale = step_info["content"]
+            elif step_info["step"] == 6:
+                has_reflection = len(step_info["reflections"]) > 0
+                if has_reflection:
+                    predicted_step6_rationale = step_info["reflections"][-1]
+                    has_tagged_smiles = ".".join(info["products"]) in predicted_step6_rationale
+                else:
+                    predicted_step6_rationale = step_info["content"]
+                    has_tagged_smiles = info["product_changes_tagged"] in predicted_step6_rationale
+
+        # Metric 3: SMILES highlighting bonding atoms
+        has_reactive_atoms_smiles = info["reactive_atoms_smiles_str"] in predicted_step4_rationale
+
+        # Metric 4: Reactive atom bonds
+        # Check all of the str(tuple(info['reactive_atom_bonds'][0]) in predicted_reasoning
+        has_reactive_atom_bonds = all(str(tuple(bond)) in predicted_step5_rationale for bond in info['reactive_atom_bonds'])
+
+        return {
+            "forward/step4/has_reactive_atoms_smiles": int(has_reactive_atoms_smiles),
+            "forward/step5/has_reactive_atom_bonds": int(has_reactive_atom_bonds),
+            "forward/step6/has_tagged_smiles": int(has_tagged_smiles),
+        }
+
+
+    def calculate_retro_rationale_metrics(self, info, predicted_rationale):
+        predicted_step5_rationale = ""
+        predicted_step6_rationale = ""
+        predicted_step7_rationale = ""
+
+        steps_data = self.parse_steps_with_reflections(predicted_rationale)
+        for step_key, step_info in steps_data.items():
+            if step_info["step"] == 5:
+                has_reflection = len(step_info["reflections"]) > 0
+                if has_reflection:
+                    predicted_step5_rationale = step_info["reflections"][-1]
+                else:
+                    predicted_step5_rationale = step_info["content"]
+            elif step_info["step"] == 6:
+                has_reflection = len(step_info["reflections"]) > 0
+                if has_reflection:
+                    predicted_step6_rationale = step_info["reflections"][-1]
+                else:
+                    predicted_step6_rationale = step_info["content"]
+            elif step_info["step"] == 7:
+                has_reflection = len(step_info["reflections"]) > 0
+                if has_reflection:
+                    predicted_step7_rationale = step_info["reflections"][-1]
+                else:
+                    predicted_step7_rationale = step_info["content"]
+
+
+        # Metric 4: Bond disconnected
+        bond_disconnection_list = []
+        for bond in info["bond_list"]:
+            bond_str = f"{bond[0]}, {bond[1]}: {bond[2]}"
+            bond_disconnection_list.append(bond_str)
+        has_bond_disconnection = all(bond_str in predicted_step5_rationale for bond_str in bond_disconnection_list)
+
+        # Metric 5: Synthons
+        has_synthons = all(synthon in predicted_step6_rationale for synthon in info["synthons_list"])
+
+        # Metric 6: Synthetic equivalents
+        has_synthetic_equivalents = all(syn_equiv in predicted_step7_rationale for syn_equiv in info["synthetic_equivalents"])
+
+        return {
+            "retro/step5/has_bond_disconnection": int(has_bond_disconnection),
+            "retro/step6/has_synthons": int(has_synthons),
+            "retro/step7/has_synthetic_equivalents": int(has_synthetic_equivalents),
+        }
+
+
+    def calculate_reagent_rationale_metrics(self, info, predicted_rationale):
+        predicted_step6_rationale = ""
+        predicted_step7_rationale = ""
+
+        steps_data = self.parse_steps_with_reflections(predicted_rationale)
+        for step_key, step_info in steps_data.items():
+            if step_info["step"] == 6:
+                has_reflection = len(step_info["reflections"]) > 0
+                if has_reflection:
+                    predicted_step6_rationale = step_info["reflections"][-1]
+                else:
+                    predicted_step6_rationale = step_info["content"]
+            elif step_info["step"] == 7:
+                has_reflection = len(step_info["reflections"]) > 0
+                if has_reflection:
+                    predicted_step7_rationale = step_info["reflections"][-1]
+                else:
+                    predicted_step7_rationale = step_info["content"]
+
+        # Metric 3: Has reagents
+        reagent_list = self.extract_numbered_items(predicted_step6_rationale)
+        has_reagents = ".".join(info["reagents"]) in reagent_list
+
+        # Metric 4: Correct reagent number
+        correct_reagent_number = reagent_list.index(".".join(info["reagents"])) + 1 if ".".join(info["reagents"]) in reagent_list else -1
+        reagent_num = re.search(r"reagent (\d+)", predicted_step7_rationale, re.IGNORECASE)
+        if reagent_num:
+            predicted_reagent_number = int(reagent_num.group(1))
+            has_correct_reagent_number = (predicted_reagent_number == correct_reagent_number) and has_reagents
+        else:
+            has_correct_reagent_number = False
+
+        return {
+            "reagent/step6/has_reagents": int(has_reagents),
+            "reagent/step7/has_correct_reagent_number": int(has_correct_reagent_number),
+        }
+
+
+    def evaluate(self, info_list, GT_rationale_list, predicted_reasoning_list, task):
+        if "forward" in task:
+            forward_metrics_dict = defaultdict(list)
+            for info, GT_rationale, predicted_reasoning in zip(info_list, GT_rationale_list, predicted_reasoning_list):
+                forward_metrics = self.calculate_forward_rationale_metrics(info, GT_rationale, predicted_reasoning)
+                for key, value in forward_metrics.items():
+                    forward_metrics_dict[key].append(value)
+            metric_dict = {}
+            for key, values in forward_metrics_dict.items():
+                metric_dict[key] = sum(values) / len(values) if values else 0.0
+            return metric_dict
+
+        elif "retro" in task:
+            retro_metrics_dict = defaultdict(list)
+            for info, GT_rationale, predicted_reasoning in zip(info_list, GT_rationale_list, predicted_reasoning_list):
+                retro_metrics = self.calculate_retro_rationale_metrics(info, GT_rationale, predicted_reasoning)
+                for key, value in retro_metrics.items():
+                    retro_metrics_dict[key].append(value)
+            metric_dict = {}
+            for key, values in retro_metrics_dict.items():
+                metric_dict[key] = sum(values) / len(values) if values else 0.0
+            return metric_dict
+
+        elif "reagent" in task:
+            reagent_metrics_dict = defaultdict(list)
+            for info, GT_rationale, predicted_reasoning in zip(info_list, GT_rationale_list, predicted_reasoning_list):
+                reagent_metrics = self.calculate_reagent_rationale_metrics(info, GT_rationale, predicted_reasoning)
+                for key, value in reagent_metrics.items():
+                    reagent_metrics_dict[key].append(value)
+            metric_dict = {}
+            for key, values in reagent_metrics_dict.items():
+                metric_dict[key] = sum(values) / len(values) if values else 0.0
+            return metric_dict
+
+
 class ChemistryEvaluator:
     """Main evaluation interface."""
     
@@ -425,6 +700,7 @@ class ChemistryEvaluator:
         self.task_evaluator = TaskEvaluator()
         self.validator = SMILESValidator()
         self.parser = StepParser()
+        self.step_evaluator = StepEvaluator()
     
     def is_correct_strict_tag(self, pred: str, gt: str) -> Tuple[int, Optional[str]]:
         """Check prediction correctness using strict ANSWER tag criteria."""
@@ -442,23 +718,36 @@ class ChemistryEvaluator:
     def compute_score(self, solution_str: str, ground_truth: str, extra_info: Optional[Dict] = None) -> Union[EvaluationResult, Dict[str, Any]]:
         """Compute comprehensive evaluation score."""
         correct, pred = self.verify(solution_str, ground_truth, extra_info)
-        
-        metrics = {}
-        if extra_info and "task" in extra_info:
-            task_type = TaskType(extra_info["task"])
-            pred_steps = self.parser.decompose_steps(solution_str)
-            gt_steps = self.parser.decompose_steps(ground_truth)
-            metrics = self.task_evaluator.evaluate_task(task_type, pred_steps, gt_steps)
-        
-        reward = correct + sum(metrics.values()) if correct else -1.0
+
+        task = extra_info['task']
+        info = {
+            "products": extra_info['products'],
+            "reactants": extra_info['reactants'],
+            "reagents": extra_info['reagents'],
+        }
+        info.update(extra_info["supporting_info"][task])
+        match = re.search(r'<think>(.*?)</think>', solution_str, re.DOTALL)
+        predicted_rationale = ""
+        if match:
+            predicted_rationale = match.group(1).strip()
+        if task == "forward":
+            step_eval_results = self.step_evaluator.calculate_forward_rationale_metrics(info, predicted_rationale)
+        elif task == "retro":
+            step_eval_results = self.step_evaluator.calculate_retro_rationale_metrics(info, predicted_rationale)
+        elif task == "reagent":
+            step_eval_results = self.step_evaluator.calculate_reagent_rationale_metrics(info, predicted_rationale)
+        else:
+            step_eval_results = {}
+
+        reward = correct + sum(step_eval_results.values())
 
         result = EvaluationResult(
             score=reward,
-            acc=reward > 0,
+            acc=correct,
             pred=pred,
-            metrics=metrics
+            metrics=step_eval_results
         )
-        
+
         # Return dict format for compatibility with existing code
         return result.to_dict()
 

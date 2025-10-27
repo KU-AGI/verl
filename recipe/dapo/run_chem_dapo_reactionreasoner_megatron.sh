@@ -12,7 +12,7 @@ exec > >(tee -a "${SCRIPT_LOG}")
 exec 2>&1
 
 project_name="verl-dapo" # 'DAPO'
-exp_name='rl_test_2node'
+exp_name='step_reward'
 
 adv_estimator=grpo
 
@@ -33,11 +33,11 @@ overlong_penalty_factor=1.0
 loss_agg_mode="token-mean"
 
 enable_filter_groups=True
-filter_groups_metric=acc
-# filter_groups_metric=seq_final_reward
+# filter_groups_metric=acc
+filter_groups_metric=seq_final_reward
 max_num_gen_batches=0
 train_prompt_bsz=32 # 512
-gen_prompt_bsz=16 # $((train_prompt_bsz * 2))
+gen_prompt_bsz=32 # $((train_prompt_bsz * 2))
 n_resp_per_prompt=8 # 16
 train_prompt_mini_bsz=16 # 32
 
@@ -45,18 +45,19 @@ train_prompt_mini_bsz=16 # 32
 RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
 WORKING_DIR=${WORKING_DIR:-"${PWD}"}
 RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/verl/trainer/runtime_env.yaml"}
-NNODES=${NNODES:-2}
+NNODES=${NNODES:-1}
 N_GPUS_PER_NODE=${N_GPUS_PER_NODE:-8}
 
 # Paths
 HOME="/data" ##
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
 # MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/ReactionReasoner_stage12_lora_adapter_merged"} ##
+# MODEL_PATH="/data/llm-reaction-reasoning/all_checkpoints/answeronly_fullft_8b/best.ckpt/hf_model"
 MODEL_PATH="/data/llm-reaction-reasoning/all_checkpoints/reflection_v4_fullft_all/best.ckpt/hf_model"
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
-TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/chem_dapo_all/syntheticreact_2M_train.parquet"}
-VAL_FILE=${VAL_FILE:-"${RAY_DATA_HOME}/data/chem_dapo_all/syntheticreact_300_val.parquet"}
-TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/chem_dapo_all/syntheticreact_3k_test.parquet"}
+TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/chem_dapo/syntheticreact_train.parquet"}
+VAL_FILE=${VAL_FILE:-"${RAY_DATA_HOME}/data/chem_dapo/syntheticreact_val.parquet"}
+TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/chem_dapo/syntheticreact_test.parquet"}
 
 # Algorithm
 temperature=1.2
@@ -71,7 +72,7 @@ use_dynamic_bsz=True
 actor_ppo_max_token_len=$((max_prompt_length + max_response_length))
 infer_ppo_max_token_len=$((max_prompt_length + max_response_length))
 offload=True
-train_tp=2
+train_tp=1
 train_pp=4
 train_vpp=null
 train_cp=1
@@ -86,10 +87,10 @@ if [ "$rollout_mode" = "async" ]; then
     return_raw_chat="True"
 fi
 
-# python -m recipe.dapo.main_chem_dapo \
-ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
-    --working-dir "${WORKING_DIR}" \
-    -- python3 -m recipe.dapo.main_chem_dapo \
+# ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
+#     --working-dir "${WORKING_DIR}" \
+#     -- python3 -m recipe.dapo.main_chem_dapo \
+python -m recipe.dapo.main_chem_dapo \
     --config-name="dapo_megatron_trainer" \
     data.train_files="${TRAIN_FILE}" \
     data.val_files="${VAL_FILE}" \
@@ -130,6 +131,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     actor_rollout_ref.actor.megatron.param_offload=${offload} \
     actor_rollout_ref.actor.megatron.optimizer_offload=${offload} \
     actor_rollout_ref.actor.megatron.grad_offload=${offload} \
+    actor_rollout_ref.ref.megatron.param_offload=${offload} \
     actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=${train_pp} \
     actor_rollout_ref.actor.megatron.virtual_pipeline_model_parallel_size=${train_vpp} \
     actor_rollout_ref.actor.megatron.tensor_model_parallel_size=${train_tp} \
@@ -157,7 +159,6 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     actor_rollout_ref.ref.megatron.virtual_pipeline_model_parallel_size=${train_vpp} \
     actor_rollout_ref.ref.megatron.tensor_model_parallel_size=${train_tp} \
     actor_rollout_ref.ref.megatron.context_parallel_size=${train_cp} \
-    actor_rollout_ref.ref.megatron.param_offload=${offload} \
     actor_rollout_ref.ref.megatron.expert_model_parallel_size=${train_ep} \
     actor_rollout_ref.ref.megatron.expert_tensor_parallel_size=${train_etp} \
     reward_model.reward_manager=dapo \
@@ -170,11 +171,11 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     trainer.log_val_generations=-1 \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
-    trainer.n_gpus_per_node=8 \
-    trainer.nnodes=2 \
+    trainer.n_gpus_per_node=${N_GPUS_PER_NODE} \
+    trainer.nnodes=${NNODES} \
     trainer.val_before_train=False \
     trainer.test_freq=30 \
-    trainer.save_freq=510 \
+    trainer.save_freq=150 \
     trainer.total_epochs=20 \
     trainer.default_local_dir="${CKPTS_DIR}" \
     trainer.resume_mode=auto \
