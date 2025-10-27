@@ -15,7 +15,7 @@ export CUDA_VISIBLE_DEVICES=0,1,2,3
 export HYDRA_FULL_ERROR=1
 
 GPUS=4 # `nvidia-smi -L | wc -l`
-MODEL_PATH=/data/mllm/checkpoints/Janus-Pro-7B
+MODEL_PATH=/data/mllm/ckpt/pretrained # /data/mllm/checkpoints/Janus-Pro-7B
 # RM_MODEL_PATH=OpenGVLab/InternVL3_5-38B
 TRAIN_FILES=/data/mllm/data/train.parquet
 VAL_FILES=/data/mllm/data/val.parquet

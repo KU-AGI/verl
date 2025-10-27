@@ -37,6 +37,7 @@ from pathlib import Path
 from torch.distributed.device_mesh import DeviceMesh
 from verl.workers.config import HFModelConfig, RolloutConfig
 from recipe.image_rl.config import ImageGenerationHFModelConfig
+from recipe.image_rl.utils import FormattingEvaluator
 
 __all__ = ['ImageUnifiedRollout']
 
@@ -71,6 +72,7 @@ class ImageUnifiedRollout(BaseRollout):
         self.generation_mode = getattr(config, "generation_mode", None)
         self.feedback_system_prompt = getattr(config, "feedback_system_prompt", "")
         self.regen_system_prompt = getattr(config, "regen_system_prompt", "")
+        self.formatter = FormattingEvaluator()
 
         self.image_token_num_per_image = getattr(config, "image_token_num_per_image", 576)
         self.max_reflect_len = getattr(config, "max_reflect_len", 1024)
@@ -347,10 +349,14 @@ class ImageUnifiedRollout(BaseRollout):
         print(f"[TEXT_GEN] Processing feedback for {len(gen_imgs_pixel_values)} images in batch")
 
         # Prepare messages for all images: '<|User|>: a photo of a bench\n\n<|Assistant|>:<begin_of_image><image_placeholder><end_of_image>'
-        input_format = [
-            prompt + self.image_tag + self.image_end_tag # Add image placeholder at the end
-            for prompt in data_proto.non_tensor_batch['raw_prompt']
-        ]
+        input_format = []
+        for prompt in data_proto.non_tensor_batch['raw_prompt']:
+            last_prompt = prompt.replace("<|User|>: ", "").replace("\n\n<|Assistant|>:<begin_of_image>", "")
+            input_format.append(prompt + self.image_tag + self.image_end_tag + "\nFirst, Decompose input prompt: " + f"'{last_prompt}'" + '\n')
+        # input_format = [
+        #     prompt + self.image_tag + self.image_end_tag + "\nFirst, Decompose input prompt: " # Add image placeholder at the end
+        #     for prompt in data_proto.non_tensor_batch['raw_prompt']
+        # ]
 
         inputs = self.processor.tokenizer(
             input_format,
@@ -378,11 +384,40 @@ class ImageUnifiedRollout(BaseRollout):
         # merge text and image embeds
         merged_embeds = self.merge_text_and_image_embeds(text_embeds, image_embeds, all_image_start_indices)
 
-        feedback_text = self.generate_text(merged_embeds, batched_attention_mask)
+        batch_size, _, embed_dim = merged_embeds.shape
+        max_input_len = max(output_start_indices)
+        input_ids = torch.full((batch_size, max_input_len), self.processor.pad_id, dtype=torch.long, device=merged_embeds.device)
+        input_embeds = torch.zeros((batch_size, max_input_len, embed_dim), dtype=merged_embeds.dtype, device=merged_embeds.device)
+        input_attention_mask = torch.zeros((batch_size, max_input_len), dtype=torch.long, device=merged_embeds.device)
+        
+        # Left-padding 후의 이미지 시작 인덱스를 저장할 리스트
+        new_all_image_start_indices = []
 
+        for i in range(batch_size):
+            input_len = output_start_indices[i]
+            pad_len = max_input_len - input_len
+            
+            prompt_embeds = merged_embeds[i, :input_len]
+            prompt_attn_mask = batched_attention_mask[i, :input_len]           
+
+            input_ids[i, pad_len:] = batched_total_ids[i, :input_len]
+            input_embeds[i, pad_len:] = prompt_embeds
+            input_attention_mask[i, pad_len:] = prompt_attn_mask
+            
+            # 패딩 길이를 더해 새로운 이미지 시작 인덱스 계산
+            original_indices = all_image_start_indices[i]
+            new_indices = [idx + pad_len for idx in original_indices]
+            new_all_image_start_indices.append(new_indices)
+
+        feedback_text = self.generate_text(input_embeds, input_attention_mask)
+ 
         data_proto.meta_info["task2_merged_embeds"] = merged_embeds
-        data_proto.meta_info["task2_attention_mask"] = batched_attention_mask
+        data_proto.meta_info["task2_batched_attention_mask"] = batched_attention_mask
         data_proto.meta_info["feedback_texts"] = feedback_text
+
+        data_proto.meta_info["task2_input_ids"] = input_ids
+        data_proto.meta_info["task2_input_embeds"] = input_embeds
+        data_proto.meta_info["task2_attention_mask"] = input_attention_mask
 
         return data_proto
 
@@ -404,12 +439,12 @@ class ImageUnifiedRollout(BaseRollout):
         print(f"[REGEN] Processing regen for {batch_size} images in batch")
 
         # Parse feedback texts
-        # feedback_texts = [self.parse_feedback(feedback) for feedback in data_proto.non_tensor_batch['feedback_texts']]
+        feedback_texts = [self.formatter._split_text_into_parts(feedback)[-1] for feedback in data_proto.meta_info['feedback_texts']]
 
         # Prepare messages for all images: '<|User|>: a photo of a bench\n\n<|Assistant|>:<begin_of_image><image_placeholder><end_of_image>'
         input_format = [
             self.get_sft_format(self.image_start_tag + self.image_tag + self.image_end_tag + "\n" + feedback) # Add image placeholder at the end
-            for feedback in data_proto.meta_info['feedback_texts']
+            for feedback in feedback_texts
         ]
 
         inputs = self.processor.tokenizer(
@@ -445,14 +480,44 @@ class ImageUnifiedRollout(BaseRollout):
         # merge text and image embeds
         merged_embeds = self.merge_text_and_image_embeds(text_embeds, image_embeds, all_image_start_indices)
 
+        batch_size, _, embed_dim = merged_embeds.shape
+        max_input_len = max(output_start_indices)
+        input_ids = torch.full((batch_size, max_input_len), self.processor.pad_id, dtype=torch.long, device=merged_embeds.device)
+        input_embeds = torch.zeros((batch_size, max_input_len, embed_dim), dtype=merged_embeds.dtype, device=merged_embeds.device)
+        input_attention_mask = torch.zeros((batch_size, max_input_len), dtype=torch.long, device=merged_embeds.device)
+        
+        # Left-padding 후의 이미지 시작 인덱스를 저장할 리스트
+        new_all_image_start_indices = []
+
+        for i in range(batch_size):
+            input_len = output_start_indices[i]
+            pad_len = max_input_len - input_len
+            
+            prompt_embeds = merged_embeds[i, :input_len]
+            prompt_attn_mask = batched_attention_mask[i, :input_len]           
+
+            input_ids[i, pad_len:] = batched_total_ids[i, :input_len]
+            input_embeds[i, pad_len:] = prompt_embeds
+            input_attention_mask[i, pad_len:] = prompt_attn_mask
+            
+            # 패딩 길이를 더해 새로운 이미지 시작 인덱스 계산
+            original_indices = all_image_start_indices[i]
+            new_indices = [idx + pad_len for idx in original_indices]
+            new_all_image_start_indices.append(new_indices)
+
         data_proto.meta_info["task3_total_ids"] = batched_total_ids
         data_proto.meta_info["task3_merged_embeds"] = merged_embeds
-        data_proto.meta_info["task3_attention_mask"] = batched_attention_mask
+        data_proto.meta_info["task3_batched_attention_mask"] = batched_attention_mask
+
+        data_proto.meta_info["task3_input_ids"] = input_ids
+        data_proto.meta_info["task3_attention_mask"] = input_attention_mask
+        data_proto.meta_info["task3_input_embeds"] = input_embeds
 
         regen_final_embeds, regen_final_attention_mask = self._prepare_regen_cfg_embeds(data_proto)
 
         regenerated_tokens = self.generate_img(regen_final_embeds, regen_final_attention_mask)
         regen_decoded_images = self._decode_image_tokens(regenerated_tokens)
+        breakpoint()
         print(f"[REGEN] Generated sequences shape: {regenerated_tokens.shape}")
 
         from torchvision import transforms
@@ -641,9 +706,9 @@ class ImageUnifiedRollout(BaseRollout):
         return answer
 
     def _prepare_regen_cfg_embeds(self, data_proto: DataProto) -> Tuple[torch.Tensor, torch.Tensor]:
-        input_ids = data_proto.meta_info['task3_total_ids']
+        input_ids = data_proto.meta_info['task3_input_ids']
         attention_mask = data_proto.meta_info['task3_attention_mask']
-        input_embeds = data_proto.meta_info['task3_merged_embeds']
+        input_embeds = data_proto.meta_info['task3_input_embeds']
 
         cond_embeds = input_embeds
         uncond_embeds = input_embeds.clone()
