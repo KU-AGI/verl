@@ -154,7 +154,6 @@ class ImageRLDataset(Dataset):
 
     def _build_messages(self, example: dict):
         messages: list = example.pop(self.prompt_key)
-        messages = [{"role": "<|User|>", "content": "a photo of a bench"}, {"role": "<|Assistant|>", "content": ""}]
         return messages
 
     def __getitem__(self, item):
