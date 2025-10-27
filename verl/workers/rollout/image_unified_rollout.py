@@ -229,28 +229,25 @@ class ImageUnifiedRollout(BaseRollout):
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                 input_embeds = self.module.language_model.get_input_embeddings()(input_ids)
 
+        # For computing logits: input (especially input text embedding)
         data_proto.meta_info["task1_input_ids"] = input_ids
         data_proto.meta_info["task1_attention_mask"] = attention_mask
         data_proto.meta_info["task1_input_embeds"] = input_embeds
 
-        # Generate n images in batch
-        print(f"[IMG_GEN] Generating {batch_size} images in batch")
-        
-        final_embeds, final_attention_mask = self._prepare_cfg_embeds(data_proto)
-        generated_tokens = self.generate_img(final_embeds, final_attention_mask)
+        gen_final_cfg_embeds, gen_final_cfg_attention_mask = self._prepare_cfg_embeds(data_proto)
+        # For reproducing generated images
+        data_proto.meta_info["gen_final_cfg_embeds"] = gen_final_cfg_embeds
+        data_proto.meta_info["gen_final_cfg_attention_mask"] = gen_final_cfg_attention_mask
+
+        generated_tokens = self.generate_img(gen_final_cfg_embeds, gen_final_cfg_attention_mask)
+        # For reproducing generated images
+        data_proto.meta_info["gen_img_tokens"] = generated_tokens
+
         decoded_images = self._decode_image_tokens(generated_tokens)
-        for i, img_array in enumerate(decoded_images):
-            PIL.Image.fromarray(img_array).save(f"img_gen_{i}.png")
-
-        print(f"[IMG_GEN] Generated sequences shape: {generated_tokens.shape}")
-
         gen_imgs_pil_list = [PIL.Image.fromarray(img_array) for img_array in decoded_images]
         gen_imgs_tensor = self.processor.image_processor(gen_imgs_pil_list).pixel_values
+        # For generating feedback texts and computing logits: output
         data_proto.meta_info["gen_imgs_pixel_values"] = gen_imgs_tensor.cpu()
-
-        data_proto.meta_info["gen_image_embeds"] = final_embeds
-        data_proto.meta_info["gen_attention_mask"] = final_attention_mask
-        data_proto.meta_info["gen_img_tokens"] = generated_tokens
 
         print(f"[IMG_GEN] Created DataProto with batch_size: {batch_size}")
 
@@ -340,15 +337,11 @@ class ImageUnifiedRollout(BaseRollout):
         # Process all images in batch
         print(f"[TEXT_GEN] Processing feedback for {len(gen_imgs_pixel_values)} images in batch")
 
-        # Prepare messages for all images: '<|User|>: a photo of a bench\n\n<|Assistant|>:<begin_of_image><image_placeholder><end_of_image>'
+        # Prepare messages for all images
         input_format = []
         for prompt in data_proto.non_tensor_batch['raw_prompt']:
             last_prompt = prompt.replace("<|User|>: ", "").replace("\n\n<|Assistant|>:<begin_of_image>", "")
             input_format.append(prompt + self.image_tag + self.image_end_tag + "\nFirst, Decompose input prompt: " + f"'{last_prompt}'" + '\n')
-        # input_format = [
-        #     prompt + self.image_tag + self.image_end_tag + "\nFirst, Decompose input prompt: " # Add image placeholder at the end
-        #     for prompt in data_proto.non_tensor_batch['raw_prompt']
-        # ]
 
         inputs = self.processor.tokenizer(
             input_format,
@@ -360,6 +353,9 @@ class ImageUnifiedRollout(BaseRollout):
         attention_mask = inputs["attention_mask"].to(self.device)
 
         batched_total_ids, batched_attention_mask, output_start_indices, all_image_start_indices, images_to_batch = self.expand_image_placeholders(input_ids, gen_imgs_pixel_values)
+        # For computing logits: input
+        data_proto.meta_info["task2_batched_total_ids"] = batched_total_ids
+        data_proto.meta_info["task2_batched_attention_mask"] = batched_attention_mask
 
         # embedding
         param_ctx = contextlib.nullcontext()
@@ -375,6 +371,8 @@ class ImageUnifiedRollout(BaseRollout):
 
         # merge text and image embeds
         merged_embeds = self.merge_text_and_image_embeds(text_embeds, image_embeds, all_image_start_indices)
+        # For computing logits: input
+        data_proto.meta_info["task2_merged_embeds"] = merged_embeds
 
         batch_size, _, embed_dim = merged_embeds.shape
         max_input_len = max(output_start_indices)
@@ -401,18 +399,18 @@ class ImageUnifiedRollout(BaseRollout):
             new_indices = [idx + pad_len for idx in original_indices]
             new_all_image_start_indices.append(new_indices)
 
-        feedback_text = self.generate_text(input_embeds, input_attention_mask)
-        for i, text in enumerate(feedback_text):
-            with open(f"feedback_text_{i}.txt", "w") as f:
-                f.write(text)
- 
-        data_proto.meta_info["task2_merged_embeds"] = merged_embeds
-        data_proto.meta_info["task2_batched_attention_mask"] = batched_attention_mask
-        data_proto.meta_info["feedback_texts"] = feedback_text
-
+        # For generating feedback texts
         data_proto.meta_info["task2_input_ids"] = input_ids
         data_proto.meta_info["task2_input_embeds"] = input_embeds
         data_proto.meta_info["task2_attention_mask"] = input_attention_mask
+
+        feedback_texts = self.generate_text(input_embeds, input_attention_mask)
+
+        # For computing logits: output
+        data_proto.meta_info["feedback_texts"] = feedback_texts
+        outputs = self.processor.tokenizer(feedback_texts, padding=True, return_tensors="pt")
+        data_proto.meta_info["feedback_ids"] = outputs["input_ids"]
+        data_proto.meta_info["feedback_attention_mask"] = outputs["attention_mask"]
 
         return data_proto
 
@@ -436,7 +434,7 @@ class ImageUnifiedRollout(BaseRollout):
         # Parse feedback texts
         feedback_texts = [self.formatter._split_text_into_parts(feedback)[-1] for feedback in data_proto.meta_info['feedback_texts']]
 
-        # Prepare messages for all images: '<|User|>: a photo of a bench\n\n<|Assistant|>:<begin_of_image><image_placeholder><end_of_image>'
+        # Prepare messages for all images
         input_format = [
             self.get_sft_format(self.image_start_tag + self.image_tag + self.image_end_tag + "\n" + feedback) # Add image placeholder at the end
             for feedback in feedback_texts
@@ -452,6 +450,9 @@ class ImageUnifiedRollout(BaseRollout):
         attention_mask = inputs["attention_mask"].to(self.device)
 
         batched_total_ids, batched_attention_mask, output_start_indices, all_image_start_indices, images_to_batch = self.expand_image_placeholders(input_ids, gen_imgs_pixel_values)
+        # For computing logits: input
+        data_proto.meta_info["task3_batched_total_ids"] = batched_total_ids
+        data_proto.meta_info["task3_batched_attention_mask"] = batched_attention_mask
 
         B, C, H, W = gen_imgs_pixel_values.shape
 
@@ -474,6 +475,8 @@ class ImageUnifiedRollout(BaseRollout):
 
         # merge text and image embeds
         merged_embeds = self.merge_text_and_image_embeds(text_embeds, image_embeds, all_image_start_indices)
+        # For computing logits: input
+        data_proto.meta_info["task3_merged_embeds"] = merged_embeds
 
         batch_size, _, embed_dim = merged_embeds.shape
         max_input_len = max(output_start_indices)
@@ -500,29 +503,26 @@ class ImageUnifiedRollout(BaseRollout):
             new_indices = [idx + pad_len for idx in original_indices]
             new_all_image_start_indices.append(new_indices)
 
-        data_proto.meta_info["task3_total_ids"] = batched_total_ids
-        data_proto.meta_info["task3_merged_embeds"] = merged_embeds
-        data_proto.meta_info["task3_batched_attention_mask"] = batched_attention_mask
-
+        # For generating regen images
         data_proto.meta_info["task3_input_ids"] = input_ids
         data_proto.meta_info["task3_attention_mask"] = input_attention_mask
         data_proto.meta_info["task3_input_embeds"] = input_embeds
 
-        regen_final_embeds, regen_final_attention_mask = self._prepare_regen_cfg_embeds(data_proto)
+        regen_final_cfg_embeds, regen_final_cfg_attention_mask = self._prepare_regen_cfg_embeds(data_proto)
+        # For reproducing regen images
+        data_proto.meta_info["regen_final_cfg_embeds"] = regen_final_cfg_embeds
+        data_proto.meta_info["regen_final_cfg_attention_mask"] = regen_final_cfg_attention_mask
 
-        regenerated_tokens = self.generate_img(regen_final_embeds, regen_final_attention_mask)
+        regenerated_tokens = self.generate_img(regen_final_cfg_embeds, regen_final_cfg_attention_mask)
+        # For reproducing regen images
+        data_proto.meta_info["regen_img_tokens"] = regenerated_tokens
+
         regen_decoded_images = self._decode_image_tokens(regenerated_tokens)
-        for i, img_array in enumerate(regen_decoded_images):
-            PIL.Image.fromarray(img_array).save(f"img_regen_{i}.png")
-        print(f"[REGEN] Generated sequences shape: {regenerated_tokens.shape}")
 
         regen_imgs_pil_list = [PIL.Image.fromarray(img_array) for img_array in regen_decoded_images]
         regen_imgs_tensor = self.processor.image_processor(regen_imgs_pil_list).pixel_values
+        # For reproducing regen images
         data_proto.meta_info["regen_imgs_pixel_values"] = regen_imgs_tensor.cpu()
-
-        data_proto.meta_info["regen_image_embeds"] = regen_final_embeds
-        data_proto.meta_info["regen_attention_mask"] = regen_final_attention_mask
-        data_proto.meta_info["regen_img_tokens"] = regenerated_tokens
 
         print(f"[REGEN] Created DataProto with batch_size: {batch_size}")
 
@@ -571,16 +571,16 @@ class ImageUnifiedRollout(BaseRollout):
         
         batch_size, seq_len, embed_dim = input_embeds.shape
         
-        final_embeds = pad_embed.expand(batch_size * 2, seq_len, embed_dim).clone()
-        final_attention_mask = torch.zeros((batch_size * 2, seq_len), dtype=torch.long, device=attention_mask.device)
+        gen_final_cfg_embeds = pad_embed.expand(batch_size * 2, seq_len, embed_dim).clone()
+        gen_final_cfg_attention_mask = torch.zeros((batch_size * 2, seq_len), dtype=torch.long, device=attention_mask.device)
         
-        final_embeds[0::2] = cond_embeds
-        final_embeds[1::2] = uncond_embeds
+        gen_final_cfg_embeds[0::2] = cond_embeds
+        gen_final_cfg_embeds[1::2] = uncond_embeds
         
-        final_attention_mask[0::2] = attention_mask
-        final_attention_mask[1::2] = attention_mask 
+        gen_final_cfg_attention_mask[0::2] = attention_mask
+        gen_final_cfg_attention_mask[1::2] = attention_mask 
             
-        return final_embeds, final_attention_mask
+        return gen_final_cfg_embeds, gen_final_cfg_attention_mask
 
     def _decode_image_tokens(self, generated_tokens: torch.Tensor) -> np.ndarray:
         batch_size = generated_tokens.shape[0]
@@ -736,13 +736,13 @@ class ImageUnifiedRollout(BaseRollout):
         
         batch_size, seq_len, embed_dim = input_embeds.shape
         
-        final_embeds = pad_embed.expand(batch_size * 2, seq_len, embed_dim).clone()
-        final_attention_mask = torch.zeros((batch_size * 2, seq_len), dtype=torch.long, device=attention_mask.device)
+        regen_final_cfg_embeds = pad_embed.expand(batch_size * 2, seq_len, embed_dim).clone()
+        regen_final_cfg_attention_mask = torch.zeros((batch_size * 2, seq_len), dtype=torch.long, device=attention_mask.device)
         
-        final_embeds[0::2] = cond_embeds
-        final_embeds[1::2] = uncond_embeds
+        regen_final_cfg_embeds[0::2] = cond_embeds
+        regen_final_cfg_embeds[1::2] = uncond_embeds
         
-        final_attention_mask[0::2] = attention_mask
-        final_attention_mask[1::2] = attention_mask 
+        regen_final_cfg_attention_mask[0::2] = attention_mask
+        regen_final_cfg_attention_mask[1::2] = attention_mask 
             
-        return final_embeds, final_attention_mask
+        return regen_final_cfg_embeds, regen_final_cfg_attention_mask
