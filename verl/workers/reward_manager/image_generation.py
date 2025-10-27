@@ -58,93 +58,76 @@ class ImageGenerationRewardManager:
             print("[SAVE] No meta_info found, skipping save")
             return
         
-        input_texts = data.meta_info.get('input_text', [])
-        gen_img_list = data.meta_info.get('gen_img_list', [])
-        refined_img_list = data.meta_info.get('refined_gen_img_list', [])
+        prompt = data.non_tensor_batch.get('prompt', [])
+        gen_imgs_pixel_values = data.meta_info.get('gen_imgs_pixel_values', [])
+        regen_imgs_pixel_values = data.meta_info.get('regen_imgs_pixel_values', [])
         feedback_texts = data.meta_info.get('feedback_texts', [])
+        ground_truth = data.non_tensor_batch.get('reward_model', {}).get('ground_truth', "")
 
         step_dir = os.path.join(self.save_path, str(self.steps))
         os.makedirs(step_dir, exist_ok=True)
         
-        print(f"[SAVE] Saving {min(len(gen_img_list), self.save_num)} images to {step_dir}")
+        print(f"[SAVE] Saving {min(len(gen_imgs_pixel_values), self.save_num)} images to {step_dir}")
         
         with open(os.path.join(step_dir, "texts.txt"), 'w', encoding='utf-8') as f:
             f.write("Input Texts and Generated Content\n")
             f.write("=" * 80 + "\n\n")
             
-            for i in range(min(len(gen_img_list), self.save_num)):
+            for i in range(min(len(prompt), len(gen_imgs_pixel_values), len(feedback_texts), len(regen_imgs_pixel_values), len(ground_truth), self.save_num)):
                 f.write(f"Sample {i}\n")
                 f.write("=" * 40 + "\n")
                 
                 # Save input text
-                if i < len(input_texts):
-                    f.write(f"Input Text: {input_texts[i]}\n")
+                if i < len(prompt):
+                    f.write(f"Input Text: {prompt[i]}\n")
                 
                 # Save generated image
-                if i < len(gen_img_list):
-                    gen_img = gen_img_list[i]
-                    if isinstance(gen_img, PIL.Image.Image):
-                        save_path = os.path.join(step_dir, f"img_{i}.png")
-                        gen_img.save(save_path)
-                        f.write(f"Generated Image: img_{i}.png\n")
+                if i < len(gen_imgs_pixel_values):
+                    save_path = os.path.join(step_dir, f"img_{i}.png")
+                    PIL.Image.fromarray(gen_imgs_pixel_values[i].cpu().numpy()).save(save_path)
+                    f.write(f"Generated Image: img_{i}.png\n")
                 
                 # Save feedback text
                 if i < len(feedback_texts):
                     f.write(f"Feedback: {feedback_texts[i]}\n\n")
                 
-                # Save refined image
-                if i < len(refined_img_list):
-                    refined_img = refined_img_list[i]
-                    if isinstance(refined_img, PIL.Image.Image):
-                        refined_path = os.path.join(step_dir, f"refined_img_{i}.png")
-                        refined_img.save(refined_path)
-                        f.write(f"Refined Image: refined_img_{i}.png\n")
+                # Save regen image
+                if i < len(regen_imgs_pixel_values):
+                    regen_path = os.path.join(step_dir, f"regen_img_{i}.png")
+                    PIL.Image.fromarray(regen_imgs_pixel_values[i].cpu().numpy()).save(regen_path)
+                    f.write(f"Regenerated Image: regen_img_{i}.png\n")
                 
                 # Save RM text if available
-                if 'rm_text' in data.non_tensor_batch and i < len(data.non_tensor_batch['rm_text']):
-                    rm_text = data.non_tensor_batch['rm_text'][i]
-                    f.write(f"RM Text: {rm_text}\n")
-                
-                # Save text tokens if available
-                if 'text_tokens' in data.batch and i < len(data.batch['text_tokens']):
-                    text_tokens = data.batch['text_tokens'][i]
-                    decoded = self.tokenizer.decode(text_tokens, skip_special_tokens=True)
-                    f.write(f"Text Tokens: {decoded}\n")
+                if i < len(ground_truth):
+                    ground_truth_path = os.path.join(step_dir, f"ground_truth_{i}.png")
+                    PIL.Image.open(ground_truth).save(ground_truth_path)
+                    f.write(f"Ground Truth: ground_truth_{i}.png\n")
                 
                 f.write("\n" + "=" * 40 + "\n\n")
         
-        print(f"[SAVE] Saved {min(len(gen_img_list), self.save_num)} samples to {step_dir}")
+        print(f"[SAVE] Saved {min(len(prompt), len(gen_imgs_pixel_values), len(feedback_texts), len(regen_imgs_pixel_values), len(ground_truth), self.save_num)} samples to {step_dir}")
 
     def verify(self, data: DataProto) -> List[dict]:
         """Verify and compute scores for batch."""
         # Get lists from meta_info
-        input_texts = data.meta_info.get('input_text', [])
-        gen_img_list = data.meta_info.get('gen_img_list', [])
-        refined_img_list = data.meta_info.get('refined_gen_img_list', [])
+        prompt = data.non_tensor_batch.get('prompt', [])
+        gen_imgs_pixel_values = data.meta_info.get('gen_imgs_pixel_values', [])
+        regen_imgs_pixel_values = data.meta_info.get('regen_imgs_pixel_values', [])
         feedback_texts = data.meta_info.get('feedback_texts', [])
+        ground_truth = data.non_tensor_batch.get('reward_model', {}).get('ground_truth', "")
         
-        print(f"[VERIFY] Processing batch of {len(data)} samples")
-        
-        # Get ground truths and extras
-        ground_truths = []
-        extras = []
-        for i in range(len(data)):
-            gt = data[i].non_tensor_batch.get("reward_model", {}).get("ground_truth", None)
-            ground_truths.append(gt)
-            
-            extra = data[i].non_tensor_batch.get("extra_info", {})
-            extras.append(extra)
+        print(f"[VERIFY] Processing batch of {len(prompt)} samples")
         
         # Compute scores for all samples
         scores = []
         for i in range(len(data)):
             score_result = self.compute_score(
-                prompt=input_texts[i],
-                gen_img=gen_img_list[i] if i < len(gen_img_list) else None,
+                prompt=prompt[i],
+                gen_img_pixel_values=gen_imgs_pixel_values[i] if i < len(gen_imgs_pixel_values) else None,
                 feedback_text=feedback_texts[i] if i < len(feedback_texts) else "",
-                refined_gen_img=refined_img_list[i] if i < len(refined_img_list) else None,
-                ground_truth=ground_truths[i],
-                extra_info=extras[i],
+                regen_img_pixel_values=regen_imgs_pixel_values[i] if i < len(regen_imgs_pixel_values) else None,
+                ground_truth=ground_truth[i],
+                extra_info=data.non_tensor_batch.get("extra_info", {}),
                 **self.reward_kwargs,
             )
             scores.append(score_result)
@@ -176,11 +159,11 @@ class ImageGenerationRewardManager:
         print(f"[REWARD] Computing rewards for batch_size={len(data)}")
         
         # Initialize reward tensor
-        device = data.batch["input_ids"].device
+        device = data.batch["task1_input_ids"].device
         reward_tensor = torch.zeros(len(data), dtype=torch.float32, device=device)
         reward_extra_info = defaultdict(list)
         
-        input_texts = data.meta_info.get('input_text', [])
+        prompt = data.non_tensor_batch.get('prompt', [])
 
         # Get data sources
         data_sources = data.non_tensor_batch.get(self.reward_fn_key, ["unknown"] * len(data))
@@ -205,7 +188,7 @@ class ImageGenerationRewardManager:
             # Print examination samples
             data_source = data_sources[i] if i < len(data_sources) else "unknown"
             if already_printed.get(data_source, 0) < self.num_examine:
-                prompt_text = input_texts[i]
+                prompt_text = prompt[i]
                 ground_truth = data[i].non_tensor_batch.get("reward_model", {}).get("ground_truth", "N/A")
                 
                 print(f"\n[EXAMINE {i}]")
