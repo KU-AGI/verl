@@ -90,6 +90,7 @@ class ImageRLDataset(Dataset):
         tokenizer: PreTrainedTokenizer,
         config: DictConfig,
         processor: Optional[ProcessorMixin] = None,
+        max_samples: int = -1,
     ):
         if not isinstance(data_files, list | ListConfig):
             data_files = [data_files]
@@ -98,6 +99,7 @@ class ImageRLDataset(Dataset):
         self.original_data_files = copy.deepcopy(data_files)  # use for resume
         self.tokenizer = tokenizer
         self.processor = processor
+        self.max_samples = max_samples
         self.config = config
 
         self.cache_dir = os.path.expanduser(config.get("cache_dir", "~/.cache/verl/rlhf"))
@@ -119,6 +121,8 @@ class ImageRLDataset(Dataset):
         self.filter_prompts = config.get("filter_prompts", True)
         self.serialize_dataset = False
         self.return_multi_modal_inputs = config.get("return_multi_modal_inputs", True)
+        self.shuffle = config.get("shuffle", False)
+        self.seed = config.get("seed")
 
         self._download()
         self._read_files_and_tokenize()
@@ -138,7 +142,18 @@ class ImageRLDataset(Dataset):
             dataframes.append(dataframe)
         self.dataframe: datasets.Dataset = datasets.concatenate_datasets(dataframes)
 
+        total = len(self.dataframe)
         print(f"dataset len: {len(self.dataframe)}")
+
+        if self.max_samples > 0 and self.max_samples < total:
+            if self.shuffle:
+                rngs_args = (self.seed,) if self.seed is not None else ()
+                rng = np.random.default_rng(*rngs_args)
+                indices = rng.choice(total, size=self.max_samples, replace=False)
+            else:
+                indices = np.arange(self.max_samples)
+            self.dataframe = self.dataframe.select(indices.tolist())
+            print(f"selected {self.max_samples} random samples out of {total}")
 
     def resume_dataset_state(self):
         self.serialize_dataset = not hasattr(self, "original_data_files")
@@ -152,25 +167,14 @@ class ImageRLDataset(Dataset):
     def __len__(self):
         return len(self.dataframe)
 
-    def _build_messages(self, example: dict):
-        messages: list = example.pop(self.prompt_key)
-        return messages
-
     def __getitem__(self, item):
         """
         Note that we also return the raw_input_ids so that it can be combined with other chat template
         """
         row_dict: dict = self.dataframe[item]
-        messages = self._build_messages(row_dict)
+        prompt = row_dict.pop(self.prompt_key)
 
-        raw_prompt = self.processor.apply_sft_template_for_multi_turn_prompts(
-            conversations=messages,
-            sft_format=self.processor.sft_format,
-            system_prompt="",
-        )
-
-        raw_prompt = raw_prompt + self.processor.image_start_tag
-        row_dict["raw_prompt"] = raw_prompt
+        row_dict["prompt"] = prompt
 
         # for tensor batch in DataProto
         row_dict["dummy_tensor"] = torch.zeros(1)
