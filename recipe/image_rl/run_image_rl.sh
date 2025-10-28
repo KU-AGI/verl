@@ -30,7 +30,7 @@ RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/verl/trainer/runtime_env.yaml"}
 # Parameters
 train_prompt_bsz=4
 val_prompt_bsz=4
-n_resp_per_prompt=2
+n_resp_per_prompt=4
 train_prompt_mini_bsz=4
 
 max_prompt_length=$((1024 * 1)) # 1k
@@ -43,6 +43,7 @@ python3 -m recipe.image_rl.main_image_generation_rl \
     algorithm.adv_estimator=grpo \
     data.train_files=$TRAIN_FILES \
     data.val_files=$VAL_FILES \
+    data.shuffle=False \
     data.prompt_key=prompt \
     data.train_batch_size=${train_prompt_bsz} \
     data.max_prompt_length=${max_prompt_length} \

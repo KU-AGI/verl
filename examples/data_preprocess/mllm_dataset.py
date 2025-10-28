@@ -30,7 +30,7 @@ if __name__ == "__main__":
                 "prompt": prompt,
                 "ability": "image_unified_generation",
                 "reward_model": {"style": "rule", "ground_truth": aligned_image_path},
-                "extra_info": {"split": split, "index": idx, "prompt_id": prompt_id},
+                "extra_info": {"split": split, "index": idx},
             }
             return data
 
