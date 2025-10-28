@@ -62,7 +62,7 @@ class ImageGenerationRewardManager:
         gen_imgs_pixel_values = data.meta_info.get('gen_imgs_pixel_values', [])
         regen_imgs_pixel_values = data.meta_info.get('regen_imgs_pixel_values', [])
         feedback_texts = data.meta_info.get('feedback_texts', [])
-        ground_truth = data.non_tensor_batch.get('reward_model', {}).get('ground_truth', "")
+        ground_truth = data.non_tensor_batch.get('reward_model', {})
 
         step_dir = os.path.join(self.save_path, str(self.steps))
         os.makedirs(step_dir, exist_ok=True)
@@ -100,7 +100,7 @@ class ImageGenerationRewardManager:
                 # Save RM text if available
                 if i < len(ground_truth):
                     ground_truth_path = os.path.join(step_dir, f"ground_truth_{i}.png")
-                    PIL.Image.open(ground_truth).save(ground_truth_path)
+                    PIL.Image.open(ground_truth[i]["ground_truth"]).save(ground_truth_path)
                     f.write(f"Ground Truth: ground_truth_{i}.png\n")
                 
                 f.write("\n" + "=" * 40 + "\n\n")
@@ -114,7 +114,7 @@ class ImageGenerationRewardManager:
         gen_imgs_pixel_values = data.meta_info.get('gen_imgs_pixel_values', [])
         regen_imgs_pixel_values = data.meta_info.get('regen_imgs_pixel_values', [])
         feedback_texts = data.meta_info.get('feedback_texts', [])
-        ground_truth = data.non_tensor_batch.get('reward_model', {}).get('ground_truth', "")
+        ground_truth = data.non_tensor_batch.get('reward_model', {})
         
         print(f"[VERIFY] Processing batch of {len(prompt)} samples")
         
@@ -126,7 +126,7 @@ class ImageGenerationRewardManager:
                 gen_img_pixel_values=gen_imgs_pixel_values[i] if i < len(gen_imgs_pixel_values) else None,
                 feedback_text=feedback_texts[i] if i < len(feedback_texts) else "",
                 regen_img_pixel_values=regen_imgs_pixel_values[i] if i < len(regen_imgs_pixel_values) else None,
-                ground_truth=ground_truth[i],
+                ground_truth=ground_truth[i]["ground_truth"],
                 extra_info=data.non_tensor_batch.get("extra_info", {}),
                 **self.reward_kwargs,
             )

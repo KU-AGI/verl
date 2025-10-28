@@ -271,6 +271,7 @@ class ImageUnifiedRollout(BaseRollout):
                 image_embeds = self.module.gen_aligner(self.module.gen_embed(image_ids))
 
         data_proto.meta_info["task1_gen_img_embeds"] = image_embeds
+        data_proto.meta_info["task1_gen_img_attention_mask"] = torch.ones((B, image_embeds.size(1)), dtype=torch.long, device=image_embeds.device)
         print(f"[IMG_GEN] Created DataProto with batch_size: {batch_size}")
 
         return data_proto
@@ -447,6 +448,7 @@ class ImageUnifiedRollout(BaseRollout):
                 text_embeds = self.module.language_model.get_input_embeddings()(feedback_ids)
 
         data_proto.meta_info["task2_feedback_embeds"] = text_embeds
+        data_proto.meta_info["task2_feedback_attention_mask"] = get_response_mask(feedback_ids, self.processor.tokenizer.eos_token_id)
         print(f"[TEXT_GEN] Completed feedback generation")
 
         return data_proto
@@ -581,7 +583,7 @@ class ImageUnifiedRollout(BaseRollout):
                 image_embeds = self.module.gen_aligner(self.module.gen_embed(image_ids))
 
         data_proto.meta_info["task3_regen_img_embeds"] = image_embeds
-
+        data_proto.meta_info["task3_regen_img_attention_mask"] = torch.ones((B, image_embeds.size(1)), dtype=torch.long, device=image_embeds.device)
         torch.cuda.empty_cache()
         print(f"[REGEN] Completed regenment")
 
