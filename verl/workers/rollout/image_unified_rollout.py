@@ -206,7 +206,7 @@ class ImageUnifiedRollout(BaseRollout):
         )
 
         prompts.meta_info["task1_input_ids"] = input_ids
-        prompts.meta_info["task1_attention_mask"] = attention_mask
+        prompts.meta_info["task1_input_attention_mask"] = attention_mask
 
         data_proto = DataProto(batch=batch, non_tensor_batch=prompts.non_tensor_batch, meta_info=prompts.meta_info)
 
@@ -222,7 +222,7 @@ class ImageUnifiedRollout(BaseRollout):
         batch_size = data_proto.batch.batch_size[0]
         
         input_ids = data_proto.meta_info["task1_input_ids"]
-        attention_mask = data_proto.meta_info["task1_attention_mask"]
+        attention_mask = data_proto.meta_info["task1_input_attention_mask"]
 
         # embedding
         param_ctx = contextlib.nullcontext()
@@ -235,7 +235,7 @@ class ImageUnifiedRollout(BaseRollout):
 
         # For computing logits: input (especially input text embedding)
         data_proto.meta_info["task1_input_ids"] = input_ids ## TODO: remove this
-        data_proto.meta_info["task1_attention_mask"] = attention_mask ## TODO: remove this
+        data_proto.meta_info["task1_input_attention_mask"] = attention_mask ## TODO: remove this
         data_proto.meta_info["task1_input_embeds"] = input_embeds
 
         gen_final_cfg_embeds, gen_final_cfg_attention_mask = self._prepare_cfg_embeds(data_proto)
@@ -249,6 +249,7 @@ class ImageUnifiedRollout(BaseRollout):
 
         decoded_images = self._decode_image_tokens(generated_tokens)
         gen_imgs_pil_list = [PIL.Image.fromarray(img_array) for img_array in decoded_images]
+        data_proto.meta_info["gen_imgs_pil_list"] = gen_imgs_pil_list
         gen_imgs_tensor = self.processor.image_processor(gen_imgs_pil_list).pixel_values
         # For generating feedback texts and computing logits: output
         data_proto.meta_info["gen_imgs_pixel_values"] = gen_imgs_tensor.cpu()
@@ -474,10 +475,13 @@ class ImageUnifiedRollout(BaseRollout):
         feedback_texts = [self.formatter._split_text_into_parts(feedback)[-1] for feedback in data_proto.meta_info['feedback_texts']]
 
         # Prepare messages for all images
-        input_format = [
-            self.get_sft_format(self.image_start_tag + self.image_tag + self.image_end_tag + "\n" + feedback) # Add image placeholder at the end
-            for feedback in feedback_texts
-        ]
+        input_format = []
+        for feedback in feedback_texts:
+            prefix = self.get_sft_format(self.image_start_tag + self.image_tag + self.image_end_tag + "\n")
+            if feedback is None:
+                input_format.append(prefix + "No need to generate feedback.")
+            else:
+                input_format.append(prefix + feedback) # Add image placeholder at the end            
 
         inputs = self.processor.tokenizer(
             input_format,
@@ -559,6 +563,7 @@ class ImageUnifiedRollout(BaseRollout):
         regen_decoded_images = self._decode_image_tokens(regenerated_tokens)
 
         regen_imgs_pil_list = [PIL.Image.fromarray(img_array) for img_array in regen_decoded_images]
+        data_proto.meta_info["regen_imgs_pil_list"] = regen_imgs_pil_list
         regen_imgs_tensor = self.processor.image_processor(regen_imgs_pil_list).pixel_values
         # For reproducing regen images
         data_proto.meta_info["regen_imgs_pixel_values"] = regen_imgs_tensor.cpu()
@@ -591,7 +596,7 @@ class ImageUnifiedRollout(BaseRollout):
 
     def _prepare_cfg_embeds(self, data_proto: DataProto) -> Tuple[torch.Tensor, torch.Tensor]:
         input_ids = data_proto.meta_info['task1_input_ids']
-        attention_mask = data_proto.meta_info['task1_attention_mask']
+        attention_mask = data_proto.meta_info['task1_input_attention_mask']
         input_embeds = data_proto.meta_info['task1_input_embeds']
 
         cond_embeds = input_embeds
@@ -694,7 +699,11 @@ class ImageUnifiedRollout(BaseRollout):
         generated_tokens = torch.zeros((batch_size, self.image_token_num_per_image), dtype=torch.int, device=self.device)
 
         attention_mask = attention_masks
-        
+
+        position_ids = attention_mask.long().cumsum(1) - 1
+        position_ids = position_ids.masked_fill(attention_mask == 0, 0)
+        past_len = attention_mask.sum(dim=1, keepdim=True).long()
+
         param_ctx = contextlib.nullcontext()
         if isinstance(self.module, FSDP):
             param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=True)
@@ -706,6 +715,7 @@ class ImageUnifiedRollout(BaseRollout):
                     outputs = self.module.language_model.model(
                         inputs_embeds=inputs_embeds,
                         attention_mask=attention_mask,
+                        position_ids=position_ids,
                         past_key_values=past_key_values,
                         use_cache=True,
                     )
@@ -727,6 +737,9 @@ class ImageUnifiedRollout(BaseRollout):
                     inputs_embeds = self.module.prepare_gen_img_embeds(next_token_pair).unsqueeze(1)
 
                     attention_mask = torch.cat([attention_mask, torch.ones((attention_mask.shape[0], 1), dtype=torch.long, device=self.device)], dim=1)
+
+                    position_ids = past_len.clone()
+                    past_len += 1
 
         return generated_tokens
 

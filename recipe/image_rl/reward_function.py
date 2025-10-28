@@ -85,7 +85,7 @@ def get_messages(prompt, gen_img, feedback_text, refined_gen_img, ground_truth, 
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": [
-                {"type": "image_url", "image_url": {"url": convert_gen_img_to_base64(gen_img)}},
+                {"type": "image_pil", "image_pil": gen_img}
             ]}
         ]
         return messages
@@ -94,7 +94,7 @@ def get_messages(prompt, gen_img, feedback_text, refined_gen_img, ground_truth, 
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": [
-                {"type": "image_url", "image_url": {"url": convert_gen_img_to_base64(gen_img)}},
+                {"type": "image_pil", "image_pil": gen_img}, # convert_gen_img_to_base64(gen_img)}},
                 {"type": "text", "text": feedback_text},
             ]}
         ]
@@ -104,8 +104,8 @@ def get_messages(prompt, gen_img, feedback_text, refined_gen_img, ground_truth, 
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": [
-                {"type": "image_url", "image_url": {"url": convert_gen_img_to_base64(refined_gen_img)}},
-                {"type": "image_url", "image_url": {"url": convert_gen_img_to_base64(ground_truth_base64)}},
+                {"type": "image_pil", "image_pil": gen_img},
+                {"type": "image_pil", "image_pil": refined_gen_img}
             ]}
         ]
         return messages

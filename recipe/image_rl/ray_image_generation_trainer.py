@@ -564,7 +564,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
 
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen", keep_minibatch=False):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
-        attention_mask = batch.meta_info["task1_attention_mask"] + batch.meta_info["task2_batched_attention_mask"] + batch.meta_info["task3_batched_attention_mask"]
+        attention_mask = torch.cat([batch.meta_info["task1_input_attention_mask"], batch.meta_info["task2_batched_attention_mask"], batch.meta_info["task3_batched_attention_mask"]], dim=1)
         batch_size = attention_mask.shape[0]
         global_seqlen_lst = attention_mask.view(batch_size, -1).sum(-1)  # (train_batch_size,)
         global_seqlen_lst = calculate_workload(global_seqlen_lst)
@@ -722,7 +722,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                         self._balance_batch(batch, metrics=metrics) 
 
                     # compute global_valid tokens
-                    batch.meta_info["global_token_num"] = batch.meta_info["task1_attention_mask"].sum(dim=-1) + batch.meta_info["task2_attention_mask"].sum(dim=-1) + batch.meta_info["task3_attention_mask"].sum(dim=-1)
+                    batch.meta_info["global_token_num"] = batch.meta_info["task1_input_attention_mask"].sum(dim=-1) + batch.meta_info["task2_attention_mask"].sum(dim=-1) + batch.meta_info["task3_attention_mask"].sum(dim=-1)
 
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
@@ -734,7 +734,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                             future_reward = compute_reward_async.remote(data=batch, reward_fn=self.reward_fn)
                         else:
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
-                    breakpoint()
+
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
