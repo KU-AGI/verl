@@ -22,6 +22,10 @@ import PIL
 import datetime
 from typing import Any, List
 from collections import defaultdict
+import contextlib
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+import numpy as np
+from torchvision.transforms.functional import to_pil_image
 
 @register("image_generation")
 class ImageGenerationRewardManager:
@@ -30,6 +34,7 @@ class ImageGenerationRewardManager:
     def __init__(
         self, 
         tokenizer, 
+        processor,
         num_examine, 
         compute_score=None, 
         reward_fn_key="data_source", 
@@ -37,6 +42,7 @@ class ImageGenerationRewardManager:
         **reward_kwargs
     ) -> None:
         self.tokenizer = tokenizer
+        self.processor = processor
         self.num_examine = num_examine
         self.compute_score = compute_score or _default_compute_score
         self.steps = 0
@@ -58,22 +64,25 @@ class ImageGenerationRewardManager:
             print("[SAVE] No meta_info found, skipping save")
             return
         
+        prompt_id = data.non_tensor_batch.get('prompt_id', [])
         prompt = data.non_tensor_batch.get('prompt', [])
-        gen_imgs_pixel_values = data.meta_info.get('gen_imgs_pixel_values', [])
-        regen_imgs_pixel_values = data.meta_info.get('regen_imgs_pixel_values', [])
+        gen_imgs_pil_list = data.meta_info.get('gen_imgs_pil_list', [])
+        regen_imgs_pil_list = data.meta_info.get('regen_imgs_pil_list', [])
         feedback_texts = data.meta_info.get('feedback_texts', [])
         ground_truth = data.non_tensor_batch.get('reward_model', {})
 
         step_dir = os.path.join(self.save_path, str(self.steps))
         os.makedirs(step_dir, exist_ok=True)
         
-        print(f"[SAVE] Saving {min(len(gen_imgs_pixel_values), self.save_num)} images to {step_dir}")
+        print(f"[SAVE] Saving {min(len(gen_imgs_pil_list), self.save_num)} images to {step_dir}")
         
         with open(os.path.join(step_dir, "texts.txt"), 'w', encoding='utf-8') as f:
             f.write("Input Texts and Generated Content\n")
             f.write("=" * 80 + "\n\n")
             
-            for i in range(min(len(prompt), len(gen_imgs_pixel_values), len(feedback_texts), len(regen_imgs_pixel_values), len(ground_truth), self.save_num)):
+            for i in range(min(len(prompt), len(gen_imgs_pil_list), len(feedback_texts), len(regen_imgs_pil_list), len(ground_truth), self.save_num)):
+                prompt_id = prompt_id[i]
+
                 f.write(f"Sample {i}\n")
                 f.write("=" * 40 + "\n")
                 
@@ -82,9 +91,9 @@ class ImageGenerationRewardManager:
                     f.write(f"Input Text: {prompt[i]}\n")
                 
                 # Save generated image
-                if i < len(gen_imgs_pixel_values):
-                    save_path = os.path.join(step_dir, f"img_{i}.png")
-                    PIL.Image.fromarray(gen_imgs_pixel_values[i].cpu().numpy()).save(save_path)
+                if i < len(gen_imgs_pil_list):
+                    save_path = os.path.join(step_dir, f"img_{prompt_id}_{i}.png")
+                    gen_imgs_pil_list[i].save(save_path)
                     f.write(f"Generated Image: img_{i}.png\n")
                 
                 # Save feedback text
@@ -92,27 +101,27 @@ class ImageGenerationRewardManager:
                     f.write(f"Feedback: {feedback_texts[i]}\n\n")
                 
                 # Save regen image
-                if i < len(regen_imgs_pixel_values):
-                    regen_path = os.path.join(step_dir, f"regen_img_{i}.png")
-                    PIL.Image.fromarray(regen_imgs_pixel_values[i].cpu().numpy()).save(regen_path)
+                if i < len(regen_imgs_pil_list):
+                    regen_path = os.path.join(step_dir, f"regen_img_{prompt_id}_{i}.png")
+                    regen_imgs_pil_list[i].save(regen_path)
                     f.write(f"Regenerated Image: regen_img_{i}.png\n")
                 
                 # Save RM text if available
                 if i < len(ground_truth):
-                    ground_truth_path = os.path.join(step_dir, f"ground_truth_{i}.png")
-                    PIL.Image.open(ground_truth[i]["ground_truth"]).save(ground_truth_path)
+                    ground_truth_path = os.path.join(step_dir, f"ground_truth_{prompt_id}_{i}.png")
+                    PIL.Image.open(ground_truth[i]["ground_truth"]).convert("RGB").save(ground_truth_path)
                     f.write(f"Ground Truth: ground_truth_{i}.png\n")
                 
                 f.write("\n" + "=" * 40 + "\n\n")
         
-        print(f"[SAVE] Saved {min(len(prompt), len(gen_imgs_pixel_values), len(feedback_texts), len(regen_imgs_pixel_values), len(ground_truth), self.save_num)} samples to {step_dir}")
+        print(f"[SAVE] Saved {min(len(prompt), len(gen_imgs_pil_list), len(feedback_texts), len(regen_imgs_pil_list), len(ground_truth), self.save_num)} samples to {step_dir}")
 
     def verify(self, data: DataProto) -> List[dict]:
         """Verify and compute scores for batch."""
         # Get lists from meta_info
         prompt = data.non_tensor_batch.get('prompt', [])
-        gen_imgs_pixel_values = data.meta_info.get('gen_imgs_pixel_values', [])
-        regen_imgs_pixel_values = data.meta_info.get('regen_imgs_pixel_values', [])
+        gen_imgs_pil_list = data.meta_info.get('gen_imgs_pil_list', [])
+        regen_imgs_pil_list = data.meta_info.get('regen_imgs_pil_list', [])
         feedback_texts = data.meta_info.get('feedback_texts', [])
         ground_truth = data.non_tensor_batch.get('reward_model', {})
         
@@ -123,9 +132,9 @@ class ImageGenerationRewardManager:
         for i in range(len(data)):
             score_result = self.compute_score(
                 prompt=prompt[i],
-                gen_img_pixel_values=gen_imgs_pixel_values[i] if i < len(gen_imgs_pixel_values) else None,
+                gen_img_pixel_values=gen_imgs_pil_list[i] if i < len(gen_imgs_pil_list) else None,
                 feedback_text=feedback_texts[i] if i < len(feedback_texts) else "",
-                regen_img_pixel_values=regen_imgs_pixel_values[i] if i < len(regen_imgs_pixel_values) else None,
+                regen_img_pixel_values=regen_imgs_pil_list[i] if i < len(regen_imgs_pil_list) else None,
                 ground_truth=ground_truth[i]["ground_truth"],
                 extra_info=data.non_tensor_batch.get("extra_info", {}),
                 **self.reward_kwargs,
@@ -137,12 +146,12 @@ class ImageGenerationRewardManager:
     def __call__(self, data: DataProto, return_dict: bool = False, eval: bool = False):
         """Main reward computation with batch processing."""
         
-        # Save generated images periodically
-        if self.save_freq > 0 and self.steps % self.save_freq == 0:
-            self.save_path = os.path.join(self.save_path, "eval" if eval else "train")
-            os.makedirs(self.save_path, exist_ok=True)
-            self.save_img(data)
-            print(f"[SAVE] Saving images to {self.save_path}")
+        # # Save generated images periodically
+        # if self.save_freq > 0 and self.steps % self.save_freq == 0:
+        #     self.save_path = os.path.join(self.save_path, "eval" if eval else "train")
+        #     os.makedirs(self.save_path, exist_ok=True)
+        #     self.save_img(data)
+        #     print(f"[SAVE] Saving images to {self.save_path}")
 
         if not eval:
             self.steps += 1
@@ -159,7 +168,7 @@ class ImageGenerationRewardManager:
         print(f"[REWARD] Computing rewards for batch_size={len(data)}")
         
         # Initialize reward tensor
-        device = data.batch["task1_input_ids"].device
+        device = data.meta_info["task1_input_ids"].device
         reward_tensor = torch.zeros(len(data), dtype=torch.float32, device=device)
         reward_extra_info = defaultdict(list)
         
