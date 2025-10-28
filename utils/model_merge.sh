@@ -12,6 +12,5 @@
 # Megatron
 python -m verl.model_merger merge \
     --backend megatron \
-    --tie-word-embedding \
-    --local_dir /data/verl/ckpts/verl-dapo/DAPO-ReactionReasoner-reflection-v4-fullft-all-n8-bsz32-clip-low-sampling-megatron-tp2-pp4/global_step_300/actor \
-    --target_dir /data/verl/ckpts/verl-dapo/DAPO-ReactionReasoner-reflection-v4-fullft-all-n8-bsz32-clip-low-sampling-megatron-tp2-pp4/hf_model
+    --local_dir /data/verl/ckpts/verl-dapo/step_reward/global_step_450/actor \
+    --target_dir /data/verl/ckpts/verl-dapo/step_reward/global_step_450/actor/hf_model
