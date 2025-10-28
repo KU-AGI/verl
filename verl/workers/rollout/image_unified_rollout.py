@@ -252,7 +252,25 @@ class ImageUnifiedRollout(BaseRollout):
         gen_imgs_tensor = self.processor.image_processor(gen_imgs_pil_list).pixel_values
         # For generating feedback texts and computing logits: output
         data_proto.meta_info["gen_imgs_pixel_values"] = gen_imgs_tensor.cpu()
+        gen_imgs_pixel_values = gen_imgs_tensor.to(self.device, dtype=torch.bfloat16)
 
+        # Postprocessing output embeds
+        param_ctx = contextlib.nullcontext()
+        if isinstance(self.module, FSDP):
+            param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=True)
+
+        B, C, H, W = gen_imgs_pixel_values.shape
+
+        with param_ctx:
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                _, _, all_image_ids = self.module.gen_vision_model.encode(gen_imgs_pixel_values)
+        
+                image_ids = all_image_ids[2]
+                image_ids = image_ids.view(B, -1)
+
+                image_embeds = self.module.gen_aligner(self.module.gen_embed(image_ids))
+
+        data_proto.meta_info["task1_gen_img_embeds"] = image_embeds
         print(f"[IMG_GEN] Created DataProto with batch_size: {batch_size}")
 
         return data_proto
@@ -416,6 +434,21 @@ class ImageUnifiedRollout(BaseRollout):
         data_proto.meta_info["feedback_ids"] = outputs["input_ids"]
         data_proto.meta_info["feedback_attention_mask"] = outputs["attention_mask"]
 
+        feedback_ids = data_proto.meta_info["feedback_ids"]
+        feedback_ids = feedback_ids.to(self.device)
+
+        # Postprocessing output embeds
+        param_ctx = contextlib.nullcontext()
+        if isinstance(self.module, FSDP):
+            param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=True)
+
+        with param_ctx:
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                text_embeds = self.module.language_model.get_input_embeddings()(feedback_ids)
+
+        data_proto.meta_info["task2_feedback_embeds"] = text_embeds
+        print(f"[TEXT_GEN] Completed feedback generation")
+
         return data_proto
 
     def _generate_minibatch_regen_image_generation(self, data_proto: DataProto) -> DataProto:
@@ -527,11 +560,31 @@ class ImageUnifiedRollout(BaseRollout):
         regen_imgs_tensor = self.processor.image_processor(regen_imgs_pil_list).pixel_values
         # For reproducing regen images
         data_proto.meta_info["regen_imgs_pixel_values"] = regen_imgs_tensor.cpu()
+        regen_imgs_pixel_values = regen_imgs_tensor.to(self.device, dtype=torch.bfloat16)
 
         print(f"[REGEN] Created DataProto with batch_size: {batch_size}")
 
-        # torch.cuda.empty_cache()
+        B, C, H, W = regen_imgs_pixel_values.shape
+
+        # Postprocessing output embeds
+        param_ctx = contextlib.nullcontext()
+        if isinstance(self.module, FSDP):
+            param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=True)
+
+        with param_ctx:
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                _, _, all_image_ids = self.module.gen_vision_model.encode(regen_imgs_pixel_values)
+
+                image_ids = all_image_ids[2]
+                image_ids = image_ids.view(B, -1)
+
+                image_embeds = self.module.gen_aligner(self.module.gen_embed(image_ids))
+
+        data_proto.meta_info["task3_regen_img_embeds"] = image_embeds
+
+        torch.cuda.empty_cache()
         print(f"[REGEN] Completed regenment")
+
         return data_proto
 
     def _prepare_cfg_embeds(self, data_proto: DataProto) -> Tuple[torch.Tensor, torch.Tensor]:

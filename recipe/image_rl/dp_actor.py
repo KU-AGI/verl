@@ -308,7 +308,7 @@ class DataParallelImageGenerationActor(DataParallelPPOActor):
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
-        select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
+        select_keys = ["task1_input_embeds", "gen_imgs_pixel_values", "task2_merged_embeds", "feedback_ids", "task3_merged_embeds", "regen_imgs_pixel_values"]
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
