@@ -48,7 +48,7 @@ Give your reason of your evaluation.
 Please put your final answer about the feedback is aligned with the question or not (i.e., '1' or '0') in \\boxed{{}}.
 """
 
-TASK3_REFINED_IMAGE_GENERATOR_PROMPT_TEMPLATE = """
+TASK3_REGEN_IMAGE_GENERATOR_PROMPT_TEMPLATE = """
 You are a evaluator. Your task is to evaluate how well the generated image is aligned with the question.
 You will be given a question and generated image from target model. You need to judge if the generated image is a good image based on the question.
 First image is the generated image from target model. Second image is the ground truth image.
@@ -78,7 +78,7 @@ def convert_gen_img_to_base64(gen_img: PIL.Image.Image) -> Optional[str]:
     return f"data:image/png;base64,{img_base64}"
     
 
-def get_messages(prompt, gen_img, feedback_text, refined_gen_img, ground_truth, task_id):
+def get_messages(prompt, gen_img, feedback_text, regen_img, ground_truth, task_id):
     ground_truth_base64 = convert_gen_img_to_base64(ground_truth)
     if task_id == 1:
         system_prompt = TASK1_FIRST_IMAGE_GENERATOR_PROMPT_TEMPLATE.format(question=prompt)
@@ -100,12 +100,12 @@ def get_messages(prompt, gen_img, feedback_text, refined_gen_img, ground_truth, 
         ]
         return messages
     elif task_id == 3:
-        system_prompt = TASK3_REFINED_IMAGE_GENERATOR_PROMPT_TEMPLATE.format(question=prompt)
+        system_prompt = TASK3_REGEN_IMAGE_GENERATOR_PROMPT_TEMPLATE.format(question=prompt)
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": [
                 {"type": "image_pil", "image_pil": gen_img},
-                {"type": "image_pil", "image_pil": refined_gen_img}
+                {"type": "image_pil", "image_pil": regen_img}
             ]}
         ]
         return messages
@@ -113,8 +113,8 @@ def get_messages(prompt, gen_img, feedback_text, refined_gen_img, ground_truth, 
         raise ValueError(f"Invalid task: {task_id} is must be one of task1, task2, or task3.")
 
 
-def get_response(prompt, gen_img, feedback_text, refined_gen_img, ground_truth, task_id):
-    messages = get_messages(prompt, gen_img, feedback_text, refined_gen_img, ground_truth, task_id)
+def get_response(prompt, gen_img, feedback_text, regen_img, ground_truth, task_id):
+    messages = get_messages(prompt, gen_img, feedback_text, regen_img, ground_truth, task_id)
     for attempt in range(MAX_RETRIES):
         try:
             response = client.chat.completions.create(
@@ -133,6 +133,7 @@ def get_response(prompt, gen_img, feedback_text, refined_gen_img, ground_truth, 
     
     raise ConnectionRefusedError(f"Failed to run the model for {prompt}! Error: {e}")
 
+
 def compute_reward(response):
     reward_score = 0.0
     try:
@@ -145,18 +146,20 @@ def compute_reward(response):
     return reward_score
 
 
-def compute_score(prompt, gen_img, feedback_text, refined_gen_img, ground_truth, extra_info, **kwargs):
+def compute_score(prompt, gen_img, feedback_text, regen_img, ground_truth, extra_info, task_id, **kwargs):
     reward_score = 0.0
     reward_extra_info = {}
 
-    for task_id in range(3):
-        response = get_response(prompt, gen_img, feedback_text, refined_gen_img, ground_truth, task_id+1) # task_id is 1-indexed
-        if response is not None:
-            reward_score += compute_reward(response)
-            reward_extra_info[f"task_{task_id}"] = reward_score
-            break
-        else:
-            reward_score += 0.0
+    # vlm based reward
+    response = get_response(prompt, gen_img, feedback_text, regen_img, ground_truth, task_id)
+    if response is not None:
+        reward_score += compute_reward(response)
+        reward_extra_info[f"task_{task_id}"] = reward_score
+    else:
+        reward_score += 0.0
+
+    # rule-based reward
+    # feedback parsing <-> gt tuple & VQA result ... 
 
     return {
         "score": reward_score,
@@ -164,13 +167,13 @@ def compute_score(prompt, gen_img, feedback_text, refined_gen_img, ground_truth,
     }
 
 
-# def compute_score_batch(prompts, gen_imgs, feedback_texts, refined_gen_imgs, ground_truths, extra_infos):
+# def compute_score_batch(prompts, gen_imgs, feedback_texts, regen_imgs, ground_truths, extra_infos, task_ids):
 #     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
 #         futures = []
-#         for prompt, gen_img, feedback_text, refined_gen_img, ground_truth, extra_info in zip(
-#             prompts, gen_imgs, feedback_texts, refined_gen_imgs, ground_truths, extra_infos, strict=True
+#         for prompt, gen_img, feedback_text, regen_img, ground_truth, extra_info, task_id in zip(
+#             prompts, gen_imgs, feedback_texts, regen_imgs, ground_truths, extra_infos, task_ids, strict=True
 #         ):
-#             future = executor.submit(compute_score, prompt, gen_img, feedback_text, refined_gen_img, ground_truth, extra_info)
+#             future = executor.submit(compute_score, prompt, gen_img, feedback_text, regen_img, ground_truth, extra_info)
 #             futures.append(future)
 
 #         results = [future.result() for future in futures]
