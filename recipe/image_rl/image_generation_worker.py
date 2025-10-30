@@ -713,7 +713,7 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
         if self._is_actor:
             actor_cfg = omega_conf_to_dataclass(self.config.actor)
             self.actor = DataParallelImageGenerationActor(
-                config=actor_cfg, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer
+                config=actor_cfg, processor=self.processor, tokenizer=self.tokenizer, actor_module=self.actor_module_fsdp, actor_optimizer=self.actor_optimizer
             )
 
         if self._is_rollout:
@@ -770,7 +770,7 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="red", role="actor_update")
-    def update_actor(self, data: DataProto):
+    def update_actor(self, data: DataProto, task_id: int = 1):
         assert self._is_actor
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
@@ -782,7 +782,7 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
 
             # perform training
             with Timer(name="update_policy", logger=None) as timer:
-                metrics = self.actor.update_policy(data=data)
+                metrics = self.actor.update_policy(data=data, task_id=task_id)
             delta_time = timer.last
             global_num_tokens = data.meta_info["global_token_num"]
             estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
@@ -857,7 +857,7 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="blue", role="actor_compute_log_prob")
-    def compute_log_prob(self, data: DataProto):
+    def compute_log_prob(self, data: DataProto, task_id: int = 1):
         # when is_lora is True, we use the actor without lora applied to calculate the log_prob
         # which is mostly used for ref log_prob calculation
         assert self._is_actor
@@ -877,9 +877,9 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
         # perform recompute log_prob
         with self.ulysses_sharding_manager:
             with adapter_ctx:
-                output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+                output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True, task_id=task_id)
             output = DataProto.from_dict(
-                tensors={"old_log_probs": output, "entropys": entropys},
+                tensors={f"task{task_id}_old_log_probs": output, f"task{task_id}_entropys": entropys},
                 meta_info={"temperature": self.config.rollout.temperature},
             )
 
@@ -893,42 +893,6 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
             log_gpu_memory_usage("After offload actor model during compute_log_prob", logger=logger)
-
-        return output
-
-    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
-    @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")
-    def compute_ref_log_prob(self, data: DataProto):
-        if self._is_lora:
-            # if _is_lora, actor without lora applied is the ref
-            data.meta_info["is_lora"] = True
-            data = self.compute_log_prob(data)
-            # this old_log_probs is in fact ref_log_prob
-            data = DataProto.from_dict(tensors={"ref_log_prob": data.batch["old_log_probs"]})
-            return data
-        assert self._is_ref
-        # else:
-        # otherwise, the class have a standalone ref model
-
-        micro_batch_size = self.config.ref.log_prob_micro_batch_size_per_gpu
-        data.meta_info["micro_batch_size"] = micro_batch_size
-        data.meta_info["temperature"] = self.config.rollout.temperature
-        data.meta_info["max_token_len"] = self.config.ref.log_prob_max_token_len_per_gpu
-        data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
-        with self.ulysses_sharding_manager:
-            data = data.to("cpu")  # data will to device with each micro batch on ref.compute_log_prob
-            output, _ = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
-            output = DataProto.from_dict(tensors={"ref_log_prob": output})
-
-        output = output.to("cpu")
-
-        # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
-        # unshard the root FSDP module
-        if self.world_size > 1:
-            if fsdp_version(self.ref_policy.actor_module) == 1:
-                self.ref_policy.actor_module._handle.reshard(True)
-            elif fsdp_version(self.ref_policy.actor_module) == 2:
-                self.ref_policy.actor_module.reshard()
 
         return output
 
