@@ -578,11 +578,31 @@ class AgentLoopWorkerBase:
         non_tensor_batch = {
             "__num_turns__": np.array([input.num_turns for input in inputs], dtype=np.int32),
         }
-
         # add reward_extra_info to non_tensor_batch
         reward_extra_infos = [input.extra_fields.get("reward_extra_info", {}) for input in inputs]
-        reward_extra_keys = list(reward_extra_infos[0].keys())
+
+
+        ##############################################################################
+        ### Original verl implementation that assumes all extra_info have the same keys
+        # reward_extra_keys = list(reward_extra_infos[0].keys())
+        # for key in reward_extra_keys:
+        #     non_tensor_batch[key] = np.array([info[key] for info in reward_extra_infos])
+        ##############################################################################
+        
+        reward_extra_keys = [
+            "forward/step4/has_reactive_atoms_smiles",
+            "forward/step5/has_reactive_atom_bonds",
+            "forward/step6/has_tagged_smiles",
+            "retro/step5/has_bond_disconnection",
+            "retro/step6/has_synthons",
+            "retro/step7/has_synthetic_equivalents",
+            "reagent/step6/has_reagents",
+            "reagent/step7/has_correct_reagent_number"
+        ]
         for key in reward_extra_keys:
+            for info in reward_extra_infos:
+                if key not in info:
+                    info[key] = None
             non_tensor_batch[key] = np.array([info[key] for info in reward_extra_infos])
 
         # Add multi_modal_inputs to non_tensor_batch if any samples have them

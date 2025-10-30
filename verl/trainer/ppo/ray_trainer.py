@@ -282,6 +282,7 @@ class RayPPOTrainer:
         val_reward_fn=None,
         train_dataset: Optional[Dataset] = None,
         val_dataset: Optional[Dataset] = None,
+        test_dataset: Optional[Dataset] = None,
         collate_fn=None,
         train_sampler: Optional[Sampler] = None,
         device_name=None,
@@ -301,6 +302,7 @@ class RayPPOTrainer:
             val_reward_fn: Function for computing rewards during validation.
             train_dataset (Optional[Dataset], optional): Training dataset. Defaults to None.
             val_dataset (Optional[Dataset], optional): Validation dataset. Defaults to None.
+            test_dataset (Optional[Dataset], optional): Test dataset. Defaults to None.
             collate_fn: Function to collate data samples into batches.
             train_sampler (Optional[Sampler], optional): Sampler for the training dataset. Defaults to None.
             device_name (str, optional): Device name for training (e.g., "cuda", "cpu"). Defaults to None.
@@ -339,9 +341,9 @@ class RayPPOTrainer:
         if self.config.algorithm.use_kl_in_reward:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
-        self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+        self._create_dataloader(train_dataset, val_dataset, test_dataset, collate_fn, train_sampler)
 
-    def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
+    def _create_dataloader(self, train_dataset, val_dataset, test_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
         Creates the train and validation dataloaders.
         """
@@ -364,7 +366,15 @@ class RayPPOTrainer:
                 self.processor,
                 max_samples=self.config.data.get("val_max_samples", -1),
             )
-        self.train_dataset, self.val_dataset = train_dataset, val_dataset
+        if test_dataset is None:
+            test_dataset = create_rl_dataset(
+                self.config.data.test_files,
+                self.config.data,
+                self.tokenizer,
+                self.processor,
+                max_samples=self.config.data.get("test_max_samples", -1),
+            )
+        self.train_dataset, self.val_dataset, self.test_dataset = train_dataset, val_dataset, test_dataset
 
         if train_sampler is None:
             train_sampler = create_rl_sampler(self.config.data, self.train_dataset)
@@ -388,6 +398,10 @@ class RayPPOTrainer:
         if val_batch_size is None:
             val_batch_size = len(self.val_dataset)
 
+        test_batch_size = self.config.data.test_batch_size  # Prefer config value if set
+        if test_batch_size is None:
+            test_batch_size = len(self.test_dataset)
+
         self.val_dataloader = StatefulDataLoader(
             dataset=self.val_dataset,
             batch_size=val_batch_size,
@@ -397,14 +411,23 @@ class RayPPOTrainer:
             collate_fn=collate_fn,
         )
 
+        self.test_dataloader = StatefulDataLoader(
+            dataset=self.test_dataset,
+            batch_size=test_batch_size,
+            num_workers=num_workers,
+            shuffle=self.config.data.get("test_shuffle", True),
+            drop_last=False,
+            collate_fn=collate_fn,
+        )
+
         assert len(self.train_dataloader) >= 1, "Train dataloader is empty!"
         assert len(self.val_dataloader) >= 1, "Validation dataloader is empty!"
+        assert len(self.test_dataloader) >= 1, "Test dataloader is empty!"
 
         print(
             f"Size of train dataloader: {len(self.train_dataloader)}, Size of val dataloader: "
-            f"{len(self.val_dataloader)}"
+            f"{len(self.val_dataloader)}, Size of test dataloader: {len(self.test_dataloader)}"
         )
-
         total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
 
         if self.config.trainer.total_training_steps is not None:
@@ -849,6 +872,188 @@ class RayPPOTrainer:
 
         return metric_dict
 
+    def _test(self):
+        data_source_lst = []
+        task_lst = []
+        reward_extra_infos_dict: dict[str, list] = defaultdict(list)
+
+        # Lists to collect samples for the table
+        sample_inputs = []
+        sample_outputs = []
+        sample_gts = []
+        sample_scores = []
+        sample_turns = []
+        sample_uids = []
+
+        for test_data in self.test_dataloader:
+            test_batch = DataProto.from_single_dict(test_data)
+
+            if "uid" not in test_batch.non_tensor_batch:
+                test_batch.non_tensor_batch["uid"] = np.array(
+                    [str(uuid.uuid4()) for _ in range(len(test_batch.batch))], dtype=object
+                )
+
+            # repeat test batch
+            test_batch = test_batch.repeat(
+                repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True
+            )
+
+            # we only do test on rule-based rm
+            if self.config.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model":
+                return {}
+
+            # Store original inputs
+            input_ids = test_batch.batch["input_ids"]
+            # TODO: Can we keep special tokens except for padding tokens?
+            input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
+            sample_inputs.extend(input_texts)
+            sample_uids.extend(test_batch.non_tensor_batch["uid"])
+
+            ground_truths = [
+                item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_batch
+            ]
+            sample_gts.extend(ground_truths)
+
+            test_gen_batch = self._get_gen_batch(test_batch)
+            test_gen_batch.meta_info = {
+                "eos_token_id": self.tokenizer.eos_token_id,
+                "pad_token_id": self.tokenizer.pad_token_id,
+                "recompute_log_prob": False,
+                "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
+                "validate": True,
+                "global_steps": self.global_steps,
+            }
+            print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
+
+            # pad to be divisible by dp_size
+            size_divisor = (
+                self.actor_rollout_wg.world_size
+                if not self.async_rollout_mode
+                else self.config.actor_rollout_ref.rollout.agent.num_workers
+            )
+            test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
+            if not self.async_rollout_mode:
+                test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
+            else:
+                test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
+
+            # unpad
+            test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
+
+            print("test generation end")
+
+            # Store generated outputs
+            output_ids = test_output_gen_batch.batch["responses"]
+            output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
+            sample_outputs.extend(output_texts)
+
+            test_batch = test_batch.union(test_output_gen_batch)
+            test_batch.meta_info["validate"] = True
+
+            # evaluate using reward_function
+            if self.val_reward_fn is None:
+                raise ValueError("val_reward_fn must be provided for validation.")
+            result = self.val_reward_fn(test_batch, return_dict=True)
+            reward_tensor = result["reward_tensor"]
+            scores = reward_tensor.sum(-1).cpu().tolist()
+            sample_scores.extend(scores)
+
+            # Always add reward scores to maintain consistency
+            reward_extra_infos_dict["reward"].extend(scores)
+            # print(f"len reward_extra_infos_dict['reward']: {len(reward_extra_infos_dict['reward'])}")
+            
+            # Get current batch size for consistency
+            current_batch_size = len(scores)
+            
+            # Add reward extra info if available
+            if "reward_extra_info" in result:
+                for key, lst in result["reward_extra_info"].items():
+                    reward_extra_infos_dict[key].extend(lst)
+                    # print(f"len reward_extra_infos_dict['{key}']: {len(reward_extra_infos_dict[key])}")
+            
+            # Ensure all existing keys have the same length as the reward list
+            # This handles cases where some keys might not be present in the current result
+            for key in list(reward_extra_infos_dict.keys()):
+                if key != "reward":  # Don't modify reward list
+                    current_key_length = len(reward_extra_infos_dict[key])
+                    expected_length = len(reward_extra_infos_dict["reward"])
+                    
+                    # If this key is shorter than expected, pad with None values
+                    if current_key_length < expected_length:
+                        missing_count = expected_length - current_key_length
+                        if "forward" in key:
+                            reward_extra_infos_dict[key].extend([None] * missing_count)
+                        elif "retro" in key:
+                            # For retro, we pad in the middle
+                            onethird_idx = expected_length // 3
+                            twothird_idx = 2 * expected_length // 3
+                            reward_extra_infos_dict[key] = [None] * onethird_idx + reward_extra_infos_dict[key] + [None] * onethird_idx
+                        elif "reagent" in key:
+                            # For reagent, we pad at the start
+                            reward_extra_infos_dict[key] = [None] * missing_count + reward_extra_infos_dict[key]
+                            
+                        print(f"Padded {key} with {missing_count} None values")
+
+            # collect num_turns of each prompt
+            if "__num_turns__" in test_batch.non_tensor_batch:
+                sample_turns.append(test_batch.non_tensor_batch["__num_turns__"])
+
+            data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
+            # if task_extra_info_key is not None, we use the task as the data source
+            if "extra_info" in test_batch.non_tensor_batch and self.config.data.task_extra_info_key is not None:
+                # extra_info is a numpy array of dictionaries, so we need to extract the task key from each dict
+                extra_info_array = test_batch.non_tensor_batch["extra_info"]
+                task_values = [info.get(self.config.data.task_extra_info_key, "unknown") for info in extra_info_array]
+                task_lst.append(np.array(task_values))
+
+        # self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
+
+        # dump generations
+        test_data_dir = self.config.trainer.get("test_data_dir", None)
+        if test_data_dir:
+            self._dump_generations(
+                inputs=sample_inputs,
+                outputs=sample_outputs,
+                gts=sample_gts,
+                scores=sample_scores,
+                reward_extra_infos_dict=reward_extra_infos_dict,
+                dump_path=test_data_dir,
+            )
+
+        for key_info, lst in reward_extra_infos_dict.items():
+            assert len(lst) == 0 or len(lst) == len(sample_scores), f"{key_info}: {len(lst)=}, {len(sample_scores)=}"
+
+        data_sources = np.concatenate(data_source_lst, axis=0)
+        # if task_extra_info_key is not None, we use the task as the data source
+        if len(task_lst) > 0:
+            data_sources = np.concatenate(task_lst, axis=0)
+        
+        data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
+        metric_dict = {}
+        for data_source, var2metric2val in data_src2var2metric2val.items():
+            core_var = "acc" if "acc" in var2metric2val else "reward"
+            for var_name, metric2val in var2metric2val.items():
+                n_max = max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys()])
+                for metric_name, metric_val in metric2val.items():
+                    if (
+                        (var_name == core_var)
+                        and any(metric_name.startswith(pfx) for pfx in ["mean", "maj", "best"])
+                        and (f"@{n_max}" in metric_name)
+                    ):
+                        metric_sec = "test-core"
+                    else:
+                        metric_sec = "test-aux"
+                    pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
+                    metric_dict[pfx] = metric_val
+
+        if len(sample_turns) > 0:
+            sample_turns = np.concatenate(sample_turns)
+            metric_dict["test-aux/num_turns/min"] = sample_turns.min()
+            metric_dict["test-aux/num_turns/max"] = sample_turns.max()
+            metric_dict["test-aux/num_turns/mean"] = sample_turns.mean()
+
+        return metric_dict
+
     def init_workers(self):
         """Initialize distributed training workers using Ray backend.
 
@@ -1003,11 +1208,15 @@ class RayPPOTrainer:
                 critic_local_path, critic_remote_path, self.global_steps, max_ckpt_to_keep=max_critic_ckpt_to_keep
             )
 
-        # save dataloader
-        local_mkdir_safe(local_global_step_folder)
-        dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
-        dataloader_state_dict = self.train_dataloader.state_dict()
-        torch.save(dataloader_state_dict, dataloader_local_path)
+
+        try:
+            # save dataloader
+            local_mkdir_safe(local_global_step_folder)
+            dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
+            dataloader_state_dict = self.train_dataloader.state_dict()
+            torch.save(dataloader_state_dict, dataloader_local_path)
+        except Exception as e: # For FullyAsyncTrainer, self.train_dataloader may not exist
+            print(f"Warning: failed to save dataloader state dict due to {e}")
 
         # latest checkpointed iteration tracker (for atomic usage)
         local_latest_checkpointed_iteration = os.path.join(

@@ -19,6 +19,7 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import uuid
+from collections import defaultdict
 from copy import deepcopy
 from pprint import pprint
 
@@ -203,6 +204,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         # we start from step 1
         self.global_steps += 1
         last_val_metrics = None
+        last_test_metrics = None
         self.max_steps_duration = 0
 
         prev_step_profile = False
@@ -265,6 +267,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                     self._log_rollout(batch, reward_extra_infos_dict, timing_raw)
 
                 last_val_metrics = self._validate_metrics(is_last_step, last_val_metrics, metrics, timing_raw)
+                last_test_metrics = self._test_metrics(is_last_step, last_test_metrics, metrics, timing_raw)
                 self._check_save_checkpoint(is_last_step, timing_raw)
 
                 with marked_timer("stop_profile", timing_raw):
@@ -300,6 +303,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
 
                 if is_last_step:
                     pprint(f"Final validation metrics: {last_val_metrics}")
+                    pprint(f"Final test metrics: {last_test_metrics}")
                     progress_bar.close()
                     return
 
@@ -347,6 +351,10 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                 future_reward = compute_reward_async.remote(data=batch, reward_fn=self.reward_fn)
             else:
                 reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+                # Append 'None' padding for task-specific extra info
+                tasks = batch.non_tensor_batch['task']
+                reward_extra_infos_dict = self._expand_taskwise_lists(reward_extra_infos_dict, tasks)
+
 
         # recompute old_log_probs
         with marked_timer("old_log_prob", timing_raw, color="blue"):
@@ -476,6 +484,19 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                     last_val_metrics = val_metrics
             metrics.update(val_metrics)
             return last_val_metrics
+    
+    def _test_metrics(self, is_last_step, last_test_metrics, metrics, timing_raw):
+        if (
+            self.val_reward_fn is not None
+            and self.config.trainer.test_freq > 0
+            and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
+        ):
+            with marked_timer("testing", timing_raw, color="green"):
+                test_metrics: dict = self._test()
+                if is_last_step:
+                    last_test_metrics = test_metrics
+            metrics.update(test_metrics)
+            return last_test_metrics
 
     def _check_save_checkpoint(self, is_last_step, timing_raw):
         # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
@@ -526,3 +547,53 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         if hasattr(self.train_dataset, "on_batch_end"):
             # The dataset may be changed after each training batch
             self.train_dataset.on_batch_end(batch=batch)
+
+    def _expand_taskwise_lists(self, reward_extra_infos_dict, tasks, task_names=('forward', 'retro', 'reagent')):
+        """
+        reward_extra_infos_dict의 task-특화(key가 'task/...') 리스트를
+        전체 batch_size 길이로 확장하며, 해당 task 위치에만 값을 채우고
+        나머지는 None으로 채운다. 그 외(예: 'score', 'acc', 'pred')는 그대로 둔다.
+        """
+        # tasks는 np.array나 list 모두 허용
+        tasks_list = list(tasks)
+        batch_size = len(tasks_list)
+        
+        # 각 task별로 나타나는 인덱스 수집
+        task_to_indices = {t: [] for t in task_names}
+        for i, t in enumerate(tasks_list):
+            if t in task_to_indices:
+                task_to_indices[t].append(i)
+
+        out = defaultdict(list)
+        for k, v in reward_extra_infos_dict.items():
+            # 키에서 task 추출: 'task/...' 형태면 task는 첫 세그먼트
+            head = k.split('/', 1)[0]
+            if head in task_to_indices:
+                idxs = task_to_indices[head]
+                expected_len = len(idxs)
+
+                # v가 리스트/배열이라고 가정. 길이 검증(안 맞으면 최대한 안전하게 잘라/패딩)
+                seq = list(v)
+                if len(seq) != expected_len:
+                    # 길이가 다르면 오류보다 관용적으로 맞춰줌
+                    if len(seq) > expected_len:
+                        seq = seq[:expected_len]
+                    else:
+                        seq = seq + [None] * (expected_len - len(seq))
+
+                filled = [None] * batch_size
+                for j, pos in enumerate(idxs):
+                    filled[pos] = seq[j]
+                out[k] = filled
+            else:
+                # 일반 키: 길이가 이미 batch_size면 그대로, 아니면 필요시 패딩/자르기
+                seq = list(v) if hasattr(v, '__len__') and not isinstance(v, (str, bytes)) else [v]
+                if len(seq) == batch_size:
+                    out[k] = seq
+                else:
+                    # 보수적으로 batch_size에 맞춰 자르거나 None 패딩
+                    if len(seq) > batch_size:
+                        out[k] = seq[:batch_size]
+                    else:
+                        out[k] = seq + [None] * (batch_size - len(seq))
+        return out

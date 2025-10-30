@@ -244,6 +244,13 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                 self.logger.log(data=val_data.metrics, step=val_data.param_version)
                 pprint(f"[FullyAsyncTrainer] Initial validation metrics: {val_data.metrics}")
             self.logger.log(data=val_data.timing_raw, step=val_data.param_version)
+        test_data = self.message_queue_client.get_test_sync()
+        if test_data:
+            test_data: ValidateMetrics = ray.cloudpickle.loads(test_data)
+            if test_data.metrics:
+                self.logger.log(data=test_data.metrics, step=test_data.param_version)
+                pprint(f"[FullyAsyncTrainer] Initial test metrics: {test_data.metrics}")
+            self.logger.log(data=test_data.timing_raw, step=test_data.param_version)
 
         # Use queue mode, no need for traditional dataloader iterator
         # Initialize to get the first batch of data
@@ -285,6 +292,16 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                         Validation metrics: {val_data.metrics}"
                     )
                 self.logger.log(data=val_data.timing_raw, step=val_data.param_version)
+            test_data = self.message_queue_client.get_test_sync()
+            if test_data:
+                test_data: ValidateMetrics = ray.cloudpickle.loads(test_data)
+                if test_data.metrics:
+                    self.logger.log(data=test_data.metrics, step=test_data.param_version)
+                    pprint(
+                        f"[FullyAsyncTrainer] parameter version: {test_data.param_version} \
+                        Test metrics: {test_data.metrics}"
+                    )
+                self.logger.log(data=test_data.timing_raw, step=test_data.param_version)
             self.global_steps += 1
 
         # final parameter sync and validate

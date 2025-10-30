@@ -52,7 +52,8 @@ class DAPORewardManager(AbstractRewardManager):
 
     def __call__(self, data: DataProto, return_dict: bool = False):
         """We will expand this function gradually based on the available datasets"""
-
+        if "rm_scores" in data.batch.keys():
+            data.batch.pop("rm_scores") # There is a rm_scores for some reason in the batch. reward model 사용 안하므로 제거
         # If there is rm score, we directly return rm score. Otherwise, we compute via rm_score_fn
         if "rm_scores" in data.batch.keys():
             if return_dict:
@@ -93,6 +94,9 @@ class DAPORewardManager(AbstractRewardManager):
             data_source = data_item.non_tensor_batch[self.reward_fn_key]
 
             extra_info = data_item.non_tensor_batch.get("extra_info", {})
+            task = extra_info['task']
+            reward_extra_info['task'].append(task)
+
 
             rollout_reward_scores = data_item.non_tensor_batch.get("reward_scores", {})
 

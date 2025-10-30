@@ -91,12 +91,13 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
 
         train_dataset = create_rl_dataset(config.data.train_files, config.data, tokenizer, processor)
         val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, processor)
+        test_dataset = create_rl_dataset(config.data.test_files, config.data, tokenizer, processor)
         train_sampler = create_rl_sampler(config.data, train_dataset)
 
         self._validate_config()
         print(f"[FullyAsyncRollouter] Rollouter _create_dataloader...\n{train_dataset}\n{val_dataset}")
 
-        self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+        self._create_dataloader(train_dataset, val_dataset, test_dataset, collate_fn, train_sampler)
 
         # ==================== fully async config ====================
 
@@ -231,6 +232,20 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 timing_raw=timing_raw, metrics=val_metrics, global_steps=global_steps, param_version=version
             )
             await self.message_queue_client.put_validate(ray.cloudpickle.dumps(data))
+            
+            test_metrics = None
+            if (
+                self.val_reward_fn is not None
+                and self.config.rollout.test_freq > 0
+                and self.current_param_version % self.config.rollout.test_freq == 0
+                and self.current_param_version > 0  # don't test here in the initial parameter sync
+            ) or (validate and self.val_reward_fn is not None):
+                with marked_timer("rollouter/test_time", timing_raw, color="green"):
+                    test_metrics: dict = self._test()
+            data = ValidateMetrics(
+                timing_raw=timing_raw, metrics=test_metrics, global_steps=global_steps, param_version=version
+            )
+            await self.message_queue_client.put_test(ray.cloudpickle.dumps(data))
 
             self.version_start_time = time.time()
 

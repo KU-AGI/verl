@@ -386,9 +386,13 @@ class DataProto:
             raise TypeError(f"Indexing with {type(item)} is not supported")
 
     def __getstate__(self):
-        if version.parse(tensordict.__version__) >= version.parse("0.5.0") and self.batch is not None:
+        # if version.parse(tensordict.__version__) >= version.parse("0.5.0") and self.batch is not None:
+        #     batch = self.batch.contiguous().consolidate()
+        # else:
+        #     batch = self.batch
+        try:
             batch = self.batch.contiguous().consolidate()
-        else:
+        except Exception:
             batch = self.batch
 
         if os.getenv("VERL_DATAPROTO_SERIALIZATION_METHOD") == "numpy":

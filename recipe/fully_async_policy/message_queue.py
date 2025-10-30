@@ -38,6 +38,7 @@ class MessageQueue:
         self.current_param_version = 0
 
         self.val_queue = deque()
+        self.test_queue = deque()
 
         try:
             if hasattr(config, "async_training") and config.async_training is not None:
@@ -198,6 +199,17 @@ class MessageQueue:
             else:
                 return None
 
+    async def put_test(self, data):
+        async with self._lock:
+            self.test_queue.append(data)
+
+    async def get_test(self):
+        async with self._lock:
+            if self.test_queue:
+                return self.test_queue.popleft()
+            else:
+                return None
+
 
 class MessageQueueClient:
     """Asyncio-compatible MessageQueue client for communicating with MessageQueue Actor"""
@@ -216,6 +228,13 @@ class MessageQueueClient:
 
     def get_validate_sync(self) -> Any | None:
         return ray.get(self.queue_actor.get_validate.remote())
+    
+    async def put_test(self, data: Any) -> bool:
+        future = self.queue_actor.put_test.remote(data)
+        return await asyncio.wrap_future(future.future())
+
+    def get_test_sync(self) -> Any | None:
+        return ray.get(self.queue_actor.get_test.remote())
 
     async def get_sample(self) -> Any | None:
         """Get single sample from queue, wait until one is available (async)"""

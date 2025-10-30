@@ -15,18 +15,18 @@ kl_coef=0.0
 use_kl_loss=False
 kl_loss_coef=0.0
 
-enable_filter_groups=True
+enable_filter_groups=False
 # filter_groups_metric=acc
 filter_groups_metric=seq_final_reward
 max_num_gen_batches=0
 
 train_prompt_bsz=0
 gen_prompt_bsz=1
-n_resp_per_prompt=16
+n_resp_per_prompt=8
 train_prompt_mini_bsz=32
 total_rollout_steps=$(((512*400)))
-test_freq=10
-staleness_threshold=0
+test_freq=30
+staleness_threshold=0.0
 trigger_parameter_sync_step=16
 partial_rollout=False
 
@@ -55,6 +55,13 @@ python -m recipe.fully_async_policy.fully_async_main \
     data.val_files="${VAL_FILE}" \
     data.gen_batch_size=${gen_prompt_bsz} \
     data.return_raw_chat=${return_raw_chat} \
+    data.task_extra_info_key=task \
+    data.validation_shuffle=False \
+    data.test_shuffle=False \
+    data.prompt_key=prompt \
+    data.truncation='left' \
+    data.max_prompt_length=300 \
+    data.max_response_length=1700 \
     algorithm.adv_estimator=${adv_estimator} \
     algorithm.use_kl_in_reward=${use_kl_in_reward} \
     algorithm.kl_ctrl.kl_coef=${kl_coef} \
@@ -65,8 +72,11 @@ python -m recipe.fully_async_policy.fully_async_main \
     actor_rollout_ref.actor.use_dynamic_bsz=${use_dynamic_bsz} \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=16 \
     actor_rollout_ref.actor.optim.weight_decay=0.1 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=16 \
+    actor_rollout_ref.actor.fsdp_config.param_offload=True \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
     actor_rollout_ref.hybrid_engine=False \
     actor_rollout_ref.ref.log_prob_use_dynamic_bsz=${use_dynamic_bsz} \
     actor_rollout_ref.rollout.n=${n_resp_per_prompt} \
