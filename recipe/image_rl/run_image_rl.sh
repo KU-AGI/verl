@@ -11,10 +11,9 @@ exec > >(tee -a "${SCRIPT_LOG}")
 exec 2>&1
 
 # export VLLM_ATTENTION_BACKEND=XFORMERS
-export CUDA_VISIBLE_DEVICES=0,1,2,3
 export HYDRA_FULL_ERROR=1
 
-GPUS=4 # `nvidia-smi -L | wc -l`
+GPUS=2 # `nvidia-smi -L | wc -l`
 MODEL_PATH=/data/mllm/ckpt/pretrained # /data/mllm/checkpoints/Janus-Pro-7B
 # RM_MODEL_PATH=OpenGVLab/InternVL3_5-38B
 TRAIN_FILES=/data/mllm/data/train.parquet
@@ -23,15 +22,16 @@ RUN_NAME=debug
 PROJ_NAME=mllm_reasoning
 SAVE_DIR=/data/verl/ckpts/$PROJ_NAME/$RUN_NAME
 
-RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8266"}
+# pip install attrdict timm
+RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
 WORKING_DIR=${WORKING_DIR:-"${PWD}"}
 RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/verl/trainer/runtime_env.yaml"}
 
 # Parameters
-train_prompt_bsz=4
-val_prompt_bsz=4
-n_resp_per_prompt=4
-train_prompt_mini_bsz=4
+train_prompt_bsz=8
+val_prompt_bsz=8
+n_resp_per_prompt=8
+train_prompt_mini_bsz=8
 
 max_prompt_length=$((1024 * 1)) # 1k
 max_response_length=$((1024 * 1)) # 1k
@@ -78,9 +78,10 @@ python3 -m recipe.image_rl.main_image_generation_rl \
     actor_rollout_ref.rollout.cfg_weight=5.0 \
     actor_rollout_ref.rollout.n=${n_resp_per_prompt} \
     actor_rollout_ref.rollout.feedback_system_prompt="You should give me a feedback on the image generation." \
-    actor_rollout_ref.rollout.refine_system_prompt="You should refine the image generation." \
+    actor_rollout_ref.rollout.regen_system_prompt="You should refine the image generation." \
     actor_rollout_ref.rollout.image_token_num_per_image=576 \
-    actor_rollout_ref.rollout.max_reflect_len=1024 \
+    actor_rollout_ref.rollout.prompt_length=1024 \
+    actor_rollout_ref.rollout.response_length=1024 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.ref.fsdp_config.param_offload=False \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
@@ -105,6 +106,6 @@ python3 -m recipe.image_rl.main_image_generation_rl \
     custom_reward_function.path=recipe/image_rl/reward_function.py \
     custom_reward_function.name=compute_score \
     reward_model.reward_kwargs.img_saving.save_freq=1 \
-    reward_model.reward_kwargs.img_saving.num=4 \
+    reward_model.reward_kwargs.img_saving.num=2 \
     reward_model.reward_kwargs.img_saving.path=/data/verl/$PROJ_NAME/$RUN_NAME/rollout \
     reward_model.reward_kwargs.img_saving.experiment_name=$RUN_NAME
