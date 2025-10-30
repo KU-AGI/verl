@@ -59,16 +59,11 @@ class ImageGenerationRewardManager:
 
     def save_img(self, data: DataProto):
         """Save images from meta_info lists."""
-        # Get lists from meta_info
-        if not hasattr(data, "meta_info"):
-            print("[SAVE] No meta_info found, skipping save")
-            return
-        
         prompt_id = data.non_tensor_batch.get('prompt_id', [])
         prompt = data.non_tensor_batch.get('prompt', [])
-        gen_imgs_pil_list = data.meta_info.get('gen_imgs_pil_list', [])
-        regen_imgs_pil_list = data.meta_info.get('regen_imgs_pil_list', [])
-        feedback_texts = data.meta_info.get('feedback_texts', [])
+        gen_imgs_pil_list = data.non_tensor_batch.get('task1_gen_imgs_pil_list', [])
+        feedback_texts = data.non_tensor_batch.get('task2_feedback_texts', [])
+        regen_imgs_pil_list = data.non_tensor_batch.get('task3_regen_imgs_pil_list', [])
         ground_truth = data.non_tensor_batch.get('reward_model', {})
 
         step_dir = os.path.join(self.save_path, str(self.steps))
@@ -116,13 +111,13 @@ class ImageGenerationRewardManager:
         
         print(f"[SAVE] Saved {min(len(prompt), len(gen_imgs_pil_list), len(feedback_texts), len(regen_imgs_pil_list), len(ground_truth), self.save_num)} samples to {step_dir}")
 
-    def verify(self, data: DataProto) -> List[dict]:
+    def verify(self, data: DataProto, task_id: int) -> List[dict]:
         """Verify and compute scores for batch."""
-        # Get lists from meta_info
+        # Get lists from non_tensor_batch
         prompt = data.non_tensor_batch.get('prompt', [])
-        gen_imgs_pil_list = data.meta_info.get('gen_imgs_pil_list', [])
-        regen_imgs_pil_list = data.meta_info.get('regen_imgs_pil_list', [])
-        feedback_texts = data.meta_info.get('feedback_texts', [])
+        gen_imgs_pil_list = data.non_tensor_batch.get('task1_gen_imgs_pil_list', [])
+        feedback_texts = data.non_tensor_batch.get('task2_feedback_texts', [])
+        regen_imgs_pil_list = data.non_tensor_batch.get('task3_regen_imgs_pil_list', [])
         ground_truth = data.non_tensor_batch.get('reward_model', {})
         
         print(f"[VERIFY] Processing batch of {len(prompt)} samples")
@@ -132,43 +127,35 @@ class ImageGenerationRewardManager:
         for i in range(len(data)):
             score_result = self.compute_score(
                 prompt=prompt[i],
-                gen_img_pixel_values=gen_imgs_pil_list[i] if i < len(gen_imgs_pil_list) else None,
+                gen_img=gen_imgs_pil_list[i] if i < len(gen_imgs_pil_list) else None,
                 feedback_text=feedback_texts[i] if i < len(feedback_texts) else "",
-                regen_img_pixel_values=regen_imgs_pil_list[i] if i < len(regen_imgs_pil_list) else None,
+                regen_img=regen_imgs_pil_list[i] if i < len(regen_imgs_pil_list) else None,
                 ground_truth=ground_truth[i]["ground_truth"],
                 extra_info=data.non_tensor_batch.get("extra_info", {}),
+                task_id=task_id,
                 **self.reward_kwargs,
             )
             scores.append(score_result)
         
         return scores
 
-    def __call__(self, data: DataProto, return_dict: bool = False, eval: bool = False):
+    def __call__(self, data: DataProto, task_id: int = 1, eval: bool = False, return_dict: bool = True):
         """Main reward computation with batch processing."""
         
-        # # Save generated images periodically
-        # if self.save_freq > 0 and self.steps % self.save_freq == 0:
-        #     self.save_path = os.path.join(self.save_path, "eval" if eval else "train")
-        #     os.makedirs(self.save_path, exist_ok=True)
-        #     self.save_img(data)
-        #     print(f"[SAVE] Saving images to {self.save_path}")
+        # Save generated images periodically
+        if self.save_freq > 0 and self.steps % self.save_freq == 0:
+            self.save_path = os.path.join(self.save_path, "eval" if eval else "train")
+            os.makedirs(self.save_path, exist_ok=True)
+            self.save_img(data)
+            print(f"[SAVE] Saving images to {self.save_path}")
 
         if not eval:
             self.steps += 1
 
-        # If rm_scores already computed, return directly
-        if "rm_scores" in data.batch.keys():
-            if return_dict:
-                reward_extra_keys = data.meta_info.get("reward_extra_keys", [])
-                reward_extra_info = {key: data.non_tensor_batch[key] for key in reward_extra_keys}
-                return {"reward_tensor": data.batch["rm_scores"], "reward_extra_info": reward_extra_info}
-            else:
-                return data.batch["rm_scores"]
-
         print(f"[REWARD] Computing rewards for batch_size={len(data)}")
         
         # Initialize reward tensor
-        device = data.meta_info["task1_input_ids"].device
+        device = data.batch["task1_input_ids"].device
         reward_tensor = torch.zeros(len(data), dtype=torch.float32, device=device)
         reward_extra_info = defaultdict(list)
         
@@ -178,7 +165,7 @@ class ImageGenerationRewardManager:
         data_sources = data.non_tensor_batch.get(self.reward_fn_key, ["unknown"] * len(data))
         
         # Compute scores
-        scores = self.verify(data)
+        scores = self.verify(data, task_id)
         rewards = []
         already_printed = {}
 
@@ -215,6 +202,6 @@ class ImageGenerationRewardManager:
         print(f"[REWARD] Computed {len(rewards)} rewards, mean={sum(rewards)/len(rewards):.4f}")
 
         if return_dict:
-            return {"reward_tensor": reward_tensor, "reward_extra_info": reward_extra_info}
+            return {f"task{task_id}_reward_tensor": reward_tensor, "task{task_id}_reward_extra_info": reward_extra_info}
         else:
             return reward_tensor
