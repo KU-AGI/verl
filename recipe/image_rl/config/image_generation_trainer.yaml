@@ -23,10 +23,11 @@ actor_rollout_ref:
     img_top_p: 1.0
     name: image_unified
     mode: sync
+    prompt_length: 1024
+    response_length: 1024
     feedback_system_prompt: "You should give me a feedback on the image generation."
-    refine_system_prompt: "You should refine the image generation."
+    regen_system_prompt: "You should refine the image generation."
     image_token_num_per_image: 576
-    max_reflect_len: 1024
 
 reward_model:
   reward_manager: image_generation

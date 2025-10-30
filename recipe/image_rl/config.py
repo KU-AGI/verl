@@ -29,9 +29,8 @@ class ImageGenerationRolloutConfig(RolloutConfig):
     img_top_p: float = 1.0
 
     feedback_system_prompt : Optional[str] = None
-    refine_system_prompt : Optional[str] = None
+    regen_system_prompt : Optional[str] = None
     image_token_num_per_image: int = 576
-    max_reflect_len: int = 1024
 
 
 @dataclass
