@@ -619,32 +619,33 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                     batch = batch.union(gen_batch_output)
 
                     # compute global_valid tokens
-                    batch.meta_info["global_token_num"] = batch.meta_info["task1_attention_mask"].sum(dim=-1) + batch.meta_info["task1_response_mask"].sum(dim=-1) + batch.meta_info["task2_attention_mask"].sum(dim=-1) + batch.meta_info["task2_response_mask"].sum(dim=-1) + batch.meta_info["task3_attention_mask"].sum(dim=-1) + batch.meta_info["task3_response_mask"].sum(dim=-1)
+                    batch.meta_info["global_token_num"] = batch.batch["task1_attention_mask"].sum(dim=-1) + batch.batch["task1_response_mask"].sum(dim=-1) + batch.batch["task2_attention_mask"].sum(dim=-1) + batch.batch["task2_response_mask"].sum(dim=-1) + batch.batch["task3_attention_mask"].sum(dim=-1) + batch.batch["task3_response_mask"].sum(dim=-1)
 
                     for task_id in [1, 2, 3]:
                         
-                        if "attention_mask" not in batch.batch.keys():
-                            batch.batch["attention_mask"] = torch.cat(batch.batch[f"task{task_id}_attention_mask"], batch.batch[f"task{task_id}_response_mask"], dim=1)
+                        batch.batch["attention_mask"] = torch.cat([batch.batch[f"task{task_id}_attention_mask"], batch.batch[f"task{task_id}_response_mask"]], dim=1)
 
                         if self.config.trainer.balance_batch:
                             self._balance_batch(batch, metrics=metrics) 
 
                         with marked_timer("reward", timing_raw, color="yellow"):
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn, task_id)
+                            batch.batch["task_id"] = torch.tensor([task_id for _ in range(len(batch))], dtype=int)
 
                         # recompute old_log_probs
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
-                            old_log_prob = self.actor_rollout_wg.compute_log_prob(batch, task_id)
+                            old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
                             entropys = old_log_prob.batch[f"task{task_id}_entropys"]
                             response_masks = batch.batch[f"task{task_id}_response_mask"]
+                            
                             loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
                             entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
                             old_log_prob_metrics = {f"actor/task{task_id}_entropy": entropy_agg.detach().item()}
                             metrics.update(old_log_prob_metrics)
-                            old_log_prob.batch.pop(f"task{task_id}_entropy")
+                            old_log_prob.batch.pop(f"task{task_id}_entropys")
                             batch = batch.union(old_log_prob)
 
-                            if "rollout_log_probs" in batch.batch.keys():
+                            if f"task{task_id}_rollout_log_probs" in batch.batch.keys():
                                 # TODO: we may want to add diff of probs too.
                                 from verl.utils.debug.metrics import calculate_debug_metrics
 
@@ -686,30 +687,30 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                                 config=self.config.algorithm,
                                 task_id=task_id
                             )
+
+                        # update critic
+                        if self.use_critic:
+                            with marked_timer("update_critic", timing_raw, color="pink"):
+                                critic_output = self.critic_wg.update_critic(batch)
+                            critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
+                            metrics.update(critic_output_metrics)
+
+                        # implement critic warmup
+                        if self.config.trainer.critic_warmup <= self.global_steps:
+                            # update actor
+                            with marked_timer("update_actor", timing_raw, color="red"):
+                                batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+                                actor_output = self.actor_rollout_wg.update_actor(batch)
+                            actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                            metrics.update(actor_output_metrics)
+
+                        # Log rollout generations if enabled
+                        rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+                        if rollout_data_dir:
+                            self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
                         
                         # Remove universal keys from batch
-                        batch.pop(batch_keys=["attention_mask", f"task{task_id}_response_mask"])
-
-                    # update critic
-                    if self.use_critic:
-                        with marked_timer("update_critic", timing_raw, color="pink"):
-                            critic_output = self.critic_wg.update_critic(batch)
-                        critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
-                        metrics.update(critic_output_metrics)
-
-                    # implement critic warmup
-                    if self.config.trainer.critic_warmup <= self.global_steps:
-                        # update actor
-                        with marked_timer("update_actor", timing_raw, color="red"):
-                            batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
-                            actor_output = self.actor_rollout_wg.update_actor(batch)
-                        actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
-                        metrics.update(actor_output_metrics)
-
-                    # Log rollout generations if enabled
-                    rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
-                    if rollout_data_dir:
-                        self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
+                        batch.pop(batch_keys=["attention_mask", "task_id"])
 
                 # validate
                 if (

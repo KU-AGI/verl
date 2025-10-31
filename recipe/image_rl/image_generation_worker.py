@@ -770,7 +770,7 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="red", role="actor_update")
-    def update_actor(self, data: DataProto, task_id: int = 1):
+    def update_actor(self, data: DataProto):
         assert self._is_actor
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
@@ -782,7 +782,7 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
 
             # perform training
             with Timer(name="update_policy", logger=None) as timer:
-                metrics = self.actor.update_policy(data=data, task_id=task_id)
+                metrics = self.actor.update_policy(data=data)
             delta_time = timer.last
             global_num_tokens = data.meta_info["global_token_num"]
             estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
@@ -857,7 +857,7 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="blue", role="actor_compute_log_prob")
-    def compute_log_prob(self, data: DataProto, task_id: int = 1):
+    def compute_log_prob(self, data: DataProto):
         # when is_lora is True, we use the actor without lora applied to calculate the log_prob
         # which is mostly used for ref log_prob calculation
         assert self._is_actor
@@ -877,7 +877,8 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
         # perform recompute log_prob
         with self.ulysses_sharding_manager:
             with adapter_ctx:
-                output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True, task_id=task_id)
+                output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+            task_id = data.batch["task_id"].view(-1)[0].item()
             output = DataProto.from_dict(
                 tensors={f"task{task_id}_old_log_probs": output, f"task{task_id}_entropys": entropys},
                 meta_info={"temperature": self.config.rollout.temperature},

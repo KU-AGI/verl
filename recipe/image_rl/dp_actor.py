@@ -3,10 +3,6 @@ import os
 
 import torch
 
-import logging
-import os
-
-import torch
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.tensor import DTensor
@@ -34,6 +30,7 @@ from verl.workers.actor import BasePPOActor
 from verl.workers.config import ActorConfig
 import contextlib
 from recipe.image_rl.utils import FormattingEvaluator
+from typing import List
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -110,7 +107,7 @@ class DataParallelImageGenerationActor(BasePPOActor):
 
         batch_size = text_embeds.size(0)
         num_img = len(all_image_start_indices[0])
-        reshape_image_embeds = image_embeds.view(-1, num_img, self.image_token_num_per_image, image_embeds.size(-1))
+        reshape_image_embeds = image_embeds.view(-1, num_img, self.processor.num_image_tokens, image_embeds.size(-1))
 
         assert text_embeds.size(0) == reshape_image_embeds.size(0) == len(all_image_start_indices)
 
@@ -119,7 +116,7 @@ class DataParallelImageGenerationActor(BasePPOActor):
         for i in range(batch_size):
             for j in range(num_img):
                 start_idx = all_image_start_indices[i][j]
-                end_idx = start_idx + self.image_token_num_per_image
+                end_idx = start_idx + self.processor.num_image_tokens
                 merged_embeds[i, start_idx:end_idx] = reshape_image_embeds[i, j]
     
         return merged_embeds
@@ -138,7 +135,7 @@ class DataParallelImageGenerationActor(BasePPOActor):
 
         with param_ctx:
             with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
-                
+                entropy = None
                 if task_id == 1:
                     # Task 1: Image Generation: input
                     task1_input_ids = micro_batch["task1_input_ids"]
@@ -153,7 +150,7 @@ class DataParallelImageGenerationActor(BasePPOActor):
                     task1_image_ids = all_image_ids[2]
                     task1_image_ids = task1_image_ids.view(gen_imgs_pixel_values.size(0), -1)
 
-                    task1_gen_img_embeds = self.actor_module.gen_aligner(self.module.gen_embed(task1_image_ids))
+                    task1_gen_img_embeds = self.actor_module.gen_aligner(self.actor_module.gen_embed(task1_image_ids))
                     
                     # Labels
                     gen_img_tokens = micro_batch["task1_gen_img_tokens"]
@@ -166,34 +163,34 @@ class DataParallelImageGenerationActor(BasePPOActor):
                         inputs_embeds=torch.cat([task1_input_embeds.to(self.device_name), task1_gen_img_embeds.to(self.device_name)], dim=1),
                         attention_mask=torch.cat([task1_attention_mask.to(self.device_name), task1_response_mask.to(self.device_name)], dim=1),
                     )  # prevent model thinks we are generating
-
-                    # Response masking until EOS tokens
-                    eos_pos = (task1_response_mask == self.tokenizer.eos_token_id).nonzero(as_tuple=True)[1]
-                    task1_response_mask = task1_response_mask[:, :eos_pos[0]]
                     
                     task1_logits = self.actor_module.gen_head(task1_output.last_hidden_state)
                     task1_response_length = task1_response_mask.size(1)
                     task1_logits = task1_logits[:, -task1_response_length - 1 : -1, :]
 
-                    task1_log_probs = logprobs_from_logits(task1_logits, gen_img_tokens.to(self.device_name))
+                    log_probs = logprobs_from_logits(task1_logits, gen_img_tokens.to(self.device_name))
 
                     if calculate_entropy:
                         if not self.config.entropy_checkpointing:
-                            task1_entropy = verl_F.entropy_from_logits(task1_logits)  # (bsz, gen_img_tokens)
+                            entropy = verl_F.entropy_from_logits(task1_logits)  # (bsz, gen_img_tokens)
                         else:
-                            task1_entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, task1_logits)
-                    return task1_entropy, task1_log_probs
+                            entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, task1_logits)
+                    return entropy, log_probs
 
-                if task_id == 2:
+                elif task_id == 2:
                     # Task 2: Feedback Generation: input
                     task2_input_ids = micro_batch["task2_input_ids"]
                     task2_attention_mask = micro_batch["task2_attention_mask"]
 
+                    gen_imgs_pixel_values = micro_batch["task1_gen_imgs_pixel_values"]
+
                     task2_text_embeds = self.actor_module.language_model.get_input_embeddings()(task2_input_ids)
                     task2_image_embeds = self.actor_module.aligner(self.actor_module.vision_model(gen_imgs_pixel_values))
 
-                    task2_image_mask = (task2_input_ids == self.processor.image_id)
-                    task2_merged_embeds = torch.where(task2_image_mask.unsqueeze(-1), task2_image_embeds.unsqueeze(-1), task2_text_embeds.clone())
+                    image_token_pos = (task2_input_ids[0] == self.processor.image_id).nonzero(as_tuple=False)[0].item()
+                    task2_image_start_indices = [[image_token_pos]]
+
+                    task2_merged_embeds = self.merge_text_and_image_embeds(task2_text_embeds, task2_image_embeds, task2_image_start_indices)
                     
                     # Task 2: Feedback Generation: output
                     feedback_ids = micro_batch["task2_feedback_ids"]
@@ -208,33 +205,33 @@ class DataParallelImageGenerationActor(BasePPOActor):
                         attention_mask=torch.cat([task2_attention_mask.to(self.device_name), task2_response_mask.to(self.device_name)], dim=1),
                     )  # prevent model thinks we are generating
 
-                    # Response masking until EOS tokens
-                    eos_pos = (task2_response_mask == self.tokenizer.eos_token_id).nonzero(as_tuple=True)[1]
-                    task2_response_mask = task2_response_mask[:, :eos_pos[0]]
-                    
                     task2_logits = task2_output.logits
                     task2_response_length = task2_response_mask.size(1)
                     task2_logits = task2_logits[:, -task2_response_length - 1 : -1, :]
 
-                    task2_log_probs = logprobs_from_logits(task2_logits, feedback_ids.to(self.device_name))
+                    log_probs = logprobs_from_logits(task2_logits, feedback_ids.to(self.device_name))
 
                     if calculate_entropy:
                         if not self.config.entropy_checkpointing:
-                            task2_entropy = verl_F.entropy_from_logits(task2_logits)  # (bsz, feedback_ids)
+                            entropy = verl_F.entropy_from_logits(task2_logits)  # (bsz, feedback_ids)
                     else:
-                        task2_entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, task2_logits)
-                    return task2_entropy, task2_log_probs
+                        entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, task2_logits)
+                    return entropy, log_probs
 
-                if task_id == 3:
+                elif task_id == 3:
                     # Task 3: Regen Image Generation: input
                     task3_input_ids = micro_batch["task3_input_ids"]
                     task3_attention_mask = micro_batch["task3_attention_mask"]
-                    
+
+                    gen_imgs_pixel_values = micro_batch["task1_gen_imgs_pixel_values"]
+
                     task3_text_embeds = self.actor_module.language_model.get_input_embeddings()(task3_input_ids)
                     task3_image_embeds = self.actor_module.aligner(self.actor_module.vision_model(gen_imgs_pixel_values))
 
-                    task3_image_mask = (task3_input_ids == self.processor.image_id)
-                    task3_merged_embeds = torch.where(task3_image_mask.unsqueeze(-1), task3_image_embeds.unsqueeze(-1), task3_text_embeds.clone())
+                    image_token_pos = (task3_input_ids[0] == self.processor.image_id).nonzero(as_tuple=False)[0].item()
+                    task3_image_start_indices = [[image_token_pos]]
+
+                    task3_merged_embeds = self.merge_text_and_image_embeds(task3_text_embeds, task3_image_embeds, task3_image_start_indices)
 
                     # Task 3: Regen Image Generation: output
                     regen_imgs_pixel_values = micro_batch["task3_regen_imgs_pixel_values"]
@@ -244,7 +241,7 @@ class DataParallelImageGenerationActor(BasePPOActor):
                     task3_image_ids = all_image_ids[2]
                     task3_image_ids = task3_image_ids.view(regen_imgs_pixel_values.size(0), -1)
 
-                    task3_regen_img_embeds = self.actor_module.gen_aligner(self.module.gen_embed(task3_image_ids))
+                    task3_regen_img_embeds = self.actor_module.gen_aligner(self.actor_module.gen_embed(task3_image_ids))
 
                     # Labels
                     regen_img_tokens = micro_batch["task3_regen_img_tokens"]
@@ -258,22 +255,18 @@ class DataParallelImageGenerationActor(BasePPOActor):
                         attention_mask=torch.cat([task3_attention_mask.to(self.device_name), task3_response_mask.to(self.device_name)], dim=1),
                     )  # prevent model thinks we are generating
 
-                    # Response masking until EOS tokens
-                    eos_pos = (task3_response_mask == self.tokenizer.eos_token_id).nonzero(as_tuple=True)[1]
-                    task3_response_mask = task3_response_mask[:, :eos_pos[0]]
-                    
                     task3_logits = self.actor_module.gen_head(task3_output.last_hidden_state)
                     task3_response_length = task3_response_mask.size(1)
                     task3_logits = task3_logits[:, -task3_response_length - 1 : -1, :]
 
-                    task3_log_probs = logprobs_from_logits(task3_logits, regen_img_tokens.to(self.device_name))
+                    log_probs = logprobs_from_logits(task3_logits, regen_img_tokens.to(self.device_name))
 
                     if calculate_entropy:
                         if not self.config.entropy_checkpointing:
-                            task3_entropy = verl_F.entropy_from_logits(task3_logits)  # (bsz, regen_img_tokens)
+                            entropy = verl_F.entropy_from_logits(task3_logits)  # (bsz, regen_img_tokens)
                         else:
-                            task3_entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, task3_logits)
-                    return task3_entropy, task3_log_probs 
+                            entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, task3_logits)
+                    return entropy, log_probs 
 
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
@@ -297,7 +290,7 @@ class DataParallelImageGenerationActor(BasePPOActor):
         return grad_norm
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
-    def compute_log_prob(self, data: DataProto, calculate_entropy=False, task_id: int = 1) -> torch.Tensor:
+    def compute_log_prob(self, data: DataProto, calculate_entropy=False) -> torch.Tensor:
         """Compute the log probability of the responses given input_ids, attention_mask and position_ids
 
         Args:
@@ -322,19 +315,21 @@ class DataParallelImageGenerationActor(BasePPOActor):
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
-        
+
+        task_id = data.batch["task_id"].view(-1)[0].item()
+
         # batch_keys
         select_batch_keys = [
             "task1_input_ids", "task1_attention_mask", "task1_gen_imgs_pixel_values", "task1_gen_img_tokens", "task1_response_mask",
             "task2_input_ids", "task2_attention_mask", "task2_feedback_ids", "task2_response_mask",
-            "task3_input_ids", "task3_attention_mask", "task3_regen_imgs_pixel_values", "task3_regen_img_tokens", "task3_response_mask"
+            "task3_input_ids", "task3_attention_mask", "task3_regen_imgs_pixel_values", "task3_regen_img_tokens", "task3_response_mask",
+            "task_id"
         ]
-        task_select_batch_keys = [key for key in select_batch_keys if str(task_id) in key]
 
         # non_tensor_batch_keys
         non_tensor_batch_keys = ["task2_feedback_texts"]
 
-        data = data.select(batch_keys=task_select_batch_keys, non_tensor_batch_keys=non_tensor_batch_keys)
+        data = data.select(batch_keys=select_batch_keys, non_tensor_batch_keys=non_tensor_batch_keys)
 
         if use_dynamic_bsz:
             max_token_len = data.meta_info["max_token_len"] * self.ulysses_sequence_parallel_size
@@ -345,10 +340,11 @@ class DataParallelImageGenerationActor(BasePPOActor):
         log_probs_lst = []
         entropy_lst = []
         for micro_batch in micro_batches:
-            seq_len = micro_batch["task1_response_mask"].size(1)
             micro_batch = micro_batch.to(get_device_id())
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
-            
+            response_mask = model_inputs[f"task{task_id}_response_mask"]
+            seq_len = response_mask.size(1)
+
             # ### task2 -> 3 jump
             # micro_batch_feedback_text = model_inputs["task2_feedback_texts"]
             # feedback = self.formatter._split_text_into_parts(micro_batch_feedback_text)[-1]
@@ -379,36 +375,33 @@ class DataParallelImageGenerationActor(BasePPOActor):
         return log_probs, entropys
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
-    def update_policy(self, data: DataProto, task_id: int = 1):
+    def update_policy(self, data: DataProto):
         # make sure we are in training mode
         self.actor_module.train()
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
 
+        task_id = data.batch["task_id"].view(-1)[0].item()
+
         # batch_keys
         select_batch_keys = [
             "task1_input_ids", "task1_attention_mask", "task1_gen_imgs_pixel_values", "task1_gen_img_tokens", "task1_response_mask",
             "task2_input_ids", "task2_attention_mask", "task2_feedback_ids", "task2_response_mask",
-            "task3_input_ids", "task3_attention_mask", "task3_regen_imgs_pixel_values", "task3_regen_img_tokens", "task3_response_mask"
+            "task3_input_ids", "task3_attention_mask", "task3_regen_imgs_pixel_values", "task3_regen_img_tokens", "task3_response_mask",
             "task1_old_log_probs", "task2_old_log_probs", "task3_old_log_probs",
-            "task1_advantages", "task2_advantages", "task2_advantages",
+            "task1_advantages", "task2_advantages", "task3_dvantages",
+            "task_id"
         ]
         task_select_batch_keys = [key for key in select_batch_keys if str(task_id) in key]
 
-        # non_tensor_batch_keys
-        non_tensor_batch_keys = ["task2_feedback_texts"]
-
         if self.config.use_kl_loss:
             task_select_batch_keys.append(f"task{task_id}_ref_log_prob")
-        if self.config.tis_imp_ratio_cap > 0:
-            assert f"{task_id}_rollout_log_probs" in data.batch.keys(), (
-                "Truncated Importance Sampling (TIS) requires to configure "
-                "`actor_rollout_ref.rollout.calculate_log_probs=True` "
-                "and is not currently supported in Server mode (agent loop)."
-            )
-            task_select_batch_keys.append(f"task{task_id}_rollout_log_probs")
+        # Include pre-computed IS weights if present in batch
+        # Weights are computed centrally in trainer and added to batch when algorithm.rollout_is=True
+        if "rollout_is_weights" in data.batch.keys():
+            task_select_batch_keys.append("rollout_is_weights")
 
-        data = data.select(meta_info_keys=task_select_batch_keys, non_tensor_batch_keys=non_tensor_batch_keys)
+        data = data.select(meta_info_keys=task_select_batch_keys)
 
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
@@ -434,10 +427,10 @@ class DataParallelImageGenerationActor(BasePPOActor):
                     micro_batch = micro_batch.to(get_device_id())
                     micro_batch_metrics = {}
                     model_inputs = {**micro_batch.batch}
-                    response_mask = model_inputs[f"task{task_id}_response_mask"]
+
                     old_log_prob = model_inputs[f"task{task_id}_old_log_probs"]
-                    rollout_log_probs = model_inputs[f"task{task_id}_rollout_log_probs"] if self.config.tis_imp_ratio_cap > 0 else None
                     advantages = model_inputs[f"task{task_id}_advantages"]
+                    response_mask = model_inputs[f"task{task_id}_response_mask"]
 
                     entropy_coeff = self.config.entropy_coeff
                     loss_agg_mode = self.config.loss_agg_mode
@@ -455,16 +448,32 @@ class DataParallelImageGenerationActor(BasePPOActor):
                         model_inputs, temperature=temperature, calculate_entropy=calculate_entropy, task_id=task_id
                     )
 
-                    if on_policy:
-                        old_log_prob = log_prob.detach()
+                    # for fully_async_policy recipe
+                    if hasattr(self.config, "use_rollout_log_probs") and self.config.use_rollout_log_probs:
+                        old_log_prob = model_inputs["old_log_probs"]
                     else:
-                        old_log_prob = model_inputs[f"task{task_id}_old_log_probs"]
+                        if on_policy:
+                            old_log_prob = log_prob.detach()
+                        else:
+                            old_log_prob = model_inputs[f"task{task_id}_old_log_probs"]
 
                     loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
                     # vanilla -> verl.trainer.ppo.core_algos.compute_policy_loss_vanilla
+
+                    # Extract pre-computed rollout importance sampling weights if present
+                    # Weights are computed centrally in trainer and added when algorithm.rollout_is=True
+                    rollout_is_weights = model_inputs.get("rollout_is_weights", None)
+
+                    # NOTE: Both mismatch diagnostic metrics (PPL, KL, etc.) and IS weight metrics
+                    # are computed centrally in ray_trainer.py for consistency and efficiency.
+                    # This ensures metrics are computed uniformly across all batches at the trainer level
+                    # and avoids redundant computation across workers and micro-batches.
+
                     # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
                     # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
                     policy_loss_fn = get_policy_loss_fn(loss_mode)
+
+                    # Compute policy loss (all functions return 4 values)
                     pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
                         old_log_prob=old_log_prob,
                         log_prob=log_prob,
@@ -472,7 +481,7 @@ class DataParallelImageGenerationActor(BasePPOActor):
                         response_mask=response_mask,
                         loss_agg_mode=loss_agg_mode,
                         config=self.config,
-                        rollout_log_probs=rollout_log_probs,
+                        rollout_is_weights=rollout_is_weights,
                     )
 
                     if entropy_coeff != 0:
@@ -500,7 +509,12 @@ class DataParallelImageGenerationActor(BasePPOActor):
                         loss = policy_loss * loss_scale_factor
                     else:
                         loss = policy_loss * loss_scale_factor
-                    loss.backward()
+                    # breakpoint()
+                    # loss.backward()
+                    try:
+                        loss.backward()
+                    except Exception as e:
+                        print(f"backward() failed: {e}")
 
                     micro_batch_metrics.update(
                         {

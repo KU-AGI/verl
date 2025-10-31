@@ -1,3 +1,4 @@
+import os
 from concurrent.futures import ThreadPoolExecutor
 from this import d
 from time import sleep
@@ -17,7 +18,7 @@ API_KEY = "EMPTY"
 MAX_RETRIES = 3
 BASE_DELAY = 2
 MAX_WORKERS = 32
-MODEL_NAME = "OpenGVLab/InternVL3_5-38B"
+MODEL_NAME = os.environ.get("RM_MODEL_PATH", "OpenGVLab/InternVL3_5-38B")
 
 client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
 

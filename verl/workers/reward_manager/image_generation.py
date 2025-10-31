@@ -88,24 +88,24 @@ class ImageGenerationRewardManager:
                 # Save generated image
                 if i < len(gen_imgs_pil_list):
                     save_path = os.path.join(step_dir, f"img_{prompt_id}_{i}.png")
-                    gen_imgs_pil_list[i].save(save_path)
-                    f.write(f"Generated Image: img_{i}.png\n")
+                    PIL.Image.fromarray(gen_imgs_pil_list[i].astype(np.uint8)).save(save_path)
+                    f.write(f"Generated Image:\nimg_{prompt_id}_{i}.png\n\n")
                 
                 # Save feedback text
                 if i < len(feedback_texts):
-                    f.write(f"Feedback: {feedback_texts[i]}\n\n")
+                    f.write(f"Feedback of {prompt_id}:\n{feedback_texts[i]}\n\n")
                 
                 # Save regen image
                 if i < len(regen_imgs_pil_list):
                     regen_path = os.path.join(step_dir, f"regen_img_{prompt_id}_{i}.png")
-                    regen_imgs_pil_list[i].save(regen_path)
-                    f.write(f"Regenerated Image: regen_img_{i}.png\n")
+                    PIL.Image.fromarray(regen_imgs_pil_list[i].astype(np.uint8)).save(regen_path)
+                    f.write(f"Regenerated Image:\nregen_img_{prompt_id}_{i}.png\n\n")
                 
                 # Save RM text if available
                 if i < len(ground_truth):
                     ground_truth_path = os.path.join(step_dir, f"ground_truth_{prompt_id}_{i}.png")
                     PIL.Image.open(ground_truth[i]["ground_truth"]).convert("RGB").save(ground_truth_path)
-                    f.write(f"Ground Truth: ground_truth_{i}.png\n")
+                    f.write(f"Ground Truth:\nground_truth_{prompt_id}_{i}.png\n\n")
                 
                 f.write("\n" + "=" * 40 + "\n\n")
         
@@ -153,10 +153,10 @@ class ImageGenerationRewardManager:
             self.steps += 1
 
         print(f"[REWARD] Computing rewards for batch_size={len(data)}")
-        
+
+        response_mask = data.batch[f"task{task_id}_response_mask"]
         # Initialize reward tensor
-        device = data.batch["task1_input_ids"].device
-        reward_tensor = torch.zeros(len(data), dtype=torch.float32, device=device)
+        reward_tensor = torch.zeros_like(response_mask, dtype=torch.float32)
         reward_extra_info = defaultdict(list)
         
         prompt = data.non_tensor_batch.get('prompt', [])
@@ -170,6 +170,7 @@ class ImageGenerationRewardManager:
         already_printed = {}
 
         for i in range(len(data)):
+            valid_response_length = response_mask.sum()
             score_dict = scores[i]
             reward = score_dict.get("score", 0.0)
             
@@ -179,7 +180,7 @@ class ImageGenerationRewardManager:
                     reward_extra_info[key].append(value)
             
             rewards.append(reward)
-            reward_tensor[i] = reward
+            reward_tensor[i, valid_response_length - 1] = reward
 
             # Print examination samples
             data_source = data_sources[i] if i < len(data_sources) else "unknown"
@@ -197,11 +198,11 @@ class ImageGenerationRewardManager:
                 already_printed[data_source] = already_printed.get(data_source, 0) + 1
 
         # Store accuracy
-        data.batch["acc"] = torch.tensor(rewards, dtype=torch.float32, device=device)
-        
+        data.batch["acc"] = torch.tensor(rewards, dtype=torch.float32)
+                
         print(f"[REWARD] Computed {len(rewards)} rewards, mean={sum(rewards)/len(rewards):.4f}")
 
         if return_dict:
-            return {f"task{task_id}_reward_tensor": reward_tensor, "task{task_id}_reward_extra_info": reward_extra_info}
+            return {f"task{task_id}_reward_tensor": reward_tensor, f"task{task_id}_reward_extra_info": reward_extra_info}
         else:
             return reward_tensor
