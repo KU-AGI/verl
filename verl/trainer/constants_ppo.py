@@ -20,10 +20,10 @@ from ray._private.runtime_env.constants import RAY_JOB_CONFIG_JSON_ENV_VAR
 PPO_RAY_RUNTIME_ENV = {
     "env_vars": {
         "TOKENIZERS_PARALLELISM": "true",
-        "NCCL_DEBUG": "WARN",
+        # "NCCL_DEBUG": "WARN",
         "VLLM_LOGGING_LEVEL": "WARN",
         "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true",
-        "CUDA_DEVICE_MAX_CONNECTIONS": "1",
+        # "CUDA_DEVICE_MAX_CONNECTIONS": "1",
         # To prevent hanging or crash during synchronization of weights between actor and rollout
         # in disaggregated mode. See:
         # https://docs.vllm.ai/en/latest/usage/troubleshooting.html?h=nccl_cumem_enable#known-issues

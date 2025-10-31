@@ -1,0 +1,22 @@
+# VCS
+.git
+**/.git/**
+
+# Python 빌드/캐시
+__pycache__/
+**/*.pyc
+**/*.pyo
+
+# 노트북 체크포인트
+**/.ipynb_checkpoints/**
+
+# 대용량/학습 산출물
+data/**
+checkpoints/**
+*.pt
+*.bin
+*.safetensors
+
+# 로그/임시
+logs/**
+tmp/**
