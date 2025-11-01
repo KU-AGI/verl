@@ -11,6 +11,8 @@ env_vars:
   NCCL_NET_GDR_LEVEL: "2"
   NCCL_DEBUG: "INFO"
   NCCL_ASYNC_ERROR_HANDLING: "1"
+  WANDB_ENTITY: "llm-reaction-reasoning"
+  WANDB_PROJECT: "verl-dapo"
   VLLM_USE_V1: "1"
   NCCL_DEBUG: "INFO"
   HYDRA_FULL_ERROR: "1"

@@ -32,14 +32,14 @@ adv_estimator=grpo
 use_kl_in_reward=False
 kl_coef=0.0
 use_kl_loss=False
-kl_loss_coef=0.01
+kl_loss_coef=0.0
 
-clip_ratio_low=0.02
-clip_ratio_high=0.02
+clip_ratio_low=1.0
+clip_ratio_high=1.0
 
 enable_filter_groups=True
-# filter_groups_metric=acc
-filter_groups_metric=seq_final_reward
+filter_groups_metric=acc
+# filter_groups_metric=seq_final_reward
 max_num_gen_batches=0
 
 # Response length parameters
@@ -82,12 +82,12 @@ gen_prompt_bsz=1
 n_resp_per_prompt=8
 train_prompt_mini_bsz=16
 total_rollout_steps=$(((512*100000)))
-test_freq=30
+test_freq=5
 staleness_threshold=0.3
 trigger_parameter_sync_step=4
-require_batches=3
+require_batches=24
 partial_rollout=False
-save_freq=$((test_freq * trigger_parameter_sync_step))
+save_freq=$((test_freq * trigger_parameter_sync_step * 40))
 
 
 # python -m recipe.fully_async_policy.fully_async_main \
@@ -115,6 +115,8 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     algorithm.filter_groups.enable=${enable_filter_groups} \
     algorithm.filter_groups.max_num_gen_batches=${max_num_gen_batches} \
     algorithm.filter_groups.metric=${filter_groups_metric} \
+    algorithm.rollout_is_threshold=2.0 \
+    algorithm.rollout_is=True \
     actor_rollout_ref.actor.strategy=fsdp2 \
     critic.strategy=fsdp2 \
     actor_rollout_ref.actor.use_kl_loss=${use_kl_loss} \
@@ -132,7 +134,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
-    actor_rollout_ref.actor.optim.lr=1e-6 \
+    actor_rollout_ref.actor.optim.lr=5e-7 \
     actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
     actor_rollout_ref.actor.optim.weight_decay=0.1 \
     actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \

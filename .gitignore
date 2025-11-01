@@ -1,4 +1,4 @@
-
+.git
 **/*.pt
 **/checkpoints
 **/wget-log
