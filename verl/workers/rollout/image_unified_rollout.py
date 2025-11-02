@@ -143,19 +143,7 @@ class ImageUnifiedRollout(BaseRollout):
                     data_proto.batch[key], self.prompt_length, pad_value
                 )
         
-        # # Task 1 - Image Generation (outputs)
-        # output_tensors_task1 = [
-        #     "task1_response_mask"
-        # ]
-        # for key in output_tensors_task1:
-        #     if key in data_proto.batch:
-        #         if "mask" in key:
-        #             pad_value = 0  # attention masks and embeddings use 0 padding
-        #         else:
-        #             pad_value = self.processor.tokenizer.eos_token_id
-        #         data_proto.batch[key] = self._pad_tensor_right(
-        #             data_proto.batch[key], self.response_length, pad_value
-        #         )
+        # Skip Task 1 - Image Generation (outputs) tokens are always same length (576)
 
         # Task 2 - Text Generation (inputs)
         input_tensors_task2 = [
@@ -199,19 +187,7 @@ class ImageUnifiedRollout(BaseRollout):
                     data_proto.batch[key], self.prompt_length, pad_value
                 )
 
-        # # Task 3 - Regen Image Generation (outputs)
-        # output_tensors_task3 = [
-        #     "task3_response_mask"
-        # ]
-        # for key in output_tensors_task3:
-        #     if key in data_proto.batch:
-        #         if "mask" in key:
-        #             pad_value = 0  # attention masks and embeddings use 0 padding
-        #         else:
-        #             pad_value = self.processor.tokenizer.eos_token_id
-        #         data_proto.batch[key] = self._pad_tensor_right(
-        #             data_proto.batch[key], self.response_length, pad_value
-        #         )
+        # Skip Task 3 - Regen Image Generation (outputs) tokens are always same length (576)
 
         return data_proto
 
@@ -582,11 +558,12 @@ class ImageUnifiedRollout(BaseRollout):
         # Prepare messages for all images
         input_format = []
         for feedback in feedback_texts:
-            prefix = self.get_sft_format(self.image_start_tag + self.image_tag + self.image_end_tag + "\n")
+            _prefix = self.image_start_tag + self.image_tag + self.image_end_tag + "\n"
             if feedback is None:
-                input_format.append(prefix + "No need to generate feedback.")
+                prefix = self.get_sft_format(_prefix + "No need to generate feedback.")
             else:
-                input_format.append(prefix + feedback) # Add image placeholder at the end            
+                prefix = self.get_sft_format(_prefix + feedback)
+            input_format.append(prefix) # Add image placeholder at the end            
 
         inputs = self.processor.tokenizer(
             input_format,
@@ -597,11 +574,8 @@ class ImageUnifiedRollout(BaseRollout):
         input_ids = inputs["input_ids"].to(self.device)
         attention_mask = inputs["attention_mask"].to(self.device)
 
-        batched_total_ids, batched_attention_mask, output_start_indices, all_image_start_indices, images_to_batch = self.expand_image_placeholders(input_ids, gen_imgs_pixel_values)
-
-        B, C, H, W = gen_imgs_pixel_values.shape
-
-        gen_imgs_pixel_values = gen_imgs_pixel_values.to(self.device, dtype=torch.bfloat16)
+        data_proto.batch["task3_input_ids"] = input_ids
+        data_proto.batch["task3_attention_mask"] = attention_mask
 
         # embedding
         param_ctx = contextlib.nullcontext()
@@ -610,81 +584,42 @@ class ImageUnifiedRollout(BaseRollout):
 
         with param_ctx:
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                _, _, all_image_ids = self.module.gen_vision_model.encode(gen_imgs_pixel_values)
-        
-                image_ids = all_image_ids[2]
-                image_ids = image_ids.view(B, -1)
+                input_embeds = self.module.language_model.get_input_embeddings()(input_ids)
 
-                image_embeds = self.module.gen_aligner(self.module.gen_embed(image_ids))
-                text_embeds = self.module.language_model.get_input_embeddings()(batched_total_ids)
-
-        # merge text and image embeds
-        merged_embeds = self.merge_text_and_image_embeds(text_embeds, image_embeds, all_image_start_indices)
-
-        batch_size, _, embed_dim = merged_embeds.shape
-        max_input_len = max(output_start_indices)
-        input_ids = torch.full((batch_size, max_input_len), self.processor.pad_id, dtype=torch.long, device=merged_embeds.device)
-        input_embeds = torch.zeros((batch_size, max_input_len, embed_dim), dtype=merged_embeds.dtype, device=merged_embeds.device)
-        input_attention_mask = torch.zeros((batch_size, max_input_len), dtype=torch.long, device=merged_embeds.device)
-        
-        # Left-padding 후의 이미지 시작 인덱스를 저장할 리스트
-        new_all_image_start_indices = []
-
-        for i in range(batch_size):
-            input_len = output_start_indices[i]
-            pad_len = max_input_len - input_len
-            
-            prompt_embeds = merged_embeds[i, :input_len]
-            prompt_attn_mask = batched_attention_mask[i, :input_len]           
-
-            input_ids[i, pad_len:] = batched_total_ids[i, :input_len]
-            input_embeds[i, pad_len:] = prompt_embeds
-            input_attention_mask[i, pad_len:] = prompt_attn_mask
-            
-            # 패딩 길이를 더해 새로운 이미지 시작 인덱스 계산
-            original_indices = all_image_start_indices[i]
-            new_indices = [idx + pad_len for idx in original_indices]
-            new_all_image_start_indices.append(new_indices)
-
-        # For generating regen images
-        data_proto.batch["task3_input_ids"] = input_ids
-        data_proto.batch["task3_attention_mask"] = input_attention_mask
+        # For computing logits: input (especially input text embedding)
         data_proto.batch["task3_input_embeds"] = input_embeds
 
         regen_final_cfg_embeds, regen_final_cfg_attention_mask = self._prepare_regen_cfg_embeds(data_proto)
         regenerated_tokens = self.generate_img(regen_final_cfg_embeds, regen_final_cfg_attention_mask)
-        # For reproducing regen images
+        # For reproducing generated images
         data_proto.batch["task3_regen_img_tokens"] = regenerated_tokens
 
         regen_decoded_images = self._decode_image_tokens(regenerated_tokens)
-
         regen_imgs_pil_list = [PIL.Image.fromarray(img_array) for img_array in regen_decoded_images]
         data_proto.non_tensor_batch["task3_regen_imgs_pil_list"] = np.array(regen_imgs_pil_list, dtype=object)
         regen_imgs_tensor = self.processor.image_processor(regen_imgs_pil_list).pixel_values
-        # For reproducing regen images
+        # For generating feedback texts and computing logits: output
         data_proto.batch["task3_regen_imgs_pixel_values"] = regen_imgs_tensor.cpu()
         regen_imgs_pixel_values = regen_imgs_tensor.to(self.device, dtype=torch.bfloat16)
-
-        print(f"[REGEN] Created DataProto with batch_size: {batch_size}")
-
-        B, C, H, W = regen_imgs_pixel_values.shape
 
         # Postprocessing output embeds
         param_ctx = contextlib.nullcontext()
         if isinstance(self.module, FSDP):
             param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=True)
 
+        B, C, H, W = gen_imgs_pixel_values.shape
+
         with param_ctx:
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                 _, _, all_image_ids = self.module.gen_vision_model.encode(regen_imgs_pixel_values)
-
+        
                 image_ids = all_image_ids[2]
                 image_ids = image_ids.view(B, -1)
 
                 image_embeds = self.module.gen_aligner(self.module.gen_embed(image_ids))
 
         data_proto.batch["task3_response_mask"] = torch.ones((B, image_embeds.size(1)), dtype=torch.long, device=image_embeds.device)
-        print(f"[REGEN] Completed regeneration")
+        print(f"[IMG_GEN] Created DataProto with batch_size: {batch_size}")
 
         return data_proto
 
