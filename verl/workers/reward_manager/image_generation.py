@@ -25,7 +25,7 @@ from collections import defaultdict
 import contextlib
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 import numpy as np
-from torchvision.transforms.functional import to_pil_image
+
 
 @register("image_generation")
 class ImageGenerationRewardManager:
@@ -45,19 +45,22 @@ class ImageGenerationRewardManager:
         self.processor = processor
         self.num_examine = num_examine
         self.compute_score = compute_score or _default_compute_score
-        self.steps = 0
         self.reward_fn_key = reward_fn_key
         self.reward_kwargs = reward_kwargs
         self.save_freq = reward_kwargs.get("img_saving", {}).get("save_freq", 0)
         self.save_num = reward_kwargs.get("img_saving", {}).get("num", 0)
-        self.save_path = reward_kwargs.get("img_saving", {}).get("path", "")
+        
+        # Create base save path once
+        root_path: str = reward_kwargs.get("img_saving", {}).get("path", "")
+        exp_name: str = reward_kwargs.get("img_saving", {}).get("experiment_name", "")
         time_stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        self.save_path = os.path.join(
-            self.save_path, 
-            f"{reward_kwargs.get('img_saving', {}).get('experiment_name', '')}_{time_stamp}"
-        )
+        self.save_base = os.path.join(root_path, f"{exp_name}_{time_stamp}")
+        
+        # Initialize step counters
+        self.steps = 0
+        self.eval_steps = 0
 
-    def save_img(self, data: DataProto):
+    def save_img(self, data: DataProto, eval: bool = False):
         """Save images from meta_info lists."""
         prompt_id = data.non_tensor_batch.get('prompt_id', [])
         prompt = data.non_tensor_batch.get('prompt', [])
@@ -66,7 +69,10 @@ class ImageGenerationRewardManager:
         regen_imgs_pil_list = data.non_tensor_batch.get('task3_regen_imgs_pil_list', [])
         ground_truth = data.non_tensor_batch.get('reward_model', {})
 
-        step_dir = os.path.join(self.save_path, str(self.steps))
+        # Create proper save path without repetition
+        mode = "eval" if eval else "train"
+        current_step = self.eval_steps if eval else self.steps
+        step_dir = os.path.join(self.save_base, mode, str(current_step))
         os.makedirs(step_dir, exist_ok=True)
         
         print(f"[SAVE] Saving {min(len(gen_imgs_pil_list), self.save_num)} images to {step_dir}")
@@ -76,7 +82,7 @@ class ImageGenerationRewardManager:
             f.write("=" * 80 + "\n\n")
             
             for i in range(min(len(prompt), len(gen_imgs_pil_list), len(feedback_texts), len(regen_imgs_pil_list), len(ground_truth), self.save_num)):
-                prompt_id = prompt_id[i]
+                current_prompt_id = prompt_id[i] if i < len(prompt_id) else i
 
                 f.write(f"Sample {i}\n")
                 f.write("=" * 40 + "\n")
@@ -87,25 +93,25 @@ class ImageGenerationRewardManager:
                 
                 # Save generated image
                 if i < len(gen_imgs_pil_list):
-                    save_path = os.path.join(step_dir, f"img_{prompt_id}_{i}.png")
+                    save_path = os.path.join(step_dir, f"img_{current_prompt_id}_{i}.png")
                     PIL.Image.fromarray(gen_imgs_pil_list[i].astype(np.uint8)).save(save_path)
-                    f.write(f"Generated Image:\nimg_{prompt_id}_{i}.png\n\n")
+                    f.write(f"Generated Image:\nimg_{current_prompt_id}_{i}.png\n\n")
                 
                 # Save feedback text
                 if i < len(feedback_texts):
-                    f.write(f"Feedback of {prompt_id}:\n{feedback_texts[i]}\n\n")
+                    f.write(f"Feedback of {current_prompt_id}:\n{feedback_texts[i]}\n\n")
                 
                 # Save regen image
                 if i < len(regen_imgs_pil_list):
-                    regen_path = os.path.join(step_dir, f"regen_img_{prompt_id}_{i}.png")
+                    regen_path = os.path.join(step_dir, f"regen_img_{current_prompt_id}_{i}.png")
                     PIL.Image.fromarray(regen_imgs_pil_list[i].astype(np.uint8)).save(regen_path)
-                    f.write(f"Regenerated Image:\nregen_img_{prompt_id}_{i}.png\n\n")
+                    f.write(f"Regenerated Image:\nregen_img_{current_prompt_id}_{i}.png\n\n")
                 
                 # Save RM text if available
                 if i < len(ground_truth):
-                    ground_truth_path = os.path.join(step_dir, f"ground_truth_{prompt_id}_{i}.png")
+                    ground_truth_path = os.path.join(step_dir, f"ground_truth_{current_prompt_id}_{i}.png")
                     PIL.Image.open(ground_truth[i]["ground_truth"]).convert("RGB").save(ground_truth_path)
-                    f.write(f"Ground Truth:\nground_truth_{prompt_id}_{i}.png\n\n")
+                    f.write(f"Ground Truth:\nground_truth_{current_prompt_id}_{i}.png\n\n")
                 
                 f.write("\n" + "=" * 40 + "\n\n")
         
@@ -145,13 +151,16 @@ class ImageGenerationRewardManager:
         """Main reward computation with batch processing."""
         
         # Save generated images periodically
-        if self.save_freq > 0 and self.steps % self.save_freq == 0:
-            self.save_path = os.path.join(self.save_path, "eval" if eval else "train")
-            os.makedirs(self.save_path, exist_ok=True)
-            self.save_img(data)
-            print(f"[SAVE] Saving images to {self.save_path}")
+        if self.save_freq > 0:
+            current_step = self.eval_steps if eval else self.steps
+            if current_step % self.save_freq == 0:
+                self.save_img(data, eval)
+                print(f"[SAVE] Saved images for {'eval' if eval else 'train'} step {current_step}")
 
-        if not eval:
+        # Update step counters
+        if eval:
+            self.eval_steps += 1
+        else:
             self.steps += 1
 
         print(f"[REWARD] Computing rewards for batch_size={len(data)}")
