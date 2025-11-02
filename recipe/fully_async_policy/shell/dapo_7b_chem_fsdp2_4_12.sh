@@ -79,15 +79,15 @@ n_gpus_training=$((NGPUS_PER_NODE - n_gpus_rollout))
 # (train_prompt_mini_bsz * require_batches * n_resp_per_prompt) % total_trainer_gpus == 0 must be satisfied
 train_prompt_bsz=0
 gen_prompt_bsz=1
-n_resp_per_prompt=8
+n_resp_per_prompt=12
 train_prompt_mini_bsz=16
 total_rollout_steps=$(((512*100000)))
 test_freq=5
 staleness_threshold=0.3
 trigger_parameter_sync_step=4
-require_batches=24
+require_batches=3
 partial_rollout=False
-save_freq=$((test_freq * trigger_parameter_sync_step * 40))
+save_freq=$((test_freq * trigger_parameter_sync_step * 5))
 
 
 # python -m recipe.fully_async_policy.fully_async_main \
