@@ -93,7 +93,7 @@ class ImageGenerationRewardManager:
                 
                 # Save generated image
                 if i < len(gen_imgs_pil_list):
-                    save_path = os.path.join(step_dir, f"img_{current_prompt_id}_{i}.png")
+                    save_path = os.path.join(step_dir, f"gen_img_{current_prompt_id}_{i}.png")
                     PIL.Image.fromarray(gen_imgs_pil_list[i].astype(np.uint8)).save(save_path)
                     f.write(f"Generated Image:\nimg_{current_prompt_id}_{i}.png\n\n")
                 
