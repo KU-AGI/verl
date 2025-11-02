@@ -84,7 +84,7 @@ def convert_gen_img_to_base64(gen_img: PIL.Image.Image) -> Optional[str]:
     
 
 def get_messages(prompt, gen_img, feedback_text, regen_img, ground_truth, task_id):
-    ground_truth_base64 = convert_gen_img_to_base64(ground_truth)
+    ground_truth = convert_gen_img_to_base64(ground_truth)
     if task_id == 1:
         system_prompt = TASK1_FIRST_IMAGE_GENERATOR_PROMPT_TEMPLATE.format(question=prompt)
         messages = [
@@ -99,7 +99,7 @@ def get_messages(prompt, gen_img, feedback_text, regen_img, ground_truth, task_i
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": [
-                {"type": "image_url", "image_url": {"url": convert_gen_img_to_base64(gen_img)}}, # convert_gen_img_to_base64(gen_img)}},
+                {"type": "image_url", "image_url": {"url": convert_gen_img_to_base64(gen_img)}},
                 {"type": "text", "text": feedback_text},
             ]}
         ]
@@ -143,7 +143,7 @@ def compute_reward(response):
         boxed_result = last_boxed_only_string(response)
         if boxed_result is not None:
             result = remove_boxed(boxed_result)
-            reward_score = float(result == "True")
+            reward_score = float(result.lower() in ["true", "1", "yes"])
     except Exception as e:
         print(e)
     return reward_score
