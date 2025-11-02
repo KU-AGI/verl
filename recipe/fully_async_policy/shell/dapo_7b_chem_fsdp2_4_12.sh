@@ -38,8 +38,8 @@ clip_ratio_low=1.0
 clip_ratio_high=1.0
 
 enable_filter_groups=True
-filter_groups_metric=acc
-# filter_groups_metric=seq_final_reward
+# filter_groups_metric=acc
+filter_groups_metric=seq_final_reward
 max_num_gen_batches=0
 
 # Response length parameters
@@ -53,7 +53,7 @@ overlong_penalty_factor=1.0
 loss_agg_mode="token-mean"
 
 # Algorithm
-temperature=0.8
+temperature=1.0
 top_p=1.0
 top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
 val_temperature=0.0
@@ -134,7 +134,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
-    actor_rollout_ref.actor.optim.lr=5e-7 \
+    actor_rollout_ref.actor.optim.lr=2e-7 \
     actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
     actor_rollout_ref.actor.optim.weight_decay=0.1 \
     actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \

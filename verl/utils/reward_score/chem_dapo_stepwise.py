@@ -641,10 +641,19 @@ class StepEvaluator():
 
         # Metric 3: Has reagents
         reagent_list = self.extract_numbered_items(predicted_step6_rationale)
-        has_reagents = ".".join(info["reagents"]) in reagent_list
+        reagent_gt = ".".join(info["reagents"])
+        has_reagents = False
+        for reagent_pred in reagent_list:
+            if SMILESValidator.exact_match(reagent_pred, reagent_gt):
+                has_reagents = True
+                break
 
         # Metric 4: Correct reagent number
-        correct_reagent_number = reagent_list.index(".".join(info["reagents"])) + 1 if ".".join(info["reagents"]) in reagent_list else -1
+        correct_reagent_number = -1
+        for idx, reagent_pred in enumerate(reagent_list):
+            if SMILESValidator.exact_match(reagent_pred, ".".join(info["reagents"])):
+                correct_reagent_number = idx + 1
+                break
         reagent_num = re.search(r"reagent (\d+)", predicted_step7_rationale, re.IGNORECASE)
         if reagent_num:
             predicted_reagent_number = int(reagent_num.group(1))
@@ -657,7 +666,7 @@ class StepEvaluator():
             "reagent/step7/has_correct_reagent_number": int(has_correct_reagent_number),
         }
 
-
+    """
     def evaluate(self, info_list, GT_rationale_list, predicted_reasoning_list, task):
         if "forward" in task:
             forward_metrics_dict = defaultdict(list)
@@ -691,7 +700,7 @@ class StepEvaluator():
             for key, values in reagent_metrics_dict.items():
                 metric_dict[key] = sum(values) / len(values) if values else 0.0
             return metric_dict
-
+    """
 
 class ChemistryEvaluator:
     """Main evaluation interface."""
@@ -725,6 +734,8 @@ class ChemistryEvaluator:
             "reactants": extra_info['reactants'],
             "reagents": extra_info['reagents'],
         }
+        extra_info["supporting_info"]['reagent']['reagent_list'] = extra_info["supporting_info"]['reagent']['reagents']
+        del extra_info["supporting_info"]['reagent']['reagents']
         info.update(extra_info["supporting_info"][task])
         match = re.search(r'<think>(.*?)</think>', solution_str, re.DOTALL)
         predicted_rationale = ""
@@ -739,7 +750,7 @@ class ChemistryEvaluator:
         else:
             step_eval_results = {}
 
-        reward = correct + sum(step_eval_results.values())
+        reward = correct + (sum(step_eval_results.values()) / len(step_eval_results) if step_eval_results else 0.0)
 
         result = EvaluationResult(
             score=reward,
