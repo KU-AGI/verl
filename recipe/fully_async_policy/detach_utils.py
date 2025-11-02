@@ -29,31 +29,33 @@ from verl.utils.model import compute_position_id_with_mask
 def mask_between_tokens(labels_tensor, start_token, end_token, include_start=True, include_end=True):
     labels_list = labels_tensor.tolist()
     mask = [0] * len(labels_list)
+    start_positions = []
+
     i = 0
-    while i < len(labels_list):
-        # Find start token
+    while i <= len(labels_list) - len(start_token):
         if labels_list[i:i+len(start_token)] == start_token:
-            start_idx = i
-            # Search for next end token after start
-            j = start_idx + len(start_token)
-            found_end = False
-            while j <= len(labels_list) - len(end_token):
-                if labels_list[j:j+len(end_token)] == end_token:
-                    mask_start_idx = start_idx if include_start else start_idx + len(start_token)
-                    mask_end_idx = j + len(end_token) if include_end else j
-                    for k in range(mask_start_idx, mask_end_idx):
-                        mask[k] = 1
-                    i = j + len(end_token)  # continue search after this end token
-                    found_end = True
-                    break
-                else:
-                    j += 1
-            if not found_end:
-                # No end token found, break out
-                break
+            start_positions.append(i)
+            i += len(start_token)
         else:
             i += 1
-    mask_tensor = labels_tensor.new_tensor(mask)
+
+    i = 0
+    while i <= len(labels_list) - len(end_token):
+        if labels_list[i:i+len(end_token)] == end_token:
+            # find the nearest unmatched start_token before this end_token
+            valid_starts = [s for s in start_positions if s < i]
+            if valid_starts:
+                start_idx = valid_starts[-1]  # closest start before this end
+                start_positions.remove(start_idx)  # prevent reuse
+                mask_start_idx = start_idx if include_start else start_idx + len(start_token)
+                mask_end_idx = i + len(end_token) if include_end else i
+                for k in range(mask_start_idx, mask_end_idx):
+                    mask[k] = 1
+            i += len(end_token)
+        else:
+            i += 1
+
+    mask_tensor = labels_tensor.new_tensor(mask, dtype=labels_tensor.dtype)
     return mask_tensor
 
 
@@ -116,9 +118,10 @@ def postprocess_agent_loop_outputs(rs: "RolloutSample", tokenizer, config, proce
 
     for i in range(len(response_ids)):
         if "<REFLECTION>" in tokenizer.decode(response_ids[i]):
+            qwen3_stepstart = [565, 14822, 220] # ## Step 
             qwen3_reflection_start = [27, 5996, 28017] # <REFLECTION
             qwen3_reflection_end = [522, 5996, 28017] # </REFLECTION
-            reflection_mask = -1 * mask_between_tokens(response_ids[i], qwen3_reflection_start, qwen3_reflection_end) + 1 # inverted mask
+            reflection_mask = -1 * mask_between_tokens(response_ids[i], qwen3_stepstart, qwen3_reflection_start, include_start=True, include_end=False) + 1 # inverted mask
             response_mask[i] = response_mask[i] * reflection_mask
 
 
