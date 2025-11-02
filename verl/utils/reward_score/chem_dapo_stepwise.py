@@ -734,8 +734,10 @@ class ChemistryEvaluator:
             "reactants": extra_info['reactants'],
             "reagents": extra_info['reagents'],
         }
-        extra_info["supporting_info"]['reagent']['reagent_list'] = extra_info["supporting_info"]['reagent']['reagents']
-        del extra_info["supporting_info"]['reagent']['reagents']
+        if "reagents" in extra_info["supporting_info"]['reagent']:
+            del extra_info["supporting_info"]['reagent']['reagents']
+        # extra_info["supporting_info"]['reagent']['reagent_list'] = extra_info["supporting_info"]['reagent']['reagents']
+        # del extra_info["supporting_info"]['reagent']['reagents']
         info.update(extra_info["supporting_info"][task])
         match = re.search(r'<think>(.*?)</think>', solution_str, re.DOTALL)
         predicted_rationale = ""
