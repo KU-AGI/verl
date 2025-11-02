@@ -12,8 +12,9 @@ from openai import OpenAI
 
 from verl.utils.dataset.vision_utils import process_image
 from verl.utils.reward_score.math_reward import last_boxed_only_string, remove_boxed
+import numpy as np
 
-BASE_URL = "http://218.238.5.120:8000/v1"
+BASE_URL = "http://192.169.0.3:8004/v1"
 API_KEY = "EMPTY"
 MAX_RETRIES = 3
 BASE_DELAY = 2
@@ -66,6 +67,9 @@ Please put your final answer about the generated image is aligned with the quest
 def convert_gen_img_to_base64(gen_img: PIL.Image.Image) -> Optional[str]:
     if isinstance(gen_img, str):
         gen_img = PIL.Image.open(gen_img)
+    elif isinstance(gen_img, np.ndarray):
+        gen_img = np.array(gen_img, dtype=np.uint8)
+        gen_img = PIL.Image.fromarray(gen_img)
 
     """Convert gen_img to base64 data URL."""
     if not isinstance(gen_img, PIL.Image.Image):
@@ -86,7 +90,7 @@ def get_messages(prompt, gen_img, feedback_text, regen_img, ground_truth, task_i
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": [
-                {"type": "image_pil", "image_pil": gen_img}
+                {"type": "image_url", "image_url": {"url": convert_gen_img_to_base64(gen_img)}}
             ]}
         ]
         return messages
@@ -95,7 +99,7 @@ def get_messages(prompt, gen_img, feedback_text, regen_img, ground_truth, task_i
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": [
-                {"type": "image_pil", "image_pil": gen_img}, # convert_gen_img_to_base64(gen_img)}},
+                {"type": "image_url", "image_url": {"url": convert_gen_img_to_base64(gen_img)}}, # convert_gen_img_to_base64(gen_img)}},
                 {"type": "text", "text": feedback_text},
             ]}
         ]
@@ -105,8 +109,8 @@ def get_messages(prompt, gen_img, feedback_text, regen_img, ground_truth, task_i
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": [
-                {"type": "image_pil", "image_pil": gen_img},
-                {"type": "image_pil", "image_pil": regen_img}
+                {"type": "image_url", "image_url": {"url": convert_gen_img_to_base64(gen_img)}},
+                {"type": "image_url", "image_url": {"url": convert_gen_img_to_base64(regen_img)}}
             ]}
         ]
         return messages
@@ -131,8 +135,6 @@ def get_response(prompt, gen_img, feedback_text, regen_img, ground_truth, task_i
                 sleep(delay)
             else:
                 print(f"Failed after {MAX_RETRIES} attempts. Error: {e}")
-    
-    raise ConnectionRefusedError(f"Failed to run the model for {prompt}! Error: {e}")
 
 
 def compute_reward(response):
@@ -168,15 +170,16 @@ def compute_score(prompt, gen_img, feedback_text, regen_img, ground_truth, extra
     }
 
 
-# def compute_score_batch(prompts, gen_imgs, feedback_texts, regen_imgs, ground_truths, extra_infos, task_ids):
-#     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-#         futures = []
-#         for prompt, gen_img, feedback_text, regen_img, ground_truth, extra_info, task_id in zip(
-#             prompts, gen_imgs, feedback_texts, regen_imgs, ground_truths, extra_infos, task_ids, strict=True
-#         ):
-#             future = executor.submit(compute_score, prompt, gen_img, feedback_text, regen_img, ground_truth, extra_info)
-#             futures.append(future)
+def compute_score_batch(prompts, gen_imgs, feedback_texts, regen_imgs, ground_truths, extra_infos, task_ids):
+    """Batch processing using ThreadPoolExecutor"""
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = []
+        for prompt, gen_img, feedback_text, regen_img, ground_truth, extra_info, task_id in zip(
+            prompts, gen_imgs, feedback_texts, regen_imgs, ground_truths, extra_infos, task_ids, strict=True
+        ):
+            future = executor.submit(compute_score, prompt, gen_img, feedback_text, regen_img, ground_truth, extra_info, task_id)
+            futures.append(future)
 
-#         results = [future.result() for future in futures]
+        results = [future.result() for future in futures]
 
-#     return results
+    return results

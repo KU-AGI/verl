@@ -48,15 +48,14 @@ init-container-with-infiniband:
 		tail -f /dev/null
 
 CACHE_PATH=/data/.cache
-MODEL_PATH=$(CACHE_PATH)/huggingface/hub/models--OpenGVLab/InternVL3_5-38B
+MODEL_PATH=OpenGVLab/InternVL3_5-38B
 VLLM_CONTAINER_NAME_PREFIX=vllm-g
 
 # https://github.com/vllm-project/vllm/pull/22386
 start-vllm-servers:
-	for GPU in 0 ; do \
+	for GPU in 4 ; do \
 		PORT=$$((8000 + $$GPU)) ; \
 		docker run --rm -d --name ${VLLM_CONTAINER_NAME_PREFIX}$$GPU \
-			--runtime nvidia \
 			--gpus all \
 			-v /data:/data \
 			-v /home:/home \

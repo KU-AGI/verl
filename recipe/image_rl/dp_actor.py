@@ -131,7 +131,7 @@ class DataParallelImageGenerationActor(BasePPOActor):
         """
         param_ctx = contextlib.nullcontext()
         if isinstance(self.actor_module, FSDP):
-            param_ctx = FSDP.summon_full_params(self.actor_module, writeback=False, recurse=True)
+            param_ctx = FSDP.summon_full_params(self.actor_module, writeback=False, recurse=True, with_grads=True)
 
         with param_ctx:
             with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
@@ -160,21 +160,21 @@ class DataParallelImageGenerationActor(BasePPOActor):
 
                     # Task 1: Image Generation
                     task1_output = self.actor_module.language_model.model(
-                        inputs_embeds=torch.cat([task1_input_embeds.to(self.device_name), task1_gen_img_embeds.to(self.device_name)], dim=1),
-                        attention_mask=torch.cat([task1_attention_mask.to(self.device_name), task1_response_mask.to(self.device_name)], dim=1),
+                        inputs_embeds=torch.cat([task1_input_embeds, task1_gen_img_embeds], dim=1),
+                        attention_mask=torch.cat([task1_attention_mask, task1_response_mask], dim=1),
                     )  # prevent model thinks we are generating
                     
                     task1_logits = self.actor_module.gen_head(task1_output.last_hidden_state)
                     task1_response_length = task1_response_mask.size(1)
                     task1_logits = task1_logits[:, -task1_response_length - 1 : -1, :]
 
-                    log_probs = logprobs_from_logits(task1_logits, gen_img_tokens.to(self.device_name))
+                    log_probs = logprobs_from_logits(task1_logits, gen_img_tokens)
 
                     if calculate_entropy:
                         if not self.config.entropy_checkpointing:
                             entropy = verl_F.entropy_from_logits(task1_logits)  # (bsz, gen_img_tokens)
-                        else:
-                            entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, task1_logits)
+                    else:
+                        entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, task1_logits)
                     return entropy, log_probs
 
                 elif task_id == 2:
@@ -201,15 +201,15 @@ class DataParallelImageGenerationActor(BasePPOActor):
 
                     # Task 2: Feedback Generation
                     task2_output = self.actor_module.language_model(
-                        inputs_embeds=torch.cat([task2_merged_embeds.to(self.device_name), task2_feedback_embeds.to(self.device_name)], dim=1),
-                        attention_mask=torch.cat([task2_attention_mask.to(self.device_name), task2_response_mask.to(self.device_name)], dim=1),
+                        inputs_embeds=torch.cat([task2_merged_embeds, task2_feedback_embeds], dim=1),
+                        attention_mask=torch.cat([task2_attention_mask, task2_response_mask], dim=1),
                     )  # prevent model thinks we are generating
 
                     task2_logits = task2_output.logits
                     task2_response_length = task2_response_mask.size(1)
                     task2_logits = task2_logits[:, -task2_response_length - 1 : -1, :]
 
-                    log_probs = logprobs_from_logits(task2_logits, feedback_ids.to(self.device_name))
+                    log_probs = logprobs_from_logits(task2_logits, feedback_ids)
 
                     if calculate_entropy:
                         if not self.config.entropy_checkpointing:
@@ -251,21 +251,21 @@ class DataParallelImageGenerationActor(BasePPOActor):
 
                     # Task 3: Regen Image Generation
                     task3_output = self.actor_module.language_model.model(
-                        inputs_embeds=torch.cat([task3_merged_embeds.to(self.device_name), task3_regen_img_embeds.to(self.device_name)], dim=1),
-                        attention_mask=torch.cat([task3_attention_mask.to(self.device_name), task3_response_mask.to(self.device_name)], dim=1),
+                        inputs_embeds=torch.cat([task3_merged_embeds, task3_regen_img_embeds], dim=1),
+                        attention_mask=torch.cat([task3_attention_mask, task3_response_mask], dim=1),
                     )  # prevent model thinks we are generating
 
                     task3_logits = self.actor_module.gen_head(task3_output.last_hidden_state)
                     task3_response_length = task3_response_mask.size(1)
                     task3_logits = task3_logits[:, -task3_response_length - 1 : -1, :]
 
-                    log_probs = logprobs_from_logits(task3_logits, regen_img_tokens.to(self.device_name))
+                    log_probs = logprobs_from_logits(task3_logits, regen_img_tokens)
 
                     if calculate_entropy:
                         if not self.config.entropy_checkpointing:
                             entropy = verl_F.entropy_from_logits(task3_logits)  # (bsz, regen_img_tokens)
-                        else:
-                            entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, task3_logits)
+                    else:
+                        entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, task3_logits)
                     return entropy, log_probs 
 
     def _optimizer_step(self):
@@ -374,11 +374,52 @@ class DataParallelImageGenerationActor(BasePPOActor):
 
         return log_probs, entropys
 
+    def freeze_param(self):
+        for n, p in self.actor_module.language_model.named_parameters():
+            p.requires_grad = True
+        self.actor_module.language_model.train()
+
+        for n, p in self.actor_module.gen_embed.named_parameters():
+            p.requires_grad = False
+        self.actor_module.gen_embed.eval()
+
+        for n, p in self.actor_module.gen_head.named_parameters():
+            p.requires_grad = True
+        self.actor_module.gen_head.train()
+
+        for n, p in self.actor_module.gen_aligner.named_parameters():
+            p.requires_grad = True
+        self.actor_module.gen_aligner.train()
+
+        for n, p in self.actor_module.aligner.named_parameters():
+            p.requires_grad = True
+        self.actor_module.aligner.train()
+
+        for n, p in self.actor_module.vision_model.named_parameters():
+            p.requires_grad = False
+        self.actor_module.vision_model.eval()
+
+        for n, p in self.actor_module.gen_vision_model.named_parameters():
+            p.requires_grad = False
+        self.actor_module.gen_vision_model.eval()
+
+    def print_trainable_parameters(self):
+        print("Trainable Parameters:")
+        for name, param in self.actor_module.named_parameters():
+            if param.requires_grad:
+                print(f"{name}: {param.shape}, dtype={param.dtype}")
+
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
         # make sure we are in training mode
         self.actor_module.train()
-
+        # self.actor_module = self.actor_module.float()
+        self.freeze_param()
+        # self.print_trainable_parameter()
+        # for name, param in self.actor_module.named_parameters():
+        #     if param.dtype == torch.long:
+        #         print(f"Parameter {name} is of type torch.long. Converting to float32.")
+        #         param.data = param.data.float()
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
 
         task_id = data.batch["task_id"].view(-1)[0].item()
@@ -389,7 +430,7 @@ class DataParallelImageGenerationActor(BasePPOActor):
             "task2_input_ids", "task2_attention_mask", "task2_feedback_ids", "task2_response_mask",
             "task3_input_ids", "task3_attention_mask", "task3_regen_imgs_pixel_values", "task3_regen_img_tokens", "task3_response_mask",
             "task1_old_log_probs", "task2_old_log_probs", "task3_old_log_probs",
-            "task1_advantages", "task2_advantages", "task3_dvantages",
+            "task1_advantages", "task2_advantages", "task3_advantages",
             "task_id"
         ]
         task_select_batch_keys = [key for key in select_batch_keys if str(task_id) in key]
@@ -509,25 +550,27 @@ class DataParallelImageGenerationActor(BasePPOActor):
                         loss = policy_loss * loss_scale_factor
                     else:
                         loss = policy_loss * loss_scale_factor
-                    # breakpoint()
-                    # loss.backward()
-                    try:
-                        loss.backward()
-                    except Exception as e:
-                        print(f"backward() failed: {e}")
+
+                    param_ctx = contextlib.nullcontext()
+                    if isinstance(self.actor_module, FSDP):
+                        param_ctx = FSDP.summon_full_params(self.actor_module, writeback=False, recurse=True, with_grads=True)
+
+                    with param_ctx:
+                        with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
+                            loss.backward()
 
                     micro_batch_metrics.update(
                         {
-                            f"actor/{task_id}_pg_loss": pg_loss.detach().item() * loss_scale_factor,
-                            f"actor/{task_id}_pg_clipfrac": pg_clipfrac.detach().item(),
-                            f"actor/{task_id}_ppo_kl": ppo_kl.detach().item(),
-                            f"actor/{task_id}_pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+                            f"actor/task{task_id}_pg_loss": pg_loss.detach().item() * loss_scale_factor,
+                            f"actor/task{task_id}_pg_clipfrac": pg_clipfrac.detach().item(),
+                            f"actor/task{task_id}_ppo_kl": ppo_kl.detach().item(),
+                            f"actor/task{task_id}_pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
                         }
                     )
                     append_to_dict(metrics, micro_batch_metrics)
 
                 grad_norm = self._optimizer_step()
-                mini_batch_metrics = {f"actor/{task_id}_grad_norm": grad_norm.detach().item()}
+                mini_batch_metrics = {f"actor/task{task_id}_grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()
         return metrics

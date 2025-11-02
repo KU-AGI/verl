@@ -122,21 +122,23 @@ class ImageGenerationRewardManager:
         
         print(f"[VERIFY] Processing batch of {len(prompt)} samples")
         
-        # Compute scores for all samples
-        scores = []
-        for i in range(len(data)):
-            score_result = self.compute_score(
-                prompt=prompt[i],
-                gen_img=gen_imgs_pil_list[i] if i < len(gen_imgs_pil_list) else None,
-                feedback_text=feedback_texts[i] if i < len(feedback_texts) else "",
-                regen_img=regen_imgs_pil_list[i] if i < len(regen_imgs_pil_list) else None,
-                ground_truth=ground_truth[i]["ground_truth"],
-                extra_info=data.non_tensor_batch.get("extra_info", {}),
-                task_id=task_id,
-                **self.reward_kwargs,
-            )
-            scores.append(score_result)
+        # Use batch processing
+        print(f"[VERIFY] Using batch processing with {len(data)} samples")
         
+        # Prepare batch data
+        prompts = prompt
+        gen_imgs = [gen_imgs_pil_list[i] if i < len(gen_imgs_pil_list) else None for i in range(len(data))]
+        feedback_texts_padded = [feedback_texts[i] if i < len(feedback_texts) else "" for i in range(len(data))]
+        regen_imgs = [regen_imgs_pil_list[i] if i < len(regen_imgs_pil_list) else None for i in range(len(data))]
+        ground_truths = [ground_truth[i]["ground_truth"] if i < len(ground_truth) else None for i in range(len(data))]
+        extra_infos = [data.non_tensor_batch.get("extra_info", {})] * len(data)
+        task_ids = [task_id] * len(data)
+        
+        # Call batch processing function
+        scores = self.compute_score(
+            prompts, gen_imgs, feedback_texts_padded, regen_imgs, ground_truths, extra_infos, task_ids
+        )
+
         return scores
 
     def __call__(self, data: DataProto, task_id: int = 1, eval: bool = False, return_dict: bool = True):
@@ -180,7 +182,7 @@ class ImageGenerationRewardManager:
                     reward_extra_info[key].append(value)
             
             rewards.append(reward)
-            reward_tensor[i, valid_response_length - 1] = reward
+            reward_tensor[i, :valid_response_length] = reward
 
             # Print examination samples
             data_source = data_sources[i] if i < len(data_sources) else "unknown"
