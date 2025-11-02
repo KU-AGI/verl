@@ -48,7 +48,7 @@ from verl.trainer.config import AlgoConfig
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
-from verl.trainer.ppo.metric_utils import (
+from recipe.image_rl.cusrom_metric_utils import ( # custom metric
     compute_data_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
@@ -629,7 +629,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                             self._balance_batch(batch, metrics=metrics) 
 
                         with marked_timer("reward", timing_raw, color="yellow"):
-                            reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn, task_id)
+                            reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn, eval=False, task_id=task_id)
                             batch.batch["task_id"] = torch.tensor([task_id for _ in range(len(batch))], dtype=int)
 
                         # recompute old_log_probs
@@ -768,9 +768,15 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                         "training/epoch": epoch,
                     }
                 )
-                # collect metrics
-                metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
-                metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+
+                for task_id in [1, 2, 3]:
+                    batch.batch["task_id"] = torch.tensor([task_id for _ in range(len(batch))], dtype=int)
+                    # collect metrics
+                    metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                    metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+                    # Remove universal keys from batch
+                    batch.pop(batch_keys=["task_id"])
+                
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
