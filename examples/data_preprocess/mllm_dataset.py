@@ -6,8 +6,8 @@ import datasets
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--root_dir", default="/data/mllm/janus_r1_sft/data")
-    parser.add_argument("--data_path", default="/data/mllm/janus_r1_filter_final.json")
+    parser.add_argument("--root_dir", default="/data/mllm/janus_r1_sft/data") # flow_grpo/images, reasonr1
+    parser.add_argument("--data_path", default="/data/mllm/flowgrpo_reasonr1_train_format_58891.json")
     parser.add_argument("--save_dir", default="/data/mllm/data")
 
     args = parser.parse_args()
@@ -23,7 +23,12 @@ if __name__ == "__main__":
         def process_fn(example, idx):
             prompt_id = example["prompt_id"]
             prompt = example["prompt"]
-            aligned_image_path = os.path.join(root_dir, example["aligned_data"][0]["img_path"].lstrip("/"))
+            
+            if "flowgrpo" in prompt_id:
+                root_dir = "/data/mllm/flow_grpo/images"
+            elif "reasonr1" in prompt_id:
+                root_dir = "/data/mllm/reasonr1"
+            aligned_image_path = os.path.join(root_dir, example["aligned_data"]["img_path"].lstrip("/"))
 
             data = {
                 "data_source": "image_generation",
