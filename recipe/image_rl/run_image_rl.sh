@@ -10,6 +10,14 @@ SCRIPT_LOG="${LOG_DIR}/script_$(date +%Y%m%d_%H%M%S).log"
 exec > >(tee -a "${SCRIPT_LOG}")
 exec 2>&1
 
+export NCCL_IB_GID_INDEX=0
+export NCCL_CUDA_DEVICE_MAX_CONNECTIONS=8
+export CUDA_DEVICE_MAX_CONNECTIONS=8
+export NCCL_P2P_LEVEL="NVL"
+export NCCL_NET_GDR_LEVEL=2
+export NCCL_SOCKET_TIMEOUT=300000
+export NCCL_IB_TIMEOUT=300
+
 # export VLLM_ATTENTION_BACKEND=XFORMERS
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 export HYDRA_FULL_ERROR=1
@@ -34,6 +42,9 @@ train_prompt_bsz=8
 # val_prompt_bsz=8
 n_resp_per_prompt=4
 train_prompt_mini_bsz=4
+
+# Perf
+fsdp_size=4
 
 max_prompt_length=$((1024 * 1)) # 1k
 max_response_length=$((1024 * 2)) # 2k
@@ -70,7 +81,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     actor_rollout_ref.actor.fsdp_config.reshard_after_forward=True \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
-    actor_rollout_ref.actor.fsdp_config.fsdp_size=${GPUS} \
+    actor_rollout_ref.actor.fsdp_config.fsdp_size=${fsdp_size} \
     actor_rollout_ref.actor.fsdp_config.use_torch_compile=False \
     actor_rollout_ref.rollout.dtype=bfloat16 \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
@@ -103,10 +114,10 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     trainer.experiment_name=$RUN_NAME \
     trainer.n_gpus_per_node=$GPUS \
     trainer.nnodes=1 \
-    trainer.save_freq=100 \
-    trainer.test_freq=100 \
+    trainer.save_freq=5 \
+    trainer.test_freq=5 \
     trainer.total_epochs=1 \
-    trainer.resume_mode=disable \
+    trainer.resume_mode=auto \
     trainer.default_local_dir=$SAVE_DIR \
     reward_model.reward_manager=image_generation \
     custom_reward_function.path=recipe/image_rl/reward_function.py \
