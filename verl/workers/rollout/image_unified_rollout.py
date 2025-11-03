@@ -541,13 +541,9 @@ class ImageUnifiedRollout(BaseRollout):
         print(f"[REGEN] Input batch_size: {batch_size}")
 
         # Get data from meta_info
-        gen_imgs_pixel_values = data_proto.batch.get('task1_gen_imgs_pixel_values', [])
         feedback_texts = data_proto.non_tensor_batch.get('task2_feedback_texts', [])
-        
-        if len(gen_imgs_pixel_values) == 0:
-            raise ValueError("No images found in meta_info['task1_gen_imgs_pixel_values']")
-        
-        print(f"[REGEN] Loaded {len(gen_imgs_pixel_values)} images and {len(feedback_texts)} task2_feedback_texts from meta_info")
+
+        print(f"[REGEN] Loaded {len(feedback_texts)} task2_feedback_texts from meta_info")
 
         # Process all images in batch
         print(f"[REGEN] Processing regen for {batch_size} images in batch")
@@ -607,7 +603,7 @@ class ImageUnifiedRollout(BaseRollout):
         if isinstance(self.module, FSDP):
             param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=True)
 
-        B, C, H, W = gen_imgs_pixel_values.shape
+        B, C, H, W = regen_imgs_pixel_values.shape
 
         with param_ctx:
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
