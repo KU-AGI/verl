@@ -1,8 +1,9 @@
 import logging
 import os
+import contextlib
+from typing import List
 
 import torch
-
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.tensor import DTensor
@@ -10,27 +11,16 @@ from torch.distributed.tensor import DTensor
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
-from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, unpad_input
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
 from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_batch
 from verl.utils.torch_functional import logprobs_from_logits
-from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
-
-import verl.utils.torch_functional as verl_F
-from verl import DataProto
-from verl.trainer.ppo.core_algos import agg_loss, kl_penalty
-from verl.utils.device import get_device_id
-from verl.utils.profiler import GPUMemoryLogger
-from verl.utils.py_functional import append_to_dict
-from verl.utils.seqlen_balancing import rearrange_micro_batches
 from verl.workers.actor import BasePPOActor
 from verl.workers.config import ActorConfig
-import contextlib
+
 from recipe.image_rl.utils import FormattingEvaluator
-from typing import List
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -38,9 +28,9 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 def compute_image_generation_loss(
     old_log_prob: torch.Tensor,  # (bs, seq_len)
-    log_prob: torch.Tensor,  # (bs, seq_len)
-    rewards: torch.Tensor,  # (bs,)
-    response_mask: torch.Tensor,  # (bs, seq_len)
+    log_prob: torch.Tensor,      # (bs, seq_len)
+    rewards: torch.Tensor,       # (bs,)
+    response_mask: torch.Tensor, # (bs, seq_len)
     eta: float = 1.0,
     loss_agg_mode: str = "token-mean",
 ):
@@ -63,16 +53,16 @@ def compute_image_generation_loss(
 
 
 class DataParallelImageGenerationActor(BasePPOActor):
-    """FSDP DataParallel PPO Actor or Ref worker
+    """FSDP DataParallel PPO Actor or Ref worker"""
 
-    Args:
-        config (ActorConfig): Actor config
-        processor (Processor): Processor
-        tokenizer (Tokenizer): Tokenizer
-        actor_module (nn.Module): Actor or ref module
-        actor_optimizer (torch.optim.Optimizer, optional): Actor optimizer. Defaults to None.
-    """
-    def __init__(self, config: ActorConfig, processor: None, tokenizer: None, actor_module: nn.Module, actor_optimizer: torch.optim.Optimizer = None):
+    def __init__(
+        self,
+        config: ActorConfig,
+        processor: None,
+        tokenizer: None,
+        actor_module: nn.Module,
+        actor_optimizer: torch.optim.Optimizer = None,
+    ):
         super().__init__(config)
         self.processor = processor
         self.tokenizer = tokenizer
@@ -98,18 +88,17 @@ class DataParallelImageGenerationActor(BasePPOActor):
 
         self.compute_entropy_from_logits = (
             torch.compile(entropy_from_logits, dynamic=True)
-            if self.config.get("use_torch_compile", True)  # use torch compile by default
+            if self.config.get("use_torch_compile", True)
             else entropy_from_logits
         )
         self.device_name = get_device_name()
 
     def merge_text_and_image_embeds(self, text_embeds: torch.Tensor, image_embeds: torch.Tensor, all_image_start_indices: List[List[int]]):
-
         batch_size = text_embeds.size(0)
         num_img = len(all_image_start_indices[0])
-        reshape_image_embeds = image_embeds.view(-1, num_img, self.processor.num_image_tokens, image_embeds.size(-1))
+        reshape_image_embeds = image_embeds.view(text_embeds.size(0), num_img, self.processor.num_image_tokens, image_embeds.size(-1))
 
-        assert text_embeds.size(0) == reshape_image_embeds.size(0) == len(all_image_start_indices)
+        assert len(all_image_start_indices) == batch_size, "Per-sample image positions required"
 
         merged_embeds = text_embeds.clone()
 
@@ -126,12 +115,13 @@ class DataParallelImageGenerationActor(BasePPOActor):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Returns:
-            entropy: # (bs, response_len)
+            entropy: # (bs, response_len) or None
             log_probs: # (bs, response_len)
         """
+        # Unshard only with grads when training
         param_ctx = contextlib.nullcontext()
         if isinstance(self.actor_module, FSDP):
-            param_ctx = FSDP.summon_full_params(self.actor_module, writeback=False, recurse=True, with_grads=True)
+            param_ctx = FSDP.summon_full_params(self.actor_module, writeback=False, recurse=True, with_grads=torch.is_grad_enabled())
 
         with param_ctx:
             with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
@@ -171,10 +161,11 @@ class DataParallelImageGenerationActor(BasePPOActor):
                     log_probs = logprobs_from_logits(task1_logits, gen_img_tokens)
 
                     if calculate_entropy:
-                        if not self.config.entropy_checkpointing:
-                            entropy = verl_F.entropy_from_logits(task1_logits)  # (bsz, gen_img_tokens)
-                    else:
-                        entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, task1_logits)
+                        if self.config.get("entropy_checkpointing", False) and torch.is_grad_enabled():
+                            entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, task1_logits)
+                        else:
+                            entropy = verl_F.entropy_from_logits(task1_logits)
+
                     return entropy, log_probs
 
                 elif task_id == 2:
@@ -187,8 +178,12 @@ class DataParallelImageGenerationActor(BasePPOActor):
                     task2_text_embeds = self.actor_module.language_model.get_input_embeddings()(task2_input_ids)
                     task2_image_embeds = self.actor_module.aligner(self.actor_module.vision_model(gen_imgs_pixel_values))
 
-                    image_token_pos = (task2_input_ids[0] == self.processor.image_id).nonzero(as_tuple=False)[0].item()
-                    task2_image_start_indices = [[image_token_pos]]
+                    # per-sample image token position
+                    pos_list = []
+                    for ids in task2_input_ids:
+                        pos = (ids == self.processor.image_id).nonzero(as_tuple=False)[0].item()
+                        pos_list.append([pos])
+                    task2_image_start_indices = pos_list
 
                     task2_merged_embeds = self.merge_text_and_image_embeds(task2_text_embeds, task2_image_embeds, task2_image_start_indices)
                     
@@ -212,26 +207,18 @@ class DataParallelImageGenerationActor(BasePPOActor):
                     log_probs = logprobs_from_logits(task2_logits, feedback_ids)
 
                     if calculate_entropy:
-                        if not self.config.entropy_checkpointing:
-                            entropy = verl_F.entropy_from_logits(task2_logits)  # (bsz, feedback_ids)
-                    else:
-                        entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, task2_logits)
+                        if self.config.get("entropy_checkpointing", False) and torch.is_grad_enabled():
+                            entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, task2_logits)
+                        else:
+                            entropy = verl_F.entropy_from_logits(task2_logits)
+
                     return entropy, log_probs
 
                 elif task_id == 3:
                     # Task 3: Regen Image Generation: input
                     task3_input_ids = micro_batch["task3_input_ids"]
                     task3_attention_mask = micro_batch["task3_attention_mask"]
-
-                    gen_imgs_pixel_values = micro_batch["task1_gen_imgs_pixel_values"]
-
-                    task3_text_embeds = self.actor_module.language_model.get_input_embeddings()(task3_input_ids)
-                    task3_image_embeds = self.actor_module.aligner(self.actor_module.vision_model(gen_imgs_pixel_values))
-
-                    image_token_pos = (task3_input_ids[0] == self.processor.image_id).nonzero(as_tuple=False)[0].item()
-                    task3_image_start_indices = [[image_token_pos]]
-
-                    task3_merged_embeds = self.merge_text_and_image_embeds(task3_text_embeds, task3_image_embeds, task3_image_start_indices)
+                    task3_input_embeds = self.actor_module.language_model.get_input_embeddings()(task3_input_ids)
 
                     # Task 3: Regen Image Generation: output
                     regen_imgs_pixel_values = micro_batch["task3_regen_imgs_pixel_values"]
@@ -251,9 +238,9 @@ class DataParallelImageGenerationActor(BasePPOActor):
 
                     # Task 3: Regen Image Generation
                     task3_output = self.actor_module.language_model.model(
-                        inputs_embeds=torch.cat([task3_merged_embeds, task3_regen_img_embeds], dim=1),
+                        inputs_embeds=torch.cat([task3_input_embeds, task3_regen_img_embeds], dim=1),
                         attention_mask=torch.cat([task3_attention_mask, task3_response_mask], dim=1),
-                    )  # prevent model thinks we are generating
+                    )
 
                     task3_logits = self.actor_module.gen_head(task3_output.last_hidden_state)
                     task3_response_length = task3_response_mask.size(1)
@@ -262,11 +249,12 @@ class DataParallelImageGenerationActor(BasePPOActor):
                     log_probs = logprobs_from_logits(task3_logits, regen_img_tokens)
 
                     if calculate_entropy:
-                        if not self.config.entropy_checkpointing:
-                            entropy = verl_F.entropy_from_logits(task3_logits)  # (bsz, regen_img_tokens)
-                    else:
-                        entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, task3_logits)
-                    return entropy, log_probs 
+                        if self.config.get("entropy_checkpointing", False) and torch.is_grad_enabled():
+                            entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, task3_logits)
+                        else:
+                            entropy = verl_F.entropy_from_logits(task3_logits)
+
+                    return entropy, log_probs
 
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
@@ -291,30 +279,13 @@ class DataParallelImageGenerationActor(BasePPOActor):
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def compute_log_prob(self, data: DataProto, calculate_entropy=False) -> torch.Tensor:
-        """Compute the log probability of the responses given input_ids, attention_mask and position_ids
-
-        Args:
-            data (DataProto): a DataProto containing keys
-
-                ``input_ids``: tensor of shape [batch_size, sequence_length]. torch.int64. Note that input_ids is the
-                concatenation of prompt and response. Note that ``sequence_length = prompt_length + response_length``.
-
-                ``attention_mask``: tensor of shape [batch_size, sequence_length]. torch.int64.
-
-                ``position_ids``: tensor of shape [batch_size, sequence_length]. torch.int64.
-
-                ``responses``:  tensor of shape [batch_size, response_length]. torch.int64.
-
-        Returns:
-            torch.Tensor: the log_prob tensor
-        """
+        """Compute the log probability of the responses given input_ids, attention_mask and position_ids"""
         # set to eval
         self.actor_module.eval()
 
         micro_batch_size = data.meta_info["micro_batch_size"]
-        temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
+        temperature = data.meta_info["temperature"]
         use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
-        has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
 
         task_id = data.batch["task_id"].view(-1)[0].item()
 
@@ -342,22 +313,24 @@ class DataParallelImageGenerationActor(BasePPOActor):
         for micro_batch in micro_batches:
             micro_batch = micro_batch.to(get_device_id())
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
-            response_mask = model_inputs[f"task{task_id}_response_mask"]
-            seq_len = response_mask.size(1)
-
-            # ### task2 -> 3 jump
-            # micro_batch_feedback_text = model_inputs["task2_feedback_texts"]
-            # feedback = self.formatter._split_text_into_parts(micro_batch_feedback_text)[-1]
-            # if feedback is None or feedback == "No need to generate feedback.":
-            #     log_probs_lst.append(torch.zeros(1, seq_len))
-            #     if calculate_entropy:
-            #         entropy_lst.append(torch.zeros(1, seq_len))
-            #     continue
 
             with torch.no_grad():
                 entropy, log_probs = self._forward_micro_batch(
                     model_inputs, temperature=temperature, calculate_entropy=calculate_entropy, task_id=task_id
                 )
+
+            # For task 3, mask out samples that don't need regen *after* the forward
+            if task_id == 3:
+                texts = model_inputs["task2_feedback_texts"]
+                need = []
+                for t in texts:
+                    last = self.formatter._split_text_into_parts(t)[-1]
+                    need.append(not (last is None or last == "No need to generate feedback."))
+                need = torch.tensor(need, device=log_probs.device, dtype=torch.bool)
+            else:
+                need = torch.ones(log_probs.size(0), device=log_probs.device, dtype=torch.bool)
+
+            log_probs = log_probs * need.unsqueeze(1)
             log_probs_lst.append(log_probs)
             if calculate_entropy:
                 entropy_lst.append(entropy)
@@ -403,25 +376,13 @@ class DataParallelImageGenerationActor(BasePPOActor):
             p.requires_grad = False
         self.actor_module.gen_vision_model.eval()
 
-    def print_trainable_parameters(self):
-        print("Trainable Parameters:")
-        for name, param in self.actor_module.named_parameters():
-            if param.requires_grad:
-                print(f"{name}: {param.shape}, dtype={param.dtype}")
-
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
         # make sure we are in training mode
         self.actor_module.train()
-        # self.actor_module = self.actor_module.float()
         self.freeze_param()
-        # self.print_trainable_parameter()
-        # for name, param in self.actor_module.named_parameters():
-        #     if param.dtype == torch.long:
-        #         print(f"Parameter {name} is of type torch.long. Converting to float32.")
-        #         param.data = param.data.float()
-        temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
 
+        temperature = data.meta_info["temperature"]
         task_id = data.batch["task_id"].view(-1)[0].item()
 
         # batch_keys
@@ -553,7 +514,7 @@ class DataParallelImageGenerationActor(BasePPOActor):
 
                     param_ctx = contextlib.nullcontext()
                     if isinstance(self.actor_module, FSDP):
-                        param_ctx = FSDP.summon_full_params(self.actor_module, writeback=False, recurse=True, with_grads=True)
+                        param_ctx = FSDP.summon_full_params(self.actor_module, writeback=False, recurse=True, with_grads=torch.is_grad_enabled())
 
                     with param_ctx:
                         with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
