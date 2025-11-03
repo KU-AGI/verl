@@ -218,7 +218,25 @@ class DataParallelImageGenerationActor(BasePPOActor):
                     # Task 3: Regen Image Generation: input
                     task3_input_ids = micro_batch["task3_input_ids"]
                     task3_attention_mask = micro_batch["task3_attention_mask"]
-                    task3_input_embeds = self.actor_module.language_model.get_input_embeddings()(task3_input_ids)
+
+                    gen_imgs_pixel_values = micro_batch["task1_gen_imgs_pixel_values"]
+
+                    _, _, all_image_ids = self.actor_module.gen_vision_model.encode(gen_imgs_pixel_values)
+            
+                    task3_image_ids = all_image_ids[2]
+                    task3_image_ids = task3_image_ids.view(gen_imgs_pixel_values.size(0), -1)
+
+                    task3_image_embeds = self.actor_module.gen_aligner(self.actor_module.gen_embed(task3_image_ids))
+                    task3_text_embeds = self.actor_module.language_model.get_input_embeddings()(task3_input_ids)
+                    
+                    # per-sample image token position
+                    pos_list = []
+                    for ids in task3_input_ids:
+                        pos = (ids == self.processor.image_id).nonzero(as_tuple=False)[0].item()
+                        pos_list.append([pos])
+                    task3_image_start_indices = pos_list
+
+                    task3_merged_embeds = self.merge_text_and_image_embeds(task3_text_embeds, task3_image_embeds, task3_image_start_indices)
 
                     # Task 3: Regen Image Generation: output
                     regen_imgs_pixel_values = micro_batch["task3_regen_imgs_pixel_values"]
@@ -238,9 +256,9 @@ class DataParallelImageGenerationActor(BasePPOActor):
 
                     # Task 3: Regen Image Generation
                     task3_output = self.actor_module.language_model.model(
-                        inputs_embeds=torch.cat([task3_input_embeds, task3_regen_img_embeds], dim=1),
+                        inputs_embeds=torch.cat([task3_merged_embeds, task3_regen_img_embeds], dim=1),
                         attention_mask=torch.cat([task3_attention_mask, task3_response_mask], dim=1),
-                    )
+                    )  # prevent model thinks we are generating
 
                     task3_logits = self.actor_module.gen_head(task3_output.last_hidden_state)
                     task3_response_length = task3_response_mask.size(1)

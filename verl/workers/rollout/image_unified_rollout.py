@@ -439,10 +439,10 @@ class ImageUnifiedRollout(BaseRollout):
         batch_size = data_proto.batch.batch_size[0]
         print(f"[TEXT_GEN] Input batch_size: {batch_size}")
         
-        # Get images from meta_info
+        # Get images from batch
         gen_imgs_pixel_values = data_proto.batch.get('task1_gen_imgs_pixel_values', [])
         if len(gen_imgs_pixel_values) == 0:
-            raise ValueError("No images found in meta_info['task1_gen_imgs_pixel_values']")
+            raise ValueError("No images found in batch['task1_gen_imgs_pixel_values']")
         
         # Process all images in batch
         print(f"[TEXT_GEN] Processing feedback for {len(gen_imgs_pixel_values)} images in batch")
@@ -478,7 +478,6 @@ class ImageUnifiedRollout(BaseRollout):
 
         # merge text and image embeds
         merged_embeds = self.merge_text_and_image_embeds(text_embeds, image_embeds, all_image_start_indices)
-        # For computing logits: input
 
         batch_size, _, embed_dim = merged_embeds.shape
         max_input_len = max(output_start_indices)
@@ -540,10 +539,14 @@ class ImageUnifiedRollout(BaseRollout):
 
         print(f"[REGEN] Input batch_size: {batch_size}")
 
-        # Get data from meta_info
-        feedback_texts = data_proto.non_tensor_batch.get('task2_feedback_texts', [])
+        # Get data from batch
+        gen_imgs_pixel_values = data_proto.batch.get('task1_gen_imgs_pixel_values', [])
+        feedback_texts = data_proto.non_tensor_batch.get('feedback_texts', [])
+        
+        if len(gen_imgs_pixel_values) == 0:
+            raise ValueError("No images found in batch['task1_gen_imgs_pixel_values']")
 
-        print(f"[REGEN] Loaded {len(feedback_texts)} task2_feedback_texts from meta_info")
+        print(f"[REGEN] Loaded {len(gen_imgs_pixel_values)} images and {len(feedback_texts)} feedback_texts from non_tensor_batch")
 
         # Process all images in batch
         print(f"[REGEN] Processing regen for {batch_size} images in batch")
@@ -570,8 +573,11 @@ class ImageUnifiedRollout(BaseRollout):
         input_ids = inputs["input_ids"].to(self.device)
         attention_mask = inputs["attention_mask"].to(self.device)
 
-        data_proto.batch["task3_input_ids"] = input_ids
-        data_proto.batch["task3_attention_mask"] = attention_mask
+        batched_total_ids, batched_attention_mask, output_start_indices, all_image_start_indices, images_to_batch = self.expand_image_placeholders(input_ids, gen_imgs_pixel_values)
+
+        B, C, H, W = gen_imgs_pixel_values.shape
+
+        gen_imgs_pixel_values = gen_imgs_pixel_values.to(self.device, dtype=torch.bfloat16)
 
         # embedding
         param_ctx = contextlib.nullcontext()
@@ -580,14 +586,50 @@ class ImageUnifiedRollout(BaseRollout):
 
         with param_ctx:
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                input_embeds = self.module.language_model.get_input_embeddings()(input_ids)
+                _, _, all_image_ids = self.module.gen_vision_model.encode(gen_imgs_pixel_values)
+        
+                image_ids = all_image_ids[2]
+                image_ids = image_ids.view(B, -1)
 
-        # For computing logits: input (especially input text embedding)
+                image_embeds = self.module.gen_aligner(self.module.gen_embed(image_ids))
+                text_embeds = self.module.language_model.get_input_embeddings()(batched_total_ids)
+
+        # merge text and image embeds
+        merged_embeds = self.merge_text_and_image_embeds(text_embeds, image_embeds, all_image_start_indices)
+
+        batch_size, _, embed_dim = merged_embeds.shape
+        max_input_len = max(output_start_indices)
+        input_ids = torch.full((batch_size, max_input_len), self.processor.pad_id, dtype=torch.long, device=merged_embeds.device)
+        input_embeds = torch.zeros((batch_size, max_input_len, embed_dim), dtype=merged_embeds.dtype, device=merged_embeds.device)
+        input_attention_mask = torch.zeros((batch_size, max_input_len), dtype=torch.long, device=merged_embeds.device)
+        
+        # Left-padding 후의 이미지 시작 인덱스를 저장할 리스트
+        new_all_image_start_indices = []
+
+        for i in range(batch_size):
+            input_len = output_start_indices[i]
+            pad_len = max_input_len - input_len
+            
+            prompt_embeds = merged_embeds[i, :input_len]
+            prompt_attn_mask = batched_attention_mask[i, :input_len]           
+
+            input_ids[i, pad_len:] = batched_total_ids[i, :input_len]
+            input_embeds[i, pad_len:] = prompt_embeds
+            input_attention_mask[i, pad_len:] = prompt_attn_mask
+            
+            # 패딩 길이를 더해 새로운 이미지 시작 인덱스 계산
+            original_indices = all_image_start_indices[i]
+            new_indices = [idx + pad_len for idx in original_indices]
+            new_all_image_start_indices.append(new_indices)
+
+        # For generating regen images
+        data_proto.batch["task3_input_ids"] = input_ids
+        data_proto.batch["task3_attention_mask"] = input_attention_mask
         data_proto.batch["task3_input_embeds"] = input_embeds
 
         regen_final_cfg_embeds, regen_final_cfg_attention_mask = self._prepare_regen_cfg_embeds(data_proto)
         regenerated_tokens = self.generate_img(regen_final_cfg_embeds, regen_final_cfg_attention_mask)
-        # For reproducing generated images
+        # For reproducing regen images
         data_proto.batch["task3_regen_img_tokens"] = regenerated_tokens
 
         regen_decoded_images = self._decode_image_tokens(regenerated_tokens)
