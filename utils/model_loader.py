@@ -6,43 +6,44 @@ import os
 import json
 from typing import Dict
 from collections import defaultdict
+from deepspeed.utils.zero_to_fp32 import load_state_dict_from_zero_checkpoint, get_fp32_state_dict_from_zero_checkpoint
 
-def load_sharded_checkpoint(checkpoint_path: str) -> Dict:
-    """
-    Load Sharded .bin (Optimized for speed and memory)
-    """
-    index_path = os.path.join(checkpoint_path, "pytorch_model.bin.index.json")
-    if not os.path.exists(index_path):
-        raise FileNotFoundError(f"Index file not found at {index_path}")
+def load_deepspeed_ckpt(model, ckpt_path, dtype='bf16'):
+    sft_state_dict = get_fp32_state_dict_from_zero_checkpoint(ckpt_path)
 
-    with open(index_path, "r") as f:
-        index = json.load(f)
+    corrected_state_dict = {}
+    keys_were_corrected = False
+
+    prefix_to_remove = 'model.'
+
+    print(f"Attempting to remove prefix: '{prefix_to_remove}'")
+
+    for k, v in sft_state_dict.items():
+        if k.startswith(prefix_to_remove):
+            new_key = k[len(prefix_to_remove):] 
+            corrected_state_dict[new_key] = v
+            keys_were_corrected = True
+        else:
+            corrected_state_dict[k] = v 
+            print(f"WARNING: Found a key without expected prefix: {k}")
+
+    if keys_were_corrected:
+        print(f"Successfully corrected '{prefix_to_remove}' prefix from SFT keys.")
+    else:
+        print("ERROR: No keys were corrected. The prefix 'model.' was not found.")
+
+    print("Loading corrected state_dict into model (strict=False)...")
+    load_result = model.load_state_dict(corrected_state_dict, strict=False)
     
-    # 1. weight_map을 뒤집어서 shard_file -> [tensor_names] 구조로 변경
-    # 이렇게 하면 각 샤드를 한 번만 로드할 수 있습니다.
-    shards_to_tensors = defaultdict(list)
-    for tensor_name, shard_file in index["weight_map"].items():
-        shards_to_tensors[shard_file].append(tensor_name)
+    # 4. 로드 결과 확인
+    print("--- Load Result (after correction) ---")
+    print(f"Missing Keys : {load_result.missing_keys}")
+    print(f"Unexpected Keys : {load_result.unexpected_keys}")
 
-    full_state_dict = OrderedDict()
+    model_dtype = torch.bfloat16 if dtype == 'bf16' else torch.float32
+    model = model.to(model_dtype)
 
-    # 2. 샤드 파일별로 순회
-    for shard_file, tensor_names in shards_to_tensors.items():
-        shard_path = os.path.join(checkpoint_path, shard_file)
-        
-        # 3. 단일 샤드 파일만 메모리에 로드
-        loaded_shard = torch.load(shard_path, map_location="cpu", weights_only=True)
-        
-        # 4. 해당 샤드에 포함된 텐서들만 full_state_dict에 추가
-        for tensor_name in tensor_names:
-            # 'model.' 접두사 제거
-            new_key = tensor_name.replace("model.", "", 1)
-            full_state_dict[new_key] = loaded_shard[tensor_name]
-        
-        # 5. 작업이 끝난 샤드는 메모리에서 즉시 해제 (가비지 컬렉션 유도)
-        del loaded_shard
-
-    return full_state_dict
+    return model
 
 
 if __name__ == "__main__":
@@ -64,18 +65,7 @@ if __name__ == "__main__":
     )
     
     # 모델 로드
-    full_state_dict = load_sharded_checkpoint(finetuned_ckpt_dir)
+    model = load_deepspeed_ckpt(model, finetuned_ckpt_dir)
 
-    incompatible_keys = model.load_state_dict(full_state_dict, strict=False)
-    
-    print("✅ Finetuned weights loaded successfully.")
-
-    if incompatible_keys.missing_keys:
-        print("\n--- Missing Keys (were not in the checkpoint, kept original weights) ---")
-        print(f"Found {len(incompatible_keys.missing_keys)} missing keys.")
-    if incompatible_keys.unexpected_keys:
-        print("\n--- Unexpected Keys (were in the checkpoint but not in the model) ---")
-        print(f"Found {len(incompatible_keys.unexpected_keys)} unexpected keys.")
-    
     model.save_pretrained(save_path)
     processor.save_pretrained(save_path)
