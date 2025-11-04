@@ -337,13 +337,13 @@ class DataParallelImageGenerationActor(BasePPOActor):
                     model_inputs, temperature=temperature, calculate_entropy=calculate_entropy, task_id=task_id
                 )
 
-            # For task 3, mask out samples that don't need regen *after* the forward
+            # For task 3, mask out samples that don't need regen after the forward
             if task_id == 3:
                 texts = model_inputs["task2_feedback_texts"]
                 need = []
                 for t in texts:
                     last = self.formatter._split_text_into_parts(t)[-1]
-                    need.append(not (last is None or last == "No need to generate feedback."))
+                    need.append(not (last is None or "No need to generate feedback.".lower() in last.lower()))
                 need = torch.tensor(need, device=log_probs.device, dtype=torch.bool)
             else:
                 need = torch.ones(log_probs.size(0), device=log_probs.device, dtype=torch.bool)
