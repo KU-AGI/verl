@@ -38,10 +38,7 @@ reward_model:
     log: False
   reward_kwargs:
     img_saving:
-      save_freq: 1
       num: 4
-      path: null
-      experiment_name: null
 
 algorithm:
   filter_groups:
