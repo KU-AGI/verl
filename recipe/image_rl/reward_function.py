@@ -1,19 +1,23 @@
 import os
-import asyncio
 import base64
 import PIL
 from io import BytesIO
 from typing import Optional, List, Dict, Any
-from openai import AsyncOpenAI
+from openai import OpenAI
 import numpy as np
-
-from verl.utils.dataset.vision_utils import process_image
+from transformers import AutoTokenizer
+from concurrent.futures import ThreadPoolExecutor
+import time
+from collections import defaultdict
 from verl.utils.reward_score.math_reward import last_boxed_only_string, remove_boxed
+from recipe.image_rl.utils import FormattingEvaluator
+
+formatter = FormattingEvaluator()
 
 # Configuration
 BASE_URLS = [
-    "http://192.169.0.2:8004/v1",
-    "http://192.169.0.2:8006/v1"
+    "http://192.169.0.3:8000/v1",
+    "http://192.169.0.3:8002/v1"
 ]
 API_KEY = "EMPTY"
 MAX_RETRIES = 3
@@ -21,8 +25,10 @@ BASE_DELAY = 2
 MAX_CONCURRENT_REQUESTS = 32
 MODEL_NAME = os.environ.get("RM_MODEL_PATH", "OpenGVLab/InternVL3_5-38B")
 
-# Create async clients for each URL
-clients = [AsyncOpenAI(api_key=API_KEY, base_url=url) for url in BASE_URLS]
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+
+# Create sync clients for each URL
+clients = [OpenAI(api_key=API_KEY, base_url=url) for url in BASE_URLS]
 client_index = 0
 
 TASK1_FIRST_IMAGE_GENERATOR_PROMPT_TEMPLATE = """
@@ -86,38 +92,37 @@ def convert_gen_img_to_base64(gen_img: PIL.Image.Image) -> Optional[str]:
     
 
 def get_messages(prompt, gen_img, feedback_text, regen_img, ground_truth, task_id):
-    ground_truth = convert_gen_img_to_base64(ground_truth)
     if task_id == 1:
         system_prompt = TASK1_FIRST_IMAGE_GENERATOR_PROMPT_TEMPLATE.format(question=prompt)
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": [
-                {"type": "image_url", "image_url": {"url": convert_gen_img_to_base64(gen_img)}}
+                {"type": "image_pil", "image_pil": {"pil": gen_img}},
             ]}
         ]
-        return messages
     elif task_id == 2:
         system_prompt = TASK2_FEEDBACK_GENERATOR_PROMPT_TEMPLATE.format(question=prompt, feedback=feedback_text)
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": [
-                {"type": "image_url", "image_url": {"url": convert_gen_img_to_base64(gen_img)}},
+                {"type": "image_pil", "image_pil": {"pil": gen_img}},
                 {"type": "text", "text": feedback_text},
             ]}
         ]
-        return messages
     elif task_id == 3:
         system_prompt = TASK3_REGEN_IMAGE_GENERATOR_PROMPT_TEMPLATE.format(question=prompt)
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": [
-                {"type": "image_url", "image_url": {"url": convert_gen_img_to_base64(gen_img)}},
-                {"type": "image_url", "image_url": {"url": convert_gen_img_to_base64(regen_img)}}
+                {"type": "image_pil", "image_pil": {"pil": gen_img}},
+                {"type": "image_pil", "image_pil": {"pil": regen_img}},
             ]}
         ]
-        return messages
     else:
         raise ValueError(f"Invalid task: {task_id} is must be one of task1, task2, or task3.")
+    
+    prompt = tokenizer.apply_chat_template(conversation=messages, add_generation_prompt=True, tokenize=False)
+    return prompt
 
 
 def get_next_client():
@@ -128,24 +133,25 @@ def get_next_client():
     return client
 
 
-async def get_response(prompt, gen_img, feedback_text, regen_img, ground_truth, task_id):
+def get_response(prompt, gen_img, feedback_text, regen_img, ground_truth, task_id):
     """Get response from API with retry logic"""
     messages = get_messages(prompt, gen_img, feedback_text, regen_img, ground_truth, task_id)
     
     for attempt in range(MAX_RETRIES):
         try:
             client = get_next_client()
-            response = await client.chat.completions.create(
+            response = client.completions.create(
                 model=MODEL_NAME,
-                messages=messages,
+                prompt=messages,
+                max_tokens=250
             )
-            return response.choices[0].message.content
+            return response.choices[0].text
         except Exception as e:
             if attempt < MAX_RETRIES - 1:
                 print(f"Exception: {repr(e)}")
                 delay = BASE_DELAY * (2**attempt)
                 print(f"Retrying in {delay} seconds...")
-                await asyncio.sleep(delay)
+                time.sleep(delay)
             else:
                 print(f"Failed after {MAX_RETRIES} attempts. Error: {e}")
                 return None
@@ -164,67 +170,53 @@ def compute_reward(response):
     return reward_score
 
 
-async def compute_score_async(prompt, gen_img, feedback_text, regen_img, ground_truth, extra_info, task_id, **kwargs):
-    """Async version of compute_score"""
+def compute_score_single(prompt, gen_img, feedback_text, regen_img, ground_truth, extra_info, task_id, **kwargs):
+    """Sync version of compute_score"""
     reward_score = 0.0
     reward_extra_info = {}
 
     # VLM based reward
-    response = await get_response(prompt, gen_img, feedback_text, regen_img, ground_truth, task_id)
+    response = get_response(prompt, gen_img, feedback_text, regen_img, ground_truth, task_id)
     if response is not None:
         reward_score += compute_reward(response)
-        reward_extra_info[f"task_{task_id}"] = reward_score
+        reward_extra_info[f"task{task_id}_reward_response"] = response
     else:
         reward_score += 0.0
-
     return {
         "score": reward_score,
         "reward_extra_info": reward_extra_info,
     }
 
 
-async def compute_score_batch_async(prompts, gen_imgs, feedback_texts, regen_imgs, ground_truths, extra_infos, task_ids):
-    """Async batch processing with semaphore for concurrency control"""
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+def compute_score_batch_threaded(prompts, gen_imgs, feedback_texts, regen_imgs, ground_truths, extra_infos, task_ids):
+    """Threaded batch processing for concurrency"""
     
-    async def process_with_semaphore(prompt, gen_img, feedback_text, regen_img, ground_truth, extra_info, task_id):
-        async with semaphore:
-            return await compute_score_async(prompt, gen_img, feedback_text, regen_img, ground_truth, extra_info, task_id)
+    def process_single_item(args):
+        prompt, gen_img, feedback_text, regen_img, ground_truth, extra_info, task_id = args
+        try:
+            return compute_score_single(prompt, gen_img, feedback_text, regen_img, ground_truth, extra_info, task_id)
+        except Exception as e:
+            print(f"Task failed with exception: {e}")
+            return {"score": 0.0, "reward_extra_info": {}}
     
-    # Create tasks for all items
-    tasks = []
-    for prompt, gen_img, feedback_text, regen_img, ground_truth, extra_info, task_id in zip(
-        prompts, gen_imgs, feedback_texts, regen_imgs, ground_truths, extra_infos, task_ids, strict=True
-    ):
-        task = process_with_semaphore(prompt, gen_img, feedback_text, regen_img, ground_truth, extra_info, task_id)
-        tasks.append(task)
+    # Prepare arguments for ThreadPoolExecutor
+    args_list = list(zip(prompts, gen_imgs, feedback_texts, regen_imgs, ground_truths, extra_infos, task_ids))
     
-    # Execute all tasks concurrently
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    # Use ThreadPoolExecutor for concurrent processing
+    with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_REQUESTS) as executor:
+        results = list(executor.map(process_single_item, args_list))
     
-    # Handle exceptions
-    clean_results = []
-    for result in results:
-        if isinstance(result, Exception):
-            print(f"Task failed with exception: {result}")
-            clean_results.append({"score": 0.0, "reward_extra_info": {}})
-        else:
-            clean_results.append(result)
-    
-    return clean_results
+    return results
 
 
 def compute_score_batch(prompts, gen_imgs, feedback_texts, regen_imgs, ground_truths, extra_infos, task_ids):
-    """Synchronous wrapper for backward compatibility"""
-    return asyncio.run(
-        compute_score_batch_async(prompts, gen_imgs, feedback_texts, regen_imgs, ground_truths, extra_infos, task_ids)
-    )
+    """Synchronous batch processing"""
+    return compute_score_batch_threaded(prompts, gen_imgs, feedback_texts, regen_imgs, ground_truths, extra_infos, task_ids)
 
 
 def compute_score(prompt, gen_img, feedback_text, regen_img, ground_truth, extra_info, task_id, **kwargs):
-    """Legacy single score computation - now uses async processing internally"""
+    """Legacy single score computation"""
     results = compute_score_batch(
-        [prompt], [gen_img], [feedback_text], [regen_img], 
-        [ground_truth], [extra_info], [task_id]
+        [prompt], [gen_img], [feedback_text], [regen_img], [ground_truth], [extra_info], [task_id]
     )
     return results[0]
