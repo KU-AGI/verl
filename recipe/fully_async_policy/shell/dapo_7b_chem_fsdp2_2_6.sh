@@ -2,7 +2,7 @@
 set -xeuo pipefail
 
 project_name='verl-dapo'
-exp_name='fully_async_debug'
+exp_name='RR_seq-mean-token-sum_no-rp-step7rwd'
 
 # Ray
 RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
@@ -34,8 +34,8 @@ kl_coef=0.0
 use_kl_loss=False
 kl_loss_coef=0.0
 
-clip_ratio_low=1.0
-clip_ratio_high=1.0
+clip_ratio_low=0.2
+clip_ratio_high=0.2
 
 enable_filter_groups=True
 # filter_groups_metric=acc
@@ -45,12 +45,12 @@ max_num_gen_batches=0
 # Response length parameters
 max_prompt_length=500 # $((1024 * 2))
 max_response_length=1700 # $((1024 * 8))
-enable_overlong_buffer=True
-overlong_buffer_len=1000 # $((1024 * 4))
+enable_overlong_buffer=False
+overlong_buffer_len=0 # $((1024 * 4))
 overlong_penalty_factor=1.0
 
 # Training parameters
-loss_agg_mode="token-mean"
+loss_agg_mode="seq-mean-token-sum"
 
 # Algorithm
 temperature=1.0
@@ -83,7 +83,7 @@ n_resp_per_prompt=8
 train_prompt_mini_bsz=16
 total_rollout_steps=$(((512*100000)))
 test_freq=5
-staleness_threshold=0.3
+staleness_threshold=0.0
 trigger_parameter_sync_step=4
 require_batches=3
 partial_rollout=False
@@ -134,7 +134,7 @@ python -m recipe.fully_async_policy.fully_async_main \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
-    actor_rollout_ref.actor.optim.lr=1e-7 \
+    actor_rollout_ref.actor.optim.lr=3e-7 \
     actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
     actor_rollout_ref.actor.optim.weight_decay=0.1 \
     actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \

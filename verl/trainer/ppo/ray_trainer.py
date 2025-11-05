@@ -60,6 +60,7 @@ from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
+from verl.evaluator.reflection_evaluator import ReflectionEvaluator
 
 
 @dataclass
@@ -873,6 +874,19 @@ class RayPPOTrainer:
             metric_dict["val-aux/num_turns/max"] = sample_turns.max()
             metric_dict["val-aux/num_turns/mean"] = sample_turns.mean()
 
+        # Reflection metrics
+        tasks = list(set(data_sources.tolist()))
+        evaluator = ReflectionEvaluator()
+        for task in tasks:
+            task_indices = [i for i, ds in enumerate(data_sources) if ds == task]
+            task_inputs = [sample_inputs[i] for i in task_indices]
+            task_outputs = [sample_outputs[i].split("<think>")[-1].split("</think>")[0].strip() for i in task_indices]
+            task_gts = [sample_gts[i].split("<think>")[-1].split("</think>")[0].strip() for i in task_indices]
+            reflection_metrics = evaluator.evaluate([[] for _ in range(len(task_gts))], task_gts, task_outputs, task)
+            for metric_name, metric_val in reflection_metrics.items():
+                pfx = f"val-aux/{task}/reflection/{metric_name}"
+                metric_dict[pfx] = metric_val
+
         return metric_dict
 
     def _test(self):
@@ -1054,6 +1068,19 @@ class RayPPOTrainer:
             metric_dict["test-aux/num_turns/min"] = sample_turns.min()
             metric_dict["test-aux/num_turns/max"] = sample_turns.max()
             metric_dict["test-aux/num_turns/mean"] = sample_turns.mean()
+
+        # Reflection metrics
+        tasks = list(set(data_sources.tolist()))
+        evaluator = ReflectionEvaluator()
+        for task in tasks:
+            task_indices = [i for i, ds in enumerate(data_sources) if ds == task]
+            task_inputs = [sample_inputs[i] for i in task_indices]
+            task_outputs = [sample_outputs[i].split("<think>")[-1].split("</think>")[0].strip() for i in task_indices]
+            task_gts = [sample_gts[i].split("<think>")[-1].split("</think>")[0].strip() for i in task_indices]
+            reflection_metrics = evaluator.evaluate([[] for _ in range(len(task_gts))], task_gts, task_outputs, task)
+            for metric_name, metric_val in reflection_metrics.items():
+                pfx = f"test-aux/{task}/reflection/{metric_name}"
+                metric_dict[pfx] = metric_val
 
         return metric_dict
 

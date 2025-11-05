@@ -663,7 +663,7 @@ class StepEvaluator():
 
         return {
             "reagent/step6/has_reagents": int(has_reagents),
-            "reagent/step7/has_correct_reagent_number": int(has_correct_reagent_number),
+            # "reagent/step7/has_correct_reagent_number": int(has_correct_reagent_number),
         }
 
     """
@@ -717,7 +717,7 @@ class ChemistryEvaluator:
         extracted_gt = TextProcessor.extract_answer_tag(gt) if gt else None
         
         is_correct = self.validator.exact_match(extracted_pred, extracted_gt) if extracted_pred and extracted_gt else False
-        return (1 if is_correct else -1), extracted_pred
+        return (1 if is_correct else 0), extracted_pred
     
     def verify(self, solution_str: str, ground_truth: str, extra_info: Optional[Dict] = None) -> Tuple[bool, Optional[str]]:
         """Verify if the solution is correct."""
