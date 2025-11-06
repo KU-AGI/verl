@@ -2,7 +2,7 @@
 set -xeuo pipefail
 
 project_name='verl-dapo'
-exp_name='RR_seq-mean-token-sum_no-rp-step7rwd'
+exp_name='ref_bonus_kl0.001'
 
 # Ray
 RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
@@ -31,8 +31,8 @@ adv_estimator=grpo
 
 use_kl_in_reward=False
 kl_coef=0.0
-use_kl_loss=False
-kl_loss_coef=0.0
+use_kl_loss=True
+kl_loss_coef=0.001
 
 clip_ratio_low=0.2
 clip_ratio_high=0.2
@@ -82,12 +82,12 @@ gen_prompt_bsz=1
 n_resp_per_prompt=8
 train_prompt_mini_bsz=16
 total_rollout_steps=$(((512*100000)))
-test_freq=5
+test_freq=1
 staleness_threshold=0.0
-trigger_parameter_sync_step=4
+trigger_parameter_sync_step=200
 require_batches=3
 partial_rollout=False
-save_freq=$((test_freq * trigger_parameter_sync_step * 100))
+save_freq=$((test_freq * trigger_parameter_sync_step * 3))
 
 
 # ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
