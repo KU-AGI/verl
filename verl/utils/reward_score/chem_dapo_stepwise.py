@@ -633,6 +633,7 @@ class StepEvaluator():
         predicted_step7_rationale = ""
 
         steps_data = self.parse_steps_with_reflections(predicted_rationale)
+        reflection_bonus = 0.
         for step_key, step_info in steps_data.items():
             if step_info["step"] == 6:
                 has_reflection = len(step_info["reflections"]) > 0
