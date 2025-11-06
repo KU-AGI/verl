@@ -761,6 +761,7 @@ class ChemistryEvaluator:
             step_eval_results, reflection_bonus = self.step_evaluator.calculate_reagent_rationale_metrics(info, predicted_rationale)
         else:
             step_eval_results = {}
+            reflection_bonus = 0.0
 
         reward = correct + (sum(step_eval_results.values()) / len(step_eval_results) if step_eval_results else 0.0) + reflection_bonus
 
