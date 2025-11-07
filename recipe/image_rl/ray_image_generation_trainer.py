@@ -385,7 +385,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
         except Exception as e:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
-    def _dump_generations(self, prompt_id, prompt, gen_imgs_pil_list, feedback_texts, regen_imgs_pil_list,
+    def _dump_generations(self, uid, prompt_id, prompt, gen_imgs_pil_list, feedback_texts, regen_imgs_pil_list,
             gts, scores, reward_extra_infos_dict, dump_path, task_id
         ):
         """Dump rollout/validation samples as JSONL."""
@@ -411,33 +411,38 @@ class RayImageGenerationTrainer(RayPPOTrainer):
         with open(filename, "w") as f:
             f.write("\n".join(lines) + "\n")
         
-        save_num = self.reward_kwargs.get("img_saving", {}).get("num", n)
-        for i in range(min(n, save_num)):
+        # save_num = self.reward_kwargs.get("img_saving", {}).get("num", n)
+        for i in range(n): # (min(n, save_num)):
             
-            with open(os.path.join(image_dir, f"text_num{i}.txt"), 'w', encoding='utf-8') as f:
-                f.write(f"Sample {i}\n")
+            # Set uid
+            id = uid[i]
+
+            # Prompt id
+            pid = prompt_id[i]
+
+            with open(os.path.join(image_dir, f"text_{pid}_{id}.txt"), 'w', encoding='utf-8') as f:
+                f.write(f"Sample {pid}'s {id}\n")
                 f.write("=" * 40 + "\n")
                 
                 # Save input text
-                prompt_id = prompt_id[i]
                 f.write(f"Input Text: {prompt[i]}\n")
 
                 if task_id == 1:
                     # Save generated image
-                    save_path = os.path.join(image_dir, f"gen_img_{prompt_id}_{i}.png")
+                    save_path = os.path.join(image_dir, f"gen_img_{pid}_{id}.png")
                     PIL.Image.fromarray(gen_imgs_pil_list[i].astype(np.uint8)).save(save_path)
-                    f.write(f"Generated Image:\nimg_{prompt_id}_{i}.png\n\n")
+                    f.write(f"Generated Image:\nimg_{pid}_{id}.png\n\n")
                     task1_reward_response = reward_extra_infos_dict["task1_reward_response"][i]
                     f.write(f"Response of task1 reward:\n{task1_reward_response}\n\n")
 
                     # Save GT image
-                    ground_truth_path = os.path.join(image_dir, f"ground_truth_{prompt_id}_{i}.png")
+                    ground_truth_path = os.path.join(image_dir, f"ground_truth_{pid}_{id}.png")
                     PIL.Image.open(gts[i]).convert("RGB").save(ground_truth_path)
-                    f.write(f"Ground Truth:\nground_truth_{prompt_id}_{i}.png\n\n")
+                    f.write(f"Ground Truth:\nground_truth_{pid}_{id}.png\n\n")
 
                 elif task_id == 2:
                     # Save feedback text
-                    f.write(f"Feedback of {prompt_id}:\n{feedback_texts[i]}\n\n")
+                    f.write(f"Feedback of {pid}_{id}:\n{feedback_texts[i]}\n\n")
                     parsed_feedback = self.formatter._split_text_into_parts(feedback_texts[i])[-1]
                     f.write(f"Parsed feedback: {'No need to generate feedback.' if parsed_feedback is None else parsed_feedback}\n\n")
                     task2_reward_response = reward_extra_infos_dict["task2_reward_response"][i]
@@ -445,16 +450,16 @@ class RayImageGenerationTrainer(RayPPOTrainer):
 
                 elif task_id == 3:
                     # Save regen image
-                    regen_path = os.path.join(image_dir, f"regen_img_{prompt_id}_{i}.png")
+                    regen_path = os.path.join(image_dir, f"regen_img_{pid}_{id}.png")
                     PIL.Image.fromarray(regen_imgs_pil_list[i].astype(np.uint8)).save(regen_path)
-                    f.write(f"Regenerated Image:\nregen_img_{prompt_id}_{i}.png\n\n")
+                    f.write(f"Regenerated Image:\nregen_img_{pid}_{id}.png\n\n")
                     task3_reward_response = reward_extra_infos_dict["task3_reward_response"][i]
                     f.write(f"Response task3 reward:\n{task3_reward_response}\n\n")
 
                     # Save GT image
-                    ground_truth_path = os.path.join(image_dir, f"ground_truth_{prompt_id}_{i}.png")
+                    ground_truth_path = os.path.join(image_dir, f"ground_truth_{pid}_{id}.png")
                     PIL.Image.open(gts[i]).convert("RGB").save(ground_truth_path)
-                    f.write(f"Ground Truth:\nground_truth_{prompt_id}_{i}.png\n\n")
+                    f.write(f"Ground Truth:\nground_truth_{pid}_{id}.png\n\n")
 
                 f.write("\n" + "=" * 40 + "\n\n")
         
@@ -473,6 +478,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
         """
         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
             prompt_id = batch.non_tensor_batch['prompt_id'].tolist()
+            uid = batch.non_tensor_batch["uid"].tolist()
             prompt = batch.non_tensor_batch['prompt'].tolist()
             gen_imgs_pil_list = batch.non_tensor_batch['task1_gen_imgs_pil_list']
             feedback_texts = batch.non_tensor_batch['task2_feedback_texts'].tolist()
@@ -492,6 +498,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             
             self._dump_generations(
                 prompt_id=prompt_id,
+                uid=uid,
                 prompt=prompt,
                 gen_imgs_pil_list=gen_imgs_pil_list,
                 feedback_texts=feedback_texts,
@@ -544,37 +551,12 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             test_batch = test_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n,
                                            interleave=True)
 
-            # we only do validation on rule-based rm
-            # if self.config.reward_model.enable:
-            #     return {}
+            # add uid to batch <- dummy tensor in batch
+            test_batch.non_tensor_batch["uid"] = np.array(
+                [str(uuid.uuid4()) for _ in range(len(test_batch.batch))], dtype=object
+            )
 
-            # Store original inputs
-            input_ids = test_batch.batch['input_ids']
-            input_texts = [self.processor.decode(ids) for ids in input_ids]
-            sample_inputs.extend(input_texts)
-
-            if 'multi_modal_inputs' in test_batch.non_tensor_batch.keys():
-                test_gen_batch = test_batch.pop(
-                    batch_keys=['input_ids', 'attention_mask', 'position_ids'],
-                    non_tensor_batch_keys=['raw_prompt_ids', 'multi_modal_data', 'multi_modal_inputs','data_source'],
-                )
-            else:
-                test_gen_batch = test_batch.pop(
-                    batch_keys=['input_ids', 'attention_mask', 'position_ids'],
-                    non_tensor_batch_keys=['raw_prompt_ids','data_source'],
-                )
-
-            test_gen_batch.meta_info = {
-                'boi_token_id': self.processor.boi_token_id,
-                'eoi_token_id': self.processor.eoi_token_id,
-                'bos_token_id': self.tokenizer.bos_token_id,
-                'eos_token_id': self.tokenizer.eos_token_id,
-                'pad_token_id': self.tokenizer.pad_token_id,
-                'recompute_log_prob': False,
-                'do_sample': self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
-                'validate': True,
-            }
-            print(f'test_gen_batch meta info: {test_gen_batch.meta_info}')
+            test_gen_batch = self._get_gen_batch(test_batch)
 
             # pad to be divisible by dp_size
             test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_wg.world_size)
@@ -584,10 +566,6 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
             print('validation generation end')
 
-            # Store generated outputs
-            # output_ids = test_output_gen_batch.batch['responses']
-            # output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
-            # sample_outputs.extend(output_texts)
             output_imgs = test_output_gen_batch.batch.non_tensor_batch['gen_img_list']
             output_imgs = [output_img.to('cpu').numpy() if isinstance(output_img, torch.Tensor) else output_img for output_img in output_imgs]
             output_img_list = [wandb.Image(PIL.Image.fromarray(img), caption=input_texts[i]) for i, img in enumerate(output_imgs)]
@@ -745,8 +723,8 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                         
                         batch.batch["attention_mask"] = torch.cat([batch.batch[f"task{task_id}_attention_mask"], batch.batch[f"task{task_id}_response_mask"]], dim=1)
 
-                        if self.config.trainer.balance_batch:
-                            self._balance_batch(batch, metrics=metrics) 
+                        # if self.config.trainer.balance_batch:
+                        #     self._balance_batch(batch, metrics=metrics) 
 
                         with marked_timer("reward", timing_raw, color="yellow"):
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn, eval=False, task_id=task_id)
@@ -771,7 +749,14 @@ class RayImageGenerationTrainer(RayPPOTrainer):
 
                                 metrics.update(calculate_debug_metrics(batch))
 
-                        # Not use use_reference_policy in RLVR
+                        if self.use_reference_policy:
+                            # compute reference log_prob
+                            with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
+                                if not self.ref_in_actor:
+                                    ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                                else:
+                                    ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
+                                batch = batch.union(ref_log_prob)
 
                         # Not use computing values in RLVR
                         
