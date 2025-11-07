@@ -25,10 +25,10 @@ export TORCH_DISTRIBUTED_DEBUG=DETAIL
 
 GPUS=4 # `nvidia-smi -L | wc -l`
 MODEL_PATH=/data/mllm/ckpt/pretrained # /data/mllm/checkpoints/Janus-Pro-7B
-RM_MODEL_PATH=OpenGVLab/InternVL3_5-38B
+RM_MODEL_PATH=Qwen/Qwen3-VL-30B-A3B-Instruct # OpenGVLab/InternVL3_5-38B
 TRAIN_FILES=/data/mllm/data/train.parquet
 VAL_FILES=/data/mllm/data/val.parquet
-RUN_NAME=naive
+RUN_NAME=naive_qwen_vlm
 PROJ_NAME=mllm_reasoning
 SAVE_DIR=/data/verl/ckpts/$PROJ_NAME/$RUN_NAME
 
@@ -38,9 +38,9 @@ WORKING_DIR=${WORKING_DIR:-"${PWD}"}
 RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/verl/trainer/runtime_env.yaml"}
 
 # Parameters
-train_prompt_bsz=8
+train_prompt_bsz=4
 # val_prompt_bsz=8
-n_resp_per_prompt=4
+n_resp_per_prompt=8
 train_prompt_mini_bsz=4
 
 # Perf

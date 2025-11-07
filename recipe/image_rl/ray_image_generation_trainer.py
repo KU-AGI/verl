@@ -386,7 +386,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
     def _dump_generations(self, uid, prompt_id, prompt, gen_imgs_pil_list, feedback_texts, regen_imgs_pil_list,
-            gts, scores, reward_extra_infos_dict, dump_path, task_id
+            gts_imgs, gts_tuples, gts_vqas, scores, reward_extra_infos_dict, dump_path, task_id
         ):
         """Dump rollout/validation samples as JSONL."""
         os.makedirs(dump_path, exist_ok=True)
@@ -437,14 +437,14 @@ class RayImageGenerationTrainer(RayPPOTrainer):
 
                     # Save GT image
                     ground_truth_path = os.path.join(image_dir, f"ground_truth_{pid}_{id}.png")
-                    PIL.Image.open(gts[i]).convert("RGB").save(ground_truth_path)
+                    PIL.Image.open(gts_imgs[i]).convert("RGB").save(ground_truth_path)
                     f.write(f"Ground Truth:\nground_truth_{pid}_{id}.png\n\n")
 
                 elif task_id == 2:
                     # Save feedback text
                     f.write(f"Feedback of {pid}_{id}:\n{feedback_texts[i]}\n\n")
-                    parsed_feedback = self.formatter._split_text_into_parts(feedback_texts[i])[-1]
-                    f.write(f"Parsed feedback: {'No need to generate feedback.' if parsed_feedback is None else parsed_feedback}\n\n")
+                    ground_truth_tuple, ground_truth_vqa_question = gts_tuples[i], gts_vqas[i]
+                    f.write(f"Ground Truth:\nTuple:\n{ground_truth_tuple}\nVQA:\n{ground_truth_vqa_question}\n\n")
                     task2_reward_response = reward_extra_infos_dict["task2_reward_response"][i]
                     f.write(f"Response task2 reward:\n{task2_reward_response}\n\n")
 
@@ -458,7 +458,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
 
                     # Save GT image
                     ground_truth_path = os.path.join(image_dir, f"ground_truth_{pid}_{id}.png")
-                    PIL.Image.open(gts[i]).convert("RGB").save(ground_truth_path)
+                    PIL.Image.open(gts_imgs[i]).convert("RGB").save(ground_truth_path)
                     f.write(f"Ground Truth:\nground_truth_{pid}_{id}.png\n\n")
 
                 f.write("\n" + "=" * 40 + "\n\n")
@@ -483,15 +483,12 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             gen_imgs_pil_list = batch.non_tensor_batch['task1_gen_imgs_pil_list']
             feedback_texts = batch.non_tensor_batch['task2_feedback_texts'].tolist()
             regen_imgs_pil_list = batch.non_tensor_batch['task3_regen_imgs_pil_list']
-            sample_gts = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
+            gts_imgs = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
+            gts_tuples = [item.non_tensor_batch.get("reward_model", {}).get("tuple", None) for item in batch]
+            gts_vqas = [item.non_tensor_batch.get("reward_model", {}).get("vqa_question", None) for item in batch]
             scores = batch.batch[f"task{task_id}_token_level_scores"].sum(-1).cpu().tolist()
 
             reward_extra_infos_to_dump = reward_extra_infos_dict.copy()
-            if "request_id" in batch.non_tensor_batch:
-                reward_extra_infos_dict.setdefault(
-                    "request_id",
-                    batch.non_tensor_batch["request_id"].tolist(),
-                )
 
             dump_path = os.path.join(rollout_data_dir, f"task_{task_id}")
             os.makedirs(dump_path, exist_ok=True)
@@ -503,7 +500,9 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                 gen_imgs_pil_list=gen_imgs_pil_list,
                 feedback_texts=feedback_texts,
                 regen_imgs_pil_list=regen_imgs_pil_list,
-                gts=sample_gts,
+                gts_imgs=gts_imgs,
+                gts_tuples=gts_tuples,
+                gts_vqas=gts_vqas,
                 scores=scores,
                 reward_extra_infos_dict=reward_extra_infos_to_dump,
                 dump_path=dump_path,
