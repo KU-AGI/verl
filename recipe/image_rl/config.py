@@ -27,9 +27,6 @@ class ImageGenerationRolloutConfig(RolloutConfig):
     txt_top_p: float = 1.0
     img_top_k: int = 4096
     img_top_p: float = 1.0
-
-    feedback_system_prompt : Optional[str] = None
-    regen_system_prompt : Optional[str] = None
     image_token_num_per_image: int = 576
 
 

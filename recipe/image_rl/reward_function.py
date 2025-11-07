@@ -3,6 +3,7 @@ import base64
 import PIL
 from io import BytesIO
 from typing import Optional, List, Dict, Any
+import PIL.Image
 from openai import OpenAI
 import numpy as np
 from transformers import AutoTokenizer
@@ -16,8 +17,9 @@ formatter = FormattingEvaluator()
 
 # Configuration
 BASE_URLS = [
-    "http://192.169.0.3:8000/v1",
-    "http://192.169.0.3:8002/v1"
+    # "http://192.169.0.3:8000/v1",
+    # "http://192.169.0.3:8002/v1",
+    "http://192.169.0.3:8004/v1",
 ]
 API_KEY = "EMPTY"
 MAX_RETRIES = 3
@@ -97,7 +99,7 @@ def get_messages(prompt, gen_img, feedback_text, regen_img, ground_truth, task_i
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": [
-                {"type": "image_pil", "image_pil": {"pil": gen_img}},
+                {"type": "image_url", "image_url": {"url": convert_gen_img_to_base64(gen_img)}},
             ]}
         ]
     elif task_id == 2:
@@ -105,7 +107,7 @@ def get_messages(prompt, gen_img, feedback_text, regen_img, ground_truth, task_i
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": [
-                {"type": "image_pil", "image_pil": {"pil": gen_img}},
+                {"type": "image_url", "image_url": {"url": convert_gen_img_to_base64(gen_img)}},
                 {"type": "text", "text": feedback_text},
             ]}
         ]
@@ -114,15 +116,14 @@ def get_messages(prompt, gen_img, feedback_text, regen_img, ground_truth, task_i
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": [
-                {"type": "image_pil", "image_pil": {"pil": gen_img}},
-                {"type": "image_pil", "image_pil": {"pil": regen_img}},
+                {"type": "image_url", "image_url": {"url": convert_gen_img_to_base64(regen_img)}},
+                {"type": "image_url", "image_url": {"url": convert_gen_img_to_base64(ground_truth)}},
             ]}
         ]
     else:
         raise ValueError(f"Invalid task: {task_id} is must be one of task1, task2, or task3.")
     
-    prompt = tokenizer.apply_chat_template(conversation=messages, add_generation_prompt=True, tokenize=False)
-    return prompt
+    return messages
 
 
 def get_next_client():
@@ -140,12 +141,11 @@ def get_response(prompt, gen_img, feedback_text, regen_img, ground_truth, task_i
     for attempt in range(MAX_RETRIES):
         try:
             client = get_next_client()
-            response = client.completions.create(
+            response = client.chat.completions.create(
                 model=MODEL_NAME,
-                prompt=messages,
-                max_tokens=250
+                messages=messages
             )
-            return response.choices[0].text
+            return response.choices[0].message.content
         except Exception as e:
             if attempt < MAX_RETRIES - 1:
                 print(f"Exception: {repr(e)}")
@@ -194,6 +194,7 @@ def compute_score_batch_threaded(prompts, gen_imgs, feedback_texts, regen_imgs, 
     def process_single_item(args):
         prompt, gen_img, feedback_text, regen_img, ground_truth, extra_info, task_id = args
         try:
+            ground_truth = PIL.Image.open(ground_truth).convert("RGB")
             return compute_score_single(prompt, gen_img, feedback_text, regen_img, ground_truth, extra_info, task_id)
         except Exception as e:
             print(f"Task failed with exception: {e}")
