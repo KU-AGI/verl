@@ -30,11 +30,14 @@ if __name__ == "__main__":
                 root_dir = "/data/mllm/reasonr1"
             aligned_image_path = os.path.join(root_dir, example["aligned_data"]["img_path"].lstrip("/"))
 
+            feedback_tuple = example["tuple"]
+            vqa_question = example["question"] # for task 2 eval
+
             data = {
                 "data_source": "image_generation",
                 "prompt": prompt,
                 "ability": "image_unified_generation",
-                "reward_model": {"style": "rule", "ground_truth": aligned_image_path},
+                "reward_model": {"style": "rule", "ground_truth": aligned_image_path, "tuple": feedback_tuple, "vqa_question": vqa_question},
                 "extra_info": {"split": split, "index": idx},
             }
             return data
