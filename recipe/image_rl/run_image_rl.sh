@@ -52,7 +52,7 @@ max_response_length=$((1024 * 2)) # 2k
 ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     --working-dir "${WORKING_DIR}" \
     -- python3 -m recipe.image_rl.main_image_generation_rl \
-    algorithm.adv_estimator=grpo \
+    algorithm.adv_estimator=grpo_task_skip \
     data.train_files=$TRAIN_FILES \
     data.val_files=$VAL_FILES \
     data.shuffle=False \

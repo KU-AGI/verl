@@ -276,7 +276,7 @@ def compute_score_single(prompt, gen_img, feedback_text, regen_img, ground_truth
         task2_reward_score = 0.0
         
         # Rule-based reward
-        formatting_evaluator = FormattingEvaluator() # task 2 only
+        formatting_evaluator = FormattingEvaluator()
         part1, part2, part3 = formatting_evaluator._split_text_into_parts(feedback_text.strip())
 
         # formatting
@@ -315,6 +315,16 @@ def compute_score_single(prompt, gen_img, feedback_text, regen_img, ground_truth
         reward_extra_info[f"task{task_id}_reward_response"] = response
 
     elif task_id == 3:
+        formatting_evaluator = FormattingEvaluator()
+        last = formatting_evaluator._split_text_into_parts(feedback_text)[-1]
+        if last is not None and "No need to generate feedback.".lower() in last.lower():
+            reward_score += -100
+            reward_extra_info[f"task{task_id}_reward_response"] = "None"
+            return {
+                "score": reward_score,
+                "reward_extra_info": reward_extra_info,
+            }
+
         # VLM based reward
         response = get_response(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, task_id)
         if response is not None:

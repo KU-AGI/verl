@@ -45,9 +45,9 @@ from verl.single_controller.base import Worker
 from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.config import AlgoConfig
-from verl.trainer.ppo import core_algos
+from recipe.image_rl import core_algos
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
-from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
+from recipe.image_rl.core_algos import AdvantageEstimator, agg_loss
 from recipe.image_rl.cusrom_metric_utils import ( # custom metric
     compute_data_metrics,
     compute_throughout_metrics,
@@ -217,7 +217,7 @@ def compute_advantage(
     Returns:
         DataProto: The updated data with computed advantages and returns.
     """
-    if adv_estimator == AdvantageEstimator.GRPO: # Now only support GRPO methods
+    if adv_estimator == AdvantageEstimator.GRPO:
         # Initialize the mask for GRPO calculation
         grpo_calculation_mask = data.batch[f"task{task_id}_response_mask"]
 
@@ -230,6 +230,21 @@ def compute_advantage(
         )
         data.batch[f"task{task_id}_advantages"] = advantages
         data.batch[f"task{task_id}_returns"] = returns
+
+    elif adv_estimator == AdvantageEstimator.GRPO_TASK_SKIP: # GRPO task3 masking if needed
+        # Initialize the mask for GRPO calculation
+        grpo_calculation_mask = data.batch[f"task{task_id}_response_mask"]
+
+        # Call compute_grpo_task_skip_outcome_advantage with parameters matching its definition
+        advantages, returns = core_algos.compute_grpo_task_skip_outcome_advantage(
+            token_level_rewards=data.batch[f"task{task_id}_token_level_rewards"],
+            response_mask=grpo_calculation_mask,
+            index=data.non_tensor_batch["uid"],
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+        )
+        data.batch[f"task{task_id}_advantages"] = advantages
+        data.batch[f"task{task_id}_returns"] = returns
+    
     return data
 
 class RayImageGenerationTrainer(RayPPOTrainer):
