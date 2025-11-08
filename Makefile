@@ -48,7 +48,7 @@ init-container-with-infiniband:
 		tail -f /dev/null
 
 CACHE_PATH=/data/.cache
-MODEL_PATH=OpenGVLab/InternVL3_5-38B
+MODEL_PATH=Qwen/Qwen3-VL-30B-A3B-Instruct # OpenGVLab/InternVL3_5-38B
 VLLM_CONTAINER_NAME_PREFIX=vllm-g
 
 # https://github.com/vllm-project/vllm/pull/22386
@@ -59,18 +59,20 @@ start-vllm-servers:
 			--gpus all \
 			-v /data:/data \
 			-v /home:/home \
-			-v /data/.cache:/root/.cache \
+			-v /data/.cache:/root/.cache/huggingface \
 			-e CUDA_VISIBLE_DEVICES=$$GPU,$$(($$GPU + 1)) \
 			-e VLLM_WORKER_MULTIPROC_METHOD=spawn \
 			-p $${PORT}:8000 \
 			--ipc=host \
-			vllm/vllm-openai:v0.10.1 \
+			vllm/vllm-openai:v0.11.0 \
 			--model ${MODEL_PATH} \
-			--served-model-name OpenGVLab/InternVL3_5-38B \
+			--served-model-name ${MODEL_PATH} \
 			--trust-remote-code \
 			--host 0.0.0.0 \
 			--port 8000 \
-			--tensor-parallel-size 2 ; \
+			--tensor-parallel-size 2 \
+			--limit-mm-per-prompt.video 0 \
+			--async-scheduling ; \
 	done
 
 stop-vllm-servers:
