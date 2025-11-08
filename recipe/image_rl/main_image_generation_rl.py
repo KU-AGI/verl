@@ -24,8 +24,9 @@ from omegaconf import OmegaConf, open_dict
 
 from verl.experimental.dataset.sampler import AbstractSampler
 from recipe.image_rl.ray_image_generation_trainer import RayImageGenerationTrainer
+from recipe.image_rl.reward import load_reward_manager, get_custom_reward_fn
+
 from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
-from verl.trainer.ppo.reward import load_reward_manager, get_custom_reward_fn
 from verl.trainer.ppo.utils import need_critic, need_reference_policy
 from verl.utils.config import validate_config
 from verl.utils.device import is_cuda_available
@@ -43,64 +44,6 @@ from verl.utils.reward_score import default_compute_score
 from verl.workers.reward_manager import get_reward_manager_cls
 from verl.workers.reward_manager.abstract import AbstractRewardManager
 
-def load_reward_manager(
-    config: DictConfig, tokenizer: Any, processor: Any, num_examine: int, **reward_kwargs: Any
-) -> AbstractRewardManager:
-    """
-    Load and initialize a reward manager based on the configuration.
-
-    Args:
-        config: PPO trainer configuration object containing reward_model fields.
-        tokenizer: Tokenizer object used for processing text.
-        num_examine: Number of samples to examine.
-        **reward_kwargs: Additional keyword arguments for the reward manager.
-
-    Returns:
-        An instance of the specified reward manager class.
-    """
-
-    # Try to get a custom reward function based on the configuration
-    # user defined reward manager can be registered in custom_reward_fn
-    compute_score = get_custom_reward_fn(config)
-    final_compute_score = compute_score
-
-    # The list of pre-defined reward managers are defined in `verl/workers/reward_manager/`:
-    # naive: NaiveRewardManager
-    # prime: PrimeRewardManager
-    # batch: BatchRewardManager
-    # dapo: DAPORewardManager
-    # Note(haibin.lin): For custom reward managers, please make sure they are imported and
-    # registered via `verl.workers.reward_manager.register`
-    # By default reward_manager is set to naive (NaiveRewardManager)
-    reward_manager_name = config.reward_model.get("reward_manager", "naive")
-    reward_manager_cls = get_reward_manager_cls(reward_manager_name)
-
-    if compute_score is None:
-        sandbox_config = config.reward_model.get("sandbox_fusion")
-        sandbox_url = sandbox_config.get("url") if sandbox_config else None
-        memory_limit_mb = sandbox_config.get("memory_limit_mb", 1024)
-        if sandbox_url:
-            sandbox_manager = multiprocessing.Manager()
-            # Create a semaphore to control concurrent access to the sandbox
-            _concurrent_semaphore = sandbox_manager.Semaphore(sandbox_config.get("max_concurrent", 64))
-            final_compute_score = partial(
-                default_compute_score,
-                sandbox_fusion_url=sandbox_url,
-                concurrent_semaphore=_concurrent_semaphore,
-                memory_limit_mb=memory_limit_mb,
-            )
-        else:
-            final_compute_score = default_compute_score
-
-    # Instantiate and return the reward manager with the specified parameters
-    return reward_manager_cls(
-        tokenizer=tokenizer,
-        processor=processor,
-        num_examine=num_examine,
-        compute_score=final_compute_score,
-        reward_fn_key=config.data.reward_fn_key,
-        **reward_kwargs,
-    )
 
 @hydra.main(config_path='config', config_name='image_generation_trainer', version_base=None)
 def main(config):

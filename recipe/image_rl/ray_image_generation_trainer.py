@@ -55,7 +55,6 @@ from recipe.image_rl.cusrom_metric_utils import ( # custom metric
     process_validation_metrics,
     reduce_metrics,
 )
-# from verl.trainer.ppo.reward import compute_reward, compute_reward_async
 from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
@@ -71,6 +70,8 @@ from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.utils.transferqueue_utils import tqbridge
 from verl.workers.reward_manager.abstract import AbstractRewardManager
+
+from recipe.image_rl.reward import compute_reward, compute_reward_async
 from recipe.image_rl.utils import FormattingEvaluator
 
 @dataclass
@@ -170,23 +171,6 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
     metrics = {f"actor/task{task_id}_reward_kl_penalty": current_kl, f"actor/task{task_id}_reward_kl_penalty_coeff": beta}
 
     return data, metrics
-
-
-@tqbridge(put_data=False)
-def compute_reward(data: DataProto, reward_fn: AbstractRewardManager, eval: bool = False, task_id: int = 1) -> tuple[torch.Tensor, dict[str, Any]]:
-    """
-    Compute reward for a batch of data.
-    Args:
-        data: DataProto object containing the input data.
-        reward_fn: Reward function to compute the reward.
-    Returns:
-        Tuple of reward tensor and extra info dictionary.
-    """
-    reward_result = reward_fn(data, task_id, eval, return_dict=True)
-    reward_tensor = reward_result[f"task{task_id}_reward_tensor"]
-    reward_extra_infos_dict = reward_result.get(f"task{task_id}_reward_extra_info", {})
-
-    return reward_tensor, reward_extra_infos_dict
 
 
 def compute_advantage(
@@ -741,7 +725,10 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                         #     self._balance_batch(batch, metrics=metrics) 
 
                         with marked_timer("reward", timing_raw, color="yellow"):
-                            reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn, eval=False, task_id=task_id)
+                            if self.config.reward_model.launch_reward_fn_async:
+                                future_reward = compute_reward_async.remote(data=batch, config=self.config, tokenizer=self.tokenizer, processor=self.processor, reward_fn=self.reward_fn, eval=False, task_id=task_id)
+                            else:
+                                reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn, eval=False, task_id=task_id)
                             batch.batch["task_id"] = torch.tensor([task_id for _ in range(len(batch))], dtype=int)
 
                         # recompute old_log_probs
@@ -777,6 +764,8 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                         with marked_timer("adv", timing_raw, color="brown"):
                             # we combine with rule-based rm
                             reward_extra_infos_dict: dict[str, list]
+                            if self.config.reward_model.launch_reward_fn_async:
+                                reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
                             batch.batch[f"task{task_id}_token_level_scores"] = reward_tensor
 
                             if reward_extra_infos_dict:
