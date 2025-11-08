@@ -47,3 +47,4 @@ algorithm:
 
 trainer:
   project_name: verl-image-rl
+  rollout_freq: 20

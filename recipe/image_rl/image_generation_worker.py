@@ -144,7 +144,7 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
 
         self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
         self._lora_rank = self.config.model.get("lora_rank", 0)
-        self._is_lora = self._lora_rank > 0
+        self._is_lora = self.config.model.get("lora_adapter_path") is not None or self._lora_rank > 0
 
         self.role = role
         assert self.role in ["actor", "rollout", "ref", "actor_rollout", "actor_rollout_ref"]
@@ -322,9 +322,27 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
             if enable_gradient_checkpointing:
                 actor_module.language_model.config.use_cache = True
                 actor_module.language_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-            if self._is_lora:
-                print("Applying LoRA to actor module")
-                actor_module.enable_input_require_grads()
+
+        if self._is_lora:
+            print("Applying LoRA to actor module")
+            actor_module.enable_input_require_grads()
+
+            lora_adapter_path = self.config.model.get("lora_adapter_path")
+            if lora_adapter_path is not None:
+                from peft import PeftModel
+
+                print(f"Loading pre-trained LoRA adapter to {role} from: {lora_adapter_path}")
+
+                # Copy adapter to local if needed
+                local_adapter_path = copy_to_local(lora_adapter_path, use_shm=self.config.model.get("use_shm", False))
+
+                actor_module = PeftModel.from_pretrained(actor_module, local_adapter_path, is_trainable=True)
+                peft_config = actor_module.peft_config["default"]
+                # Ensure task_type is TaskType enum, not string
+                if isinstance(peft_config.task_type, str):
+                    peft_config.task_type = TaskType.CAUSAL_LM
+
+            else:
                 # Convert config to regular Python types before creating PEFT model
                 lora_config = {
                     "task_type": TaskType.CAUSAL_LM,
@@ -1030,3 +1048,40 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
             except Exception:
                 # silently ignore if profiler doesn't support memory snapshots
                 pass
+
+
+# ================================= Async related workers =================================
+class ImageGenerationAsyncActorRolloutRefWorker(ImageGenerationActorRolloutRefWorker):
+    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
+    async def wake_up(self):
+        await self.rollout_mode()
+        return True
+
+    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
+    async def sleep(self):
+        await self.trainer_mode()
+        return True
+
+    # ============================ vLLM related ============================
+
+    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
+    def get_zeromq_address(self):
+        return self.rollout.get_zeromq_address()
+
+    # ============================ SGLang related ============================
+
+    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD, blocking=False)
+    async def chat_completion(self, json_request):
+        ret = await self.rollout.chat_completion(json_request)
+        return ret
+
+    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD, blocking=False)
+    async def generate(
+        self,
+        prompt_ids: list[int],
+        sampling_params: dict[str, Any],
+        request_id: str,
+        image_data: Optional[list[Any]] = None,
+    ) -> list[int]:
+        ret = await self.rollout.generate(prompt_ids, sampling_params, request_id, image_data=image_data)
+        return ret
