@@ -814,7 +814,9 @@ class RayImageGenerationTrainer(RayPPOTrainer):
 
                         # Log rollout generations if enabled
                         rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
-                        if rollout_data_dir:
+                        if self.config.trainer.rollout_freq > 0 and (
+                            self.global_steps % self.config.trainer.rollout_freq == 0 and rollout_data_dir
+                        ):
                             self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir, task_id)
                             
                         # Remove universal keys from batch
