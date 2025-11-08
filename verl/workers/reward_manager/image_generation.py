@@ -65,13 +65,15 @@ class ImageGenerationRewardManager:
         gen_imgs = [gen_imgs_pil_list[i] if i < len(gen_imgs_pil_list) else None for i in range(len(data))]
         feedback_texts_padded = [feedback_texts[i] if i < len(feedback_texts) else "" for i in range(len(data))]
         regen_imgs = [regen_imgs_pil_list[i] if i < len(regen_imgs_pil_list) else None for i in range(len(data))]
-        ground_truths = [ground_truth[i]["ground_truth"] if i < len(ground_truth) else None for i in range(len(data))]
+        ground_truth_imgs = [ground_truth[i]["ground_truth"] if i < len(ground_truth) else None for i in range(len(data))]
+        feedback_tuples = [ground_truth[i]["tuple"] if i < len(ground_truth) else None for i in range(len(data))]
+        vqa_questions = [ground_truth[i]["vqa_question"] if i < len(ground_truth) else None for i in range(len(data))]
         extra_infos = [data.non_tensor_batch.get("extra_info", {})] * len(data)
         task_ids = [task_id] * len(data)
         
         # Call batch processing function
         scores = self.compute_score(
-            prompts, gen_imgs, feedback_texts_padded, regen_imgs, ground_truths, extra_infos, task_ids
+            prompts, gen_imgs, feedback_texts_padded, regen_imgs, ground_truth_imgs, feedback_tuples, vqa_questions, extra_infos, task_ids
         )
 
         return scores
@@ -108,6 +110,9 @@ class ImageGenerationRewardManager:
             rewards.append(reward)
             reward_tensor[i, :valid_response_length] = reward
 
+            if reward == -100:
+                data.batch[f"task{task_id}_response_mask"][i] = torch.zeros_like(response_mask[i], dtype=torch.float32)
+
             # Print examination samples
             data_source = data_sources[i] if i < len(data_sources) else "unknown"
             if already_printed.get(data_source, 0) < self.num_examine:
@@ -126,7 +131,7 @@ class ImageGenerationRewardManager:
         # Store accuracy
         data.batch["acc"] = torch.tensor(rewards, dtype=torch.float32)
                 
-        print(f"[REWARD] Computed {len(rewards)} rewards, mean={sum(rewards)/len(rewards):.4f}")
+        print(f"[REWARD] Computed {len(rewards)} rewards, mean={sum([reward for reward in rewards if reward != -100])/len([reward for reward in rewards if reward != -100]):.4f}")
 
         if return_dict:
             return {f"task{task_id}_reward_tensor": reward_tensor, f"task{task_id}_reward_extra_info": reward_extra_info}
