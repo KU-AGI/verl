@@ -157,6 +157,13 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         self.result_queue = asyncio.Queue()
         self.cancel_queue = asyncio.Queue()
 
+        # ReactionReasoner task async queues
+        self.task_counts = {
+            "forward": 0,
+            "retro": 0,
+            "reagent": 0
+        }
+
     async def set_message_queue_client(self, message_queue_client: MessageQueueClient):
         """Set message queue client"""
         async with self.lock:
@@ -315,6 +322,12 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         continuous_iterator = self._create_continuous_iterator()
 
         for epoch, batch_dict in continuous_iterator:
+            if self.config.data.balance_task:
+                least_task = min(self.task_counts, key=self.task_counts.get)
+                cur_task = batch_dict['task'][0]
+                if cur_task != least_task:
+                    continue # Skip this sample to balance tasks, but may skip too many samples
+
             # Similar to _prepare_generate_batch: Separate data
             full_batch = prepare_single_generation_data(
                 batch_dict, self.global_steps, self.config.actor_rollout_ref.rollout.n
@@ -492,6 +505,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             rollout_sample.param_version = self.current_param_version
             rollout_sample.rollout_status = await self.get_statistics()
             await self.result_queue.put(rollout_sample)
+            self.task_counts[task] += 1
 
         self.processed_sample_count += 1
 

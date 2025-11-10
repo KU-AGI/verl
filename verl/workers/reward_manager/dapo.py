@@ -34,6 +34,9 @@ class DAPORewardManager(AbstractRewardManager):
         reward_fn_key="data_source",
         max_resp_len=None,
         overlong_buffer_cfg=None,
+        use_reflection_bonus=False,
+        reflection_bonus_weight=0.5,
+        use_stepwise_reward=False,
     ) -> None:
         self.tokenizer = tokenizer
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
@@ -41,6 +44,9 @@ class DAPORewardManager(AbstractRewardManager):
         self.reward_fn_key = reward_fn_key
         self.overlong_buffer_cfg = overlong_buffer_cfg
         self.max_resp_len = max_resp_len
+        self.use_reflection_bonus = use_reflection_bonus
+        self.reflection_bonus_weight = reflection_bonus_weight
+        self.use_stepwise_reward = use_stepwise_reward
 
         if self.overlong_buffer_cfg is not None:
             assert self.max_resp_len is not None, (
@@ -107,6 +113,9 @@ class DAPORewardManager(AbstractRewardManager):
                 solution_str=response_str,
                 ground_truth=ground_truth,
                 extra_info=extra_info,
+                use_reflection_bonus=self.use_reflection_bonus,
+                reflection_bonus_weight=self.reflection_bonus_weight,
+                use_stepwise_reward=self.use_stepwise_reward,
             )
 
             score: float

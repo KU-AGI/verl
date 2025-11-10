@@ -530,11 +530,16 @@ class StepEvaluator():
         
         return steps_data
 
-
     def calculate_forward_rationale_metrics(self, info, predicted_rationale):
         predicted_step4_rationale = ""
+        step4_initial_rationale = ""
+        step4_has_reflection = False
         predicted_step5_rationale = ""
+        step5_initial_rationale = ""
+        step5_has_reflection = False
         predicted_step6_rationale = ""
+        step6_initial_rationale = ""
+        step6_has_reflection = False
         has_tagged_smiles = False
         steps_data = self.parse_steps_with_reflections(predicted_rationale)
         reflection_bonus = 0.
@@ -543,44 +548,113 @@ class StepEvaluator():
                 has_reflection = len(step_info["reflections"]) > 0
                 if has_reflection:
                     predicted_step4_rationale = step_info["reflections"][-1]
-                    reflection_bonus += 0.5 / 3
+                    reflection_bonus += 1
+                    step4_initial_rationale = step_info["content"]
+                    step4_has_reflection = True
                 else:
                     predicted_step4_rationale = step_info["content"]
+                    step4_initial_rationale = step_info["content"]
+                    step4_has_reflection = False
             elif step_info["step"] == 5:
                 has_reflection = len(step_info["reflections"]) > 0
                 if has_reflection:
                     predicted_step5_rationale = step_info["reflections"][-1]
-                    reflection_bonus += 0.5 / 3
+                    reflection_bonus += 1
+                    step5_initial_rationale = step_info["content"]
+                    step5_has_reflection = True
                 else:
                     predicted_step5_rationale = step_info["content"]
+                    step5_initial_rationale = step_info["content"]
+                    step5_has_reflection = False
             elif step_info["step"] == 6:
                 has_reflection = len(step_info["reflections"]) > 0
                 if has_reflection:
                     predicted_step6_rationale = step_info["reflections"][-1]
                     has_tagged_smiles = ".".join(info["products"]) in predicted_step6_rationale
-                    reflection_bonus += 0.5 / 3
+                    reflection_bonus += 1
+                    step6_initial_rationale = step_info["content"]
+                    step6_has_reflection = True
                 else:
                     predicted_step6_rationale = step_info["content"]
                     has_tagged_smiles = info["product_changes_tagged"] in predicted_step6_rationale
+                    step6_initial_rationale = step_info["content"]
+                    step6_has_reflection = False
 
         # Metric 3: SMILES highlighting bonding atoms
         has_reactive_atoms_smiles = info["reactive_atoms_smiles_str"] in predicted_step4_rationale
+        has_reactive_atom_smiles_initial = info["reactive_atoms_smiles_str"] in step4_initial_rationale
 
         # Metric 4: Reactive atom bonds
         # Check all of the str(tuple(info['reactive_atom_bonds'][0]) in predicted_reasoning
+        for i in range(len(info['reactive_atom_bonds'])):
+            info['reactive_atom_bonds'][i][0] = int(info['reactive_atom_bonds'][i][0]) # convert to int for comparison
+            info['reactive_atom_bonds'][i][1] = int(info['reactive_atom_bonds'][i][1]) # convert to int for comparison
+            info['reactive_atom_bonds'][0][2] = info['reactive_atom_bonds'][0][2].replace("'", "") # remove extra quotes if any
         has_reactive_atom_bonds = all(str(tuple(bond)) in predicted_step5_rationale for bond in info['reactive_atom_bonds'])
+        has_reactive_atom_bonds_initial = all(str(tuple(bond)) in step5_initial_rationale for bond in info['reactive_atom_bonds'])
+        has_tagged_smiles_initial = info["product_changes_tagged"] in step6_initial_rationale
+
+
+        # Calculate TP, FP, TN, FN for each step. Only check reflection is correct.
+        step4_TP = has_reactive_atom_smiles_initial and step4_has_reflection
+        step4_FP = (not has_reactive_atom_smiles_initial) and step4_has_reflection
+        step4_TN = (not has_reactive_atom_smiles_initial) and (not step4_has_reflection)
+        step4_FN = has_reactive_atom_smiles_initial and (not step4_has_reflection)
+        step5_TP = has_reactive_atom_bonds_initial and step5_has_reflection
+        step5_FP = (not has_reactive_atom_bonds_initial) and step5_has_reflection
+        step5_TN = (not has_reactive_atom_bonds_initial) and (not step5_has_reflection)
+        step5_FN = has_reactive_atom_bonds_initial and (not step5_has_reflection)
+        step6_TP = has_tagged_smiles_initial and step6_has_reflection
+        step6_FP = (not has_tagged_smiles_initial) and step6_has_reflection
+        step6_TN = (not has_tagged_smiles_initial) and (not step6_has_reflection)
+        step6_FN = has_tagged_smiles_initial and (not step6_has_reflection)
+
+        # print("Step4 - TP:", step4_TP, "FP:", step4_FP, "TN:", step4_TN, "FN:", step4_FN)
+        # print("Step5 - TP:", step5_TP, "FP:", step5_FP, "TN:", step5_TN, "FN:", step5_FN)
+        # print("Step6 - TP:", step6_TP, "FP:", step6_FP, "TN:", step6_TN, "FN:", step6_FN)
+
+        # step4_F1 = (2 * step4_TP) / (2 * step4_TP + step4_FP + step4_FN)
+        # step5_F1 = (2 * step5_TP) / (2 * step5_TP + step5_FP + step5_FN)
+        # step6_F1 = (2 * step6_TP) / (2 * step6_TP + step6_FP + step6_FN)
+
+        reward_dict = {
+            "forward/step4/has_reactive_atoms_smiles": int(has_reactive_atoms_smiles),
+            "forward/step5/has_reactive_atom_bonds": int(has_reactive_atom_bonds),
+            "forward/step6/has_tagged_smiles": int(has_tagged_smiles),
+        }
 
         return {
             "forward/step4/has_reactive_atoms_smiles": int(has_reactive_atoms_smiles),
             "forward/step5/has_reactive_atom_bonds": int(has_reactive_atom_bonds),
             "forward/step6/has_tagged_smiles": int(has_tagged_smiles),
-        }, reflection_bonus
+            # "forward/step4/reflection_F1": step4_F1,
+            # "forward/step5/reflection_F1": step5_F1,
+            # "forward/step6/reflection_F1": step6_F1,
+            "forward/step4/TP": step4_TP,
+            "forward/step4/FP": step4_FP,
+            "forward/step4/TN": step4_TN,
+            "forward/step4/FN": step4_FN,
+            "forward/step5/TP": step5_TP,
+            "forward/step5/FP": step5_FP,
+            "forward/step5/TN": step5_TN,
+            "forward/step5/FN": step5_FN,
+            "forward/step6/TP": step6_TP,
+            "forward/step6/FP": step6_FP,
+            "forward/step6/TN": step6_TN,
+            "forward/step6/FN": step6_FN,
+        }, reflection_bonus, reward_dict
 
 
     def calculate_retro_rationale_metrics(self, info, predicted_rationale):
         predicted_step5_rationale = ""
+        step5_initial_rationale = ""
+        step5_has_reflection = False
         predicted_step6_rationale = ""
+        step6_initial_rationale = ""
+        step6_has_reflection = False
         predicted_step7_rationale = ""
+        step7_initial_rationale = ""
+        step7_has_reflection = False
 
         steps_data = self.parse_steps_with_reflections(predicted_rationale)
         reflection_bonus = 0.
@@ -589,24 +663,35 @@ class StepEvaluator():
                 has_reflection = len(step_info["reflections"]) > 0
                 if has_reflection:
                     predicted_step5_rationale = step_info["reflections"][-1]
-                    reflection_bonus += 0.5 / 3
+                    reflection_bonus += 1
+                    step5_initial_rationale = step_info["content"]
+                    step5_has_reflection = True
                 else:
                     predicted_step5_rationale = step_info["content"]
+                    step5_initial_rationale = step_info["content"]
+                    step5_has_reflection = False
             elif step_info["step"] == 6:
                 has_reflection = len(step_info["reflections"]) > 0
                 if has_reflection:
                     predicted_step6_rationale = step_info["reflections"][-1]
-                    reflection_bonus += 0.5 / 3
+                    reflection_bonus += 1
+                    step6_initial_rationale = step_info["content"]
+                    step6_has_reflection = True
                 else:
                     predicted_step6_rationale = step_info["content"]
+                    step6_initial_rationale = step_info["content"]
+                    step6_has_reflection = False
             elif step_info["step"] == 7:
                 has_reflection = len(step_info["reflections"]) > 0
                 if has_reflection:
                     predicted_step7_rationale = step_info["reflections"][-1]
-                    reflection_bonus += 0.5 / 3
+                    reflection_bonus += 1
+                    step7_initial_rationale = step_info["content"]
+                    step7_has_reflection = True
                 else:
                     predicted_step7_rationale = step_info["content"]
-
+                    step7_initial_rationale = step_info["content"]
+                    step7_has_reflection = False
 
         # Metric 4: Bond disconnected
         bond_disconnection_list = []
@@ -614,23 +699,71 @@ class StepEvaluator():
             bond_str = f"{bond[0]}, {bond[1]}: {bond[2]}"
             bond_disconnection_list.append(bond_str)
         has_bond_disconnection = all(bond_str in predicted_step5_rationale for bond_str in bond_disconnection_list)
+        has_bond_disconnection_initial = all(bond_str in step5_initial_rationale for bond_str in bond_disconnection_list)
 
         # Metric 5: Synthons
         has_synthons = all(synthon in predicted_step6_rationale for synthon in info["synthons_list"])
+        has_synthons_initial = all(synthon in step6_initial_rationale for synthon in info["synthons_list"])
 
         # Metric 6: Synthetic equivalents
         has_synthetic_equivalents = all(syn_equiv in predicted_step7_rationale for syn_equiv in info["synthetic_equivalents"])
+        has_synthetic_equivalents_initial = all(syn_equiv in step7_initial_rationale for syn_equiv in info["synthetic_equivalents"])
+
+        step5_TP = has_bond_disconnection_initial and step5_has_reflection
+        step5_FP = (not has_bond_disconnection_initial) and step5_has_reflection
+        step5_TN = (not has_bond_disconnection_initial) and (not step5_has_reflection)
+        step5_FN = has_bond_disconnection_initial and (not step5_has_reflection)
+        step6_TP = has_synthons_initial and step6_has_reflection
+        step6_FP = (not has_synthons_initial) and step6_has_reflection
+        step6_TN = (not has_synthons_initial) and (not step6_has_reflection)
+        step6_FN = has_synthons_initial and (not step6_has_reflection)
+        step7_TP = has_synthetic_equivalents_initial and step7_has_reflection
+        step7_FP = (not has_synthetic_equivalents_initial) and step7_has_reflection
+        step7_TN = (not has_synthetic_equivalents_initial) and (not step7_has_reflection)
+        step7_FN = has_synthetic_equivalents_initial and (not step7_has_reflection)
+        # step5_F1 = (2 * step5_TP) / (2 * step5_TP + step5_FP + step5_FN)
+        # step6_F1 = (2 * step6_TP) / (2 * step6_TP + step6_FP + step6_FN)
+        # step7_F1 = (2 * step7_TP) / (2 * step7_TP + step7_FP + step7_FN)
+
+        # print("Step5 - TP:", step5_TP, "FP:", step5_FP, "TN:", step5_TN, "FN:", step5_FN)
+        # print("Step6 - TP:", step6_TP, "FP:", step6_FP, "TN:", step6_TN, "FN:", step6_FN)
+        # print("Step7 - TP:", step7_TP, "FP:", step7_FP, "TN:", step7_TN, "FN:", step7_FN)
+
+        reward_dict = {
+            "retro/step5/has_bond_disconnection": int(has_bond_disconnection),
+            "retro/step6/has_synthons": int(has_synthons),
+            "retro/step7/has_synthetic_equivalents": int(has_synthetic_equivalents),
+        }
 
         return {
             "retro/step5/has_bond_disconnection": int(has_bond_disconnection),
             "retro/step6/has_synthons": int(has_synthons),
             "retro/step7/has_synthetic_equivalents": int(has_synthetic_equivalents),
-        }, reflection_bonus
+            # "retro/step5/reflection_F1": step5_F1,
+            # "retro/step6/reflection_F1": step6_F1,
+            # "retro/step7/reflection_F1": step7_F1,
+            "retro/step5/TP": step5_TP,
+            "retro/step5/FP": step5_FP,
+            "retro/step5/TN": step5_TN,
+            "retro/step5/FN": step5_FN,
+            "retro/step6/TP": step6_TP,
+            "retro/step6/FP": step6_FP,
+            "retro/step6/TN": step6_TN,
+            "retro/step6/FN": step6_FN,
+            "retro/step7/TP": step7_TP,
+            "retro/step7/FP": step7_FP,
+            "retro/step7/TN": step7_TN,
+            "retro/step7/FN": step7_FN,
+        }, reflection_bonus, reward_dict
 
 
     def calculate_reagent_rationale_metrics(self, info, predicted_rationale):
         predicted_step6_rationale = ""
+        step6_initial_rationale = ""
+        step6_has_reflection = False
         predicted_step7_rationale = ""
+        step7_initial_rationale = ""
+        step7_has_reflection = False
 
         steps_data = self.parse_steps_with_reflections(predicted_rationale)
         reflection_bonus = 0.
@@ -639,15 +772,24 @@ class StepEvaluator():
                 has_reflection = len(step_info["reflections"]) > 0
                 if has_reflection:
                     predicted_step6_rationale = step_info["reflections"][-1]
-                    reflection_bonus += 0.5 / 1
+                    reflection_bonus += 1
+                    step6_initial_rationale = step_info["content"]
+                    step6_has_reflection = True
                 else:
                     predicted_step6_rationale = step_info["content"]
+                    step6_initial_rationale = step_info["content"]
+                    step6_has_reflection = False
             elif step_info["step"] == 7:
                 has_reflection = len(step_info["reflections"]) > 0
                 if has_reflection:
                     predicted_step7_rationale = step_info["reflections"][-1]
+                    reflection_bonus += 1
+                    step7_initial_rationale = step_info["content"]
+                    step7_has_reflection = True
                 else:
                     predicted_step7_rationale = step_info["content"]
+                    step7_initial_rationale = step_info["content"]
+                    step7_has_reflection = False
 
         # Metric 3: Has reagents
         reagent_list = self.extract_numbered_items(predicted_step6_rationale)
@@ -657,6 +799,15 @@ class StepEvaluator():
             if SMILESValidator.exact_match(reagent_pred, reagent_gt):
                 has_reagents = True
                 break
+
+        reagent_list_initial = self.extract_numbered_items(step6_initial_rationale)
+        reagent_gt = ".".join(info["reagents"])
+        has_reagents_initial = False
+        for reagent_pred in reagent_list_initial:
+            if SMILESValidator.exact_match(reagent_pred, reagent_gt):
+                has_reagents_initial = True
+                break
+
 
         # Metric 4: Correct reagent number
         correct_reagent_number = -1
@@ -671,46 +822,54 @@ class StepEvaluator():
         else:
             has_correct_reagent_number = False
 
+        correct_reagent_number_initial = -1
+        for idx, reagent_pred in enumerate(reagent_list_initial):
+            if SMILESValidator.exact_match(reagent_pred, ".".join(info["reagents"])):
+                correct_reagent_number_initial = idx + 1
+                break
+        reagent_num_initial = re.search(r"reagent (\d+)", step7_initial_rationale, re.IGNORECASE)
+        if reagent_num_initial:
+            predicted_reagent_number_initial = int(reagent_num_initial.group(1))
+            has_correct_reagent_number_initial = (predicted_reagent_number_initial == correct_reagent_number_initial) and has_reagents_initial
+        else:
+            has_correct_reagent_number_initial = False
+
+
+        # Calculate TP, FP, TN, FN for each step. Only check reflection is correct.
+        step6_TP = has_reagents_initial and step6_has_reflection
+        step6_FP = (not has_reagents_initial) and step6_has_reflection
+        step6_TN = (not has_reagents_initial) and (not step6_has_reflection)
+        step6_FN = has_reagents_initial and (not step6_has_reflection)
+        step7_TP = has_correct_reagent_number_initial and step7_has_reflection
+        step7_FP = (not has_correct_reagent_number_initial) and step7_has_reflection
+        step7_TN = (not has_correct_reagent_number_initial) and (not step7_has_reflection)
+        step7_FN = has_correct_reagent_number_initial and (not step7_has_reflection)
+        # step6_F1 = (2 * step6_TP) / (2 * step6_TP + step6_FP + step6_FN)
+        # step7_F1 = (2 * step7_TP) / (2 * step7_TP + step7_FP + step7_FN)
+
+        # print("Step6 - TP:", step6_TP, "FP:", step6_FP, "TN:", step6_TN, "FN:", step6_FN)
+        # print("Step7 - TP:", step7_TP, "FP:", step7_FP, "TN:", step7_TN, "FN:", step7_FN)
+
+        reward_dict = {
+            "reagent/step6/has_reagents": int(has_reagents),
+            "reagent/step7/has_correct_reagent_number": int(has_correct_reagent_number),
+        }
+
         return {
             "reagent/step6/has_reagents": int(has_reagents),
-            # "reagent/step7/has_correct_reagent_number": int(has_correct_reagent_number),
-        }, reflection_bonus
+            "reagent/step7/has_correct_reagent_number": int(has_correct_reagent_number),
+            # "reagent/step6/reflection_F1": step6_F1,
+            # "reagent/step7/reflection_F1": step7_F1,
+            "reagent/step6/TP": step6_TP,
+            "reagent/step6/FP": step6_FP,
+            "reagent/step6/TN": step6_TN,
+            "reagent/step6/FN": step6_FN,
+            "reagent/step7/TP": step7_TP,
+            "reagent/step7/FP": step7_FP,
+            "reagent/step7/TN": step7_TN,
+            "reagent/step7/FN": step7_FN,
+        }, reflection_bonus, reward_dict
 
-    """
-    def evaluate(self, info_list, GT_rationale_list, predicted_reasoning_list, task):
-        if "forward" in task:
-            forward_metrics_dict = defaultdict(list)
-            for info, GT_rationale, predicted_reasoning in zip(info_list, GT_rationale_list, predicted_reasoning_list):
-                forward_metrics = self.calculate_forward_rationale_metrics(info, GT_rationale, predicted_reasoning)
-                for key, value in forward_metrics.items():
-                    forward_metrics_dict[key].append(value)
-            metric_dict = {}
-            for key, values in forward_metrics_dict.items():
-                metric_dict[key] = sum(values) / len(values) if values else 0.0
-            return metric_dict
-
-        elif "retro" in task:
-            retro_metrics_dict = defaultdict(list)
-            for info, GT_rationale, predicted_reasoning in zip(info_list, GT_rationale_list, predicted_reasoning_list):
-                retro_metrics = self.calculate_retro_rationale_metrics(info, GT_rationale, predicted_reasoning)
-                for key, value in retro_metrics.items():
-                    retro_metrics_dict[key].append(value)
-            metric_dict = {}
-            for key, values in retro_metrics_dict.items():
-                metric_dict[key] = sum(values) / len(values) if values else 0.0
-            return metric_dict
-
-        elif "reagent" in task:
-            reagent_metrics_dict = defaultdict(list)
-            for info, GT_rationale, predicted_reasoning in zip(info_list, GT_rationale_list, predicted_reasoning_list):
-                reagent_metrics = self.calculate_reagent_rationale_metrics(info, GT_rationale, predicted_reasoning)
-                for key, value in reagent_metrics.items():
-                    reagent_metrics_dict[key].append(value)
-            metric_dict = {}
-            for key, values in reagent_metrics_dict.items():
-                metric_dict[key] = sum(values) / len(values) if values else 0.0
-            return metric_dict
-    """
 
 class ChemistryEvaluator:
     """Main evaluation interface."""
@@ -733,8 +892,8 @@ class ChemistryEvaluator:
         """Verify if the solution is correct."""
         correct_score, pred = self.is_correct_strict_tag(solution_str, ground_truth)
         return correct_score == 1, pred
-    
-    def compute_score(self, solution_str: str, ground_truth: str, extra_info: Optional[Dict] = None) -> Union[EvaluationResult, Dict[str, Any]]:
+
+    def compute_score(self, solution_str: str, ground_truth: str, extra_info: Optional[Dict] = None, use_reflection_bonus=False, reflection_bonus_weight=0.5, use_stepwise_reward=False) -> Union[EvaluationResult, Dict[str, Any]]:
         """Compute comprehensive evaluation score."""
         correct, pred = self.verify(solution_str, ground_truth, extra_info)
 
@@ -753,17 +912,22 @@ class ChemistryEvaluator:
         predicted_rationale = ""
         if match:
             predicted_rationale = match.group(1).strip()
+        # breakpoint()
         if task == "forward":
-            step_eval_results, reflection_bonus = self.step_evaluator.calculate_forward_rationale_metrics(info, predicted_rationale)
+            step_eval_results, reflection_bonus, reward_dict = self.step_evaluator.calculate_forward_rationale_metrics(info, predicted_rationale)
         elif task == "retro":
-            step_eval_results, reflection_bonus = self.step_evaluator.calculate_retro_rationale_metrics(info, predicted_rationale)
+            step_eval_results, reflection_bonus, reward_dict = self.step_evaluator.calculate_retro_rationale_metrics(info, predicted_rationale)
         elif task == "reagent":
-            step_eval_results, reflection_bonus = self.step_evaluator.calculate_reagent_rationale_metrics(info, predicted_rationale)
+            step_eval_results, reflection_bonus, reward_dict = self.step_evaluator.calculate_reagent_rationale_metrics(info, predicted_rationale)
         else:
             step_eval_results = {}
             reflection_bonus = 0.0
 
-        reward = correct + (sum(step_eval_results.values()) / len(step_eval_results) if step_eval_results else 0.0) + reflection_bonus
+        reward = correct
+        if use_reflection_bonus:
+            reward += (reflection_bonus / len(reward_dict) * reflection_bonus_weight if reward_dict else 0.0)
+        if use_stepwise_reward:
+            reward += (sum(reward_dict.values()) / len(reward_dict) if reward_dict else 0.0)
 
         result = EvaluationResult(
             score=reward,
@@ -776,8 +940,8 @@ class ChemistryEvaluator:
         return result.to_dict()
 
 
-def compute_score(solution_str: str, ground_truth: str, extra_info: Optional[dict] = None) -> Dict[str, Any]:
+def compute_score(solution_str: str, ground_truth: str, extra_info: Optional[dict] = None, use_reflection_bonus=False, reflection_bonus_weight=0.5, use_stepwise_reward=False) -> Dict[str, Any]:
     evaluator = ChemistryEvaluator()
-    result = evaluator.compute_score(solution_str, ground_truth, extra_info)
+    result = evaluator.compute_score(solution_str, ground_truth, extra_info, use_reflection_bonus, reflection_bonus_weight, use_stepwise_reward)
     # result is already a dict from compute_score method
     return result

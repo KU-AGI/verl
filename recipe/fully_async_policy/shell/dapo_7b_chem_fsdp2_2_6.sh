@@ -5,7 +5,7 @@ export WANDB_ENTITY="llm-reaction-reasoning"
 export WANDB_PROJECT="verl-dapo"
 
 project_name='verl-dapo'
-exp_name='filtering_test'
+exp_name='with_balance_task'
 
 # Ray
 RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
@@ -45,6 +45,13 @@ enable_filter_groups=True
 filter_groups_metric=seq_final_reward
 max_num_gen_batches=0
 
+balance_task=True
+
+# Reward related parameters
+use_reflection_bonus=False
+use_stepwise_reward=True
+reflection_bonus_weight=0.0
+
 # Response length parameters
 max_prompt_length=500 # $((1024 * 2))
 max_response_length=1700 # $((1024 * 8))
@@ -70,14 +77,14 @@ infer_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 3))
 ref_offload=False
 actor_offload=False
 gen_tp=1
-sp_size=2
-fsdp_size=3 # Must be divisible by (n_gpus_training*n_nodes) and (n_gpus_rollout*n_nodes)
+sp_size=1
+fsdp_size=4 # Must be divisible by (n_gpus_training*n_nodes) and (n_gpus_rollout*n_nodes)
 
 # Fully async specific parameters
 NNODES=${NNODES:-1}
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
 
-n_gpus_rollout=2
+n_gpus_rollout=4
 n_gpus_training=$((NGPUS_PER_NODE - n_gpus_rollout))
 # (train_prompt_mini_bsz * require_batches * n_resp_per_prompt) % total_trainer_gpus == 0 must be satisfied
 train_prompt_bsz=0
@@ -87,10 +94,10 @@ train_prompt_mini_bsz=16
 total_rollout_steps=$(((512*100000)))
 test_freq=1
 staleness_threshold=0.0
-trigger_parameter_sync_step=4
+trigger_parameter_sync_step=50
 require_batches=3
 partial_rollout=False
-save_freq=$((test_freq * trigger_parameter_sync_step * 12))
+save_freq=$((test_freq * trigger_parameter_sync_step * 6))
 
 
 # ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
@@ -106,6 +113,7 @@ python -m recipe.fully_async_policy.fully_async_main \
     data.test_shuffle=False \
     data.prompt_key=prompt \
     data.truncation='left' \
+    +data.balance_task=${balance_task} \
     data.max_prompt_length=${max_prompt_length} \
     data.max_response_length=${max_response_length} \
     data.train_batch_size=${train_prompt_bsz} \
@@ -172,10 +180,13 @@ python -m recipe.fully_async_policy.fully_async_main \
     +reward_model.reward_kwargs.overlong_buffer_cfg.penalty_factor=${overlong_penalty_factor} \
     +reward_model.reward_kwargs.overlong_buffer_cfg.log=False \
     +reward_model.reward_kwargs.max_resp_len=${max_response_length} \
+    +reward_model.reward_kwargs.use_reflection_bonus=${use_reflection_bonus} \
+    +reward_model.reward_kwargs.reflection_bonus_weight=${reflection_bonus_weight} \
+    +reward_model.reward_kwargs.use_stepwise_reward=${use_stepwise_reward} \
     trainer.logger=['console','wandb'] \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
-    trainer.val_before_train=False \
+    trainer.val_before_train=True \
     trainer.default_local_dir="${CKPTS_DIR}" \
     trainer.validation_data_dir="${DUMP_DIR}/val" \
     trainer.test_data_dir="${DUMP_DIR}/test" \

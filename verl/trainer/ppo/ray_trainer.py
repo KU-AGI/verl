@@ -34,6 +34,7 @@ from omegaconf import OmegaConf, open_dict
 from torch.utils.data import Dataset, Sampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
+from copy import deepcopy
 
 from verl import DataProto
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
@@ -849,7 +850,16 @@ class RayPPOTrainer:
         # if task_extra_info_key is not None, we use the task as the data source
         if len(task_lst) > 0:
             data_sources = np.concatenate(task_lst, axis=0)
-        
+
+        # Extract ReactionReasoner step binary metrics
+        step_binary_metrics = {}
+        reward_extra_infos_dict_keys = deepcopy(list(reward_extra_infos_dict.keys()))
+        for key in reward_extra_infos_dict_keys:
+            if "TP" in key or "FP" in key or "TN" in key or "FN" in key:
+                step_binary_metrics[key] = reward_extra_infos_dict.pop(key)
+                # remove None values
+                step_binary_metrics[key] = [v for v in step_binary_metrics[key] if v is not None]
+
         data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
         metric_dict = {}
         for data_source, var2metric2val in data_src2var2metric2val.items():
@@ -873,6 +883,38 @@ class RayPPOTrainer:
             metric_dict["val-aux/num_turns/min"] = sample_turns.min()
             metric_dict["val-aux/num_turns/max"] = sample_turns.max()
             metric_dict["val-aux/num_turns/mean"] = sample_turns.mean()
+
+        for key, val in step_binary_metrics.items():
+            pfx = f"val-aux/{key}"
+            metric_dict[pfx] = sum(val)
+
+        for step in ["step4", "step5", "step6"]:
+            FN = metric_dict[f"val-aux/forward/{step}/FN"]
+            TP = metric_dict[f"val-aux/forward/{step}/TP"]
+            FP = metric_dict[f"val-aux/forward/{step}/FP"]
+            TN = metric_dict[f"val-aux/forward/{step}/TN"]
+            F1 = 2 * TP / (2 * TP + FP + FN + 1e-8)
+            metric_dict[f"val-aux/forward/{step}/precision"] = TP / (TP + FP + 1e-8)
+            metric_dict[f"val-aux/forward/{step}/recall"] = TP / (TP + FN + 1e-8)
+            metric_dict[f"val-aux/forward/{step}/F1"] = F1
+        for step in ["step5", "step6", "step7"]:
+            FN = metric_dict[f"val-aux/retro/{step}/FN"]
+            TP = metric_dict[f"val-aux/retro/{step}/TP"]
+            FP = metric_dict[f"val-aux/retro/{step}/FP"]
+            TN = metric_dict[f"val-aux/retro/{step}/TN"]
+            F1 = 2 * TP / (2 * TP + FP + FN + 1e-8)
+            metric_dict[f"val-aux/retro/{step}/precision"] = TP / (TP + FP + 1e-8)
+            metric_dict[f"val-aux/retro/{step}/recall"] = TP / (TP + FN + 1e-8)
+            metric_dict[f"val-aux/retro/{step}/F1"] = F1
+        for step in ["step6", "step7"]:
+            FN = metric_dict[f"val-aux/reagent/{step}/FN"]
+            TP = metric_dict[f"val-aux/reagent/{step}/TP"]
+            FP = metric_dict[f"val-aux/reagent/{step}/FP"]
+            TN = metric_dict[f"val-aux/reagent/{step}/TN"]
+            F1 = 2 * TP / (2 * TP + FP + FN + 1e-8)
+            metric_dict[f"val-aux/reagent/{step}/precision"] = TP / (TP + FP + 1e-8)
+            metric_dict[f"val-aux/reagent/{step}/recall"] = TP / (TP + FN + 1e-8)
+            metric_dict[f"val-aux/reagent/{step}/F1"] = F1
 
         # Reflection metrics
         tasks = list(set(data_sources.tolist()))
@@ -1044,7 +1086,16 @@ class RayPPOTrainer:
         # if task_extra_info_key is not None, we use the task as the data source
         if len(task_lst) > 0:
             data_sources = np.concatenate(task_lst, axis=0)
-        
+
+        # Extract ReactionReasoner step binary metrics
+        step_binary_metrics = {}
+        reward_extra_infos_dict_keys = deepcopy(list(reward_extra_infos_dict.keys()))
+        for key in reward_extra_infos_dict_keys:
+            if "TP" in key or "FP" in key or "TN" in key or "FN" in key:
+                step_binary_metrics[key] = reward_extra_infos_dict.pop(key)
+                # remove None values
+                step_binary_metrics[key] = [v for v in step_binary_metrics[key] if v is not None]
+
         data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
         metric_dict = {}
         for data_source, var2metric2val in data_src2var2metric2val.items():
@@ -1068,6 +1119,38 @@ class RayPPOTrainer:
             metric_dict["test-aux/num_turns/min"] = sample_turns.min()
             metric_dict["test-aux/num_turns/max"] = sample_turns.max()
             metric_dict["test-aux/num_turns/mean"] = sample_turns.mean()
+
+        for key, val in step_binary_metrics.items():
+            pfx = f"val-aux/{key}"
+            metric_dict[pfx] = sum(val)
+
+        for step in ["step4", "step5", "step6"]:
+            FN = metric_dict[f"val-aux/forward/{step}/FN"]
+            TP = metric_dict[f"val-aux/forward/{step}/TP"]
+            FP = metric_dict[f"val-aux/forward/{step}/FP"]
+            TN = metric_dict[f"val-aux/forward/{step}/TN"]
+            F1 = 2 * TP / (2 * TP + FP + FN + 1e-8)
+            metric_dict[f"val-aux/forward/{step}/precision"] = TP / (TP + FP + 1e-8)
+            metric_dict[f"val-aux/forward/{step}/recall"] = TP / (TP + FN + 1e-8)
+            metric_dict[f"val-aux/forward/{step}/F1"] = F1
+        for step in ["step5", "step6", "step7"]:
+            FN = metric_dict[f"val-aux/retro/{step}/FN"]
+            TP = metric_dict[f"val-aux/retro/{step}/TP"]
+            FP = metric_dict[f"val-aux/retro/{step}/FP"]
+            TN = metric_dict[f"val-aux/retro/{step}/TN"]
+            F1 = 2 * TP / (2 * TP + FP + FN + 1e-8)
+            metric_dict[f"val-aux/retro/{step}/precision"] = TP / (TP + FP + 1e-8)
+            metric_dict[f"val-aux/retro/{step}/recall"] = TP / (TP + FN + 1e-8)
+            metric_dict[f"val-aux/retro/{step}/F1"] = F1
+        for step in ["step6", "step7"]:
+            FN = metric_dict[f"val-aux/reagent/{step}/FN"]
+            TP = metric_dict[f"val-aux/reagent/{step}/TP"]
+            FP = metric_dict[f"val-aux/reagent/{step}/FP"]
+            TN = metric_dict[f"val-aux/reagent/{step}/TN"]
+            F1 = 2 * TP / (2 * TP + FP + FN + 1e-8)
+            metric_dict[f"val-aux/reagent/{step}/precision"] = TP / (TP + FP + 1e-8)
+            metric_dict[f"val-aux/reagent/{step}/recall"] = TP / (TP + FN + 1e-8)
+            metric_dict[f"val-aux/reagent/{step}/F1"] = F1
 
         # Reflection metrics
         tasks = list(set(data_sources.tolist()))
