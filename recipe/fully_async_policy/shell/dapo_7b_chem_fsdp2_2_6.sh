@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
 
+export WANDB_ENTITY="llm-reaction-reasoning"
+export WANDB_PROJECT="verl-dapo"
+
 project_name='verl-dapo'
-exp_name='ref_bonus_kl0.001'
+exp_name='filtering_test'
 
 # Ray
 RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
@@ -31,8 +34,8 @@ adv_estimator=grpo
 
 use_kl_in_reward=False
 kl_coef=0.0
-use_kl_loss=True
-kl_loss_coef=0.001
+use_kl_loss=False
+kl_loss_coef=0.000
 
 clip_ratio_low=0.2
 clip_ratio_high=0.2
@@ -84,10 +87,10 @@ train_prompt_mini_bsz=16
 total_rollout_steps=$(((512*100000)))
 test_freq=1
 staleness_threshold=0.0
-trigger_parameter_sync_step=200
+trigger_parameter_sync_step=4
 require_batches=3
 partial_rollout=False
-save_freq=$((test_freq * trigger_parameter_sync_step * 3))
+save_freq=$((test_freq * trigger_parameter_sync_step * 12))
 
 
 # ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
@@ -113,6 +116,7 @@ python -m recipe.fully_async_policy.fully_async_main \
     algorithm.use_kl_in_reward=${use_kl_in_reward} \
     algorithm.kl_ctrl.kl_coef=${kl_coef} \
     algorithm.filter_groups.enable=${enable_filter_groups} \
+    +algorithm.filter_nonanswered.enable=${enable_filter_groups} \
     algorithm.filter_groups.max_num_gen_batches=${max_num_gen_batches} \
     algorithm.filter_groups.metric=${filter_groups_metric} \
     algorithm.rollout_is_threshold=2.0 \
@@ -171,7 +175,7 @@ python -m recipe.fully_async_policy.fully_async_main \
     trainer.logger=['console','wandb'] \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
-    trainer.val_before_train=True \
+    trainer.val_before_train=False \
     trainer.default_local_dir="${CKPTS_DIR}" \
     trainer.validation_data_dir="${DUMP_DIR}/val" \
     trainer.test_data_dir="${DUMP_DIR}/test" \

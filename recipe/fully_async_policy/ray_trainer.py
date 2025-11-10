@@ -50,6 +50,8 @@ from verl.utils.metric import (
 )
 from verl.utils.rollout_skip import RolloutSkip
 
+from collections import Counter, defaultdict
+
 
 class FullyAsyncRayPPOTrainer(RayPPOTrainer):
     def init_workers(self):
@@ -559,6 +561,33 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         # TODO: implement actual tflpo and theoretical tflpo
         n_gpus = self.resource_pool_manager.get_n_gpus()
         metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
+
+        # ReactionReasoner-specific metrics
+        class_counter = Counter(batch.non_tensor_batch['class_name'])
+        for class_name, count in class_counter.items():
+            metrics[f'reaction_class_count/{class_name}'] = count
+        task_counter = Counter(batch.non_tensor_batch['task'])
+        for task_name, count in task_counter.items():
+            metrics[f'task_count/{task_name}'] = count
+
+        tasks = list(set(batch.non_tensor_batch['task']))
+        for task in tasks:
+            metrics[f"group_metrics/{task}/zero_std_num"] = 0
+        task_group_metrics = defaultdict(list)
+        uids = list(set(batch.non_tensor_batch['uid']))
+        for uid in uids:
+            uid_inds = np.where(batch.non_tensor_batch['uid'] == uid)[0]
+            task = batch.non_tensor_batch['task'][uid_inds[0]]
+            scores = batch.non_tensor_batch['score'][uid_inds]
+            # print("-" * 100)
+            # print(f"scores : {scores.tolist()}")
+            # print(f"scores (std): {scores.std().item()}")
+            task_group_metrics[f"group_metrics/{task}/reward_mean"].append(scores.mean())
+            task_group_metrics[f"group_metrics/{task}/reward_std"].append(scores.std())
+            if scores.std() == 0:
+                metrics[f"group_metrics/{task}/zero_std_num"] += 1
+        for k, v in task_group_metrics.items():
+            metrics[k] = np.mean(v)
 
     def _post_batch_processing(self, batch: DataProto):
         # this is experimental and may be changed/removed in the future in favor of a general-purpose one

@@ -344,7 +344,7 @@ def assemble_batch_from_rollout_samples(
     if not rollout_samples:
         raise ValueError("Empty rollout_samples provided for batch assembly")
 
-    print(f"[BatchUtils] Assembling batch from {len(rollout_samples)} RolloutSample objects")
+    # print(f"[BatchUtils] Assembling batch from {len(rollout_samples)} RolloutSample objects")
 
     rollout_samples_batch = []
     processing_times = []
@@ -401,7 +401,7 @@ def assemble_batch_from_rollout_samples(
         }
     )
 
-    print(f"[BatchUtils] Batch assembly completed in {time.time() - start_time:.2f}s")
+    # print(f"[BatchUtils] Batch assembly completed in {time.time() - start_time:.2f}s")
 
     return final_batch
 

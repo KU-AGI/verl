@@ -26,11 +26,17 @@ from recipe.fully_async_policy.detach_utils import (
 )
 from recipe.fully_async_policy.message_queue import MessageQueueClient
 from recipe.fully_async_policy.ray_trainer import FullyAsyncRayPPOTrainer
+from verl.protocol import DataProto
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager
 from verl.trainer.ppo.utils import Role, WorkerType
 from verl.utils.profiler import marked_timer
 from verl.utils.tracking import ValidationGenerationsLogger
+
+from recipe.fully_async_policy.detach_utils import (
+    assemble_batch_from_rollout_samples,
+)
+from copy import deepcopy
 
 
 @ray.remote(num_cpus=10, max_concurrency=100)
@@ -378,7 +384,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 simple_from_cancel_queue = True
             else:
                 rollout_sample = await self.pending_queue.get()
-                self.staleness_samples += 1
+                # self.staleness_samples += 1
 
             if rollout_sample == "DONE":
                 print(
@@ -432,6 +438,47 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         )
         rollout_sample.agent_loop_output_list = agent_loop_output_list
 
+        # breakpoint()
+        task = rollout_sample.full_batch.non_tensor_batch['task'][0]
+        if self.config.algorithm.filter_groups.enable:
+            rollout_sample_tmp = merge_rollout_sample(self.config, self.tokenizer, deepcopy(rollout_sample), self.processor)
+            batch_tmp = assemble_batch_from_rollout_samples([rollout_sample_tmp], self.tokenizer, self.config, None)
+            rewards = self.reward_fn(batch_tmp).sum(1)
+            assert len(set(batch_tmp.non_tensor_batch['task'])) == 1, "all tasks in the batch must be the same"
+            # print(
+            #     f"[FullyAsyncRollouter] Task: {task} "
+            #     f"rewards: {rewards.tolist()}"
+            #     f"rewards (std): {rewards.std().item()}"
+            # )
+            if rewards.std().item() < 0.00001: # consider float precision
+                # print(
+                #     f"[FullyAsyncRollouter] Warning: Generated a sample with zero reward variance. Task: {task} "
+                #     f"rewards: {rewards.tolist()}"
+                #     f"rewards (std): {rewards.std().item()}"
+                # )
+                # Do not use this sample: drop it and return early without enqueuing
+                self.dropped_stale_samples += 1
+                self.processed_sample_count += 1
+                return
+
+        if self.config.algorithm.filter_nonanswered.enable:
+            # task = batch_tmp.non_tensor_batch['task'][0]
+            response_str_list = [self.tokenizer.decode(output.response_ids) for output in agent_loop_output_list]
+            answered_list = []
+            for s in response_str_list:
+                is_answered = await self.has_valid_answer_tag(s)
+                answered_list.append(is_answered)
+            if not all(answered_list):
+                # print(
+                #     f"[FullyAsyncRollouter] Warning: Generated a sample with invalid answer tag. Task: {task} "
+                #     f"responses: {response_str_list}"
+                # )
+                # Do not use this sample: drop it and return early without enqueuing
+                self.dropped_stale_samples += 1
+                self.processed_sample_count += 1
+                return
+
+        self.staleness_samples += 1
         is_cancel = False
         for agent_loop in agent_loop_output_list:
             if not is_cancel and agent_loop.is_cancel:
@@ -659,3 +706,15 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         }
 
         return stats
+
+    async def has_valid_answer_tag(self, s: str) -> bool:
+        start_count = s.count("<ANSWER>")
+        end_count = s.count("</ANSWER>")
+
+        if start_count != 1 or end_count != 1:
+            return False
+
+        start_idx = s.find("<ANSWER>")
+        end_idx = s.find("</ANSWER>")
+
+        return start_idx < end_idx
