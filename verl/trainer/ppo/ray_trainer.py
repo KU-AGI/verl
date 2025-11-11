@@ -1121,36 +1121,36 @@ class RayPPOTrainer:
             metric_dict["test-aux/num_turns/mean"] = sample_turns.mean()
 
         for key, val in step_binary_metrics.items():
-            pfx = f"val-aux/{key}"
+            pfx = f"test-aux/{key}"
             metric_dict[pfx] = sum(val)
 
         for step in ["step4", "step5", "step6"]:
-            FN = metric_dict[f"val-aux/forward/{step}/FN"]
-            TP = metric_dict[f"val-aux/forward/{step}/TP"]
-            FP = metric_dict[f"val-aux/forward/{step}/FP"]
-            TN = metric_dict[f"val-aux/forward/{step}/TN"]
+            FN = metric_dict[f"test-aux/forward/{step}/FN"]
+            TP = metric_dict[f"test-aux/forward/{step}/TP"]
+            FP = metric_dict[f"test-aux/forward/{step}/FP"]
+            TN = metric_dict[f"test-aux/forward/{step}/TN"]
             F1 = 2 * TP / (2 * TP + FP + FN + 1e-8)
-            metric_dict[f"val-aux/forward/{step}/precision"] = TP / (TP + FP + 1e-8)
-            metric_dict[f"val-aux/forward/{step}/recall"] = TP / (TP + FN + 1e-8)
-            metric_dict[f"val-aux/forward/{step}/F1"] = F1
+            metric_dict[f"test-aux/forward/{step}/precision"] = TP / (TP + FP + 1e-8)
+            metric_dict[f"test-aux/forward/{step}/recall"] = TP / (TP + FN + 1e-8)
+            metric_dict[f"test-aux/forward/{step}/F1"] = F1
         for step in ["step5", "step6", "step7"]:
-            FN = metric_dict[f"val-aux/retro/{step}/FN"]
-            TP = metric_dict[f"val-aux/retro/{step}/TP"]
-            FP = metric_dict[f"val-aux/retro/{step}/FP"]
-            TN = metric_dict[f"val-aux/retro/{step}/TN"]
+            FN = metric_dict[f"test-aux/retro/{step}/FN"]
+            TP = metric_dict[f"test-aux/retro/{step}/TP"]
+            FP = metric_dict[f"test-aux/retro/{step}/FP"]
+            TN = metric_dict[f"test-aux/retro/{step}/TN"]
             F1 = 2 * TP / (2 * TP + FP + FN + 1e-8)
-            metric_dict[f"val-aux/retro/{step}/precision"] = TP / (TP + FP + 1e-8)
-            metric_dict[f"val-aux/retro/{step}/recall"] = TP / (TP + FN + 1e-8)
-            metric_dict[f"val-aux/retro/{step}/F1"] = F1
+            metric_dict[f"test-aux/retro/{step}/precision"] = TP / (TP + FP + 1e-8)
+            metric_dict[f"test-aux/retro/{step}/recall"] = TP / (TP + FN + 1e-8)
+            metric_dict[f"test-aux/retro/{step}/F1"] = F1
         for step in ["step6", "step7"]:
-            FN = metric_dict[f"val-aux/reagent/{step}/FN"]
-            TP = metric_dict[f"val-aux/reagent/{step}/TP"]
-            FP = metric_dict[f"val-aux/reagent/{step}/FP"]
-            TN = metric_dict[f"val-aux/reagent/{step}/TN"]
+            FN = metric_dict[f"test-aux/reagent/{step}/FN"]
+            TP = metric_dict[f"test-aux/reagent/{step}/TP"]
+            FP = metric_dict[f"test-aux/reagent/{step}/FP"]
+            TN = metric_dict[f"test-aux/reagent/{step}/TN"]
             F1 = 2 * TP / (2 * TP + FP + FN + 1e-8)
-            metric_dict[f"val-aux/reagent/{step}/precision"] = TP / (TP + FP + 1e-8)
-            metric_dict[f"val-aux/reagent/{step}/recall"] = TP / (TP + FN + 1e-8)
-            metric_dict[f"val-aux/reagent/{step}/F1"] = F1
+            metric_dict[f"test-aux/reagent/{step}/precision"] = TP / (TP + FP + 1e-8)
+            metric_dict[f"test-aux/reagent/{step}/recall"] = TP / (TP + FN + 1e-8)
+            metric_dict[f"test-aux/reagent/{step}/F1"] = F1
 
         # Reflection metrics
         tasks = list(set(data_sources.tolist()))

@@ -609,14 +609,6 @@ class StepEvaluator():
         step6_TN = (not has_tagged_smiles_initial) and (not step6_has_reflection)
         step6_FN = has_tagged_smiles_initial and (not step6_has_reflection)
 
-        # print("Step4 - TP:", step4_TP, "FP:", step4_FP, "TN:", step4_TN, "FN:", step4_FN)
-        # print("Step5 - TP:", step5_TP, "FP:", step5_FP, "TN:", step5_TN, "FN:", step5_FN)
-        # print("Step6 - TP:", step6_TP, "FP:", step6_FP, "TN:", step6_TN, "FN:", step6_FN)
-
-        # step4_F1 = (2 * step4_TP) / (2 * step4_TP + step4_FP + step4_FN)
-        # step5_F1 = (2 * step5_TP) / (2 * step5_TP + step5_FP + step5_FN)
-        # step6_F1 = (2 * step6_TP) / (2 * step6_TP + step6_FP + step6_FN)
-
         reward_dict = {
             "forward/step4/has_reactive_atoms_smiles": int(has_reactive_atoms_smiles),
             "forward/step5/has_reactive_atom_bonds": int(has_reactive_atom_bonds),
@@ -627,9 +619,6 @@ class StepEvaluator():
             "forward/step4/has_reactive_atoms_smiles": int(has_reactive_atoms_smiles),
             "forward/step5/has_reactive_atom_bonds": int(has_reactive_atom_bonds),
             "forward/step6/has_tagged_smiles": int(has_tagged_smiles),
-            # "forward/step4/reflection_F1": step4_F1,
-            # "forward/step5/reflection_F1": step5_F1,
-            # "forward/step6/reflection_F1": step6_F1,
             "forward/step4/TP": step4_TP,
             "forward/step4/FP": step4_FP,
             "forward/step4/TN": step4_TN,
@@ -721,13 +710,6 @@ class StepEvaluator():
         step7_FP = (not has_synthetic_equivalents_initial) and step7_has_reflection
         step7_TN = (not has_synthetic_equivalents_initial) and (not step7_has_reflection)
         step7_FN = has_synthetic_equivalents_initial and (not step7_has_reflection)
-        # step5_F1 = (2 * step5_TP) / (2 * step5_TP + step5_FP + step5_FN)
-        # step6_F1 = (2 * step6_TP) / (2 * step6_TP + step6_FP + step6_FN)
-        # step7_F1 = (2 * step7_TP) / (2 * step7_TP + step7_FP + step7_FN)
-
-        # print("Step5 - TP:", step5_TP, "FP:", step5_FP, "TN:", step5_TN, "FN:", step5_FN)
-        # print("Step6 - TP:", step6_TP, "FP:", step6_FP, "TN:", step6_TN, "FN:", step6_FN)
-        # print("Step7 - TP:", step7_TP, "FP:", step7_FP, "TN:", step7_TN, "FN:", step7_FN)
 
         reward_dict = {
             "retro/step5/has_bond_disconnection": int(has_bond_disconnection),
@@ -739,9 +721,6 @@ class StepEvaluator():
             "retro/step5/has_bond_disconnection": int(has_bond_disconnection),
             "retro/step6/has_synthons": int(has_synthons),
             "retro/step7/has_synthetic_equivalents": int(has_synthetic_equivalents),
-            # "retro/step5/reflection_F1": step5_F1,
-            # "retro/step6/reflection_F1": step6_F1,
-            # "retro/step7/reflection_F1": step7_F1,
             "retro/step5/TP": step5_TP,
             "retro/step5/FP": step5_FP,
             "retro/step5/TN": step5_TN,
@@ -844,11 +823,6 @@ class StepEvaluator():
         step7_FP = (not has_correct_reagent_number_initial) and step7_has_reflection
         step7_TN = (not has_correct_reagent_number_initial) and (not step7_has_reflection)
         step7_FN = has_correct_reagent_number_initial and (not step7_has_reflection)
-        # step6_F1 = (2 * step6_TP) / (2 * step6_TP + step6_FP + step6_FN)
-        # step7_F1 = (2 * step7_TP) / (2 * step7_TP + step7_FP + step7_FN)
-
-        # print("Step6 - TP:", step6_TP, "FP:", step6_FP, "TN:", step6_TN, "FN:", step6_FN)
-        # print("Step7 - TP:", step7_TP, "FP:", step7_FP, "TN:", step7_TN, "FN:", step7_FN)
 
         reward_dict = {
             "reagent/step6/has_reagents": int(has_reagents),
@@ -858,8 +832,6 @@ class StepEvaluator():
         return {
             "reagent/step6/has_reagents": int(has_reagents),
             "reagent/step7/has_correct_reagent_number": int(has_correct_reagent_number),
-            # "reagent/step6/reflection_F1": step6_F1,
-            # "reagent/step7/reflection_F1": step7_F1,
             "reagent/step6/TP": step6_TP,
             "reagent/step6/FP": step6_FP,
             "reagent/step6/TN": step6_TN,
@@ -918,6 +890,7 @@ class ChemistryEvaluator:
         elif task == "retro":
             step_eval_results, reflection_bonus, reward_dict = self.step_evaluator.calculate_retro_rationale_metrics(info, predicted_rationale)
         elif task == "reagent":
+            breakpoint()
             step_eval_results, reflection_bonus, reward_dict = self.step_evaluator.calculate_reagent_rationale_metrics(info, predicted_rationale)
         else:
             step_eval_results = {}
