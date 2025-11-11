@@ -116,13 +116,14 @@ def postprocess_agent_loop_outputs(rs: "RolloutSample", tokenizer, config, proce
     response_mask = response_mask * response_attention_mask
 
 
-    for i in range(len(response_ids)):
-        if "<REFLECTION>" in tokenizer.decode(response_ids[i]):
-            qwen3_stepstart = [565, 14822, 220] # ## Step 
-            qwen3_reflection_start = [27, 5996, 28017] # <REFLECTION
-            qwen3_reflection_end = [522, 5996, 28017] # </REFLECTION
-            reflection_mask = -1 * mask_between_tokens(response_ids[i], qwen3_stepstart, qwen3_reflection_start, include_start=True, include_end=False) + 1 # inverted mask
-            response_mask[i] = response_mask[i] * reflection_mask
+    if config.actor_rollout_ref.rollout.use_response_mask_to_reflection_step:
+        for i in range(len(response_ids)):
+            if "<REFLECTION>" in tokenizer.decode(response_ids[i]):
+                qwen3_stepstart = [565, 14822, 220] # ## Step 
+                qwen3_reflection_start = [27, 5996, 28017] # <REFLECTION
+                qwen3_reflection_end = [522, 5996, 28017] # </REFLECTION
+                reflection_mask = -1 * mask_between_tokens(response_ids[i], qwen3_stepstart, qwen3_reflection_start, include_start=True, include_end=False) + 1 # inverted mask
+                response_mask[i] = response_mask[i] * reflection_mask
 
 
     # Handle multi-modal inputs and position_ids calculation

@@ -46,6 +46,7 @@ filter_groups_metric=seq_final_reward
 max_num_gen_batches=0
 
 balance_task=True
+use_response_mask_to_reflection_step=False
 
 # Reward related parameters
 use_content_reward=True
@@ -171,6 +172,7 @@ python -m recipe.fully_async_policy.fully_async_main \
     actor_rollout_ref.rollout.val_kwargs.do_sample=False \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
     actor_rollout_ref.rollout.calculate_log_probs=True \
+    +actor_rollout_ref.rollout.use_response_mask_to_reflection_step=${use_response_mask_to_reflection_step} \
     actor_rollout_ref.ref.fsdp_config.param_offload=${ref_offload} \
     actor_rollout_ref.ref.ulysses_sequence_parallel_size=${sp_size} \
     actor_rollout_ref.rollout.name=${rollout_name} \
