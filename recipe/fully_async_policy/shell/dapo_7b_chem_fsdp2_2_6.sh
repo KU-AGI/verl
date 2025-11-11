@@ -5,7 +5,7 @@ export WANDB_ENTITY="llm-reaction-reasoning"
 export WANDB_PROJECT="verl-dapo"
 
 project_name='verl-dapo'
-exp_name='with_balance_task'
+exp_name='reflect_bonus_0.3'
 
 # Ray
 RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
@@ -48,9 +48,9 @@ max_num_gen_batches=0
 balance_task=True
 
 # Reward related parameters
-use_reflection_bonus=False
+use_reflection_bonus=True
 use_stepwise_reward=True
-reflection_bonus_weight=0.0
+reflection_bonus_weight=0.3
 
 # Response length parameters
 max_prompt_length=500 # $((1024 * 2))

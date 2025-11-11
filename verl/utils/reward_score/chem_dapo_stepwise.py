@@ -594,25 +594,38 @@ class StepEvaluator():
         has_reactive_atom_bonds_initial = all(str(tuple(bond)) in step5_initial_rationale for bond in info['reactive_atom_bonds'])
         has_tagged_smiles_initial = info["product_changes_tagged"] in step6_initial_rationale
 
+        step4_has_not_reflection = not step4_has_reflection
+        step5_has_not_reflection = not step5_has_reflection
+        step6_has_not_reflection = not step6_has_reflection
 
         # Calculate TP, FP, TN, FN for each step. Only check reflection is correct.
-        step4_TP = has_reactive_atom_smiles_initial and step4_has_reflection
-        step4_FP = (not has_reactive_atom_smiles_initial) and step4_has_reflection
-        step4_TN = (not has_reactive_atom_smiles_initial) and (not step4_has_reflection)
-        step4_FN = has_reactive_atom_smiles_initial and (not step4_has_reflection)
-        step5_TP = has_reactive_atom_bonds_initial and step5_has_reflection
-        step5_FP = (not has_reactive_atom_bonds_initial) and step5_has_reflection
-        step5_TN = (not has_reactive_atom_bonds_initial) and (not step5_has_reflection)
-        step5_FN = has_reactive_atom_bonds_initial and (not step5_has_reflection)
-        step6_TP = has_tagged_smiles_initial and step6_has_reflection
-        step6_FP = (not has_tagged_smiles_initial) and step6_has_reflection
-        step6_TN = (not has_tagged_smiles_initial) and (not step6_has_reflection)
-        step6_FN = has_tagged_smiles_initial and (not step6_has_reflection)
+        step4_TP = has_reactive_atom_smiles_initial and step4_has_not_reflection
+        step4_FP = (not has_reactive_atom_smiles_initial) and step4_has_not_reflection
+        step4_TN = (not has_reactive_atom_smiles_initial) and (not step4_has_not_reflection)
+        step4_FN = has_reactive_atom_smiles_initial and (not step4_has_not_reflection)
+        step5_TP = has_reactive_atom_bonds_initial and step5_has_not_reflection
+        step5_FP = (not has_reactive_atom_bonds_initial) and step5_has_not_reflection
+        step5_TN = (not has_reactive_atom_bonds_initial) and (not step5_has_not_reflection)
+        step5_FN = has_reactive_atom_bonds_initial and (not step5_has_not_reflection)
+        step6_TP = has_tagged_smiles_initial and step6_has_not_reflection
+        step6_FP = (not has_tagged_smiles_initial) and step6_has_not_reflection
+        step6_TN = (not has_tagged_smiles_initial) and (not step6_has_not_reflection)
+        step6_FN = has_tagged_smiles_initial and (not step6_has_not_reflection)
+
+        # Reflection accuracy reward
+        step4_reflection_correct = step4_TP + step4_TN
+        step5_reflection_correct = step5_TP + step5_TN
+        step6_reflection_correct = step6_TP + step6_TN
+        total_reflection_correct_list = [step4_reflection_correct, step5_reflection_correct, step6_reflection_correct]
+        reflection_acc = sum(total_reflection_correct_list) / len(total_reflection_correct_list)
 
         reward_dict = {
             "forward/step4/has_reactive_atoms_smiles": int(has_reactive_atoms_smiles),
             "forward/step5/has_reactive_atom_bonds": int(has_reactive_atom_bonds),
             "forward/step6/has_tagged_smiles": int(has_tagged_smiles),
+            "forward/step4/correct_reflection": int(step4_reflection_correct),
+            "forward/step5/correct_reflection": int(step5_reflection_correct),
+            "forward/step6/correct_reflection": int(step6_reflection_correct),
         }
 
         return {
@@ -631,6 +644,7 @@ class StepEvaluator():
             "forward/step6/FP": step6_FP,
             "forward/step6/TN": step6_TN,
             "forward/step6/FN": step6_FN,
+            "forward/reflection_acc": reflection_acc,
         }, reflection_bonus, reward_dict
 
 
@@ -698,23 +712,37 @@ class StepEvaluator():
         has_synthetic_equivalents = all(syn_equiv in predicted_step7_rationale for syn_equiv in info["synthetic_equivalents"])
         has_synthetic_equivalents_initial = all(syn_equiv in step7_initial_rationale for syn_equiv in info["synthetic_equivalents"])
 
-        step5_TP = has_bond_disconnection_initial and step5_has_reflection
-        step5_FP = (not has_bond_disconnection_initial) and step5_has_reflection
-        step5_TN = (not has_bond_disconnection_initial) and (not step5_has_reflection)
-        step5_FN = has_bond_disconnection_initial and (not step5_has_reflection)
-        step6_TP = has_synthons_initial and step6_has_reflection
-        step6_FP = (not has_synthons_initial) and step6_has_reflection
-        step6_TN = (not has_synthons_initial) and (not step6_has_reflection)
-        step6_FN = has_synthons_initial and (not step6_has_reflection)
-        step7_TP = has_synthetic_equivalents_initial and step7_has_reflection
-        step7_FP = (not has_synthetic_equivalents_initial) and step7_has_reflection
-        step7_TN = (not has_synthetic_equivalents_initial) and (not step7_has_reflection)
-        step7_FN = has_synthetic_equivalents_initial and (not step7_has_reflection)
+        step5_has_not_reflection = not step5_has_reflection
+        step6_has_not_reflection = not step6_has_reflection
+        step7_has_not_reflection = not step7_has_reflection
+
+        step5_TP = has_bond_disconnection_initial and step5_has_not_reflection
+        step5_FP = (not has_bond_disconnection_initial) and step5_has_not_reflection
+        step5_TN = (not has_bond_disconnection_initial) and (not step5_has_not_reflection)
+        step5_FN = has_bond_disconnection_initial and (not step5_has_not_reflection)
+        step6_TP = has_synthons_initial and step6_has_not_reflection
+        step6_FP = (not has_synthons_initial) and step6_has_not_reflection
+        step6_TN = (not has_synthons_initial) and (not step6_has_not_reflection)
+        step6_FN = has_synthons_initial and (not step6_has_not_reflection)
+        step7_TP = has_synthetic_equivalents_initial and step7_has_not_reflection
+        step7_FP = (not has_synthetic_equivalents_initial) and step7_has_not_reflection
+        step7_TN = (not has_synthetic_equivalents_initial) and (not step7_has_not_reflection)
+        step7_FN = has_synthetic_equivalents_initial and (not step7_has_not_reflection)
+
+        # Reflection accuracy reward
+        step5_reflection_correct = step5_TP + step5_TN
+        step6_reflection_correct = step6_TP + step6_TN
+        step7_reflection_correct = step7_TP + step7_TN
+        total_reflection_correct_list = [step5_reflection_correct, step6_reflection_correct, step7_reflection_correct]
+        reflection_acc = sum(total_reflection_correct_list) / len(total_reflection_correct_list)
 
         reward_dict = {
             "retro/step5/has_bond_disconnection": int(has_bond_disconnection),
             "retro/step6/has_synthons": int(has_synthons),
             "retro/step7/has_synthetic_equivalents": int(has_synthetic_equivalents),
+            "retro/step5/correct_reflection": int(step5_reflection_correct),
+            "retro/step6/correct_reflection": int(step6_reflection_correct),
+            "retro/step7/correct_reflection": int(step7_reflection_correct),
         }
 
         return {
@@ -733,6 +761,7 @@ class StepEvaluator():
             "retro/step7/FP": step7_FP,
             "retro/step7/TN": step7_TN,
             "retro/step7/FN": step7_FN,
+            "retro/reflection_acc": reflection_acc,
         }, reflection_bonus, reward_dict
 
 
@@ -813,20 +842,30 @@ class StepEvaluator():
         else:
             has_correct_reagent_number_initial = False
 
+        step6_has_not_reflection = not step6_has_reflection
+        step7_has_not_reflection = not step7_has_reflection
 
         # Calculate TP, FP, TN, FN for each step. Only check reflection is correct.
-        step6_TP = has_reagents_initial and step6_has_reflection
-        step6_FP = (not has_reagents_initial) and step6_has_reflection
-        step6_TN = (not has_reagents_initial) and (not step6_has_reflection)
-        step6_FN = has_reagents_initial and (not step6_has_reflection)
-        step7_TP = has_correct_reagent_number_initial and step7_has_reflection
-        step7_FP = (not has_correct_reagent_number_initial) and step7_has_reflection
-        step7_TN = (not has_correct_reagent_number_initial) and (not step7_has_reflection)
-        step7_FN = has_correct_reagent_number_initial and (not step7_has_reflection)
+        step6_TP = has_reagents_initial and step6_has_not_reflection
+        step6_FP = (not has_reagents_initial) and step6_has_not_reflection
+        step6_TN = (not has_reagents_initial) and (not step6_has_not_reflection)
+        step6_FN = has_reagents_initial and (not step6_has_not_reflection)
+        step7_TP = has_correct_reagent_number_initial and step7_has_not_reflection
+        step7_FP = (not has_correct_reagent_number_initial) and step7_has_not_reflection
+        step7_TN = (not has_correct_reagent_number_initial) and (not step7_has_not_reflection)
+        step7_FN = has_correct_reagent_number_initial and (not step7_has_not_reflection)
+
+        # Reflection accuracy reward
+        step6_reflection_correct = step6_TP + step6_TN
+        step7_reflection_correct = step7_TP + step7_TN
+        total_reflection_correct_list = [step6_reflection_correct, step7_reflection_correct]
+        reflection_acc = sum(total_reflection_correct_list) / len(total_reflection_correct_list)
 
         reward_dict = {
             "reagent/step6/has_reagents": int(has_reagents),
             "reagent/step7/has_correct_reagent_number": int(has_correct_reagent_number),
+            "reagent/step6/correct_reflection": int(step6_reflection_correct),
+            "reagent/step7/correct_reflection": int(step7_reflection_correct),
         }
 
         return {
@@ -840,6 +879,7 @@ class StepEvaluator():
             "reagent/step7/FP": step7_FP,
             "reagent/step7/TN": step7_TN,
             "reagent/step7/FN": step7_FN,
+            "reagent/reflection_acc": reflection_acc,
         }, reflection_bonus, reward_dict
 
 
@@ -884,13 +924,11 @@ class ChemistryEvaluator:
         predicted_rationale = ""
         if match:
             predicted_rationale = match.group(1).strip()
-        # breakpoint()
         if task == "forward":
             step_eval_results, reflection_bonus, reward_dict = self.step_evaluator.calculate_forward_rationale_metrics(info, predicted_rationale)
         elif task == "retro":
             step_eval_results, reflection_bonus, reward_dict = self.step_evaluator.calculate_retro_rationale_metrics(info, predicted_rationale)
         elif task == "reagent":
-            breakpoint()
             step_eval_results, reflection_bonus, reward_dict = self.step_evaluator.calculate_reagent_rationale_metrics(info, predicted_rationale)
         else:
             step_eval_results = {}
@@ -900,7 +938,7 @@ class ChemistryEvaluator:
         if use_reflection_bonus:
             reward += (reflection_bonus / len(reward_dict) * reflection_bonus_weight if reward_dict else 0.0)
         if use_stepwise_reward:
-            reward += (sum(reward_dict.values()) / len(reward_dict) if reward_dict else 0.0)
+            reward += (0.5 * sum(reward_dict.values()) / len(reward_dict) if reward_dict else 0.0)
 
         result = EvaluationResult(
             score=reward,
