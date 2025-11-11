@@ -116,7 +116,7 @@ def postprocess_agent_loop_outputs(rs: "RolloutSample", tokenizer, config, proce
     response_mask = response_mask * response_attention_mask
 
 
-    if config.actor_rollout_ref.rollout.use_response_mask_to_reflection_step:
+    if config.data.use_response_mask_to_reflection_step:
         for i in range(len(response_ids)):
             if "<REFLECTION>" in tokenizer.decode(response_ids[i]):
                 qwen3_stepstart = [565, 14822, 220] # ## Step 
