@@ -619,13 +619,16 @@ class StepEvaluator():
         total_reflection_correct_list = [step4_reflection_correct, step5_reflection_correct, step6_reflection_correct]
         reflection_acc = sum(total_reflection_correct_list) / len(total_reflection_correct_list)
 
-        reward_dict = {
+        content_reward_dict = {
             "forward/step4/has_reactive_atoms_smiles": int(has_reactive_atoms_smiles),
             "forward/step5/has_reactive_atom_bonds": int(has_reactive_atom_bonds),
             "forward/step6/has_tagged_smiles": int(has_tagged_smiles),
-            "forward/step4/correct_reflection": int(step4_reflection_correct),
-            "forward/step5/correct_reflection": int(step5_reflection_correct),
-            "forward/step6/correct_reflection": int(step6_reflection_correct),
+        }
+
+        reflection_decision_reward_dict = {
+            "forward/step4/reflection_decision": int(step4_has_reflection),
+            "forward/step5/reflection_decision": int(step5_has_reflection),
+            "forward/step6/reflection_decision": int(step6_has_reflection),
         }
 
         return {
@@ -644,8 +647,11 @@ class StepEvaluator():
             "forward/step6/FP": step6_FP,
             "forward/step6/TN": step6_TN,
             "forward/step6/FN": step6_FN,
-            "forward/reflection_acc": reflection_acc,
-        }, reflection_bonus, reward_dict
+            "forward/step4/reflection_decision": int(step4_has_reflection),
+            "forward/step5/reflection_decision": int(step5_has_reflection),
+            "forward/step6/reflection_decision": int(step6_has_reflection),
+            "forward/total_reflection_acc": reflection_acc,
+        }, reflection_bonus, content_reward_dict, reflection_decision_reward_dict
 
 
     def calculate_retro_rationale_metrics(self, info, predicted_rationale):
@@ -736,10 +742,13 @@ class StepEvaluator():
         total_reflection_correct_list = [step5_reflection_correct, step6_reflection_correct, step7_reflection_correct]
         reflection_acc = sum(total_reflection_correct_list) / len(total_reflection_correct_list)
 
-        reward_dict = {
+        content_reward_dict = {
             "retro/step5/has_bond_disconnection": int(has_bond_disconnection),
             "retro/step6/has_synthons": int(has_synthons),
             "retro/step7/has_synthetic_equivalents": int(has_synthetic_equivalents),
+        }
+
+        reflection_decision_reward_dict = {
             "retro/step5/correct_reflection": int(step5_reflection_correct),
             "retro/step6/correct_reflection": int(step6_reflection_correct),
             "retro/step7/correct_reflection": int(step7_reflection_correct),
@@ -761,8 +770,11 @@ class StepEvaluator():
             "retro/step7/FP": step7_FP,
             "retro/step7/TN": step7_TN,
             "retro/step7/FN": step7_FN,
-            "retro/reflection_acc": reflection_acc,
-        }, reflection_bonus, reward_dict
+            "retro/step5/correct_reflection": int(step5_reflection_correct),
+            "retro/step6/correct_reflection": int(step6_reflection_correct),
+            "retro/step7/correct_reflection": int(step7_reflection_correct),
+            "retro/total_reflection_acc": reflection_acc,
+        }, reflection_bonus, content_reward_dict, reflection_decision_reward_dict
 
 
     def calculate_reagent_rationale_metrics(self, info, predicted_rationale):
@@ -861,9 +873,12 @@ class StepEvaluator():
         total_reflection_correct_list = [step6_reflection_correct, step7_reflection_correct]
         reflection_acc = sum(total_reflection_correct_list) / len(total_reflection_correct_list)
 
-        reward_dict = {
+        content_reward_dict = {
             "reagent/step6/has_reagents": int(has_reagents),
             "reagent/step7/has_correct_reagent_number": int(has_correct_reagent_number),
+        }
+
+        reflection_decision_reward_dict = {
             "reagent/step6/correct_reflection": int(step6_reflection_correct),
             "reagent/step7/correct_reflection": int(step7_reflection_correct),
         }
@@ -879,8 +894,10 @@ class StepEvaluator():
             "reagent/step7/FP": step7_FP,
             "reagent/step7/TN": step7_TN,
             "reagent/step7/FN": step7_FN,
-            "reagent/reflection_acc": reflection_acc,
-        }, reflection_bonus, reward_dict
+            "reagent/step6/correct_reflection": int(step6_reflection_correct),
+            "reagent/step7/correct_reflection": int(step7_reflection_correct),
+            "reagent/total_reflection_acc": reflection_acc,
+        }, reflection_bonus, content_reward_dict, reflection_decision_reward_dict
 
 
 class ChemistryEvaluator:
@@ -905,7 +922,15 @@ class ChemistryEvaluator:
         correct_score, pred = self.is_correct_strict_tag(solution_str, ground_truth)
         return correct_score == 1, pred
 
-    def compute_score(self, solution_str: str, ground_truth: str, extra_info: Optional[Dict] = None, use_reflection_bonus=False, reflection_bonus_weight=0.5, use_stepwise_reward=False) -> Union[EvaluationResult, Dict[str, Any]]:
+    def compute_score(self,
+                      solution_str: str,
+                      ground_truth: str,
+                      extra_info: Optional[Dict] = None,
+                      use_content_reward=False,
+                      use_decision_reward=False,
+                      use_reflection_bonus=False,
+                      reflection_bonus_weight=0.0
+                      ) -> Union[EvaluationResult, Dict[str, Any]]:
         """Compute comprehensive evaluation score."""
         correct, pred = self.verify(solution_str, ground_truth, extra_info)
 
@@ -925,20 +950,35 @@ class ChemistryEvaluator:
         if match:
             predicted_rationale = match.group(1).strip()
         if task == "forward":
-            step_eval_results, reflection_bonus, reward_dict = self.step_evaluator.calculate_forward_rationale_metrics(info, predicted_rationale)
+            step_eval_results, reflection_bonus, content_reward_dict, reflection_decision_reward_dict = self.step_evaluator.calculate_forward_rationale_metrics(info, predicted_rationale)
         elif task == "retro":
-            step_eval_results, reflection_bonus, reward_dict = self.step_evaluator.calculate_retro_rationale_metrics(info, predicted_rationale)
+            step_eval_results, reflection_bonus, content_reward_dict, reflection_decision_reward_dict = self.step_evaluator.calculate_retro_rationale_metrics(info, predicted_rationale)
         elif task == "reagent":
-            step_eval_results, reflection_bonus, reward_dict = self.step_evaluator.calculate_reagent_rationale_metrics(info, predicted_rationale)
+            step_eval_results, reflection_bonus, content_reward_dict, reflection_decision_reward_dict = self.step_evaluator.calculate_reagent_rationale_metrics(info, predicted_rationale)
         else:
             step_eval_results = {}
             reflection_bonus = 0.0
 
         reward = correct
+
+        reward_metric_dict = {
+            f"{task}/reward/answer_correct": correct,
+        }
+
+        if use_content_reward:
+            content_reward = sum(content_reward_dict.values()) / len(content_reward_dict)
+            reward += content_reward
+            reward_metric_dict[f"{task}/reward/content_reward"] = content_reward
+        if use_decision_reward:
+            decision_reward = sum(reflection_decision_reward_dict.values()) / len(reflection_decision_reward_dict)
+            reward += decision_reward
+            reward_metric_dict[f"{task}/reward/decision_reward"] = decision_reward
         if use_reflection_bonus:
-            reward += (reflection_bonus / len(reward_dict) * reflection_bonus_weight if reward_dict else 0.0)
-        if use_stepwise_reward:
-            reward += (0.5 * sum(reward_dict.values()) / len(reward_dict) if reward_dict else 0.0)
+            reflection_bonus_reward = reflection_bonus / len(reflection_decision_reward_dict) * reflection_bonus_weight
+            reward += reflection_bonus_reward
+            reward_metric_dict[f"{task}/reward/reflection_bonus_reward"] = reflection_bonus_reward
+
+        step_eval_results.update(reward_metric_dict)
 
         result = EvaluationResult(
             score=reward,
@@ -951,8 +991,23 @@ class ChemistryEvaluator:
         return result.to_dict()
 
 
-def compute_score(solution_str: str, ground_truth: str, extra_info: Optional[dict] = None, use_reflection_bonus=False, reflection_bonus_weight=0.5, use_stepwise_reward=False) -> Dict[str, Any]:
+def compute_score(solution_str: str,
+                  ground_truth: str,
+                  extra_info: Optional[dict] = None,
+                  use_content_reward=False,
+                  use_decision_reward=False,
+                  use_reflection_bonus=False,
+                  reflection_bonus_weight=0.0
+                 ) -> Dict[str, Any]:
     evaluator = ChemistryEvaluator()
-    result = evaluator.compute_score(solution_str, ground_truth, extra_info, use_reflection_bonus, reflection_bonus_weight, use_stepwise_reward)
+    result = evaluator.compute_score(
+        solution_str,
+        ground_truth,
+        extra_info,
+        use_content_reward,
+        use_decision_reward,
+        use_reflection_bonus,
+        reflection_bonus_weight
+    )
     # result is already a dict from compute_score method
     return result

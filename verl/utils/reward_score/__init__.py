@@ -63,9 +63,8 @@ def default_compute_score(
     elif data_source == "chem_dapo":
         # from . import chem_dapo
         from . import chem_dapo_stepwise
-
         # res = chem_dapo.compute_score(solution_str, ground_truth)
-        res = chem_dapo_stepwise.compute_score(solution_str, ground_truth, extra_info)
+        res = chem_dapo_stepwise.compute_score(solution_str, ground_truth, extra_info, kwargs['use_content_reward'], kwargs['use_decision_reward'], kwargs['use_reflection_bonus'], kwargs['reflection_bonus_weight'])
     elif data_source in [
         "numina_aops_forum",
         "numina_synthetic_math",

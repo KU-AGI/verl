@@ -67,6 +67,10 @@ class DAPORewardLoopManager(RewardLoopManagerBase):
                 extra_info=extra_info,
                 reward_router_address=self.reward_router_address,
                 reward_model_tokenizer=self.reward_model_tokenizer,
+                use_content_reward=self.config.reward_model.reward_kwargs.use_content_reward,
+                use_decision_reward=self.config.reward_model.reward_kwargs.use_decision_reward,
+                use_reflection_bonus=self.config.reward_model.reward_kwargs.use_reflection_bonus,
+                reflection_bonus_weight=self.config.reward_model.reward_kwargs.reflection_bonus_weight
             )
         else:
             result = await self.loop.run_in_executor(
@@ -78,6 +82,10 @@ class DAPORewardLoopManager(RewardLoopManagerBase):
                     extra_info=extra_info,
                     reward_router_address=self.reward_router_address,
                     reward_model_tokenizer=self.reward_model_tokenizer,
+                    use_content_reward=self.config.reward_model.reward_kwargs.use_content_reward,
+                    use_decision_reward=self.config.reward_model.reward_kwargs.use_decision_reward,
+                    use_reflection_bonus=self.config.reward_model.reward_kwargs.use_reflection_bonus,
+                    reflection_bonus_weight=self.config.reward_model.reward_kwargs.reflection_bonus_weight
                 ),
             )
 
