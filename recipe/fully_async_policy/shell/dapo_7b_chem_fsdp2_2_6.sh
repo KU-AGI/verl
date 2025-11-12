@@ -5,7 +5,7 @@ export WANDB_ENTITY="llm-reaction-reasoning"
 export WANDB_PROJECT="verl-dapo"
 
 project_name='verl-dapo'
-exp_name='reflect_bonus_0.0_nomask'
+exp_name='refl_bonus_0.0'
 
 # Ray
 RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
@@ -93,7 +93,7 @@ train_prompt_bsz=0
 gen_prompt_bsz=1
 n_resp_per_prompt=8
 train_prompt_mini_bsz=16
-total_rollout_steps=$(((512*100000)))
+total_rollout_steps=$(((512*1000000)))
 test_freq=1
 staleness_threshold=0.0
 trigger_parameter_sync_step=50
