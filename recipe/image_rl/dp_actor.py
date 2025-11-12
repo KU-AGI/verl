@@ -26,83 +26,6 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
-def remove_padding_and_concat(
-    input_ids: torch.Tensor,
-    attention_mask: torch.Tensor,
-    output_ids: torch.Tensor,
-    output_mask: torch.Tensor,
-    pad_token_id: int = 0
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[int]]:
-    """
-    Remove left padding from inputs and right padding from outputs, then concatenate.
-    
-    Args:
-        input_ids: (batch_size, input_seq_len) - left padded
-        attention_mask: (batch_size, input_seq_len) - left padded
-        output_ids: (batch_size, output_seq_len) - right padded
-        output_mask: (batch_size, output_seq_len) - right padded
-        pad_token_id: padding token id
-    
-    Returns:
-        concat_ids: (batch_size, variable_len) - right padded concatenated sequence
-        concat_mask: (batch_size, variable_len) - right padded attention mask
-        position_ids: (batch_size, variable_len) - position indices
-        output_start_positions: List[int] - output start position for each sample
-    """
-    batch_size = input_ids.size(0)
-    max_total_len = 0
-    sequences = []
-    masks = []
-    output_starts = []
-    
-    # Process each sample individually
-    for i in range(batch_size):
-        # Remove left padding from input
-        input_valid_mask = attention_mask[i] == 1
-        if input_valid_mask.any():
-            first_valid = input_valid_mask.nonzero(as_tuple=False)[0].item()
-            valid_input_ids = input_ids[i, first_valid:]
-            valid_input_mask = attention_mask[i, first_valid:]
-        else:
-            valid_input_ids = torch.tensor([], dtype=input_ids.dtype, device=input_ids.device)
-            valid_input_mask = torch.tensor([], dtype=attention_mask.dtype, device=attention_mask.device)
-        
-        # Remove right padding from output
-        output_valid_mask = output_mask[i] == 1
-        if output_valid_mask.any():
-            last_valid = output_valid_mask.nonzero(as_tuple=False)[-1].item()
-            valid_output_ids = output_ids[i, :last_valid + 1]
-            valid_output_mask = output_mask[i, :last_valid + 1]
-        else:
-            valid_output_ids = torch.tensor([], dtype=output_ids.dtype, device=output_ids.device)
-            valid_output_mask = torch.tensor([], dtype=output_mask.dtype, device=output_mask.device)
-        
-        # Concatenate input and output
-        concat_seq = torch.cat([valid_input_ids, valid_output_ids], dim=0)
-        concat_mask = torch.cat([valid_input_mask, valid_output_mask], dim=0)
-        
-        sequences.append(concat_seq)
-        masks.append(concat_mask)
-        output_starts.append(len(valid_input_ids))
-        max_total_len = max(max_total_len, len(concat_seq))
-    
-    # Right pad all sequences to max length
-    concat_ids = torch.full((batch_size, max_total_len), pad_token_id, 
-                           dtype=input_ids.dtype, device=input_ids.device)
-    concat_mask = torch.zeros((batch_size, max_total_len), 
-                             dtype=attention_mask.dtype, device=attention_mask.device)
-    
-    for i, (seq, mask) in enumerate(zip(sequences, masks)):
-        seq_len = len(seq)
-        concat_ids[i, :seq_len] = seq
-        concat_mask[i, :seq_len] = mask
-    
-    # Create position ids
-    position_ids = torch.arange(max_total_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
-    
-    return concat_ids, concat_mask, position_ids, output_starts
-
-
 def remove_padding_and_concat_with_embeds(
     input_embeds: torch.Tensor,
     attention_mask: torch.Tensor,
@@ -519,6 +442,14 @@ class DataParallelImageGenerationActor(BasePPOActor):
                     
                     # Extract output logits
                     output_lengths = [original_response_mask[i].sum().item() for i in range(original_response_mask.size(0))]
+
+                    if max(output_lengths) == 0:
+                        log_probs = torch.zeros_like(original_response_mask, dtype=torch.float32, requires_grad=True)
+                        entropy = None
+                        if calculate_entropy:
+                            entropy = torch.zeros_like(original_response_mask, dtype=torch.float32, requires_grad=True)
+                        return entropy, log_probs
+                                        
                     logits = self.actor_module.gen_head(output.last_hidden_state)
                     task_logits = extract_output_logits(logits, output_starts, output_lengths)
 
@@ -539,7 +470,16 @@ class DataParallelImageGenerationActor(BasePPOActor):
 
                     # Extract output logits
                     output_lengths = [original_response_mask[i].sum().item() for i in range(original_response_mask.size(0))]
-                    task_logits = extract_output_logits(output.logits, output_starts, output_lengths)
+
+                    if max(output_lengths) == 0:
+                        log_probs = torch.zeros_like(original_response_mask, dtype=torch.float32, requires_grad=True)
+                        entropy = None
+                        if calculate_entropy:
+                            entropy = torch.zeros_like(original_response_mask, dtype=torch.float32, requires_grad=True)
+                        return entropy, log_probs
+
+                    logits = output.logits
+                    task_logits = extract_output_logits(logits, output_starts, output_lengths)
 
                     compact_log_probs = logprobs_from_logits(task_logits, valid_output_tokens)
                     log_probs = self._restore_log_probs_to_original_length(compact_log_probs, original_response_mask)
@@ -558,6 +498,14 @@ class DataParallelImageGenerationActor(BasePPOActor):
 
                     # Extract output logits
                     output_lengths = [original_response_mask[i].sum().item() for i in range(original_response_mask.size(0))]
+
+                    if max(output_lengths) == 0:
+                        log_probs = torch.zeros_like(original_response_mask, dtype=torch.float32, requires_grad=True)
+                        entropy = None
+                        if calculate_entropy:
+                            entropy = torch.zeros_like(original_response_mask, dtype=torch.float32, requires_grad=True)
+                        return entropy, log_probs
+
                     logits = self.actor_module.gen_head(output.last_hidden_state)
                     task_logits = extract_output_logits(logits, output_starts, output_lengths)
 
@@ -650,16 +598,7 @@ class DataParallelImageGenerationActor(BasePPOActor):
                     model_inputs, temperature=temperature, calculate_entropy=calculate_entropy, task_id=task_id
                 )
 
-            # For task 3, mask out samples that don't need regen after the forward
-            if task_id == 3:
-                texts = model_inputs["task2_feedback_texts"]
-                need = []
-                for t in texts:
-                    last = self.formatter._split_text_into_parts(t)[-1]
-                    need.append(not (last is None or "No need to generate feedback.".lower() in last.lower()))
-                need = torch.tensor(need, device=log_probs.device, dtype=torch.bool)
-            else:
-                need = torch.ones(log_probs.size(0), device=log_probs.device, dtype=torch.bool)
+            need = torch.ones(log_probs.size(0), device=log_probs.device, dtype=torch.bool)
 
             # Pad log_probs to global_max_len for consistent concatenation
             current_len = log_probs.size(1)

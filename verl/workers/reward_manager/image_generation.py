@@ -108,7 +108,7 @@ class ImageGenerationRewardManager:
                     reward_extra_info[key].append(value)
 
             rewards.append(reward)
-            reward_tensor[i, :valid_response_length] = reward
+            reward_tensor[i, valid_response_length - 1] = reward
 
             if reward == -100:
                 data.batch[f"task{task_id}_response_mask"][i] = torch.zeros_like(response_mask[i], dtype=torch.float32)

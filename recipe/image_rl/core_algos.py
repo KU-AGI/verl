@@ -465,7 +465,7 @@ def compute_grpo_task_skip_outcome_advantage(
     with torch.no_grad():
         bsz = scores.shape[0]
         for i in range(bsz):
-            if (scores[i] // scores_length) == -100: # ignore
+            if scores[i] == -100: # ignore
                 continue
             id2score[index[i]].append(scores[i])
         for idx in id2score:

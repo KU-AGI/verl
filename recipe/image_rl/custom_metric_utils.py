@@ -112,12 +112,12 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     prompt_mask = batch.batch[f"task{task_id}_attention_mask"].bool()
     response_mask = batch.batch[f"task{task_id}_response_mask"].bool()
 
+    max_prompt_length = prompt_mask.size(-1)
+    max_response_length = response_mask.size(-1)
+
     response_info = _compute_response_info(batch)
     prompt_length = response_info["prompt_length"]
     response_length = response_info["response_length"]
-
-    max_prompt_length = int(prompt_length.max().item())
-    max_response_length = int(response_length.max().item())
 
     aborted_mask = (response_length == 0).bool()
     non_aborted_mask = ~aborted_mask

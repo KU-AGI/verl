@@ -48,7 +48,7 @@ from verl.trainer.config import AlgoConfig
 from recipe.image_rl import core_algos
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from recipe.image_rl.core_algos import AdvantageEstimator, agg_loss
-from recipe.image_rl.cusrom_metric_utils import ( # custom metric
+from recipe.image_rl.custom_metric_utils import ( # custom metric
     compute_data_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
@@ -299,7 +299,6 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
         )
-        self.formatter = FormattingEvaluator()
         # if ref_in_actor is True, the reference policy will be actor without lora applied
         self.ref_in_actor = config.actor_rollout_ref.model.get("lora_rank", 0) > 0
 
@@ -726,7 +725,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
 
                         with marked_timer("reward", timing_raw, color="yellow"):
                             if self.config.reward_model.launch_reward_fn_async:
-                                future_reward = compute_reward_async.remote(data=batch, config=self.config, tokenizer=self.tokenizer, processor=self.processor, reward_fn=self.reward_fn, eval=False, task_id=task_id)
+                                future_reward = compute_reward_async.remote(data=batch, config=self.config, tokenizer=self.tokenizer, processor=self.processor)
                             else:
                                 reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn, eval=False, task_id=task_id)
                             batch.batch["task_id"] = torch.tensor([task_id for _ in range(len(batch))], dtype=int)
