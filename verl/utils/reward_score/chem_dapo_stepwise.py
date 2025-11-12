@@ -626,9 +626,9 @@ class StepEvaluator():
         }
 
         reflection_decision_reward_dict = {
-            "forward/step4/reflection_decision": int(step4_has_reflection),
-            "forward/step5/reflection_decision": int(step5_has_reflection),
-            "forward/step6/reflection_decision": int(step6_has_reflection),
+            "forward/step4/correct_reflection": int(step4_reflection_correct),
+            "forward/step5/correct_reflection": int(step5_reflection_correct),
+            "forward/step6/correct_reflection": int(step6_reflection_correct),
         }
 
         return {
@@ -647,9 +647,9 @@ class StepEvaluator():
             "forward/step6/FP": step6_FP,
             "forward/step6/TN": step6_TN,
             "forward/step6/FN": step6_FN,
-            "forward/step4/reflection_decision": int(step4_has_reflection),
-            "forward/step5/reflection_decision": int(step5_has_reflection),
-            "forward/step6/reflection_decision": int(step6_has_reflection),
+            "forward/step4/correct_reflection": int(step4_has_reflection),
+            "forward/step5/correct_reflection": int(step5_has_reflection),
+            "forward/step6/correct_reflection": int(step6_has_reflection),
             "forward/total_reflection_acc": reflection_acc,
         }, reflection_bonus, content_reward_dict, reflection_decision_reward_dict
 
