@@ -594,23 +594,32 @@ class StepEvaluator():
         has_reactive_atom_bonds_initial = all(str(tuple(bond)) in step5_initial_rationale for bond in info['reactive_atom_bonds'])
         has_tagged_smiles_initial = info["product_changes_tagged"] in step6_initial_rationale
 
+        step4_initial_correct = has_reactive_atom_smiles_initial
+        step5_initial_correct = has_reactive_atom_bonds_initial
+        step6_initial_correct = has_tagged_smiles_initial
+        step4_initial_incorrect = not has_reactive_atom_smiles_initial
+        step5_initial_incorrect = not has_reactive_atom_bonds_initial
+        step6_initial_incorrect = not has_tagged_smiles_initial
+
         step4_has_not_reflection = not step4_has_reflection
         step5_has_not_reflection = not step5_has_reflection
         step6_has_not_reflection = not step6_has_reflection
 
+        # Positive: reflection required (incorrect initial)
+        # Negative: reflection not required (correct initial)
         # Calculate TP, FP, TN, FN for each step. Only check reflection is correct.
-        step4_TP = has_reactive_atom_smiles_initial and step4_has_not_reflection
-        step4_FP = (not has_reactive_atom_smiles_initial) and step4_has_not_reflection
-        step4_TN = (not has_reactive_atom_smiles_initial) and (not step4_has_not_reflection)
-        step4_FN = has_reactive_atom_smiles_initial and (not step4_has_not_reflection)
-        step5_TP = has_reactive_atom_bonds_initial and step5_has_not_reflection
-        step5_FP = (not has_reactive_atom_bonds_initial) and step5_has_not_reflection
-        step5_TN = (not has_reactive_atom_bonds_initial) and (not step5_has_not_reflection)
-        step5_FN = has_reactive_atom_bonds_initial and (not step5_has_not_reflection)
-        step6_TP = has_tagged_smiles_initial and step6_has_not_reflection
-        step6_FP = (not has_tagged_smiles_initial) and step6_has_not_reflection
-        step6_TN = (not has_tagged_smiles_initial) and (not step6_has_not_reflection)
-        step6_FN = has_tagged_smiles_initial and (not step6_has_not_reflection)
+        step4_TP = step4_initial_incorrect and step4_has_reflection
+        step4_FP = step4_initial_incorrect and step4_has_not_reflection
+        step4_TN = step4_initial_correct and step4_has_not_reflection
+        step4_FN = step4_initial_correct and step4_has_reflection
+        step5_TP = step5_initial_incorrect and step5_has_reflection
+        step5_FP = step5_initial_incorrect and step5_has_not_reflection
+        step5_TN = step5_initial_correct and step5_has_not_reflection
+        step5_FN = step5_initial_correct and step5_has_reflection
+        step6_TP = step6_initial_incorrect and step6_has_reflection
+        step6_FP = step6_initial_incorrect and step6_has_not_reflection
+        step6_TN = step6_initial_correct and step6_has_not_reflection
+        step6_FN = step6_initial_correct and step6_has_reflection
 
         # Reflection accuracy reward
         step4_reflection_correct = step4_TP + step4_TN
@@ -718,22 +727,32 @@ class StepEvaluator():
         has_synthetic_equivalents = all(syn_equiv in predicted_step7_rationale for syn_equiv in info["synthetic_equivalents"])
         has_synthetic_equivalents_initial = all(syn_equiv in step7_initial_rationale for syn_equiv in info["synthetic_equivalents"])
 
+        step5_initial_correct = has_bond_disconnection_initial
+        step6_initial_correct = has_synthons_initial
+        step7_initial_correct = has_synthetic_equivalents_initial
+        step5_initial_incorrect = not has_bond_disconnection_initial
+        step6_initial_incorrect = not has_synthons_initial
+        step7_initial_incorrect = not has_synthetic_equivalents_initial
+
         step5_has_not_reflection = not step5_has_reflection
         step6_has_not_reflection = not step6_has_reflection
         step7_has_not_reflection = not step7_has_reflection
 
-        step5_TP = has_bond_disconnection_initial and step5_has_not_reflection
-        step5_FP = (not has_bond_disconnection_initial) and step5_has_not_reflection
-        step5_TN = (not has_bond_disconnection_initial) and (not step5_has_not_reflection)
-        step5_FN = has_bond_disconnection_initial and (not step5_has_not_reflection)
-        step6_TP = has_synthons_initial and step6_has_not_reflection
-        step6_FP = (not has_synthons_initial) and step6_has_not_reflection
-        step6_TN = (not has_synthons_initial) and (not step6_has_not_reflection)
-        step6_FN = has_synthons_initial and (not step6_has_not_reflection)
-        step7_TP = has_synthetic_equivalents_initial and step7_has_not_reflection
-        step7_FP = (not has_synthetic_equivalents_initial) and step7_has_not_reflection
-        step7_TN = (not has_synthetic_equivalents_initial) and (not step7_has_not_reflection)
-        step7_FN = has_synthetic_equivalents_initial and (not step7_has_not_reflection)
+        # Positive: reflection required (incorrect initial)
+        # Negative: reflection not required (correct initial)
+        # Calculate TP, FP, TN, FN for each step. Only check reflection is correct
+        step5_TP = step5_initial_incorrect and step5_has_reflection
+        step5_FP = step5_initial_incorrect and step5_has_not_reflection
+        step5_TN = step5_initial_correct and step5_has_not_reflection
+        step5_FN = step5_initial_correct and step5_has_reflection
+        step6_TP = step6_initial_incorrect and step6_has_reflection
+        step6_FP = step6_initial_incorrect and step6_has_not_reflection
+        step6_TN = step6_initial_correct and step6_has_not_reflection
+        step6_FN = step6_initial_correct and step6_has_reflection
+        step7_TP = step7_initial_incorrect and step7_has_reflection
+        step7_FP = step7_initial_incorrect and step7_has_not_reflection
+        step7_TN = step7_initial_correct and step7_has_not_reflection
+        step7_FN = step7_initial_correct and step7_has_reflection
 
         # Reflection accuracy reward
         step5_reflection_correct = step5_TP + step5_TN
@@ -854,18 +873,25 @@ class StepEvaluator():
         else:
             has_correct_reagent_number_initial = False
 
+        step6_initial_correct = has_reagents_initial
+        step7_initial_correct = has_correct_reagent_number_initial
+        step6_initial_incorrect = not has_reagents_initial
+        step7_initial_incorrect = not has_correct_reagent_number_initial
+
         step6_has_not_reflection = not step6_has_reflection
         step7_has_not_reflection = not step7_has_reflection
 
-        # Calculate TP, FP, TN, FN for each step. Only check reflection is correct.
-        step6_TP = has_reagents_initial and step6_has_not_reflection
-        step6_FP = (not has_reagents_initial) and step6_has_not_reflection
-        step6_TN = (not has_reagents_initial) and (not step6_has_not_reflection)
-        step6_FN = has_reagents_initial and (not step6_has_not_reflection)
-        step7_TP = has_correct_reagent_number_initial and step7_has_not_reflection
-        step7_FP = (not has_correct_reagent_number_initial) and step7_has_not_reflection
-        step7_TN = (not has_correct_reagent_number_initial) and (not step7_has_not_reflection)
-        step7_FN = has_correct_reagent_number_initial and (not step7_has_not_reflection)
+        # Positive: reflection required (incorrect initial)
+        # Negative: reflection not required (correct initial)
+        # Calculate TP, FP, TN, FN for each step. Only check reflection is correct
+        step6_TP = step6_initial_incorrect and step6_has_reflection
+        step6_FP = step6_initial_incorrect and step6_has_not_reflection
+        step6_TN = step6_initial_correct and step6_has_not_reflection
+        step6_FN = step6_initial_correct and step6_has_reflection
+        step7_TP = step7_initial_incorrect and step7_has_reflection
+        step7_FP = step7_initial_incorrect and step7_has_not_reflection
+        step7_TN = step7_initial_correct and step7_has_not_reflection
+        step7_FN = step7_initial_correct and step7_has_reflection
 
         # Reflection accuracy reward
         step6_reflection_correct = step6_TP + step6_TN
