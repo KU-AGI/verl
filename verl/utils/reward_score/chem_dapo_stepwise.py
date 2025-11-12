@@ -605,21 +605,21 @@ class StepEvaluator():
         step5_has_not_reflection = not step5_has_reflection
         step6_has_not_reflection = not step6_has_reflection
 
-        # Positive: reflection required (incorrect initial)
-        # Negative: reflection not required (correct initial)
-        # Calculate TP, FP, TN, FN for each step. Only check reflection is correct.
+        # Positive: Model generates reflection
+        # Negative: Model does not generate reflection
+        # Calculate TP, TN, FP, FN for each step. Only check reflection is correct
         step4_TP = step4_initial_incorrect and step4_has_reflection
-        step4_FP = step4_initial_incorrect and step4_has_not_reflection
         step4_TN = step4_initial_correct and step4_has_not_reflection
-        step4_FN = step4_initial_correct and step4_has_reflection
+        step4_FP = step4_initial_correct and step4_has_reflection
+        step4_FN = step4_initial_incorrect and step4_has_not_reflection
         step5_TP = step5_initial_incorrect and step5_has_reflection
-        step5_FP = step5_initial_incorrect and step5_has_not_reflection
         step5_TN = step5_initial_correct and step5_has_not_reflection
-        step5_FN = step5_initial_correct and step5_has_reflection
+        step5_FP = step5_initial_correct and step5_has_reflection
+        step5_FN = step5_initial_incorrect and step5_has_not_reflection
         step6_TP = step6_initial_incorrect and step6_has_reflection
-        step6_FP = step6_initial_incorrect and step6_has_not_reflection
         step6_TN = step6_initial_correct and step6_has_not_reflection
-        step6_FN = step6_initial_correct and step6_has_reflection
+        step6_FP = step6_initial_correct and step6_has_reflection
+        step6_FN = step6_initial_incorrect and step6_has_not_reflection
 
         # Reflection accuracy reward
         step4_reflection_correct = step4_TP + step4_TN
@@ -645,16 +645,16 @@ class StepEvaluator():
             "forward/step5/has_reactive_atom_bonds": int(has_reactive_atom_bonds),
             "forward/step6/has_tagged_smiles": int(has_tagged_smiles),
             "forward/step4/TP": step4_TP,
-            "forward/step4/FP": step4_FP,
             "forward/step4/TN": step4_TN,
+            "forward/step4/FP": step4_FP,
             "forward/step4/FN": step4_FN,
             "forward/step5/TP": step5_TP,
-            "forward/step5/FP": step5_FP,
             "forward/step5/TN": step5_TN,
+            "forward/step5/FP": step5_FP,
             "forward/step5/FN": step5_FN,
             "forward/step6/TP": step6_TP,
-            "forward/step6/FP": step6_FP,
             "forward/step6/TN": step6_TN,
+            "forward/step6/FP": step6_FP,
             "forward/step6/FN": step6_FN,
             "forward/step4/correct_reflection": int(step4_has_reflection),
             "forward/step5/correct_reflection": int(step5_has_reflection),
@@ -738,21 +738,21 @@ class StepEvaluator():
         step6_has_not_reflection = not step6_has_reflection
         step7_has_not_reflection = not step7_has_reflection
 
-        # Positive: reflection required (incorrect initial)
-        # Negative: reflection not required (correct initial)
-        # Calculate TP, FP, TN, FN for each step. Only check reflection is correct
+        # Positive: Model generates reflection
+        # Negative: Model does not generate reflection
+        # Calculate TP, TN, FP, FN for each step. Only check reflection is correct
         step5_TP = step5_initial_incorrect and step5_has_reflection
-        step5_FP = step5_initial_incorrect and step5_has_not_reflection
         step5_TN = step5_initial_correct and step5_has_not_reflection
-        step5_FN = step5_initial_correct and step5_has_reflection
+        step5_FP = step5_initial_correct and step5_has_reflection
+        step5_FN = step5_initial_incorrect and step5_has_not_reflection
         step6_TP = step6_initial_incorrect and step6_has_reflection
-        step6_FP = step6_initial_incorrect and step6_has_not_reflection
         step6_TN = step6_initial_correct and step6_has_not_reflection
-        step6_FN = step6_initial_correct and step6_has_reflection
+        step6_FP = step6_initial_correct and step6_has_reflection
+        step6_FN = step6_initial_incorrect and step6_has_not_reflection
         step7_TP = step7_initial_incorrect and step7_has_reflection
-        step7_FP = step7_initial_incorrect and step7_has_not_reflection
         step7_TN = step7_initial_correct and step7_has_not_reflection
-        step7_FN = step7_initial_correct and step7_has_reflection
+        step7_FP = step7_initial_correct and step7_has_reflection
+        step7_FN = step7_initial_incorrect and step7_has_not_reflection
 
         # Reflection accuracy reward
         step5_reflection_correct = step5_TP + step5_TN
@@ -778,16 +778,16 @@ class StepEvaluator():
             "retro/step6/has_synthons": int(has_synthons),
             "retro/step7/has_synthetic_equivalents": int(has_synthetic_equivalents),
             "retro/step5/TP": step5_TP,
-            "retro/step5/FP": step5_FP,
             "retro/step5/TN": step5_TN,
+            "retro/step5/FP": step5_FP,
             "retro/step5/FN": step5_FN,
             "retro/step6/TP": step6_TP,
-            "retro/step6/FP": step6_FP,
             "retro/step6/TN": step6_TN,
+            "retro/step6/FP": step6_FP,
             "retro/step6/FN": step6_FN,
             "retro/step7/TP": step7_TP,
-            "retro/step7/FP": step7_FP,
             "retro/step7/TN": step7_TN,
+            "retro/step7/FP": step7_FP,
             "retro/step7/FN": step7_FN,
             "retro/step5/correct_reflection": int(step5_reflection_correct),
             "retro/step6/correct_reflection": int(step6_reflection_correct),
@@ -881,17 +881,17 @@ class StepEvaluator():
         step6_has_not_reflection = not step6_has_reflection
         step7_has_not_reflection = not step7_has_reflection
 
-        # Positive: reflection required (incorrect initial)
-        # Negative: reflection not required (correct initial)
-        # Calculate TP, FP, TN, FN for each step. Only check reflection is correct
+        # Positive: Model generates reflection
+        # Negative: Model does not generate reflection
+        # Calculate TP, TN, FP, FN for each step. Only check reflection is correct
         step6_TP = step6_initial_incorrect and step6_has_reflection
-        step6_FP = step6_initial_incorrect and step6_has_not_reflection
         step6_TN = step6_initial_correct and step6_has_not_reflection
-        step6_FN = step6_initial_correct and step6_has_reflection
+        step6_FP = step6_initial_correct and step6_has_reflection
+        step6_FN = step6_initial_incorrect and step6_has_not_reflection
         step7_TP = step7_initial_incorrect and step7_has_reflection
-        step7_FP = step7_initial_incorrect and step7_has_not_reflection
         step7_TN = step7_initial_correct and step7_has_not_reflection
-        step7_FN = step7_initial_correct and step7_has_reflection
+        step7_FP = step7_initial_correct and step7_has_reflection
+        step7_FN = step7_initial_incorrect and step7_has_not_reflection
 
         # Reflection accuracy reward
         step6_reflection_correct = step6_TP + step6_TN
@@ -913,12 +913,12 @@ class StepEvaluator():
             "reagent/step6/has_reagents": int(has_reagents),
             "reagent/step7/has_correct_reagent_number": int(has_correct_reagent_number),
             "reagent/step6/TP": step6_TP,
-            "reagent/step6/FP": step6_FP,
             "reagent/step6/TN": step6_TN,
+            "reagent/step6/FP": step6_FP,
             "reagent/step6/FN": step6_FN,
             "reagent/step7/TP": step7_TP,
-            "reagent/step7/FP": step7_FP,
             "reagent/step7/TN": step7_TN,
+            "reagent/step7/FP": step7_FP,
             "reagent/step7/FN": step7_FN,
             "reagent/step6/correct_reflection": int(step6_reflection_correct),
             "reagent/step7/correct_reflection": int(step7_reflection_correct),
