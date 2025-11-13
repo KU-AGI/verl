@@ -396,6 +396,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
         n = len(prompt)
         base_data = {
             "prompt_id": prompt_id,
+            "uid": uid,
             "prompt": prompt,
             "scores": scores,
             "step": [self.global_steps] * n,
