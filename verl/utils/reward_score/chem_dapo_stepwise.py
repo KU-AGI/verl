@@ -656,9 +656,9 @@ class StepEvaluator():
             "forward/step6/TN": step6_TN,
             "forward/step6/FP": step6_FP,
             "forward/step6/FN": step6_FN,
-            "forward/step4/correct_reflection": int(step4_has_reflection),
-            "forward/step5/correct_reflection": int(step5_has_reflection),
-            "forward/step6/correct_reflection": int(step6_has_reflection),
+            "forward/step4/correct_reflection": int(step4_reflection_correct),
+            "forward/step5/correct_reflection": int(step5_reflection_correct),
+            "forward/step6/correct_reflection": int(step6_reflection_correct),
             "forward/total_reflection_acc": reflection_acc,
         }, reflection_bonus, content_reward_dict, reflection_decision_reward_dict
 
@@ -947,6 +947,53 @@ class ChemistryEvaluator:
         """Verify if the solution is correct."""
         correct_score, pred = self.is_correct_strict_tag(solution_str, ground_truth)
         return correct_score == 1, pred
+
+    def validate_steps_structure(self, text: str) -> bool:
+        # Normalize line endings
+        text = text.strip()
+
+        # 1. Extract all steps
+        step_pattern = r'## Step (\d+):'
+        steps = re.findall(step_pattern, text)
+
+        if not steps:
+            return False
+
+        # Convert to integers
+        steps = list(map(int, steps))
+
+        # 2. Check if step numbers are continuous and start from 1
+        if steps[0] != 1:
+            return False
+        if steps != list(range(1, len(steps) + 1)):
+            return False
+
+        # 3. Split by step blocks
+        # This regex captures a step block including optional reflection
+        block_pattern = r'(## Step (\d+):.*?)(?=## Step \d+:|<ANSWER>|$)'
+        blocks = re.findall(block_pattern, text, flags=re.S)
+
+        if len(blocks) != len(steps):
+            return False
+
+        # 4. Validate each block (0 or 1 reflection only)
+        for block, step_num in blocks:
+            reflections = re.findall(r'<REFLECTION>.*?</REFLECTION>', block, flags=re.S)
+            if len(reflections) > 1:
+                return False  # more than one reflection → invalid
+
+        # 5. Check ANSWER exists and appears only once
+        answer_match = re.search(r'<ANSWER>.*?</ANSWER>', text, flags=re.S)
+        if not answer_match:
+            return False
+
+        # Ensure <ANSWER> is AFTER the last step block
+        last_step_pos = max(m.start() for m in re.finditer(step_pattern, text))
+        if answer_match.start() < last_step_pos:
+            return False
+
+        return True
+
 
     def compute_score(self,
                       solution_str: str,
