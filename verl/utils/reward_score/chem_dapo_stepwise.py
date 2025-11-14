@@ -590,8 +590,23 @@ class StepEvaluator():
             info['reactive_atom_bonds'][i][0] = int(info['reactive_atom_bonds'][i][0]) # convert to int for comparison
             info['reactive_atom_bonds'][i][1] = int(info['reactive_atom_bonds'][i][1]) # convert to int for comparison
             info['reactive_atom_bonds'][0][2] = info['reactive_atom_bonds'][0][2].replace("'", "") # remove extra quotes if any
-        has_reactive_atom_bonds = all(str(tuple(bond)) in predicted_step5_rationale for bond in info['reactive_atom_bonds'])
-        has_reactive_atom_bonds_initial = all(str(tuple(bond)) in step5_initial_rationale for bond in info['reactive_atom_bonds'])
+        if len(info['reactive_atom_bonds']) == 0:
+            has_reactive_atom_bonds = True
+            for bond_type in ['single', 'double', 'triple', 'aromatic']:
+                if bond_type in predicted_step5_rationale:
+                    has_reactive_atom_bonds = False
+                    break
+        else:
+            has_reactive_atom_bonds = all(str(tuple(bond)) in predicted_step5_rationale for bond in info['reactive_atom_bonds'])
+        
+        if len(info['reactive_atom_bonds']) == 0:
+            has_reactive_atom_bonds_initial = True
+            for bond_type in ['single', 'double', 'triple', 'aromatic']:
+                if bond_type in step5_initial_rationale:
+                    has_reactive_atom_bonds_initial = False
+                    break
+        else:
+            has_reactive_atom_bonds_initial = all(str(tuple(bond)) in step5_initial_rationale for bond in info['reactive_atom_bonds'])
         has_tagged_smiles_initial = info["product_changes_tagged"] in step6_initial_rationale
 
         step4_initial_correct = has_reactive_atom_smiles_initial
@@ -948,49 +963,42 @@ class ChemistryEvaluator:
         correct_score, pred = self.is_correct_strict_tag(solution_str, ground_truth)
         return correct_score == 1, pred
 
-    def validate_steps_structure(self, text: str) -> bool:
-        # Normalize line endings
-        text = text.strip()
+    def validate_structure(self, text: str) -> bool:
+        # 1. <think> ... </think> 존재 여부 확인
+        think_match = re.search(r"<think>(.*?)</think>", text, re.DOTALL)
+        if not think_match:
+            return False
+        think_content = think_match.group(1)
 
-        # 1. Extract all steps
-        step_pattern = r'## Step (\d+):'
-        steps = re.findall(step_pattern, text)
+        # 2. <ANSWER> ... </ANSWER> 존재 여부 확인
+        answer_match = re.findall(r"<ANSWER>(.*?)</ANSWER>", text, re.DOTALL)
+        if len(answer_match) != 1:
+            return False
+
+        # 3. Step 패턴 찾기
+        step_pattern = r"## Step (\d+):"
+        steps = re.findall(step_pattern, think_content)
 
         if not steps:
             return False
 
-        # Convert to integers
+        # Step 번호가 1부터 N까지 순서대로인지 확인
         steps = list(map(int, steps))
-
-        # 2. Check if step numbers are continuous and start from 1
-        if steps[0] != 1:
-            return False
-        if steps != list(range(1, len(steps) + 1)):
+        N = len(steps)
+        if steps != list(range(1, N + 1)):
             return False
 
-        # 3. Split by step blocks
-        # This regex captures a step block including optional reflection
-        block_pattern = r'(## Step (\d+):.*?)(?=## Step \d+:|<ANSWER>|$)'
-        blocks = re.findall(block_pattern, text, flags=re.S)
+        # Step별 블록을 분할
+        step_blocks = re.split(step_pattern, think_content)[1:]  # [num1, block1, num2, block2 ...]
+        # step_blocks 구조: [step_num1, step_content1, step_num2, step_content2, ...]
 
-        if len(blocks) != len(steps):
-            return False
+        # 4. 각 Step 블록에 reflection이 0개 또는 1개인지 검사
+        for i in range(0, len(step_blocks), 2):
+            step_content = step_blocks[i + 1]  # 해당 step의 내용
+            reflection_blocks = re.findall(r"<REFLECTION>(.*?)</REFLECTION>", step_content, re.DOTALL)
 
-        # 4. Validate each block (0 or 1 reflection only)
-        for block, step_num in blocks:
-            reflections = re.findall(r'<REFLECTION>.*?</REFLECTION>', block, flags=re.S)
-            if len(reflections) > 1:
-                return False  # more than one reflection → invalid
-
-        # 5. Check ANSWER exists and appears only once
-        answer_match = re.search(r'<ANSWER>.*?</ANSWER>', text, flags=re.S)
-        if not answer_match:
-            return False
-
-        # Ensure <ANSWER> is AFTER the last step block
-        last_step_pos = max(m.start() for m in re.finditer(step_pattern, text))
-        if answer_match.start() < last_step_pos:
-            return False
+            if len(reflection_blocks) > 1:
+                return False  # 하나의 step에 reflection이 2개 이상이면 잘못됨
 
         return True
 
@@ -1005,6 +1013,7 @@ class ChemistryEvaluator:
                       reflection_bonus_weight=0.0
                       ) -> Union[EvaluationResult, Dict[str, Any]]:
         """Compute comprehensive evaluation score."""
+        correct_structure = self.validate_structure(solution_str)
         correct, pred = self.verify(solution_str, ground_truth, extra_info)
 
         task = extra_info['task']
@@ -1036,8 +1045,10 @@ class ChemistryEvaluator:
 
         reward_metric_dict = {
             f"{task}/reward/answer_correct": correct,
+            f"{task}/reward/valid_structure": int(correct_structure),
         }
-
+        if not correct_structure:
+            reward -= 2.0
         if use_content_reward:
             content_reward = sum(content_reward_dict.values()) / len(content_reward_dict)
             reward += content_reward
