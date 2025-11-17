@@ -260,12 +260,12 @@ def compute_score_single(prompt, gen_img, feedback_text, regen_img, ground_truth
         # VLM based reward
         response = get_response(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, task_id)
         if response is not None:
-            idx_to_ans: dict = image_evaluator_parser(response)
+            task1_idx_to_ans: dict = image_evaluator_parser(response)
 
-            task1_score = sum(idx_to_ans.values())
-            ans_count = len(idx_to_ans)
+            task1_reward_score = sum(task1_idx_to_ans.values())
+            task1_ans_count = len(task1_idx_to_ans)
             
-            task1_score_mean = (task1_score / ans_count) if ans_count > 0 else 0.0
+            task1_score_mean = (task1_reward_score / task1_ans_count) if task1_ans_count > 0 else 0.0
 
             reward_score += task1_score_mean
             reward_extra_info[f"task{task_id}_reward_response"] = response
@@ -274,6 +274,7 @@ def compute_score_single(prompt, gen_img, feedback_text, regen_img, ground_truth
 
     elif task_id == 2:
         task2_reward_score = 0.0
+        task2_ans_count = 0
         
         # Rule-based reward
         formatting_evaluator = FormattingEvaluator()
@@ -281,6 +282,7 @@ def compute_score_single(prompt, gen_img, feedback_text, regen_img, ground_truth
 
         # formatting
         task2_reward_score += 1.0 if all(part is not None for part in [part1, part2, part3]) else 0.0
+        task2_ans_count += 1
 
         # part 1 scoring
         feedback_parsed_tuple = formatting_evaluator._parse_part1(feedback_tuple) # gt_part1
@@ -289,6 +291,7 @@ def compute_score_single(prompt, gen_img, feedback_text, regen_img, ground_truth
 
         part1_reward_dict = formatting_evaluator._calculate_metrics_for_reward(feedback_parsed_tuple, predict_parsed_tuple, predict_decomposed_ans)
         task2_reward_score += sum(part1_reward_dict.values()) # 3 of values
+        task2_ans_count += len(part1_reward_dict)
 
         # VLM based reward
         response = get_response(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, task_id)
@@ -299,11 +302,12 @@ def compute_score_single(prompt, gen_img, feedback_text, regen_img, ground_truth
                 if label_response in ["targeted_only", "no_feedback_needed"]:
                     task2_reward_score += 1.0
                 elif label_response in ["non_target_touched"]:
-                    task2_reward_score += 0.5
+                    task2_reward_score += 0.0 # 0.5
                 elif label_response in ["global_or_irrelevant"]:
                     task2_reward_score += 0.0
                 else:
                     task2_reward_score += 0.0
+                task2_ans_count += 1
 
             except:
                 raw_json = {}
@@ -311,14 +315,14 @@ def compute_score_single(prompt, gen_img, feedback_text, regen_img, ground_truth
         else:
             task2_reward_score += 0.0
         
-        reward_score += task2_reward_score / 5 # 5 score normalizing
+        reward_score += (task2_reward_score / task2_ans_count) if task2_ans_count > 0 else 0.0 # now 5 parts in total
         reward_extra_info[f"task{task_id}_reward_response"] = response
 
     elif task_id == 3:
         formatting_evaluator = FormattingEvaluator()
         last = formatting_evaluator._split_text_into_parts(feedback_text)[-1]
         if last is not None and "No need to generate feedback.".lower() in last.lower():
-            reward_score += -100
+            reward_score = -100
             reward_extra_info[f"task{task_id}_reward_response"] = "None"
             return {
                 "score": reward_score,
@@ -328,12 +332,12 @@ def compute_score_single(prompt, gen_img, feedback_text, regen_img, ground_truth
         # VLM based reward
         response = get_response(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, task_id)
         if response is not None:
-            idx_to_ans: dict = image_evaluator_parser(response)
+            task3_idx_to_ans: dict = image_evaluator_parser(response)
 
-            task3_score = sum(idx_to_ans.values())
-            ans_count = len(idx_to_ans)
+            task3_reward_score = sum(task3_idx_to_ans.values())
+            task3_ans_count = len(task3_idx_to_ans)
             
-            task3_score_mean = (task3_score / ans_count) if ans_count > 0 else 0.0
+            task3_score_mean = (task3_reward_score / task3_ans_count) if task3_ans_count > 0 else 0.0
             reward_score += task3_score_mean
             reward_extra_info[f"task{task_id}_reward_response"] = response
         else:
