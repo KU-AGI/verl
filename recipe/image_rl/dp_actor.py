@@ -260,32 +260,12 @@ class DataParallelImageGenerationActor(BasePPOActor):
         output_lengths = [original_response_mask[i].sum().item() for i in range(original_response_mask.size(0))]
         local_has_output = 1 if max(output_lengths) > 0 else 0
 
-        global_has_output_tensor = torch.tensor(
-            [local_has_output],
-            device=original_response_mask.device,
-            dtype=torch.int,
-        )
-        dist.all_reduce(global_has_output_tensor, op=dist.ReduceOp.MAX)
-        global_has_output = int(global_has_output_tensor.item())
-
         # IMPORTANT: Always do forward pass even if no valid output
         # FSDP requires all ranks to participate in forward/backward for synchronization
         output = self.actor_module(
             task_id=task_id,
             batch=micro_batch,
         )
-
-        if global_has_output == 0:
-            # No valid output tokens in this micro-batch across all ranks
-            # But we still did forward pass above to keep FSDP sync
-            # Create dummy loss that maintains gradient connection to forward pass
-            # Use a small value from the logits to keep gradient graph intact
-            dummy_scalar = output.logits.flatten()[0] * 0.0
-            log_probs = torch.zeros_like(original_response_mask, dtype=output.logits.dtype, device=output.logits.device) + dummy_scalar
-            entropy = None
-            if calculate_entropy:
-                entropy = torch.zeros_like(original_response_mask, dtype=output.logits.dtype, device=output.logits.device) + dummy_scalar
-            return entropy, log_probs
 
         if local_has_output == 0:
             # This rank has no output, but we still did the forward pass above
@@ -537,10 +517,6 @@ class DataParallelImageGenerationActor(BasePPOActor):
                         model_inputs, temperature=temperature, calculate_entropy=calculate_entropy, task_id=task_id
                     )
 
-                    # Debug: Check if log_prob has gradients
-                    rank = dist.get_rank() if dist.is_initialized() else -1
-                    print(f"[DEBUG] rank {rank} after _forward_micro_batch: log_prob.requires_grad={log_prob.requires_grad}")
-
                     # for fully_async_policy recipe
                     if hasattr(self.config, "use_rollout_log_probs") and self.config.use_rollout_log_probs:
                         old_log_prob = model_inputs["old_log_probs"]
@@ -597,62 +573,12 @@ class DataParallelImageGenerationActor(BasePPOActor):
                         micro_batch_metrics[f"actor/task{task_id}_kl_loss"] = kl_loss.detach().item() * loss_scale_factor
                         micro_batch_metrics[f"actor/task{task_id}_kl_coef"] = self.config.kl_loss_coef
 
-                    # Debug: Check gradients at each step
-                    rank = dist.get_rank() if dist.is_initialized() else -1
-
-                    print(f"[DEBUG] rank {rank} log_prob: requires_grad={log_prob.requires_grad}, grad_fn={log_prob.grad_fn}")
-                    print(f"[DEBUG] rank {rank} pg_loss: requires_grad={pg_loss.requires_grad}, value={pg_loss.item()}, grad_fn={pg_loss.grad_fn}")
-                    print(f"[DEBUG] rank {rank} policy_loss: requires_grad={policy_loss.requires_grad}, value={policy_loss.item()}, grad_fn={policy_loss.grad_fn}")
-                    print(f"[DEBUG] rank {rank} loss_scale_factor: {loss_scale_factor}")
-
                     if self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz
                         loss = policy_loss * loss_scale_factor
                     else:
                         loss = policy_loss * loss_scale_factor
-
-                    print(
-                        f"[DEBUG] rank {rank} loss after scaling: "
-                        f"requires_grad={loss.requires_grad}, "
-                        f"value={loss.item()}, "
-                        f"grad_fn={loss.grad_fn}"
-                    )
-
-                    # Check if loss has gradients - if not, we need to investigate why
-                    if not loss.requires_grad:
-                        print(f"[ERROR] rank {rank}: loss does not have requires_grad!")
-                        print(f"[ERROR] rank {rank}: Investigating gradient chain...")
-
-                        # Check each component
-                        print(f"[ERROR] policy_loss.requires_grad={policy_loss.requires_grad}")
-                        print(f"[ERROR] pg_loss.requires_grad={pg_loss.requires_grad}")
-                        if entropy_coeff != 0:
-                            print(f"[ERROR] entropy_loss.requires_grad={entropy_loss.requires_grad if 'entropy_loss' in locals() else 'N/A'}")
-
-                        raise AssertionError(f"rank {rank}: loss must have requires_grad=True")
-
-                    rank = dist.get_rank() if dist.is_initialized() else -1
-                    print(
-                        f"[DEBUG] rank {rank} about to backward, "
-                        f"loss.requires_grad={loss.requires_grad}, loss.shape={loss.shape}, "
-                        f"loss.item()={loss.item()}"
-                    )
                     loss.backward()
-                    
-                    has_grad = 0
-                    total_params = 0
-
-                    for name, p in self.actor_module.named_parameters():
-                        if p.requires_grad:
-                            total_params += 1
-                            if p.grad is not None:
-                                if p.grad.abs().sum().item() > 0:
-                                    has_grad += 1
-
-                    print(
-                        f"[GRAD_CHECK] rank {rank}: "
-                        f"trainable_params={total_params}, nonzero_grad_params={has_grad}"
-                    )
 
                     micro_batch_metrics.update(
                         {
@@ -664,9 +590,7 @@ class DataParallelImageGenerationActor(BasePPOActor):
                     )
                     append_to_dict(metrics, micro_batch_metrics)
 
-                dist.barrier()
                 grad_norm = self._optimizer_step()
-                dist.barrier()
 
                 mini_batch_metrics = {f"actor/task{task_id}_grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
