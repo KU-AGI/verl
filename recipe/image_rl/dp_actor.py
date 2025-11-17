@@ -10,7 +10,6 @@ from torch.distributed.tensor import DTensor
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
-from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
 from verl.utils.profiler import GPUMemoryLogger
@@ -20,87 +19,12 @@ from verl.utils.torch_functional import logprobs_from_logits
 from verl.workers.actor import BasePPOActor
 from verl.workers.config import ActorConfig
 
+from recipe.image_rl.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
 from recipe.image_rl.utils import FormattingEvaluator
+import torch.distributed as dist
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
-
-
-def remove_padding_and_concat_with_embeds(
-    input_embeds: torch.Tensor,
-    attention_mask: torch.Tensor,
-    output_embeds: torch.Tensor,
-    output_mask: torch.Tensor
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[int]]:
-    """
-    Remove padding and concatenate embeddings version.
-    
-    Args:
-        input_embeds: (batch_size, input_seq_len, hidden_size) - left padded
-        attention_mask: (batch_size, input_seq_len) - left padded
-        output_embeds: (batch_size, output_seq_len, hidden_size) - right padded
-        output_mask: (batch_size, output_seq_len) - right padded
-    
-    Returns:
-        concat_embeds: (batch_size, variable_len, hidden_size) - right padded concatenated embeddings
-        concat_mask: (batch_size, variable_len) - right padded attention mask
-        position_ids: (batch_size, variable_len) - position indices
-        output_start_positions: List[int] - output start position for each sample
-    """
-    batch_size, _, hidden_size = input_embeds.size()
-    max_total_len = 0
-    sequences = []
-    masks = []
-    output_starts = []
-    
-    # Process each sample individually
-    for i in range(batch_size):
-        # Remove left padding from input
-        input_valid_mask = attention_mask[i] == 1
-        if input_valid_mask.any():
-            first_valid = input_valid_mask.nonzero(as_tuple=False)[0].item()
-            valid_input_embeds = input_embeds[i, first_valid:]
-            valid_input_mask = attention_mask[i, first_valid:]
-        else:
-            valid_input_embeds = torch.empty((0, hidden_size), 
-                                           dtype=input_embeds.dtype, device=input_embeds.device)
-            valid_input_mask = torch.tensor([], dtype=attention_mask.dtype, device=attention_mask.device)
-        
-        # Remove right padding from output
-        output_valid_mask = output_mask[i] == 1
-        if output_valid_mask.any():
-            last_valid = output_valid_mask.nonzero(as_tuple=False)[-1].item()
-            valid_output_embeds = output_embeds[i, :last_valid + 1]
-            valid_output_mask = output_mask[i, :last_valid + 1]
-        else:
-            valid_output_embeds = torch.empty((0, hidden_size), 
-                                            dtype=output_embeds.dtype, device=output_embeds.device)
-            valid_output_mask = torch.tensor([], dtype=output_mask.dtype, device=output_mask.device)
-        
-        # Concatenate input and output
-        concat_embeds = torch.cat([valid_input_embeds, valid_output_embeds], dim=0)
-        concat_mask = torch.cat([valid_input_mask, valid_output_mask], dim=0)
-        
-        sequences.append(concat_embeds)
-        masks.append(concat_mask)
-        output_starts.append(len(valid_input_mask))
-        max_total_len = max(max_total_len, len(concat_embeds))
-    
-    # Right pad all sequences to max length
-    concat_embeds_padded = torch.zeros((batch_size, max_total_len, hidden_size), 
-                                      dtype=input_embeds.dtype, device=input_embeds.device)
-    concat_mask_padded = torch.zeros((batch_size, max_total_len), 
-                                   dtype=attention_mask.dtype, device=attention_mask.device)
-    
-    for i, (embeds, mask) in enumerate(zip(sequences, masks)):
-        seq_len = len(embeds)
-        concat_embeds_padded[i, :seq_len] = embeds
-        concat_mask_padded[i, :seq_len] = mask
-    
-    # Create position ids
-    position_ids = torch.arange(max_total_len, device=input_embeds.device).unsqueeze(0).expand(batch_size, -1)
-    
-    return concat_embeds_padded, concat_mask_padded, position_ids, output_starts
 
 
 def extract_output_logits(
@@ -110,29 +34,44 @@ def extract_output_logits(
 ) -> torch.Tensor:
     """
     Extract output logits for each sample based on their start positions and lengths.
-    
+
     Args:
         logits: (batch_size, seq_len, vocab_size) - model output logits
         output_start_positions: List[int] - output start position for each sample
         output_lengths: List[int] - actual output length for each sample
-    
+
     Returns:
         output_logits: (batch_size, max_output_len, vocab_size) - extracted and right-padded output logits
     """
     batch_size, seq_len, vocab_size = logits.size()
     max_output_len = max(output_lengths)
-    
-    output_logits = torch.zeros((batch_size, max_output_len, vocab_size), 
-                               dtype=logits.dtype, device=logits.device)
-    
+
+    # Create list to collect extracted logits
+    extracted_logits_list = []
+
     for i, (start_pos, out_len) in enumerate(zip(output_start_positions, output_lengths)):
         if out_len > 0:
             # Extract logits for this sample's output tokens
             # Note: we need logits shifted by 1 position for next token prediction
             end_pos = start_pos + out_len
             sample_output_logits = logits[i, start_pos:end_pos]  # (out_len, vocab_size)
-            output_logits[i, :out_len] = sample_output_logits
-    
+
+            # Pad to max_output_len if needed
+            if out_len < max_output_len:
+                # Don't set requires_grad=False - let it inherit from logits
+                padding = torch.zeros((max_output_len - out_len, vocab_size),
+                                    dtype=logits.dtype, device=logits.device)
+                sample_output_logits = torch.cat([sample_output_logits, padding], dim=0)
+        else:
+            # If no output tokens, create zero tensor that can still propagate gradients
+            sample_output_logits = torch.zeros((max_output_len, vocab_size),
+                                              dtype=logits.dtype, device=logits.device)
+
+        extracted_logits_list.append(sample_output_logits.unsqueeze(0))
+
+    # Stack all samples - this preserves gradient flow
+    output_logits = torch.cat(extracted_logits_list, dim=0)
+
     return output_logits
 
 
@@ -203,34 +142,16 @@ class DataParallelImageGenerationActor(BasePPOActor):
         )
         self.device_name = get_device_name()
 
-    def merge_text_and_image_embeds(
-        self, 
-        text_embeds: torch.Tensor, 
-        image_embeds: torch.Tensor, 
-        all_image_start_indices: List[List[int]]
-    ) -> torch.Tensor:
-        """Merge text and image embeddings at specified positions"""
-        batch_size = text_embeds.size(0)
-        num_img = len(all_image_start_indices[0])
-        reshape_image_embeds = image_embeds.view(
-            text_embeds.size(0), num_img, self.processor.num_image_tokens, image_embeds.size(-1)
-        )
-
-        assert len(all_image_start_indices) == batch_size, "Per-sample image positions required"
-
-        merged_embeds = text_embeds.clone()
-
-        for i in range(batch_size):
-            for j in range(num_img):
-                start_idx = all_image_start_indices[i][j]
-                end_idx = start_idx + self.processor.num_image_tokens
-                merged_embeds[i, start_idx:end_idx] = reshape_image_embeds[i, j]
-    
-        return merged_embeds
+        # Set processor in the model for unified forward pass
+        if hasattr(self.actor_module, 'set_processor'):
+            self.actor_module.set_processor(processor)
+        elif hasattr(self.actor_module, 'module') and hasattr(self.actor_module.module, 'set_processor'):
+            # For FSDP wrapped models
+            self.actor_module.module.set_processor(processor)
 
     def _extract_valid_output_tokens(
-        self, 
-        output_tokens: torch.Tensor, 
+        self,
+        output_tokens: torch.Tensor,
         response_mask: torch.Tensor
     ) -> torch.Tensor:
         """Extract valid output tokens by removing right padding"""
@@ -246,17 +167,17 @@ class DataParallelImageGenerationActor(BasePPOActor):
                 valid_tokens = output_tokens[i, :last_valid + 1]
             else:
                 valid_tokens = torch.tensor([], dtype=output_tokens.dtype, device=output_tokens.device)
-            
+
             valid_tokens_list.append(valid_tokens)
             max_valid_len = max(max_valid_len, len(valid_tokens))
 
         # Right pad to max valid length
         if max_valid_len == 0:
-            return torch.zeros((batch_size, 1), dtype=output_tokens.dtype, device=output_tokens.device)
+            return torch.zeros((batch_size, 0), dtype=output_tokens.dtype, device=output_tokens.device)
 
-        padded_tokens = torch.zeros((batch_size, max_valid_len), 
+        padded_tokens = torch.zeros((batch_size, max_valid_len),
                                    dtype=output_tokens.dtype, device=output_tokens.device)
-        
+
         for i, valid_tokens in enumerate(valid_tokens_list):
             if len(valid_tokens) > 0:
                 padded_tokens[i, :len(valid_tokens)] = valid_tokens
@@ -271,256 +192,130 @@ class DataParallelImageGenerationActor(BasePPOActor):
     ) -> torch.Tensor:
         """
         Restore compact log_probs back to original response_mask length.
-        
+        This function must preserve gradient flow from compact_log_probs to restored_log_probs.
+
         Args:
             compact_log_probs: (batch_size, compact_len) - log probs from valid tokens only
             original_response_mask: (batch_size, original_len) - original response mask
             pad_value: value to use for padding positions
-            
+
         Returns:
             restored_log_probs: (batch_size, original_len) - log probs padded to original length
         """
         batch_size, original_len = original_response_mask.size()
-        restored_log_probs = torch.full(
-            (batch_size, original_len), 
-            pad_value, 
-            dtype=compact_log_probs.dtype, 
-            device=compact_log_probs.device
-        )
-        
+        compact_len = compact_log_probs.size(1)
+
+        # Initialize restored tensor with zeros - this will hold our output
+        # IMPORTANT: Don't set requires_grad explicitly, let it be inferred from operations
+        restored_log_probs = torch.zeros(batch_size, original_len,
+                                         dtype=compact_log_probs.dtype,
+                                         device=compact_log_probs.device)
+
+        # Process each batch item
         for i in range(batch_size):
             valid_mask = original_response_mask[i] == 1
+
             if valid_mask.any():
                 valid_positions = valid_mask.nonzero(as_tuple=False).squeeze(-1)
                 valid_len = len(valid_positions)
-                
-                # Only restore up to the available compact log probs length
-                restore_len = min(valid_len, compact_log_probs.size(1))
+                restore_len = min(valid_len, compact_len)
+
                 if restore_len > 0:
+                    # Use advanced indexing which preserves gradients
+                    # Place compact log probs at valid positions
                     restored_log_probs[i, valid_positions[:restore_len]] = compact_log_probs[i, :restore_len]
-        
+
         return restored_log_probs
 
-    def _process_task1_data(self, micro_batch: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[int], torch.Tensor, torch.Tensor]:
-        """Process Task 1 (Image Generation) data with dynamic padding"""
-        # Input processing
-        task1_input_ids = micro_batch["task1_input_ids"]
-        task1_attention_mask = micro_batch["task1_attention_mask"]
-        task1_input_embeds = self.actor_module.language_model.get_input_embeddings()(task1_input_ids)
-
-        # Output processing
-        gen_imgs_pixel_values = micro_batch["task1_gen_imgs_pixel_values"]
-        _, _, all_image_ids = self.actor_module.gen_vision_model.encode(gen_imgs_pixel_values)
-        task1_image_ids = all_image_ids[2].view(gen_imgs_pixel_values.size(0), -1)
-        task1_gen_img_embeds = self.actor_module.gen_aligner(self.actor_module.gen_embed(task1_image_ids))
-        
-        # Response mask and tokens
-        task1_response_mask = micro_batch["task1_response_mask"]
-        gen_img_tokens = micro_batch["task1_gen_img_tokens"]
-
-        # Remove padding and concatenate
-        concat_embeds, concat_mask, position_ids, output_starts = remove_padding_and_concat_with_embeds(
-            task1_input_embeds, task1_attention_mask, task1_gen_img_embeds, task1_response_mask
-        )
-
-        # Extract valid output tokens (remove right padding)
-        valid_output_tokens = self._extract_valid_output_tokens(gen_img_tokens, task1_response_mask)
-
-        return concat_embeds, concat_mask, position_ids, output_starts, valid_output_tokens, task1_response_mask
-
-    def _process_task2_data(self, micro_batch: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[int], torch.Tensor, torch.Tensor]:
-        """Process Task 2 (Feedback Generation) data with dynamic padding"""
-        # Input processing
-        task2_input_ids = micro_batch["task2_input_ids"]
-        task2_attention_mask = micro_batch["task2_attention_mask"]
-        gen_imgs_pixel_values = micro_batch["task1_gen_imgs_pixel_values"]
-
-        task2_text_embeds = self.actor_module.language_model.get_input_embeddings()(task2_input_ids)
-        task2_image_embeds = self.actor_module.aligner(self.actor_module.vision_model(gen_imgs_pixel_values))
-
-        # Find image token positions
-        pos_list = []
-        for ids in task2_input_ids:
-            pos = (ids == self.processor.image_id).nonzero(as_tuple=False)[0].item()
-            pos_list.append([pos])
-        task2_image_start_indices = pos_list
-
-        task2_merged_embeds = self.merge_text_and_image_embeds(
-            task2_text_embeds, task2_image_embeds, task2_image_start_indices
-        )
-        
-        # Output processing
-        feedback_ids = micro_batch["task2_feedback_ids"]
-        task2_feedback_embeds = self.actor_module.language_model.get_input_embeddings()(feedback_ids)
-        task2_response_mask = micro_batch["task2_response_mask"]
-
-        # Remove padding and concatenate
-        concat_embeds, concat_mask, position_ids, output_starts = remove_padding_and_concat_with_embeds(
-            task2_merged_embeds, task2_attention_mask, task2_feedback_embeds, task2_response_mask
-        )
-
-        # Extract valid output tokens (remove right padding)
-        valid_output_tokens = self._extract_valid_output_tokens(feedback_ids, task2_response_mask)
-
-        return concat_embeds, concat_mask, position_ids, output_starts, valid_output_tokens, task2_response_mask
-
-    def _process_task3_data(self, micro_batch: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[int], torch.Tensor, torch.Tensor]:
-        """Process Task 3 (Regen Image Generation) data with dynamic padding"""
-        # Input processing
-        task3_input_ids = micro_batch["task3_input_ids"]
-        task3_attention_mask = micro_batch["task3_attention_mask"]
-        gen_imgs_pixel_values = micro_batch["task1_gen_imgs_pixel_values"]
-
-        _, _, all_image_ids = self.actor_module.gen_vision_model.encode(gen_imgs_pixel_values)
-        task3_image_ids = all_image_ids[2].view(gen_imgs_pixel_values.size(0), -1)
-        task3_image_embeds = self.actor_module.gen_aligner(self.actor_module.gen_embed(task3_image_ids))
-        task3_text_embeds = self.actor_module.language_model.get_input_embeddings()(task3_input_ids)
-        
-        # Find image token positions
-        pos_list = []
-        for ids in task3_input_ids:
-            pos = (ids == self.processor.image_id).nonzero(as_tuple=False)[0].item()
-            pos_list.append([pos])
-        task3_image_start_indices = pos_list
-
-        task3_merged_embeds = self.merge_text_and_image_embeds(
-            task3_text_embeds, task3_image_embeds, task3_image_start_indices
-        )
-
-        # Output processing
-        regen_imgs_pixel_values = micro_batch["task3_regen_imgs_pixel_values"]
-        _, _, all_image_ids = self.actor_module.gen_vision_model.encode(regen_imgs_pixel_values)
-        task3_image_ids = all_image_ids[2].view(regen_imgs_pixel_values.size(0), -1)
-        task3_regen_img_embeds = self.actor_module.gen_aligner(self.actor_module.gen_embed(task3_image_ids))
-
-        # Response data
-        regen_img_tokens = micro_batch["task3_regen_img_tokens"]
-        task3_response_mask = micro_batch["task3_response_mask"]
-
-        # Remove padding and concatenate
-        concat_embeds, concat_mask, position_ids, output_starts = remove_padding_and_concat_with_embeds(
-            task3_merged_embeds, task3_attention_mask, task3_regen_img_embeds, task3_response_mask
-        )
-
-        # Extract valid output tokens (remove right padding)
-        valid_output_tokens = self._extract_valid_output_tokens(regen_img_tokens, task3_response_mask)
-
-        return concat_embeds, concat_mask, position_ids, output_starts, valid_output_tokens, task3_response_mask
-
     def _forward_micro_batch(
-        self, 
-        micro_batch: Dict[str, Any], 
-        temperature: float, 
-        calculate_entropy: bool = False, 
+        self,
+        micro_batch: Dict[str, Any],
+        temperature: float,
+        calculate_entropy: bool = False,
         task_id: int = 1
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Improved forward pass with dynamic padding handling.
-        
+        Unified forward pass using model's internal processing.
+        FSDP will automatically unshard parameters during forward pass.
+
         Returns:
             entropy: (bs, response_len) or None
             log_probs: (bs, response_len)
         """
-        # Unshard only with grads when training
-        param_ctx = contextlib.nullcontext()
-        if isinstance(self.actor_module, FSDP):
-            param_ctx = FSDP.summon_full_params(self.actor_module, writeback=False, recurse=True, with_grads=torch.is_grad_enabled())
+        # Get original response mask for length restoration
+        original_response_mask = micro_batch[f"task{task_id}_response_mask"]
 
-        with param_ctx:
-            with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
-                if task_id == 1:
-                    # Task 1: Image Generation
-                    concat_embeds, concat_mask, position_ids, output_starts, valid_output_tokens, original_response_mask = \
-                        self._process_task1_data(micro_batch)
+        # Extract valid output tokens (remove right padding)
+        if task_id == 1:
+            output_tokens = micro_batch["task1_gen_img_tokens"]
+        elif task_id == 2:
+            output_tokens = micro_batch["task2_feedback_ids"]
+        elif task_id == 3:
+            output_tokens = micro_batch["task3_regen_img_tokens"]
+        else:
+            raise ValueError(f"Invalid task_id: {task_id}")
 
-                    # Forward pass
-                    output = self.actor_module.language_model.model(
-                        inputs_embeds=concat_embeds,
-                        attention_mask=concat_mask,
-                        position_ids=position_ids,
-                    )
-                    
-                    # Extract output logits
-                    output_lengths = [original_response_mask[i].sum().item() for i in range(original_response_mask.size(0))]
+        valid_output_tokens = self._extract_valid_output_tokens(output_tokens, original_response_mask)
 
-                    if max(output_lengths) == 0:
-                        log_probs = torch.zeros_like(original_response_mask, dtype=torch.float32, requires_grad=True)
-                        entropy = None
-                        if calculate_entropy:
-                            entropy = torch.zeros_like(original_response_mask, dtype=torch.float32, requires_grad=True)
-                        return entropy, log_probs
-                                        
-                    logits = self.actor_module.gen_head(output.last_hidden_state)
-                    task_logits = extract_output_logits(logits, output_starts, output_lengths)
+        output_lengths = [original_response_mask[i].sum().item() for i in range(original_response_mask.size(0))]
+        local_has_output = 1 if max(output_lengths) > 0 else 0
 
-                    compact_log_probs = logprobs_from_logits(task_logits, valid_output_tokens)
-                    log_probs = self._restore_log_probs_to_original_length(compact_log_probs, original_response_mask)
+        global_has_output_tensor = torch.tensor(
+            [local_has_output],
+            device=original_response_mask.device,
+            dtype=torch.int,
+        )
+        dist.all_reduce(global_has_output_tensor, op=dist.ReduceOp.MAX)
+        global_has_output = int(global_has_output_tensor.item())
 
-                elif task_id == 2:
-                    # Task 2: Feedback Generation
-                    concat_embeds, concat_mask, position_ids, output_starts, valid_output_tokens, original_response_mask = \
-                        self._process_task2_data(micro_batch)
+        # IMPORTANT: Always do forward pass even if no valid output
+        # FSDP requires all ranks to participate in forward/backward for synchronization
+        output = self.actor_module(
+            task_id=task_id,
+            batch=micro_batch,
+        )
 
-                    # Forward pass
-                    output = self.actor_module.language_model(
-                        inputs_embeds=concat_embeds,
-                        attention_mask=concat_mask,
-                        position_ids=position_ids,
-                    )
+        if global_has_output == 0:
+            # No valid output tokens in this micro-batch across all ranks
+            # But we still did forward pass above to keep FSDP sync
+            # Create dummy loss that maintains gradient connection to forward pass
+            # Use a small value from the logits to keep gradient graph intact
+            dummy_scalar = output.logits.flatten()[0] * 0.0
+            log_probs = torch.zeros_like(original_response_mask, dtype=output.logits.dtype, device=output.logits.device) + dummy_scalar
+            entropy = None
+            if calculate_entropy:
+                entropy = torch.zeros_like(original_response_mask, dtype=output.logits.dtype, device=output.logits.device) + dummy_scalar
+            return entropy, log_probs
 
-                    # Extract output logits
-                    output_lengths = [original_response_mask[i].sum().item() for i in range(original_response_mask.size(0))]
+        if local_has_output == 0:
+            # This rank has no output, but we still did the forward pass above
+            # Keep gradient connection to forward pass for FSDP synchronization
+            dummy_scalar = output.logits.flatten()[0] * 0.0
+            log_probs = torch.zeros_like(original_response_mask, dtype=output.logits.dtype, device=output.logits.device) + dummy_scalar
+            entropy = None
+            if calculate_entropy:
+                entropy = torch.zeros_like(original_response_mask, dtype=output.logits.dtype, device=output.logits.device) + dummy_scalar
+            return entropy, log_probs
 
-                    if max(output_lengths) == 0:
-                        log_probs = torch.zeros_like(original_response_mask, dtype=torch.float32, requires_grad=True)
-                        entropy = None
-                        if calculate_entropy:
-                            entropy = torch.zeros_like(original_response_mask, dtype=torch.float32, requires_grad=True)
-                        return entropy, log_probs
+        # Extract output_starts from model
+        output_starts = self.actor_module.get_output_starts()
 
-                    logits = output.logits
-                    task_logits = extract_output_logits(logits, output_starts, output_lengths)
+        logits = output.logits
+        task_logits = extract_output_logits(logits, output_starts, output_lengths)
 
-                    compact_log_probs = logprobs_from_logits(task_logits, valid_output_tokens)
-                    log_probs = self._restore_log_probs_to_original_length(compact_log_probs, original_response_mask)
+        # Compute log probabilities
+        compact_log_probs = logprobs_from_logits(task_logits, valid_output_tokens)
+        log_probs = self._restore_log_probs_to_original_length(compact_log_probs, original_response_mask)
 
-                elif task_id == 3:
-                    # Task 3: Regen Image Generation
-                    concat_embeds, concat_mask, position_ids, output_starts, valid_output_tokens, original_response_mask = \
-                        self._process_task3_data(micro_batch)
+        # Calculate entropy if needed
+        entropy = None
+        if calculate_entropy:
+            if not self.config.entropy_checkpointing:
+                entropy = verl_F.entropy_from_logits(task_logits)
+            else:
+                entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, task_logits)
 
-                    # Forward pass
-                    output = self.actor_module.language_model.model(
-                        inputs_embeds=concat_embeds,
-                        attention_mask=concat_mask,
-                        position_ids=position_ids,
-                    )
-
-                    # Extract output logits
-                    output_lengths = [original_response_mask[i].sum().item() for i in range(original_response_mask.size(0))]
-
-                    if max(output_lengths) == 0:
-                        log_probs = torch.zeros_like(original_response_mask, dtype=torch.float32, requires_grad=True)
-                        entropy = None
-                        if calculate_entropy:
-                            entropy = torch.zeros_like(original_response_mask, dtype=torch.float32, requires_grad=True)
-                        return entropy, log_probs
-
-                    logits = self.actor_module.gen_head(output.last_hidden_state)
-                    task_logits = extract_output_logits(logits, output_starts, output_lengths)
-
-                    compact_log_probs = logprobs_from_logits(task_logits, valid_output_tokens)
-                    log_probs = self._restore_log_probs_to_original_length(compact_log_probs, original_response_mask)
-
-                # Calculate entropy if needed
-                entropy = None
-                if calculate_entropy:
-                    if not self.config.entropy_checkpointing:
-                        entropy = verl_F.entropy_from_logits(task_logits)
-                    else:
-                        entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, task_logits)
-
-                return entropy, log_probs
+        return entropy, log_probs
 
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
@@ -742,6 +537,10 @@ class DataParallelImageGenerationActor(BasePPOActor):
                         model_inputs, temperature=temperature, calculate_entropy=calculate_entropy, task_id=task_id
                     )
 
+                    # Debug: Check if log_prob has gradients
+                    rank = dist.get_rank() if dist.is_initialized() else -1
+                    print(f"[DEBUG] rank {rank} after _forward_micro_batch: log_prob.requires_grad={log_prob.requires_grad}")
+
                     # for fully_async_policy recipe
                     if hasattr(self.config, "use_rollout_log_probs") and self.config.use_rollout_log_probs:
                         old_log_prob = model_inputs["old_log_probs"]
@@ -798,19 +597,62 @@ class DataParallelImageGenerationActor(BasePPOActor):
                         micro_batch_metrics[f"actor/task{task_id}_kl_loss"] = kl_loss.detach().item() * loss_scale_factor
                         micro_batch_metrics[f"actor/task{task_id}_kl_coef"] = self.config.kl_loss_coef
 
+                    # Debug: Check gradients at each step
+                    rank = dist.get_rank() if dist.is_initialized() else -1
+
+                    print(f"[DEBUG] rank {rank} log_prob: requires_grad={log_prob.requires_grad}, grad_fn={log_prob.grad_fn}")
+                    print(f"[DEBUG] rank {rank} pg_loss: requires_grad={pg_loss.requires_grad}, value={pg_loss.item()}, grad_fn={pg_loss.grad_fn}")
+                    print(f"[DEBUG] rank {rank} policy_loss: requires_grad={policy_loss.requires_grad}, value={policy_loss.item()}, grad_fn={policy_loss.grad_fn}")
+                    print(f"[DEBUG] rank {rank} loss_scale_factor: {loss_scale_factor}")
+
                     if self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz
                         loss = policy_loss * loss_scale_factor
                     else:
                         loss = policy_loss * loss_scale_factor
 
-                    param_ctx = contextlib.nullcontext()
-                    if isinstance(self.actor_module, FSDP):
-                        param_ctx = FSDP.summon_full_params(self.actor_module, writeback=False, recurse=True, with_grads=torch.is_grad_enabled())
+                    print(
+                        f"[DEBUG] rank {rank} loss after scaling: "
+                        f"requires_grad={loss.requires_grad}, "
+                        f"value={loss.item()}, "
+                        f"grad_fn={loss.grad_fn}"
+                    )
 
-                    with param_ctx:
-                        with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
-                            loss.backward()
+                    # Check if loss has gradients - if not, we need to investigate why
+                    if not loss.requires_grad:
+                        print(f"[ERROR] rank {rank}: loss does not have requires_grad!")
+                        print(f"[ERROR] rank {rank}: Investigating gradient chain...")
+
+                        # Check each component
+                        print(f"[ERROR] policy_loss.requires_grad={policy_loss.requires_grad}")
+                        print(f"[ERROR] pg_loss.requires_grad={pg_loss.requires_grad}")
+                        if entropy_coeff != 0:
+                            print(f"[ERROR] entropy_loss.requires_grad={entropy_loss.requires_grad if 'entropy_loss' in locals() else 'N/A'}")
+
+                        raise AssertionError(f"rank {rank}: loss must have requires_grad=True")
+
+                    rank = dist.get_rank() if dist.is_initialized() else -1
+                    print(
+                        f"[DEBUG] rank {rank} about to backward, "
+                        f"loss.requires_grad={loss.requires_grad}, loss.shape={loss.shape}, "
+                        f"loss.item()={loss.item()}"
+                    )
+                    loss.backward()
+                    
+                    has_grad = 0
+                    total_params = 0
+
+                    for name, p in self.actor_module.named_parameters():
+                        if p.requires_grad:
+                            total_params += 1
+                            if p.grad is not None:
+                                if p.grad.abs().sum().item() > 0:
+                                    has_grad += 1
+
+                    print(
+                        f"[GRAD_CHECK] rank {rank}: "
+                        f"trainable_params={total_params}, nonzero_grad_params={has_grad}"
+                    )
 
                     micro_batch_metrics.update(
                         {
@@ -822,7 +664,10 @@ class DataParallelImageGenerationActor(BasePPOActor):
                     )
                     append_to_dict(metrics, micro_batch_metrics)
 
+                dist.barrier()
                 grad_norm = self._optimizer_step()
+                dist.barrier()
+
                 mini_batch_metrics = {f"actor/task{task_id}_grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()
