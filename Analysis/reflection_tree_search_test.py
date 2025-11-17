@@ -1,12 +1,14 @@
 import json, re
 import time
 import traceback
-import threading
+# import threading
+# import concurrent.futures
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from evaluator.smiles_evaluator import MoleculeSMILESEvaluator
 from prompt_templates import *
 from openai import OpenAI
 from tqdm import tqdm
-import concurrent.futures
 from transformers import AutoTokenizer
 
 from rdkit import Chem, RDLogger
@@ -15,8 +17,8 @@ RDLogger.DisableLog('rdApp.*')
 
 # ---- 설정 ----
 model = "ReactionReasoner"  # "predictiononly" or "ReactionReasoner"
-# tasks = ["forward", "retro", "reagent"]
-tasks = ["reagent"]
+tasks = ["forward", "retro", "reagent"]
+# tasks = ["forward"]
 max_samples = 10000  # 각 task별 최대 샘플 수
 
 
@@ -187,9 +189,8 @@ all_results = {}
 all_predictions = {}
 all_ground_truths = {}
 # for temp in [0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0]:
-for temp in [1.2]:
-    # for strategy in ["force_reflection"]:
-    for strategy in ["force_reflection"]:
+for temp in [1.0]:
+    for strategy in ["force_reflection", "naive_sampling"]:
     # for strategy in ["naive_sampling", "step123greedy_then_naive_sampling", "step123sampling_then_greedy_sampling", "step12345greedy_then_naive_sampling", "step123456greedy_then_naive_sampling", "step123456greedy_then_naive_sampling"]:
         TEMPERATURE = temp
         STRATEGY = strategy
@@ -209,7 +210,7 @@ for temp in [1.2]:
                 # 이미 처리됨
                 continue
         else:
-            NUM_GENERATIONS = 8
+            NUM_GENERATIONS = 16
 
         all_results[f"{TEMPERATURE}, {STRATEGY}"] = {}
         all_predictions[f"{TEMPERATURE}, {STRATEGY}"] = {}
@@ -218,48 +219,6 @@ for temp in [1.2]:
         # 서버별 동시 요청 수
         PER_SERVER_CONCURRENCY = 50
 
-
-        IP_PORTs = [
-            # "218.238.5.105:8000",
-            # "218.238.5.109:8000",
-            # "218.238.5.120:8000",
-            # "114.110.130.181:8000",
-
-            # "218.238.5.105:8001",
-            # "218.238.5.109:8001",
-            # "218.238.5.120:8001",
-            # "114.110.130.181:8001",
-
-            # "218.238.5.105:8002",
-            # "218.238.5.109:8002",
-            # "218.238.5.120:8002",
-            # "114.110.130.181:8002",
-
-            # "218.238.5.105:8003",
-            # "218.238.5.109:8003",
-            # "218.238.5.120:8003",
-            # "114.110.130.181:8003",
-
-            # "218.238.5.105:8004",
-            # "218.238.5.109:8004",
-            # "218.238.5.120:8004",
-            # "114.110.130.181:8004",
-            
-            # "218.238.5.105:8005",
-            "218.238.5.109:8005",
-            # "218.238.5.120:8005",
-            # "114.110.130.181:8005",
-            
-            # "218.238.5.105:8006",
-            # "218.238.5.109:8006",
-            # "218.238.5.120:8006",
-            # "114.110.130.181:8006",
-            
-            # "218.238.5.105:8007",
-            # "218.238.5.109:8007",
-            # "218.238.5.120:8007",
-            # "114.110.130.181:8007",
-        ]
         if model == "predictiononly":
             IP_PORTs = [
                 "114.110.130.181:8000",
@@ -273,14 +232,22 @@ for temp in [1.2]:
             ]
         elif model == "ReactionReasoner":
             IP_PORTs = [
-                "localhost:8000",
-                "localhost:8001",
-                "localhost:8002",
-                "localhost:8003",
-                "localhost:8004",
-                "localhost:8005",
-                "localhost:8006",
-                "localhost:8007",
+                "192.169.0.2:8000",
+                "192.169.0.2:8001",
+                "192.169.0.2:8002",
+                "192.169.0.2:8003",
+                "192.169.0.2:8004",
+                "192.169.0.2:8005",
+                "192.169.0.2:8006",
+                "192.169.0.2:8007",
+                "192.169.0.3:8000",
+                "192.169.0.3:8001",
+                "192.169.0.3:8002",
+                "192.169.0.3:8003",
+                "192.169.0.3:8004",
+                "192.169.0.3:8005",
+                "192.169.0.3:8006",
+                "192.169.0.3:8007",
             ]
         NUM_SERVERS = len(IP_PORTs)
 
@@ -291,15 +258,8 @@ for temp in [1.2]:
         ]
         tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B", trust_remote_code=True)
 
-        # 서버별 세마포어 (동시성 제어)
-        server_semaphores = [threading.Semaphore(PER_SERVER_CONCURRENCY) for _ in range(NUM_SERVERS)]
-
-        # 재시도 설정
-        MAX_RETRIES = 3
-        INITIAL_BACKOFF = 0.5  # 초
-
-        # 보충 호출을 시도할 최대 반복 (만약 한 번의 호출에서 n을 지원하지 않아 부족하면 보충)
-        FILL_ATTEMPTS = 5
+        # # 서버별 세마포어 (동시성 제어)
+        # server_semaphores = [threading.Semaphore(PER_SERVER_CONCURRENCY) for _ in range(NUM_SERVERS)]
 
         evaluator = MoleculeSMILESEvaluator()
 
@@ -310,152 +270,113 @@ for temp in [1.2]:
             except Exception:
                 return content.strip()
 
-        def call_model_collect_n(client, messages, d, num_required=NUM_GENERATIONS, model_path="/models/ReactionReasoner", **kwargs):
+        def call_model_collect_n(client, messages, d, model_path="/models/ReactionReasoner", **kwargs):
             """
             한 입력(messages)에 대해 총 `num_required`개의 생성 결과를 수집하여 리스트로 반환.
-            - 우선 한 번에 num_required를 요청(n 파라미터). 서버가 지원하지 않으면 부족분을 추가 호출로 보충.
-            - 실패 시 재시도(backoff) 로직 적용.
             """
             collected = []
-            attempts = 0
-            backoff = INITIAL_BACKOFF
-
-            while len(collected) < num_required and attempts < FILL_ATTEMPTS:
-                to_request = num_required - len(collected)
-                attempt = 0
-                last_exc = None
-                while attempt < MAX_RETRIES:
+            if temp == 0.0:
+                completion = client.chat.completions.create(
+                    model=model_path,
+                    messages=messages,
+                    n=1,
+                    temperature=0.0,
+                    max_tokens=1700,
+                )
+                choices = getattr(completion, "choices", None) or completion.get("choices", [])
+                for ch in choices:
+                    # 여러 포맷 대비 안전한 접근
+                    content = ""
                     try:
-                        if temp == 0.0:
-                            completion = client.chat.completions.create(
-                                model=model_path,
-                                messages=messages,
-                                n=1,
-                                temperature=0.0,
-                                max_tokens=1700,
-                            )
-                            choices = getattr(completion, "choices", None) or completion.get("choices", [])
-                        elif STRATEGY == "naive_sampling":
-                            completion = client.chat.completions.create(
-                                model=model_path,
-                                messages=messages,
-                                n=to_request,
-                                temperature=kwargs.get("temperature", 0.0),
-                                max_tokens=kwargs.get("max_tokens", 1700),
-                            )
-                            # completion.choices는 리스트여야 함
-                            choices = getattr(completion, "choices", None) or completion.get("choices", [])
-                            for ch in choices:
-                                # 여러 포맷 대비 안전한 접근
-                                content = ""
-                                try:
-                                    content = ch.message.content
-                                except Exception:
-                                    # dict-like 혹은 다른 구조에 대비
-                                    content = ch.get("message", {}).get("content") if isinstance(ch, dict) else getattr(ch, "text", None) or str(ch)
-                                # if "<REFLECTION>" in content:
-                                #     print(f"REFLECTION found")
-                                ans = _extract_answer_from_content(content or "")
-                                collected.append(ans)
-                        elif STRATEGY == "force_reflection":
-                            if task == "forward":
-                                refl_steps = [4, 5, 6]
-                            elif task == "retro":
-                                refl_steps = [5, 6, 7]
-                            elif task == "reagent":
-                                refl_steps = [6, 7]
+                        content = ch.message.content
+                    except Exception:
+                        # dict-like 혹은 다른 구조에 대비
+                        content = ch.get("message", {}).get("content") if isinstance(ch, dict) else getattr(ch, "text", None) or str(ch)
+                    # if "<REFLECTION>" in content:
+                    #     print(f"REFLECTION found")
+                    ans = _extract_answer_from_content(content or "")
+                    collected.append(ans)
+            elif STRATEGY == "naive_sampling":
+                completion = client.chat.completions.create(
+                    model=model_path,
+                    messages=messages,
+                    n=NUM_GENERATIONS,
+                    temperature=kwargs.get("temperature", 0.0),
+                    max_tokens=kwargs.get("max_tokens", 1700),
+                )
+                choices = getattr(completion, "choices", None) or completion.get("choices", [])
+                for ch in choices:
+                    # 여러 포맷 대비 안전한 접근
+                    content = ""
+                    try:
+                        content = ch.message.content
+                    except Exception:
+                        # dict-like 혹은 다른 구조에 대비
+                        content = ch.get("message", {}).get("content") if isinstance(ch, dict) else getattr(ch, "text", None) or str(ch)
+                    # if "<REFLECTION>" in content:
+                    #     print(f"REFLECTION found")
+                    ans = _extract_answer_from_content(content or "")
+                    collected.append(ans)
+            elif STRATEGY == "force_reflection":
+                if task == "forward":
+                    refl_steps = [4, 5, 6]
+                elif task == "retro":
+                    refl_steps = [5, 6, 7]
+                elif task == "reagent":
+                    refl_steps = [6, 7]
+                else:
+                    raise ValueError(f"Unknown task: {task}")
+
+                for request_i in range(NUM_GENERATIONS):
+                    raw_prompt = tokenizer.apply_chat_template(
+                        messages,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                        enable_thinking=True,
+                    )
+                    for step_i, step in enumerate(refl_steps):
+                        stop_strs = [f"## Step {step + 1}", "<ANSWER>", "</think>"]
+                        response = client.completions.create(
+                            model=model_path,
+                            prompt=raw_prompt,
+                            n=1,
+                            temperature=kwargs.get("temperature", 0.0),
+                            max_tokens=kwargs.get("max_tokens", 1700),
+                            stop=stop_strs,
+                        )
+                        choices = getattr(response, "choices", None) or response.get("choices", [])
+                        response = choices[0].text
+                        raw_prompt += response
+                        raw_prompt = remove_last_reflection_block(raw_prompt).strip()
+                        step_correct = is_step_correct(step, task, d, raw_prompt)
+                        if step_correct:
+                            if step_i == len(refl_steps) - 1:
+                                next_tag = "\n</think>"
                             else:
-                                raise ValueError(f"Unknown task: {task}")
-
-                            for request_i in range(to_request):
-                                raw_prompt = tokenizer.apply_chat_template(
-                                    messages,
-                                    tokenize=False,
-                                    add_generation_prompt=True,
-                                    enable_thinking=True,
-                                )
-                                for step_i, step in enumerate(refl_steps):
-                                    stop_strs = [f"## Step {step + 1}", "<ANSWER>", "</think>"]
-                                    response = client.completions.create(
-                                        model=model_path,
-                                        prompt=raw_prompt,
-                                        n=1,
-                                        temperature=kwargs.get("temperature", 0.0),
-                                        max_tokens=kwargs.get("max_tokens", 1700),
-                                        stop=stop_strs,
-                                    )
-                                    choices = getattr(response, "choices", None) or response.get("choices", [])
-                                    response = choices[0].text
-                                    raw_prompt += response
-                                    raw_prompt = remove_last_reflection_block(raw_prompt).strip()
-                                    step_correct = is_step_correct(step, task, d, raw_prompt)
-                                    if step_correct:
-                                        if step_i == len(refl_steps) - 1:
-                                            next_tag = "\n</think>"
-                                        else:
-                                            next_tag = f"\n\n## Step {step + 1}"
-                                    else:
-                                        if step_i == len(refl_steps) - 1:
-                                            next_tag = "\n<REFLECTION>"
-                                        else:
-                                            next_tag = "\n\n<REFLECTION>"
-                                    raw_prompt += next_tag
-                                # raw_prompt = raw_prompt + "\n</think>"
-                                response = client.completions.create(
-                                    model=model_path,
-                                    prompt=raw_prompt,
-                                    n=1,
-                                    temperature=kwargs.get("temperature", 0.0),
-                                    max_tokens=kwargs.get("max_tokens", 1700),
-                                )
-                                choices = getattr(response, "choices", None) or response.get("choices", [])
-                                response = choices[0].text
-                                raw_prompt += response
-                                ans = _extract_answer_from_content(raw_prompt or "")
-                                collected.append(ans)
+                                next_tag = f"\n\n## Step {step + 1}"
                         else:
-                            raise ValueError(f"Unknown STRATEGY: {STRATEGY}")
-                            
-                        # # normalize: choices may be list of choice objects
-                        # for ch in choices:
-                        #     # 여러 포맷 대비 안전한 접근
-                        #     content = ""
-                        #     try:
-                        #         content = ch.message.content
-                        #     except Exception:
-                        #         # dict-like 혹은 다른 구조에 대비
-                        #         content = ch.get("message", {}).get("content") if isinstance(ch, dict) else getattr(ch, "text", None) or str(ch)
-                        #     # if "<REFLECTION>" in content:
-                        #     #     print(f"REFLECTION found")
-                        #     ans = _extract_answer_from_content(content or "")
-                        #     collected.append(ans)
-                        #     if len(collected) >= num_required:
-                        #         break
-                        # # 만약 서버가 n을 지원하지 않아서 choices가 빈 경우도 보충 루프에서 다시 시도
-                        break
-                    except Exception as e:
-                        last_exc = e
-                        attempt += 1
-                        if attempt < MAX_RETRIES:
-                            time.sleep(backoff)
-                            backoff *= 2
-                        else:
-                            # 이 호출에서 실패한 경우, 바깥 루프에서 다시 시도하거나 최종 실패 처리
-                            # 로그 남기고 빠져나가 보충 시도 루프로 이동
-                            print(f"[WARN] model call failed after {attempt} attempts: {e}")
-                            break
-                attempts += 1
-                if len(collected) < num_required:
-                    # 짧은 backoff 후 보충 시도
-                    time.sleep(0.2)
+                            if step_i == len(refl_steps) - 1:
+                                next_tag = "\n<REFLECTION>"
+                            else:
+                                next_tag = "\n\n<REFLECTION>"
+                        raw_prompt += next_tag
+                    response = client.completions.create(
+                        model=model_path,
+                        prompt=raw_prompt,
+                        n=1,
+                        temperature=kwargs.get("temperature", 0.0),
+                        max_tokens=kwargs.get("max_tokens", 1700),
+                    )
+                    choices = getattr(response, "choices", None) or response.get("choices", [])
+                    response = choices[0].text
+                    raw_prompt += response
+                    ans = _extract_answer_from_content(raw_prompt or "")
+                    collected.append(ans)
+            else:
+                raise ValueError(f"Unknown STRATEGY: {STRATEGY}")
 
-            # 필요한 만큼 못 채웠으면 빈 문자열로 채움 (평가 파이프라인에서 비정상 처리보다 안전)
-            if len(collected) < num_required:
-                missing = num_required - len(collected)
-                print(f"[WARN] only collected {len(collected)} / {num_required} generations; padding {missing} empty strings.")
-                collected.extend([""] * missing)
 
-            return collected[:num_required]
+            return collected
 
         def worker_call(server_idx, messages, d, global_idx):
             """
@@ -463,13 +384,24 @@ for temp in [1.2]:
             messages: chat messages
             global_idx: original data index (for debugging)
             """
-            sem = server_semaphores[server_idx]
-            client = clients[server_idx]
-            sem.acquire()
-            try:
-                return call_model_collect_n(client, messages, d, num_required=NUM_GENERATIONS, model_path="/models/ReactionReasoner", temperature=TEMPERATURE, max_tokens=MAX_TOKENS)
-            finally:
-                sem.release()
+            # sem = server_semaphores[server_idx]
+            # client = clients[server_idx]
+            # sem.acquire()
+            # try:
+            #     return call_model_collect_n(client, messages, d, num_required=NUM_GENERATIONS, model_path="/models/ReactionReasoner", temperature=TEMPERATURE, max_tokens=MAX_TOKENS)
+            # finally:
+            #     sem.release()
+
+            ip_port = IP_PORTs[server_idx]
+            client = OpenAI(base_url=f"http://{ip_port}/v1", api_key="EMPTY")
+            return call_model_collect_n(
+                client,
+                messages,
+                d,
+                model_path="/models/ReactionReasoner",
+                temperature=TEMPERATURE,
+                max_tokens=MAX_TOKENS,
+            )
 
         # ---- 작업 루프 (task별) ----
         for task in tasks:
@@ -477,7 +409,7 @@ for temp in [1.2]:
             gt_molecules = []
             pred_molecules = []
 
-            with open(f"/data/data/orderly/excluded_test/excluded_{task}_test_v10.json", "r") as f:
+            with open(f"/data/llm-reaction-reasoning/data/orderly/excluded_test/excluded_{task}_test_v10.json", "r") as f:
                 data = json.load(f)[:max_samples]
             # with open(f"/data/data/orderly/excluded_test/excluded_{task}_test_v10_required.jsonl", "r") as f:
             #     data = [json.loads(line) for line in f.readlines()][:max_samples]
@@ -496,8 +428,8 @@ for temp in [1.2]:
             gts_by_index = [None] * n
 
             # Thread pool의 총 워커 수: 서버 수 * 서버별 동시성
-            max_workers = NUM_SERVERS * PER_SERVER_CONCURRENCY * 2
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            max_workers = NUM_SERVERS * PER_SERVER_CONCURRENCY
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
                 futures = {}
                 for idx, d in enumerate(data):
                     # prepare input
@@ -529,7 +461,11 @@ for temp in [1.2]:
                     gts_by_index[idx] = gt
 
                 # 진행바: futures 완료를 기다리며 업데이트
-                for fut in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc=f"Task {task}"):
+                for fut in tqdm(
+                    as_completed(futures),
+                    total=len(futures),
+                    desc=f"Task {task}"
+                ):
                     idx = futures[fut]
                     try:
                         preds_list = fut.result()  # 이제 list[str] (길이 NUM_GENERATIONS)
