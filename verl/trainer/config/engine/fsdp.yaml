@@ -7,6 +7,10 @@ wrap_policy:
   # Minimum number of parameters to trigger wrapping a layer with FSDP
   min_num_params: 0
 
+  # Transformer layer class names to wrap with FSDP (e.g., LlamaDecoderLayer)
+  # If null, will use model._no_split_modules as default
+  transformer_layer_cls_to_wrap: null
+
 # Whether to offload model parameters to CPU (trades speed for memory)
 # Note that this differs from the offload_policy in FSDP
 param_offload: false

@@ -19,28 +19,84 @@ export NCCL_SOCKET_TIMEOUT=300000
 export NCCL_IB_TIMEOUT=300
 
 # export VLLM_ATTENTION_BACKEND=XFORMERS
-export CUDA_VISIBLE_DEVICES=0,1,2,3
+export NCCL_DEBUG=WARN
+export NCCL_ASYNC_ERROR_HANDLING=0
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+export NCCL_BLOCKING_WAIT=1
+export NCCL_TIMEOUT_MS=1200000
 export HYDRA_FULL_ERROR=1
 export TORCH_DISTRIBUTED_DEBUG=DETAIL
 
 export RM_MODEL_PATH="Qwen/Qwen3-VL-30B-A3B-Instruct" # OpenGVLab/InternVL3_5-38B
-
-GPUS=4 # `nvidia-smi -L | wc -l`
-MODEL_PATH=/data/mllm/ckpt/pretrained # /data/mllm/checkpoints/Janus-Pro-7B
-TRAIN_FILES=/data/mllm/data/train.parquet
-VAL_FILES=/data/mllm/data/val.parquet
-RUN_NAME=naive_qwen_vlm
-PROJ_NAME=mllm_reasoning
-SAVE_DIR=/data/verl/ckpts/$PROJ_NAME/$RUN_NAME
 
 # pip install attrdict timm
 RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
 WORKING_DIR=${WORKING_DIR:-"${PWD}"}
 RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/verl/trainer/runtime_env.yaml"}
 
+GPUS=4 # `nvidia-smi -L | wc -l`
+MODEL_PATH=/data/mllm/ckpt/pretrained # /data/mllm/checkpoints/Janus-Pro-7B
+TRAIN_FILES=/data/mllm/data/train.parquet
+VAL_FILES=/data/mllm/data/val.parquet
+RUN_NAME=debug
+PROJ_NAME=mllm_reasoning
+SAVE_DIR=/data/verl/ckpts/$PROJ_NAME/$RUN_NAME
+
+# Algorithm parameters
+adv_estimator=grpo_task_skip
+
+use_kl_in_reward=False
+kl_coef=0.0
+use_kl_loss=True
+kl_loss_coef=0.001
+
+clip_ratio_low=0.2
+clip_ratio_high=0.2
+
+enable_filter_groups=False
+filter_groups_metric=acc
+max_num_gen_batches=10
+
+# Response length parameters
+max_prompt_length=$((1024 * 1)) # 1k
+max_response_length=$((1024 * 2)) # 2k
+# enable_overlong_buffer=False
+# overlong_buffer_len=$((1024 * 4))
+# overlong_penalty_factor=1.0
+
+# Training parameters
+loss_agg_mode="token-mean"
+
+# Algorithm
+temperature=1.0
+top_p=1.0
+top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
+val_temperature=0.0
+val_top_k=0.0
+val_top_p=1.0
+
+# Performance Related Parameter
+use_dynamic_bsz=False
+# actor_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 2))
+# infer_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 3))
+offload=False
+gen_tp=1
+sp_size=1
+fsdp_size=4 # Must be divisible by (n_gpus_training*n_nodes) and (n_gpus_rollout*n_nodes)
+
+# Fully async specific parameters
+NNODES=${NNODES:-1}
+NGPUS_PER_NODE=${NGPUS_PER_NODE:-$GPUS}
+
+save_freq=20
+test_freq=20
+total_epochs=1
+rollout_freq=20
+log_val_generations=5
+
 # Parameters
 train_prompt_bsz=4
-# val_prompt_bsz=8
+gen_prompt_bsz=$((train_prompt_bsz * 1))
 n_resp_per_prompt=8
 train_prompt_mini_bsz=4
 
@@ -61,6 +117,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     data.train_batch_size=${train_prompt_bsz} \
     data.max_prompt_length=${max_prompt_length} \
     data.max_response_length=${max_response_length} \
+    data.gen_batch_size=${gen_prompt_bsz} \
     data.truncation='left' \
     data.custom_cls.path=recipe/image_rl/image_rl_dataset.py \
     data.custom_cls.name=ImageRLDataset \
@@ -72,18 +129,26 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
-    actor_rollout_ref.actor.use_kl_loss=True \
-    actor_rollout_ref.actor.kl_loss_coef=0.001 \
+    actor_rollout_ref.actor.use_kl_loss=${use_kl_loss} \
+    actor_rollout_ref.actor.kl_loss_coef=${kl_loss_coef} \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     actor_rollout_ref.actor.entropy_coeff=-0.00 \
+    actor_rollout_ref.actor.clip_ratio_low=${clip_ratio_low} \
+    actor_rollout_ref.actor.clip_ratio_high=${clip_ratio_high} \
+    actor_rollout_ref.actor.clip_ratio_c=10.0 \
+    actor_rollout_ref.model.use_remove_padding=False \
+    actor_rollout_ref.actor.use_dynamic_bsz=${use_dynamic_bsz} \
+    actor_rollout_ref.ref.log_prob_use_dynamic_bsz=${use_dynamic_bsz} \
+    actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=${use_dynamic_bsz} \
     actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.fsdp_config.use_orig_params=True \
     actor_rollout_ref.actor.fsdp_config.reshard_after_forward=True \
-    actor_rollout_ref.actor.fsdp_config.param_offload=False \
-    actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
+    actor_rollout_ref.actor.fsdp_config.param_offload=${offload} \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=${offload} \
     actor_rollout_ref.actor.fsdp_config.fsdp_size=${fsdp_size} \
     actor_rollout_ref.actor.fsdp_config.use_torch_compile=False \
+    actor_rollout_ref.actor.fsdp_config.wrap_policy.transformer_layer_cls_to_wrap=['LlamaDecoderLayer'] \
     actor_rollout_ref.rollout.dtype=bfloat16 \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
@@ -97,14 +162,17 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     actor_rollout_ref.rollout.response_length=2500 \
     actor_rollout_ref.ref.fsdp_config.model_dtype=bfloat16 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
-    actor_rollout_ref.ref.fsdp_config.param_offload=False \
-    actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
+    actor_rollout_ref.ref.fsdp_config.use_orig_params=True \
+    actor_rollout_ref.ref.fsdp_config.param_offload=${offload} \
+    actor_rollout_ref.ref.fsdp_config.optimizer_offload=${offload} \
     actor_rollout_ref.ref.fsdp_config.use_torch_compile=False \
+    actor_rollout_ref.ref.fsdp_config.wrap_policy.transformer_layer_cls_to_wrap=['LlamaDecoderLayer'] \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     +algorithm.max_token_start=-1 \
-    algorithm.kl_ctrl.kl_coef=0.000 \
-    algorithm.filter_groups.enable=False \
+    algorithm.kl_ctrl.kl_coef=${kl_coef} \
+    algorithm.filter_groups.enable=${enable_filter_groups} \
     algorithm.filter_groups.max_num_gen_batches=8 \
+    algorithm.filter_groups.metric=${filter_groups_metric} \
     +trainer.start_step=0 \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
@@ -112,15 +180,15 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     trainer.project_name=$PROJ_NAME \
     trainer.experiment_name=$RUN_NAME \
     trainer.n_gpus_per_node=$GPUS \
-    trainer.nnodes=1 \
-    trainer.save_freq=30 \
-    trainer.test_freq=30 \
-    trainer.total_epochs=1 \
+    trainer.nnodes="${NNODES}" \
+    trainer.save_freq=${save_freq} \
+    trainer.test_freq=${test_freq} \
+    trainer.total_epochs=${total_epochs} \
     trainer.resume_mode=auto \
     trainer.default_local_dir=$SAVE_DIR \
     trainer.rollout_data_dir="$SAVE_DIR/rollout" \
-    trainer.rollout_freq=20 \
-    trainer.log_val_generations=20 \
+    trainer.rollout_freq=${rollout_freq} \
+    trainer.log_val_generations=${log_val_generations} \
     reward_model.reward_manager=image_generation \
     custom_reward_function.path=recipe/image_rl/reward_function.py \
     custom_reward_function.name=compute_score_batch \
