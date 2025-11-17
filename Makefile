@@ -1,5 +1,7 @@
 CONTAINER_NAME=verl-$(USER)
 IMAGE_NAME_TAG=verlai/verl:app-verl0.5-transformers4.55.4-vllm0.10.0-mcore0.13.0-te2.2
+HUGGING_FACE_HUB_TOKEN=hf_xx
+CACHE_PATH=/data/.cache
 
 init-container:
 	docker run -d \
@@ -47,3 +49,43 @@ init-container-with-infiniband:
 		--name $(CONTAINER_NAME) \
 		$(IMAGE_NAME_TAG) \
 		tail -f /dev/null
+
+start-predictiononly-servers:
+	for GPU in 0 ; do \
+		PORT=$$((8000 + $$GPU)) ; \
+		docker run --rm -d --name predictiononly$$GPU \
+			--runtime nvidia \
+			--gpus "device=$$GPU" \
+			-v ${CACHE_PATH}:/root/.cache/huggingface \
+			-v /data/llm-reaction-reasoning/all_checkpoints/answeronly_fullft_8b/best.ckpt/hf_model:/models/predictiononly:ro \
+			-e HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN} \
+			-p $${PORT}:8000 \
+			--ipc=host \
+			vllm/vllm-openai:v0.10.0 \
+			--model /models/predictiononly ; \
+	done
+
+start-ReactionReasoner-servers:
+	for GPU in 0 1 2 3 4 5 6 7 ; do \
+		PORT=$$((8000 + $$GPU)) ; \
+		docker run --rm -d --name ReactionReasoner$$GPU \
+			--runtime nvidia \
+			--gpus "device=$$GPU" \
+			-v ${CACHE_PATH}:/root/.cache/huggingface \
+			-v /data/verl/ckpts/verl-dapo/refl_bonus_0.3_2node/global_step_10800/hf_model:/models/ReactionReasoner:ro \
+			-e HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN} \
+			-p $${PORT}:8000 \
+			--ipc=host \
+			vllm/vllm-openai:v0.10.0 \
+			--model /models/ReactionReasoner ; \
+	done
+
+stop-predictiononly-servers:
+	for GPU in 0 1 2 3 4 5 6 7 ; do \
+		docker stop predictiononly$$GPU || true ; \
+	done
+
+stop-ReactionReasoner-servers:
+	for GPU in 0 1 2 3 4 5 6 7 ; do \
+		docker stop ReactionReasoner$$GPU || true ; \
+	done

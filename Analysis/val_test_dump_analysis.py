@@ -6,11 +6,11 @@ from pprint import pprint
 
 task = "forward"
 
-test_dump_path = "/data/verl/dumps/verl-dapo/reflect_bonus_0.3_nomask/test/*.jsonl"
+test_dump_path = "/data/verl/dumps/verl-dapo/refl_bonus_0.3/test/*.jsonl"
 test_files = glob(test_dump_path)
-test_files = sorted(test_files, key=lambda x: int(x.split("/")[-1].split(".")[0]))[-1:]
+test_files = sorted(test_files, key=lambda x: int(x.split("/")[-1].split(".")[0]))[-10:]
 
-val_dump_path = "/data/verl/dumps/verl-dapo/reflect_bonus_0.3_nomask/val/*.jsonl"
+val_dump_path = "/data/verl/dumps/verl-dapo/refl_bonus_0.3/val/*.jsonl"
 val_files = glob(val_dump_path)
 val_files = sorted(val_files, key=lambda x: int(x.split("/")[-1].split(".")[0]))
 

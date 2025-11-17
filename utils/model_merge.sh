@@ -6,8 +6,13 @@
 # FSDP
 python -m verl.model_merger merge \
     --backend fsdp \
-    --local_dir /data/verl/ckpts/verl-dapo/RR_seq-mean-token-sum_no-rp-step7rwd/global_step_2000/actor \
-    --target_dir /data/verl/ckpts/verl-dapo/RR_seq-mean-token-sum_no-rp-step7rwd/global_step_2000/hf_model
+    --local_dir /data/verl/ckpts/verl-dapo/refl_bonus_0.3_2node/global_step_10200/actor \
+    --target_dir /data/verl/ckpts/verl-dapo/refl_bonus_0.3_2node/global_step_10200/hf_model
+
+python -m verl.model_merger merge \
+    --backend fsdp \
+    --local_dir /data/verl/ckpts/verl-dapo/refl_bonus_0.3_2node/global_step_10800/actor \
+    --target_dir /data/verl/ckpts/verl-dapo/refl_bonus_0.3_2node/global_step_10800/hf_model
 
 # # Megatron
 # python -m verl.model_merger merge \
