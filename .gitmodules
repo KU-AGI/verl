@@ -1,3 +1,6 @@
 [submodule "verl/third_party/transformers"]
 	path = verl/third_party/transformers
 	url = https://github.com/huggingface/transformers.git
+[submodule "verl/third_party/dynamo"]
+	path = verl/third_party/dynamo
+	url = https://github.com/ai-dynamo/dynamo.git
