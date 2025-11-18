@@ -277,63 +277,76 @@ class PartialSingleTurnAgentLoop(AgentLoopBase):
                     request_id=request_id, prompt_ids=prompt_ids, sampling_params=sampling_params, image_data=image_data
                 )
             elif self.config.rollout.strategy == "reflection_sampling":
-                prompt_origin_ids = deepcopy(prompt_ids)
-                log_probs_all = []
-                task = kwargs['task']
-                if task == "forward":
-                    refl_steps = [4, 5, 6]
-                elif task == "retro":
-                    refl_steps = [5, 6, 7]
-                elif task == "reagent":
-                    refl_steps = [6, 7]
-                else:
-                    raise ValueError(f"Unknown task: {task}")
-                for step_i, step in enumerate(refl_steps):
-                    stop_strs = [f"## Step {step + 1}", "<REFLECTION", "<ANSWER", "</think>"]
-                    stop_ids = [self.tokenizer.encode(s) for s in stop_strs]
-                    sampling_params["stop"] = stop_strs
+                try:
+                    prompt_origin_ids = deepcopy(prompt_ids)
+                    log_probs_all = []
+                    task = kwargs['task']
+                    if task == "forward":
+                        refl_steps = [4, 5, 6]
+                    elif task == "retro":
+                        refl_steps = [5, 6, 7]
+                    elif task == "reagent":
+                        refl_steps = [6, 7]
+                    else:
+                        raise ValueError(f"Unknown task: {task}")
+                    for step_i, step in enumerate(refl_steps):
+                        stop_strs = [f"## Step {step + 1}", "<REFLECTION", "<ANSWER", "</think>"]
+                        stop_ids = [self.tokenizer.encode(s) for s in stop_strs]
+                        sampling_params["stop"] = stop_strs
+                        response_ids, log_probs, is_cancel = await self.server_manager.generate_for_partial(
+                            request_id=uuid4().hex, prompt_ids=prompt_ids, sampling_params=sampling_params, image_data=image_data
+                        )
+                        # Remove the stop_ids from response_ids if generated
+                        for stop_id in stop_ids:
+                            if response_ids[-len(stop_id):] == stop_id:
+                                response_ids = response_ids[:-len(stop_id)]
+                                log_probs = log_probs[:-len(stop_id)]
+                                break
+                        prompt_ids += response_ids
+                        log_probs_all += log_probs
+                        # prompt_ids = remove_last_reflection_block_ids(prompt_ids, reflection_ids=[27, 5996, 28017, 29])
+                        raw_prompt = self.tokenizer.decode(prompt_ids)
+                        step_correct = is_step_correct(step, task, kwargs['extra_info']['supporting_info'], raw_prompt)
+                        if step_correct:
+                            if step_i == len(refl_steps) - 1:
+                                next_ids = [151668] # self.tokenizer.encode("</think>")
+                            else:
+                                next_ids = self.tokenizer.encode(f"## Step {step + 1}")
+                        else:
+                            if step_i == len(refl_steps) - 1:
+                                next_ids = [27, 5996, 28017, 29] # self.tokenizer.encode("<REFLECTION>")
+                            else:
+                                next_ids = [27, 5996, 28017, 29] # self.tokenizer.encode("<REFLECTION>")
+                        prompt_ids += next_ids
+                        log_probs_all += [0.0] * len(next_ids) # assume log_probs of the added tokens are 0.0. This could be problematic.
+
+                    # remove sampling_params["stop"]
+                    sampling_params.pop("stop", None)
                     response_ids, log_probs, is_cancel = await self.server_manager.generate_for_partial(
                         request_id=uuid4().hex, prompt_ids=prompt_ids, sampling_params=sampling_params, image_data=image_data
                     )
-                    # Remove the stop_ids from response_ids if generated
-                    for stop_id in stop_ids:
-                        if response_ids[-len(stop_id):] == stop_id:
-                            response_ids = response_ids[:-len(stop_id)]
-                            log_probs = log_probs[:-len(stop_id)]
-                            break
                     prompt_ids += response_ids
                     log_probs_all += log_probs
-                    # prompt_ids = remove_last_reflection_block_ids(prompt_ids, reflection_ids=[27, 5996, 28017, 29])
-                    raw_prompt = self.tokenizer.decode(prompt_ids)
-                    step_correct = is_step_correct(step, task, kwargs['extra_info']['supporting_info'], raw_prompt)
-                    if step_correct:
-                        if step_i == len(refl_steps) - 1:
-                            next_ids = [151668] # self.tokenizer.encode("</think>")
-                        else:
-                            next_ids = self.tokenizer.encode(f"## Step {step + 1}")
-                    else:
-                        if step_i == len(refl_steps) - 1:
-                            next_ids = [27, 5996, 28017, 29] # self.tokenizer.encode("<REFLECTION>")
-                        else:
-                            next_ids = [27, 5996, 28017, 29] # self.tokenizer.encode("<REFLECTION>")
-                    prompt_ids += next_ids
-                    log_probs_all += [0.0] * len(next_ids) # assume log_probs of the added tokens are 0.0. This could be problematic.
-
-                # remove sampling_params["stop"]
-                sampling_params.pop("stop", None)
-                response_ids, log_probs, is_cancel = await self.server_manager.generate_for_partial(
-                    request_id=request_id, prompt_ids=prompt_ids, sampling_params=sampling_params, image_data=image_data
-                )
-                prompt_ids += response_ids
-                log_probs_all += log_probs
-                log_probs = log_probs_all
-                # response_ids are the newly generated tokens after all steps. Remove prompt_origin_ids from prompt_ids
-                response_ids = prompt_ids[len(prompt_origin_ids):]
-                prompt_ids = prompt_origin_ids
-                response_text = self.tokenizer.decode(response_ids)
-                # if "::" in response_text:
-                #     breakpoint()
-                #     print()
+                    log_probs = log_probs_all
+                    # response_ids are the newly generated tokens after all steps. Remove prompt_origin_ids from prompt_ids
+                    response_ids = prompt_ids[len(prompt_origin_ids):]
+                    prompt_ids = prompt_origin_ids
+                    response_text = self.tokenizer.decode(response_ids)
+                    # if "::" in response_text:
+                    #     breakpoint()
+                    #     print()
+                except Exception as e:
+                    logger.error(f"Reflection sampling failed with error: {e}")
+                    # In case of any error, fall back to normal generation
+                    prompt_ids = self.tokenizer.apply_chat_template(
+                        messages,
+                        add_generation_prompt=True,
+                        tokenize=True,
+                        **self.apply_chat_template_kwargs,
+                    )
+                    response_ids, log_probs, is_cancel = await self.server_manager.generate_for_partial(
+                        request_id=request_id, prompt_ids=prompt_ids, sampling_params=sampling_params, image_data=image_data
+                    )
         if not output:
             response_mask = [1] * len(response_ids)
         else:
