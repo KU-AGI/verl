@@ -130,3 +130,4 @@ outputs
 
 # ngram token analysis results
 Analysis/ngram_token_analysis
+Analysis/plots

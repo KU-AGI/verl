@@ -18,7 +18,7 @@ RDLogger.DisableLog('rdApp.*')
 # ---- 설정 ----
 model = "ReactionReasoner"  # "predictiononly" or "ReactionReasoner"
 tasks = ["forward", "retro", "reagent"]
-# tasks = ["forward"]
+# tasks = ["reagent"]
 max_samples = 10000  # 각 task별 최대 샘플 수
 
 
@@ -189,335 +189,338 @@ all_results = {}
 all_predictions = {}
 all_ground_truths = {}
 # for temp in [0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0]:
-for temp in [1.0]:
-    for strategy in ["force_reflection", "naive_sampling"]:
-    # for strategy in ["naive_sampling", "step123greedy_then_naive_sampling", "step123sampling_then_greedy_sampling", "step12345greedy_then_naive_sampling", "step123456greedy_then_naive_sampling", "step123456greedy_then_naive_sampling"]:
-        TEMPERATURE = temp
-        STRATEGY = strategy
-        if model == "predictiononly":
-            MAX_TOKENS = 500
-        elif model == "ReactionReasoner":
-            MAX_TOKENS = 1700
-        else:
-            raise ValueError(f"Unknown model: {model}")
-        
-        # 한 입력당 생성할 후보 수
-        if temp == 0.0:
-            NUM_GENERATIONS = 1
-            STRATEGY = "greedy"
-            MAX_TOKENS = 1700
-            if f"0.0, {STRATEGY}" in all_results:
-                # 이미 처리됨
-                continue
-        else:
-            NUM_GENERATIONS = 16
-
-        all_results[f"{TEMPERATURE}, {STRATEGY}"] = {}
-        all_predictions[f"{TEMPERATURE}, {STRATEGY}"] = {}
-        all_ground_truths[f"{TEMPERATURE}, {STRATEGY}"] = {}
-
-        # 서버별 동시 요청 수
-        PER_SERVER_CONCURRENCY = 50
-
-        if model == "predictiononly":
-            IP_PORTs = [
-                "114.110.130.181:8000",
-                # "114.110.130.181:8001",
-                # "114.110.130.181:8002",
-                # "114.110.130.181:8003",
-                # "114.110.130.181:8004",
-                # "114.110.130.181:8005",
-                # "114.110.130.181:8006",
-                # "114.110.130.181:8007",
-            ]
-        elif model == "ReactionReasoner":
-            IP_PORTs = [
-                "192.169.0.2:8000",
-                "192.169.0.2:8001",
-                "192.169.0.2:8002",
-                "192.169.0.2:8003",
-                "192.169.0.2:8004",
-                "192.169.0.2:8005",
-                "192.169.0.2:8006",
-                "192.169.0.2:8007",
-                "192.169.0.3:8000",
-                "192.169.0.3:8001",
-                "192.169.0.3:8002",
-                "192.169.0.3:8003",
-                "192.169.0.3:8004",
-                "192.169.0.3:8005",
-                "192.169.0.3:8006",
-                "192.169.0.3:8007",
-            ]
-        NUM_SERVERS = len(IP_PORTs)
-
-        # OpenAI 클라이언트(서버별)
-        clients = [
-            OpenAI(base_url=f"http://{ip_port}/v1", api_key="EMPTY")
-            for ip_port in IP_PORTs
-        ]
-        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B", trust_remote_code=True)
-
-        # # 서버별 세마포어 (동시성 제어)
-        # server_semaphores = [threading.Semaphore(PER_SERVER_CONCURRENCY) for _ in range(NUM_SERVERS)]
-
-        evaluator = MoleculeSMILESEvaluator()
-
-        def _extract_answer_from_content(content):
-            """응답에서 <ANSWER>...</ANSWER> 태그로 감싸진 부분을 안전하게 추출"""
-            try:
-                return content.split("<ANSWER>")[-1].split("</ANSWER>")[0].strip()
-            except Exception:
-                return content.strip()
-
-        def call_model_collect_n(client, messages, d, model_path="/models/ReactionReasoner", **kwargs):
-            """
-            한 입력(messages)에 대해 총 `num_required`개의 생성 결과를 수집하여 리스트로 반환.
-            """
-            collected = []
+for temp in [0.0, 1.0]:
+    for strategy in ["naive_sampling", "force_reflection"]:
+    # for strategy in ["naive_sampling"]:
+        # for n_generations in [4, 8, 12, 16, 20]:
+        for n_generations in [8]:
+        # for strategy in ["naive_sampling", "step123greedy_then_naive_sampling", "step123sampling_then_greedy_sampling", "step12345greedy_then_naive_sampling", "step123456greedy_then_naive_sampling", "step123456greedy_then_naive_sampling"]:
+            TEMPERATURE = temp
+            STRATEGY = strategy
+            if model == "predictiononly":
+                MAX_TOKENS = 500
+            elif model == "ReactionReasoner":
+                MAX_TOKENS = 1700
+            else:
+                raise ValueError(f"Unknown model: {model}")
+            
+            # 한 입력당 생성할 후보 수
             if temp == 0.0:
-                completion = client.chat.completions.create(
-                    model=model_path,
-                    messages=messages,
-                    n=1,
-                    temperature=0.0,
-                    max_tokens=1700,
-                )
-                choices = getattr(completion, "choices", None) or completion.get("choices", [])
-                for ch in choices:
-                    # 여러 포맷 대비 안전한 접근
-                    content = ""
-                    try:
-                        content = ch.message.content
-                    except Exception:
-                        # dict-like 혹은 다른 구조에 대비
-                        content = ch.get("message", {}).get("content") if isinstance(ch, dict) else getattr(ch, "text", None) or str(ch)
-                    # if "<REFLECTION>" in content:
-                    #     print(f"REFLECTION found")
-                    ans = _extract_answer_from_content(content or "")
-                    collected.append(ans)
-            elif STRATEGY == "naive_sampling":
-                completion = client.chat.completions.create(
-                    model=model_path,
-                    messages=messages,
-                    n=NUM_GENERATIONS,
-                    temperature=kwargs.get("temperature", 0.0),
-                    max_tokens=kwargs.get("max_tokens", 1700),
-                )
-                choices = getattr(completion, "choices", None) or completion.get("choices", [])
-                for ch in choices:
-                    # 여러 포맷 대비 안전한 접근
-                    content = ""
-                    try:
-                        content = ch.message.content
-                    except Exception:
-                        # dict-like 혹은 다른 구조에 대비
-                        content = ch.get("message", {}).get("content") if isinstance(ch, dict) else getattr(ch, "text", None) or str(ch)
-                    # if "<REFLECTION>" in content:
-                    #     print(f"REFLECTION found")
-                    ans = _extract_answer_from_content(content or "")
-                    collected.append(ans)
-            elif STRATEGY == "force_reflection":
-                if task == "forward":
-                    refl_steps = [4, 5, 6]
-                elif task == "retro":
-                    refl_steps = [5, 6, 7]
-                elif task == "reagent":
-                    refl_steps = [6, 7]
-                else:
-                    raise ValueError(f"Unknown task: {task}")
+                NUM_GENERATIONS = 1
+                STRATEGY = "greedy"
+                MAX_TOKENS = 1700
+                if f"0.0, {STRATEGY}" in all_results:
+                    # 이미 처리됨
+                    continue
+            else:
+                NUM_GENERATIONS = n_generations
 
-                for request_i in range(NUM_GENERATIONS):
-                    raw_prompt = tokenizer.apply_chat_template(
-                        messages,
-                        tokenize=False,
-                        add_generation_prompt=True,
-                        enable_thinking=True,
+            all_results[f"{TEMPERATURE}, {STRATEGY}"] = {}
+            all_predictions[f"{TEMPERATURE}, {STRATEGY}"] = {}
+            all_ground_truths[f"{TEMPERATURE}, {STRATEGY}"] = {}
+
+            # 서버별 동시 요청 수
+            PER_SERVER_CONCURRENCY = 50
+
+            if model == "predictiononly":
+                IP_PORTs = [
+                    "114.110.130.181:8000",
+                    # "114.110.130.181:8001",
+                    # "114.110.130.181:8002",
+                    # "114.110.130.181:8003",
+                    # "114.110.130.181:8004",
+                    # "114.110.130.181:8005",
+                    # "114.110.130.181:8006",
+                    # "114.110.130.181:8007",
+                ]
+            elif model == "ReactionReasoner":
+                IP_PORTs = [
+                    "192.169.0.2:8000",
+                    "192.169.0.2:8001",
+                    "192.169.0.2:8002",
+                    "192.169.0.2:8003",
+                    "192.169.0.2:8004",
+                    "192.169.0.2:8005",
+                    "192.169.0.2:8006",
+                    "192.169.0.2:8007",
+                    "192.169.0.3:8000",
+                    "192.169.0.3:8001",
+                    "192.169.0.3:8002",
+                    "192.169.0.3:8003",
+                    "192.169.0.3:8004",
+                    "192.169.0.3:8005",
+                    "192.169.0.3:8006",
+                    "192.169.0.3:8007",
+                ]
+            NUM_SERVERS = len(IP_PORTs)
+
+            # OpenAI 클라이언트(서버별)
+            clients = [
+                OpenAI(base_url=f"http://{ip_port}/v1", api_key="EMPTY")
+                for ip_port in IP_PORTs
+            ]
+            tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B", trust_remote_code=True)
+
+            # # 서버별 세마포어 (동시성 제어)
+            # server_semaphores = [threading.Semaphore(PER_SERVER_CONCURRENCY) for _ in range(NUM_SERVERS)]
+
+            evaluator = MoleculeSMILESEvaluator()
+
+            def _extract_answer_from_content(content):
+                """응답에서 <ANSWER>...</ANSWER> 태그로 감싸진 부분을 안전하게 추출"""
+                try:
+                    return content.split("<ANSWER>")[-1].split("</ANSWER>")[0].strip()
+                except Exception:
+                    return content.strip()
+
+            def call_model_collect_n(client, messages, d, model_path="/models/ReactionReasoner", **kwargs):
+                """
+                한 입력(messages)에 대해 총 `num_required`개의 생성 결과를 수집하여 리스트로 반환.
+                """
+                collected = []
+                if temp == 0.0:
+                    completion = client.chat.completions.create(
+                        model=model_path,
+                        messages=messages,
+                        n=1,
+                        temperature=0.0,
+                        max_tokens=1700,
                     )
-                    for step_i, step in enumerate(refl_steps):
-                        stop_strs = [f"## Step {step + 1}", "<ANSWER>", "</think>"]
+                    choices = getattr(completion, "choices", None) or completion.get("choices", [])
+                    for ch in choices:
+                        # 여러 포맷 대비 안전한 접근
+                        content = ""
+                        try:
+                            content = ch.message.content
+                        except Exception:
+                            # dict-like 혹은 다른 구조에 대비
+                            content = ch.get("message", {}).get("content") if isinstance(ch, dict) else getattr(ch, "text", None) or str(ch)
+                        # if "<REFLECTION>" in content:
+                        #     print(f"REFLECTION found")
+                        ans = _extract_answer_from_content(content or "")
+                        collected.append(ans)
+                elif STRATEGY == "naive_sampling":
+                    completion = client.chat.completions.create(
+                        model=model_path,
+                        messages=messages,
+                        n=NUM_GENERATIONS,
+                        temperature=kwargs.get("temperature", 0.0),
+                        max_tokens=kwargs.get("max_tokens", 1700),
+                    )
+                    choices = getattr(completion, "choices", None) or completion.get("choices", [])
+                    for ch in choices:
+                        # 여러 포맷 대비 안전한 접근
+                        content = ""
+                        try:
+                            content = ch.message.content
+                        except Exception:
+                            # dict-like 혹은 다른 구조에 대비
+                            content = ch.get("message", {}).get("content") if isinstance(ch, dict) else getattr(ch, "text", None) or str(ch)
+                        # if "<REFLECTION>" in content:
+                        #     print(f"REFLECTION found")
+                        ans = _extract_answer_from_content(content or "")
+                        collected.append(ans)
+                elif STRATEGY == "force_reflection":
+                    if task == "forward":
+                        refl_steps = [4, 5, 6]
+                    elif task == "retro":
+                        refl_steps = [5, 6, 7]
+                    elif task == "reagent":
+                        refl_steps = [6, 7]
+                    else:
+                        raise ValueError(f"Unknown task: {task}")
+
+                    for request_i in range(NUM_GENERATIONS):
+                        raw_prompt = tokenizer.apply_chat_template(
+                            messages,
+                            tokenize=False,
+                            add_generation_prompt=True,
+                            enable_thinking=True,
+                        )
+                        for step_i, step in enumerate(refl_steps):
+                            stop_strs = [f"## Step {step + 1}", "<ANSWER>", "</think>"]
+                            response = client.completions.create(
+                                model=model_path,
+                                prompt=raw_prompt,
+                                n=1,
+                                temperature=kwargs.get("temperature", 0.0),
+                                max_tokens=kwargs.get("max_tokens", 1700),
+                                stop=stop_strs,
+                            )
+                            choices = getattr(response, "choices", None) or response.get("choices", [])
+                            response = choices[0].text
+                            raw_prompt += response
+                            raw_prompt = remove_last_reflection_block(raw_prompt).strip()
+                            step_correct = is_step_correct(step, task, d, raw_prompt)
+                            if step_correct:
+                                if step_i == len(refl_steps) - 1:
+                                    next_tag = "\n</think>"
+                                else:
+                                    next_tag = f"\n\n## Step {step + 1}"
+                            else:
+                                if step_i == len(refl_steps) - 1:
+                                    next_tag = "\n<REFLECTION>"
+                                else:
+                                    next_tag = "\n\n<REFLECTION>"
+                            raw_prompt += next_tag
                         response = client.completions.create(
                             model=model_path,
                             prompt=raw_prompt,
                             n=1,
                             temperature=kwargs.get("temperature", 0.0),
                             max_tokens=kwargs.get("max_tokens", 1700),
-                            stop=stop_strs,
                         )
                         choices = getattr(response, "choices", None) or response.get("choices", [])
                         response = choices[0].text
                         raw_prompt += response
-                        raw_prompt = remove_last_reflection_block(raw_prompt).strip()
-                        step_correct = is_step_correct(step, task, d, raw_prompt)
-                        if step_correct:
-                            if step_i == len(refl_steps) - 1:
-                                next_tag = "\n</think>"
-                            else:
-                                next_tag = f"\n\n## Step {step + 1}"
-                        else:
-                            if step_i == len(refl_steps) - 1:
-                                next_tag = "\n<REFLECTION>"
-                            else:
-                                next_tag = "\n\n<REFLECTION>"
-                        raw_prompt += next_tag
-                    response = client.completions.create(
-                        model=model_path,
-                        prompt=raw_prompt,
-                        n=1,
-                        temperature=kwargs.get("temperature", 0.0),
-                        max_tokens=kwargs.get("max_tokens", 1700),
-                    )
-                    choices = getattr(response, "choices", None) or response.get("choices", [])
-                    response = choices[0].text
-                    raw_prompt += response
-                    ans = _extract_answer_from_content(raw_prompt or "")
-                    collected.append(ans)
-            else:
-                raise ValueError(f"Unknown STRATEGY: {STRATEGY}")
+                        ans = _extract_answer_from_content(raw_prompt or "")
+                        collected.append(ans)
+                else:
+                    raise ValueError(f"Unknown STRATEGY: {STRATEGY}")
 
 
-            return collected
+                return collected
 
-        def worker_call(server_idx, messages, d, global_idx):
-            """
-            server_idx: which server to use (0..NUM_SERVERS-1)
-            messages: chat messages
-            global_idx: original data index (for debugging)
-            """
-            # sem = server_semaphores[server_idx]
-            # client = clients[server_idx]
-            # sem.acquire()
-            # try:
-            #     return call_model_collect_n(client, messages, d, num_required=NUM_GENERATIONS, model_path="/models/ReactionReasoner", temperature=TEMPERATURE, max_tokens=MAX_TOKENS)
-            # finally:
-            #     sem.release()
+            def worker_call(server_idx, messages, d, global_idx):
+                """
+                server_idx: which server to use (0..NUM_SERVERS-1)
+                messages: chat messages
+                global_idx: original data index (for debugging)
+                """
+                # sem = server_semaphores[server_idx]
+                # client = clients[server_idx]
+                # sem.acquire()
+                # try:
+                #     return call_model_collect_n(client, messages, d, num_required=NUM_GENERATIONS, model_path="/models/ReactionReasoner", temperature=TEMPERATURE, max_tokens=MAX_TOKENS)
+                # finally:
+                #     sem.release()
 
-            ip_port = IP_PORTs[server_idx]
-            client = OpenAI(base_url=f"http://{ip_port}/v1", api_key="EMPTY")
-            return call_model_collect_n(
-                client,
-                messages,
-                d,
-                model_path="/models/ReactionReasoner",
-                temperature=TEMPERATURE,
-                max_tokens=MAX_TOKENS,
-            )
+                ip_port = IP_PORTs[server_idx]
+                client = OpenAI(base_url=f"http://{ip_port}/v1", api_key="EMPTY")
+                return call_model_collect_n(
+                    client,
+                    messages,
+                    d,
+                    model_path="/models/ReactionReasoner",
+                    temperature=TEMPERATURE,
+                    max_tokens=MAX_TOKENS,
+                )
 
-        # ---- 작업 루프 (task별) ----
-        for task in tasks:
-            system_prompt = pretraining_system_prompt
-            gt_molecules = []
-            pred_molecules = []
+            # ---- 작업 루프 (task별) ----
+            for task in tasks:
+                system_prompt = pretraining_system_prompt
+                gt_molecules = []
+                pred_molecules = []
 
-            with open(f"/data/llm-reaction-reasoning/data/orderly/excluded_test/excluded_{task}_test_v10.json", "r") as f:
-                data = json.load(f)[:max_samples]
-            # with open(f"/data/data/orderly/excluded_test/excluded_{task}_test_v10_required.jsonl", "r") as f:
-            #     data = [json.loads(line) for line in f.readlines()][:max_samples]
+                with open(f"/data/llm-reaction-reasoning/data/orderly/excluded_test/excluded_{task}_test_v10.json", "r") as f:
+                    data = json.load(f)[:max_samples]
+                # with open(f"/data/data/orderly/excluded_test/excluded_{task}_test_v10_required.jsonl", "r") as f:
+                #     data = [json.loads(line) for line in f.readlines()][:max_samples]
 
-            if task == "forward":
-                user_prompt_template = forward_user_prompt_templates[0]
-            elif task == "retro":
-                user_prompt_template = retro_user_prompt_templates[0]
-            elif task == "reagent":
-                user_prompt_template = reagent_user_prompt_templates[0]
-            else:
-                raise ValueError(f"Unknown task: {task}")
+                if task == "forward":
+                    user_prompt_template = forward_user_prompt_templates[0]
+                elif task == "retro":
+                    user_prompt_template = retro_user_prompt_templates[0]
+                elif task == "reagent":
+                    user_prompt_template = reagent_user_prompt_templates[0]
+                else:
+                    raise ValueError(f"Unknown task: {task}")
 
-            n = len(data)
-            preds_by_index = [None] * n
-            gts_by_index = [None] * n
+                n = len(data)
+                preds_by_index = [None] * n
+                gts_by_index = [None] * n
 
-            # Thread pool의 총 워커 수: 서버 수 * 서버별 동시성
-            max_workers = NUM_SERVERS * PER_SERVER_CONCURRENCY
-            with ProcessPoolExecutor(max_workers=max_workers) as executor:
-                futures = {}
-                for idx, d in enumerate(data):
-                    # prepare input
-                    if task == "forward":
-                        input_smiles = f"{'.'.join(d['reactants'] + d['reagents'])}"
-                        gt_keys = ["products"]
-                    elif task == "retro":
-                        input_smiles = ".".join(d['products'])
-                        gt_keys = ["reactants"]
-                    elif task == "reagent":
-                        input_smiles = f"{'.'.join(d['reactants'])}>>{'.'.join(d['products'])}"
-                        gt_keys = ["reagents"]
+                # Thread pool의 총 워커 수: 서버 수 * 서버별 동시성
+                max_workers = NUM_SERVERS * PER_SERVER_CONCURRENCY
+                with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                    futures = {}
+                    for idx, d in enumerate(data):
+                        # prepare input
+                        if task == "forward":
+                            input_smiles = f"{'.'.join(d['reactants'] + d['reagents'])}"
+                            gt_keys = ["products"]
+                        elif task == "retro":
+                            input_smiles = ".".join(d['products'])
+                            gt_keys = ["reactants"]
+                        elif task == "reagent":
+                            input_smiles = f"{'.'.join(d['reactants'])}>>{'.'.join(d['products'])}"
+                            gt_keys = ["reagents"]
 
-                    user_prompt = user_prompt_template.replace("[SMILES]", input_smiles)
-                    gt = ""
-                    for gt_key in gt_keys:
-                        gt += ".".join(d[gt_key]) + "."
-                    gt = gt.strip(".")
-                    messages = [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt}
-                    ]
+                        user_prompt = user_prompt_template.replace("[SMILES]", input_smiles)
+                        gt = ""
+                        for gt_key in gt_keys:
+                            gt += ".".join(d[gt_key]) + "."
+                        gt = gt.strip(".")
+                        messages = [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt}
+                        ]
 
-                    # 라운드로빈으로 서버 선택
-                    server_idx = idx % NUM_SERVERS
+                        # 라운드로빈으로 서버 선택
+                        server_idx = idx % NUM_SERVERS
 
-                    fut = executor.submit(worker_call, server_idx, messages, d, idx)
-                    futures[fut] = idx
-                    gts_by_index[idx] = gt
+                        fut = executor.submit(worker_call, server_idx, messages, d, idx)
+                        futures[fut] = idx
+                        gts_by_index[idx] = gt
 
-                # 진행바: futures 완료를 기다리며 업데이트
-                for fut in tqdm(
-                    as_completed(futures),
-                    total=len(futures),
-                    desc=f"Task {task}"
-                ):
-                    idx = futures[fut]
-                    try:
-                        preds_list = fut.result()  # 이제 list[str] (길이 NUM_GENERATIONS)
-                    except Exception:
-                        print(f"[ERROR] request idx={idx} failed. Filling with {NUM_GENERATIONS} empty predictions. Exception:")
-                        traceback.print_exc()
-                        preds_list = [""] * NUM_GENERATIONS
-                    # evaluator expects e.g. [["pred1","pred2",...], ["pred1",...], ...]
-                    preds_by_index[idx] = preds_list
+                    # 진행바: futures 완료를 기다리며 업데이트
+                    for fut in tqdm(
+                        as_completed(futures),
+                        total=len(futures),
+                        desc=f"Task {task}"
+                    ):
+                        idx = futures[fut]
+                        try:
+                            preds_list = fut.result()  # 이제 list[str] (길이 NUM_GENERATIONS)
+                        except Exception:
+                            print(f"[ERROR] request idx={idx} failed. Filling with {NUM_GENERATIONS} empty predictions. Exception:")
+                            traceback.print_exc()
+                            preds_list = [""] * NUM_GENERATIONS
+                        # evaluator expects e.g. [["pred1","pred2",...], ["pred1",...], ...]
+                        preds_by_index[idx] = preds_list
 
-            # 정렬된 결과 사용
-            gt_molecules = gts_by_index
-            pred_molecules = preds_by_index
+                # 정렬된 결과 사용
+                gt_molecules = gts_by_index
+                pred_molecules = preds_by_index
 
-            eval_results_passk = evaluator.evaluate_top_m(
-                predictions=pred_molecules,
-                references=gt_molecules,
-                # metrics=["exact_match"],
-            )
-            eval_results_passk = {k: v.item() for k, v in eval_results_passk.items()}
-            eval_results_majority_vote = evaluator.evaluate_majority_vote(
-                predictions=pred_molecules,
-                references=gt_molecules,
-                metrics=["exact_match"],
-            )
-            eval_results_majority_vote = {k: v.item() for k, v in eval_results_majority_vote.items()}
+                eval_results_passk = evaluator.evaluate_top_m(
+                    predictions=pred_molecules,
+                    references=gt_molecules,
+                    # metrics=["exact_match"],
+                )
+                eval_results_passk = {k: v.item() for k, v in eval_results_passk.items()}
+                eval_results_majority_vote = evaluator.evaluate_majority_vote(
+                    predictions=pred_molecules,
+                    references=gt_molecules,
+                    metrics=["exact_match"],
+                )
+                eval_results_majority_vote = {k: v.item() for k, v in eval_results_majority_vote.items()}
 
-            print("=" * 100)
-            print(f"Temperature: {TEMPERATURE}, Strategy: {STRATEGY}")
-            print("Evaluation Results (Pass@K):")
-            print(f"Task: {task}, Model: {model}, Generations per input: {NUM_GENERATIONS}")
-            print(eval_results_passk)
-            print("=" * 100)
-            print()
-            print("=" * 100)
-            print(f"Temperature: {TEMPERATURE}, Strategy: {STRATEGY}")
-            print("Evaluation Results (Majority Vote):")
-            print(f"Task: {task}, Model: {model}, Generations per input: {NUM_GENERATIONS}")
-            print(eval_results_majority_vote)
-            print("=" * 100)
-            print()
-            all_results[f"{TEMPERATURE}, {STRATEGY}"][task] = {
-                "pass@k": eval_results_passk,
-                "majority_vote": eval_results_majority_vote,
-            }
-            all_predictions[f"{TEMPERATURE}, {STRATEGY}"][task] = pred_molecules
-            all_ground_truths[f"{TEMPERATURE}, {STRATEGY}"][task] = gt_molecules
+                print("=" * 100)
+                print(f"Temperature: {TEMPERATURE}, Strategy: {STRATEGY}")
+                print("Evaluation Results (Pass@K):")
+                print(f"Task: {task}, Model: {model}, Generations per input: {NUM_GENERATIONS}")
+                print(eval_results_passk)
+                print("=" * 100)
+                print()
+                print("=" * 100)
+                print(f"Temperature: {TEMPERATURE}, Strategy: {STRATEGY}")
+                print("Evaluation Results (Majority Vote):")
+                print(f"Task: {task}, Model: {model}, Generations per input: {NUM_GENERATIONS}")
+                print(eval_results_majority_vote)
+                print("=" * 100)
+                print()
+                all_results[f"{TEMPERATURE}, {STRATEGY}"][task] = {
+                    "pass@k": eval_results_passk,
+                    "majority_vote": eval_results_majority_vote,
+                }
+                all_predictions[f"{TEMPERATURE}, {STRATEGY}"][task] = pred_molecules
+                all_ground_truths[f"{TEMPERATURE}, {STRATEGY}"][task] = gt_molecules
 
-    # # 결과 저장
-    # with open(f"/llm-reaction-reasoning/Analysis/sampling_analysis_data/{model}_all_results.json", "w") as f:
-    #     json.dump(all_results, f, indent=4)
-    # with open(f"/llm-reaction-reasoning/Analysis/sampling_analysis_data/{model}_all_predictions.json", "w") as f:
-    #     json.dump(all_predictions, f, indent=4)
-    # with open(f"/llm-reaction-reasoning/Analysis/sampling_analysis_data/{model}_all_ground_truths.json", "w") as f:
-    #     json.dump(all_ground_truths, f, indent=4)
+        # # 결과 저장
+        # with open(f"/llm-reaction-reasoning/Analysis/sampling_analysis_data/{model}_all_results.json", "w") as f:
+        #     json.dump(all_results, f, indent=4)
+        # with open(f"/llm-reaction-reasoning/Analysis/sampling_analysis_data/{model}_all_predictions.json", "w") as f:
+        #     json.dump(all_predictions, f, indent=4)
+        # with open(f"/llm-reaction-reasoning/Analysis/sampling_analysis_data/{model}_all_ground_truths.json", "w") as f:
+        #     json.dump(all_ground_truths, f, indent=4)

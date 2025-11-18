@@ -6,7 +6,7 @@ export WANDB_PROJECT="verl-dapo"
 export NCCL_DEBUG="WARN"
 
 project_name='verl-dapo'
-exp_name='refl_bonus_0.3_2node'
+exp_name='refl_bonus_0.0_2node'
 
 # Ray
 RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
@@ -53,7 +53,7 @@ use_response_mask_to_reflection_step=False
 use_content_reward=True
 use_decision_reward=True
 use_reflection_bonus=True
-reflection_bonus_weight=0.3
+reflection_bonus_weight=0.0
 
 # Response length parameters
 max_prompt_length=500 # $((1024 * 2))
