@@ -6,7 +6,7 @@ export WANDB_PROJECT="verl-dapo"
 export NCCL_DEBUG="WARN"
 
 project_name='verl-dapo'
-exp_name='refl_rollout'
+exp_name='debug'
 
 # Ray
 RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
@@ -85,7 +85,7 @@ sp_size=1
 fsdp_size=4 # Must be divisible by (n_gpus_training*n_nodes) and (n_gpus_rollout*n_nodes)
 
 # Fully async specific parameters
-NNODES=${NNODES:-2}
+NNODES=${NNODES:-1}
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
 
 n_gpus_rollout=4
@@ -104,10 +104,10 @@ partial_rollout=False
 save_freq=$((test_freq * trigger_parameter_sync_step * 6))
 
 
-# python -m recipe.fully_async_policy.fully_async_main \
-ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
-    --working-dir "${WORKING_DIR}" \
-    -- python -m recipe.fully_async_policy.fully_async_main \
+# ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
+#     --working-dir "${WORKING_DIR}" \
+#     -- python -m recipe.fully_async_policy.fully_async_main \
+python -m recipe.fully_async_policy.fully_async_main \
     --config-name="fully_async_ppo_trainer.yaml" \
     data.train_files="${TRAIN_FILE}" \
     data.val_files="${VAL_FILE}" \
@@ -192,7 +192,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     trainer.logger=['console','wandb'] \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
-    trainer.val_before_train=True \
+    trainer.val_before_train=False \
     trainer.default_local_dir="${CKPTS_DIR}" \
     trainer.validation_data_dir="${DUMP_DIR}/val" \
     trainer.test_data_dir="${DUMP_DIR}/test" \

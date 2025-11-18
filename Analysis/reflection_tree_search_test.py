@@ -54,6 +54,22 @@ def remove_last_reflection_block(text: str) -> str:
     # 마지막 reflection 블록 제거
     return text[:start_tag_pos].rstrip()
 
+def remove_last_reflection_block_ids(token_ids: list, reflection_ids: list=[27, 5996, 28017, 29]) -> list:
+    n = len(reflection_ids)
+    last_idx = -1
+
+    # 전체 token_ids에서 reflection_ids가 등장하는 모든 위치 탐색
+    for i in range(len(token_ids) - n + 1):
+        if token_ids[i:i+n] == reflection_ids:
+            last_idx = i
+
+    # reflection이 하나도 없으면 전체 반환
+    if last_idx == -1:
+        return token_ids
+
+    # 마지막 reflection 시작 직전까지만 반환
+    return token_ids[:last_idx]
+
 def parse_steps_with_reflections(text: str):
     """
     주어진 문자열을 Step 단위로 파싱하고,
@@ -189,9 +205,9 @@ all_results = {}
 all_predictions = {}
 all_ground_truths = {}
 # for temp in [0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0]:
-for temp in [0.0, 1.0]:
-    for strategy in ["naive_sampling", "force_reflection"]:
-    # for strategy in ["naive_sampling"]:
+for temp in [1.0]:
+    # for strategy in ["naive_sampling", "force_reflection"]:
+    for strategy in ["force_reflection"]:
         # for n_generations in [4, 8, 12, 16, 20]:
         for n_generations in [8]:
         # for strategy in ["naive_sampling", "step123greedy_then_naive_sampling", "step123sampling_then_greedy_sampling", "step12345greedy_then_naive_sampling", "step123456greedy_then_naive_sampling", "step123456greedy_then_naive_sampling"]:
@@ -220,7 +236,7 @@ for temp in [0.0, 1.0]:
             all_ground_truths[f"{TEMPERATURE}, {STRATEGY}"] = {}
 
             # 서버별 동시 요청 수
-            PER_SERVER_CONCURRENCY = 50
+            PER_SERVER_CONCURRENCY = 1
 
             if model == "predictiononly":
                 IP_PORTs = [
@@ -235,22 +251,22 @@ for temp in [0.0, 1.0]:
                 ]
             elif model == "ReactionReasoner":
                 IP_PORTs = [
-                    "192.169.0.2:8000",
-                    "192.169.0.2:8001",
-                    "192.169.0.2:8002",
-                    "192.169.0.2:8003",
-                    "192.169.0.2:8004",
-                    "192.169.0.2:8005",
-                    "192.169.0.2:8006",
-                    "192.169.0.2:8007",
+                    # "192.169.0.2:8000",
+                    # "192.169.0.2:8001",
+                    # "192.169.0.2:8002",
+                    # "192.169.0.2:8003",
+                    # "192.169.0.2:8004",
+                    # "192.169.0.2:8005",
+                    # "192.169.0.2:8006",
+                    # "192.169.0.2:8007",
                     "192.169.0.3:8000",
-                    "192.169.0.3:8001",
-                    "192.169.0.3:8002",
-                    "192.169.0.3:8003",
-                    "192.169.0.3:8004",
-                    "192.169.0.3:8005",
-                    "192.169.0.3:8006",
-                    "192.169.0.3:8007",
+                    # "192.169.0.3:8001",
+                    # "192.169.0.3:8002",
+                    # "192.169.0.3:8003",
+                    # "192.169.0.3:8004",
+                    # "192.169.0.3:8005",
+                    # "192.169.0.3:8006",
+                    # "192.169.0.3:8007",
                 ]
             NUM_SERVERS = len(IP_PORTs)
 
@@ -338,7 +354,7 @@ for temp in [0.0, 1.0]:
                             enable_thinking=True,
                         )
                         for step_i, step in enumerate(refl_steps):
-                            stop_strs = [f"## Step {step + 1}", "<ANSWER>", "</think>"]
+                            stop_strs = [f"## Step {step + 1}", "<REFLECTION>", "<ANSWER>", "</think>"]
                             response = client.completions.create(
                                 model=model_path,
                                 prompt=raw_prompt,
