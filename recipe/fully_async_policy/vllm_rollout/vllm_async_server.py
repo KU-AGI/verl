@@ -63,6 +63,7 @@ class vLLMHttpServerForPartial(vLLMHttpServerBase):
     ):
         max_tokens = self.config.max_model_len - len(prompt_ids)
         sampling_params["logprobs"] = 1
+        sampling_params["prompt_logprobs"] = 1
         sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
         prompt_ids = _qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
@@ -104,18 +105,27 @@ class vLLMHttpServerForPartial(vLLMHttpServerBase):
 
         async with self.lock:
             if self.req_output[request_id] is None:
-                return [], [], True
+                return [], [], [], True
             token_ids = self.req_output[request_id].outputs[0].token_ids
             log_probs: list[float] = []
+            prompt_logprobs: list[float] = []
             for i, x in enumerate(self.req_output[request_id].outputs[0].logprobs):
                 # In sampling_params, logprobs is set to 1, which should return 1,
                 # but in practice there are multiple. Take the log_prob corresponding to token_id
                 token_id = self.req_output[request_id].outputs[0].token_ids[i]
                 log_probs.append(x[token_id].logprob)
+            # extract prompt logprobs
+            for i, x in enumerate(self.req_output[request_id].prompt_logprobs):
+                if x:
+                    k, v = list(x.items())[0]
+                    prompt_logprobs.append(v.logprob)
+                else:
+                    prompt_logprobs.append(0.0)
+
             is_cancel = generation_handle not in done
             self.cancel_event.pop(request_id, None)
             self.req_output.pop(request_id, None)
-        return token_ids, log_probs, is_cancel
+        return token_ids, log_probs, prompt_logprobs, is_cancel
 
     async def cancel(self):
         async with self.lock:
