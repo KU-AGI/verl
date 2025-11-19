@@ -419,8 +419,8 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             # Prompt id
             pid = prompt_id[i]
 
-            with open(os.path.join(image_dir, f"text_{pid}_{id}.txt"), 'w', encoding='utf-8') as f:
-                f.write(f"Sample {pid}'s {id}\n")
+            with open(os.path.join(image_dir, f"text_{pid}_{id}_{i}.txt"), 'w', encoding='utf-8') as f:
+                f.write(f"Sample {pid}'s {i}th {id}\n")
                 f.write("=" * 40 + "\n")
                 
                 # Save input text
@@ -428,20 +428,20 @@ class RayImageGenerationTrainer(RayPPOTrainer):
 
                 if task_id == 1:
                     # Save generated image
-                    save_path = os.path.join(image_dir, f"gen_img_{pid}_{id}.png")
+                    save_path = os.path.join(image_dir, f"gen_img_{pid}_{id}_{i}.png")
                     PIL.Image.fromarray(gen_imgs_pil_list[i].astype(np.uint8)).save(save_path)
                     f.write(f"Generated Image:\nimg_{pid}_{id}.png\n\n")
                     task1_reward_response = reward_extra_infos_dict["task1_reward_response"][i]
                     f.write(f"Response of task1 reward:\n{task1_reward_response}\n\n")
 
                     # Save GT image
-                    ground_truth_path = os.path.join(image_dir, f"ground_truth_{pid}_{id}.png")
+                    ground_truth_path = os.path.join(image_dir, f"ground_truth_{pid}_{id}_{i}.png")
                     PIL.Image.open(gts_imgs[i]).convert("RGB").save(ground_truth_path)
                     f.write(f"Ground Truth:\nground_truth_{pid}_{id}.png\n\n")
 
                 elif task_id == 2:
                     # Save feedback text
-                    f.write(f"Feedback of {pid}_{id}:\n{feedback_texts[i]}\n\n")
+                    f.write(f"Feedback of {pid}'s {i}th {id}:\n{feedback_texts[i]}\n\n")
                     ground_truth_tuple, ground_truth_vqa_question = gts_tuples[i], gts_vqas[i]
                     f.write(f"Ground Truth:\nTuple:\n{ground_truth_tuple}\nVQA:\n{ground_truth_vqa_question}\n\n")
                     task2_reward_response = reward_extra_infos_dict["task2_reward_response"][i]
@@ -449,16 +449,16 @@ class RayImageGenerationTrainer(RayPPOTrainer):
 
                 elif task_id == 3:
                     # Save regen image
-                    regen_path = os.path.join(image_dir, f"regen_img_{pid}_{id}.png")
+                    regen_path = os.path.join(image_dir, f"regen_img_{pid}_{id}_{i}.png")
                     PIL.Image.fromarray(regen_imgs_pil_list[i].astype(np.uint8)).save(regen_path)
-                    f.write(f"Regenerated Image:\nregen_img_{pid}_{id}.png\n\n")
+                    f.write(f"Regenerated Image:\nregen_img_{pid}_{id}_{i}.png\n\n")
                     task3_reward_response = reward_extra_infos_dict["task3_reward_response"][i]
                     f.write(f"Response task3 reward:\n{task3_reward_response}\n\n")
 
                     # Save GT image
-                    ground_truth_path = os.path.join(image_dir, f"ground_truth_{pid}_{id}.png")
+                    ground_truth_path = os.path.join(image_dir, f"ground_truth_{pid}_{id}_{i}.png")
                     PIL.Image.open(gts_imgs[i]).convert("RGB").save(ground_truth_path)
-                    f.write(f"Ground Truth:\nground_truth_{pid}_{id}.png\n\n")
+                    f.write(f"Ground Truth:\nground_truth_{pid}_{id}_{i}.png\n\n")
 
                 f.write("\n" + "=" * 40 + "\n\n")
         
