@@ -3,9 +3,10 @@ set -xeuo pipefail
 
 export WANDB_ENTITY="llm-reaction-reasoning"
 export WANDB_PROJECT="verl-dapo"
+export NCCL_DEBUG="WARN"
 
 project_name='verl-dapo'
-exp_name='refl_bonus_0.0'
+exp_name='refl_rollout_1.0'
 
 # Ray
 RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
@@ -51,12 +52,12 @@ use_response_mask_to_reflection_step=False
 # Reward related parameters
 use_content_reward=True
 use_decision_reward=True
-use_reflection_bonus=False
+use_reflection_bonus=True
 reflection_bonus_weight=0.0
 
 # Response length parameters
 max_prompt_length=500 # $((1024 * 2))
-max_response_length=1700 # $((1024 * 8))
+max_response_length=2100 # $((1024 * 8))
 enable_overlong_buffer=False
 overlong_buffer_len=0 # $((1024 * 4))
 overlong_penalty_factor=1.0
@@ -71,6 +72,8 @@ top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
 val_temperature=0.0
 val_top_k=0.0
 val_top_p=1.0
+rollout_strategy="reflection_sampling" # "naive_sampling" | "reflection_sampling"
+strategy_ratio=1.0 # 1.0 means all use above rollout_strategy, 0.0 means all use naive_sampling
 
 # Performance Related Parameter
 use_dynamic_bsz=True
@@ -93,10 +96,10 @@ train_prompt_bsz=0
 gen_prompt_bsz=1
 n_resp_per_prompt=8
 train_prompt_mini_bsz=16
-total_rollout_steps=$(((512*1000000)))
+total_rollout_steps=$(((512*100000)))
 test_freq=1
 staleness_threshold=0.0
-trigger_parameter_sync_step=50
+trigger_parameter_sync_step=100
 require_batches=3
 partial_rollout=False
 save_freq=$((test_freq * trigger_parameter_sync_step * 6))
@@ -198,6 +201,8 @@ python -m recipe.fully_async_policy.fully_async_main \
     trainer.nnodes="${NNODES}" \
     trainer.n_gpus_per_node="${n_gpus_training}" \
     rollout.nnodes="${NNODES}" \
+    +rollout.strategy=${rollout_strategy} \
+    +rollout.strategy_ratio=${strategy_ratio} \
     rollout.n_gpus_per_node="${n_gpus_rollout}" \
     trainer.save_freq="${save_freq}" \
     rollout.total_rollout_steps="${total_rollout_steps}" \

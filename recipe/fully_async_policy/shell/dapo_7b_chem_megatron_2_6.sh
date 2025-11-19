@@ -44,7 +44,7 @@ max_num_gen_batches=0
 
 # Response length parameters
 max_prompt_length=500 # $((1024 * 2))
-max_response_length=1700 # $((1024 * 8))
+max_response_length=2100 # $((1024 * 8))
 enable_overlong_buffer=True
 overlong_buffer_len=1000 # $((1024 * 4))
 overlong_penalty_factor=1.0

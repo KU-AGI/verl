@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
 
+export WANDB_ENTITY="llm-reaction-reasoning"
+export WANDB_PROJECT="verl-dapo"
+export NCCL_DEBUG="WARN"
+
 project_name='verl-dapo'
-exp_name='fully_async_2node_debug'
+exp_name='refl_rollout_0.5'
 
 # Ray
 RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
@@ -32,25 +36,34 @@ adv_estimator=grpo
 use_kl_in_reward=False
 kl_coef=0.0
 use_kl_loss=False
-kl_loss_coef=0.0
+kl_loss_coef=0.000
 
-clip_ratio_low=1.0
-clip_ratio_high=1.0
+clip_ratio_low=0.2
+clip_ratio_high=0.2
 
 enable_filter_groups=True
 # filter_groups_metric=acc
 filter_groups_metric=seq_final_reward
 max_num_gen_batches=0
 
+balance_task=True
+use_response_mask_to_reflection_step=False
+
+# Reward related parameters
+use_content_reward=True
+use_decision_reward=True
+use_reflection_bonus=True
+reflection_bonus_weight=0.0
+
 # Response length parameters
 max_prompt_length=500 # $((1024 * 2))
-max_response_length=1700 # $((1024 * 8))
-enable_overlong_buffer=True
-overlong_buffer_len=1000 # $((1024 * 4))
+max_response_length=2100 # $((1024 * 8))
+enable_overlong_buffer=False
+overlong_buffer_len=0 # $((1024 * 4))
 overlong_penalty_factor=1.0
 
 # Training parameters
-loss_agg_mode="token-mean"
+loss_agg_mode="seq-mean-token-sum"
 
 # Algorithm
 temperature=1.0
@@ -59,6 +72,8 @@ top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
 val_temperature=0.0
 val_top_k=0.0
 val_top_p=1.0
+rollout_strategy="reflection_sampling" # "naive_sampling" | "reflection_sampling"
+strategy_ratio=0.5 # 1.0 means all use above rollout_strategy, 0.0 means all use naive_sampling
 
 # Performance Related Parameter
 use_dynamic_bsz=True
@@ -71,29 +86,29 @@ sp_size=1
 fsdp_size=4 # Must be divisible by (n_gpus_training*n_nodes) and (n_gpus_rollout*n_nodes)
 
 # Fully async specific parameters
-NNODES=${NNODES:-2}
+NNODES=${NNODES:-1}
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
 
-n_gpus_rollout=2
+n_gpus_rollout=4
 n_gpus_training=$((NGPUS_PER_NODE - n_gpus_rollout))
 # (train_prompt_mini_bsz * require_batches * n_resp_per_prompt) % total_trainer_gpus == 0 must be satisfied
 train_prompt_bsz=0
 gen_prompt_bsz=1
-n_resp_per_prompt=12
+n_resp_per_prompt=8
 train_prompt_mini_bsz=16
 total_rollout_steps=$(((512*100000)))
-test_freq=5
-staleness_threshold=0.3
-trigger_parameter_sync_step=4
+test_freq=1
+staleness_threshold=0.0
+trigger_parameter_sync_step=100
 require_batches=3
 partial_rollout=False
-save_freq=$((test_freq * trigger_parameter_sync_step * 5))
+save_freq=$((test_freq * trigger_parameter_sync_step * 6))
 
 
-# python -m recipe.fully_async_policy.fully_async_main \
-ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
-    --working-dir "${WORKING_DIR}" \
-    -- python -m recipe.fully_async_policy.fully_async_main \
+# ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
+#     --working-dir "${WORKING_DIR}" \
+#     -- python -m recipe.fully_async_policy.fully_async_main \
+python -m recipe.fully_async_policy.fully_async_main \
     --config-name="fully_async_ppo_trainer.yaml" \
     data.train_files="${TRAIN_FILE}" \
     data.val_files="${VAL_FILE}" \
@@ -103,6 +118,8 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     data.test_shuffle=False \
     data.prompt_key=prompt \
     data.truncation='left' \
+    +data.balance_task=${balance_task} \
+    +data.use_response_mask_to_reflection_step=${use_response_mask_to_reflection_step} \
     data.max_prompt_length=${max_prompt_length} \
     data.max_response_length=${max_response_length} \
     data.train_batch_size=${train_prompt_bsz} \
@@ -113,6 +130,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     algorithm.use_kl_in_reward=${use_kl_in_reward} \
     algorithm.kl_ctrl.kl_coef=${kl_coef} \
     algorithm.filter_groups.enable=${enable_filter_groups} \
+    +algorithm.filter_nonanswered.enable=${enable_filter_groups} \
     algorithm.filter_groups.max_num_gen_batches=${max_num_gen_batches} \
     algorithm.filter_groups.metric=${filter_groups_metric} \
     algorithm.rollout_is_threshold=2.0 \
@@ -134,7 +152,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
-    actor_rollout_ref.actor.optim.lr=2e-7 \
+    actor_rollout_ref.actor.optim.lr=3e-7 \
     actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
     actor_rollout_ref.actor.optim.weight_decay=0.1 \
     actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
@@ -168,6 +186,10 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     +reward_model.reward_kwargs.overlong_buffer_cfg.penalty_factor=${overlong_penalty_factor} \
     +reward_model.reward_kwargs.overlong_buffer_cfg.log=False \
     +reward_model.reward_kwargs.max_resp_len=${max_response_length} \
+    +reward_model.reward_kwargs.use_content_reward=${use_content_reward} \
+    +reward_model.reward_kwargs.use_decision_reward=${use_decision_reward} \
+    +reward_model.reward_kwargs.use_reflection_bonus=${use_reflection_bonus} \
+    +reward_model.reward_kwargs.reflection_bonus_weight=${reflection_bonus_weight} \
     trainer.logger=['console','wandb'] \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
@@ -179,6 +201,8 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     trainer.nnodes="${NNODES}" \
     trainer.n_gpus_per_node="${n_gpus_training}" \
     rollout.nnodes="${NNODES}" \
+    +rollout.strategy=${rollout_strategy} \
+    +rollout.strategy_ratio=${strategy_ratio} \
     rollout.n_gpus_per_node="${n_gpus_rollout}" \
     trainer.save_freq="${save_freq}" \
     rollout.total_rollout_steps="${total_rollout_steps}" \

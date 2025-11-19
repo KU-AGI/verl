@@ -87,7 +87,7 @@ class vLLMHttpServerForPartial(vLLMHttpServerBase):
         async with self.lock:
             if self.paused:
                 # After cancel, all tasks will return directly and wait for the next submission
-                return [], [], True
+                return [], [], [], True
             self.req_output[request_id]: Optional[RequestOutput] = None
             self.cancel_event[request_id] = asyncio.Event()
             cancel_handle = asyncio.create_task(self.cancel_event[request_id].wait())

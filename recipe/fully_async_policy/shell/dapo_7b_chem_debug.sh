@@ -57,7 +57,7 @@ reflection_bonus_weight=0.0
 
 # Response length parameters
 max_prompt_length=500 # $((1024 * 2))
-max_response_length=1700 # $((1024 * 8))
+max_response_length=2100 # $((1024 * 8))
 enable_overlong_buffer=False
 overlong_buffer_len=0 # $((1024 * 4))
 overlong_penalty_factor=1.0
@@ -73,6 +73,7 @@ val_temperature=0.0
 val_top_k=0.0
 val_top_p=1.0
 rollout_strategy="reflection_sampling" # "naive_sampling" | "reflection_sampling"
+strategy_ratio=0.5 # 1.0 means all use above rollout_strategy, 0.0 means all use naive_sampling
 
 # Performance Related Parameter
 use_dynamic_bsz=True
@@ -201,6 +202,7 @@ python -m recipe.fully_async_policy.fully_async_main \
     trainer.n_gpus_per_node="${n_gpus_training}" \
     rollout.nnodes="${NNODES}" \
     +rollout.strategy=${rollout_strategy} \
+    +rollout.strategy_ratio=${strategy_ratio} \
     rollout.n_gpus_per_node="${n_gpus_rollout}" \
     trainer.save_freq="${save_freq}" \
     rollout.total_rollout_steps="${total_rollout_steps}" \
