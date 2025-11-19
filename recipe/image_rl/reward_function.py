@@ -6,7 +6,7 @@ import json
 from io import BytesIO
 from typing import Optional, List, Dict, Any
 import PIL.Image
-from openai import OpenAI
+from openai import OpenAI, AsyncOpenAI
 import numpy as np
 from transformers import AutoTokenizer
 from concurrent.futures import ThreadPoolExecutor
@@ -14,6 +14,9 @@ import time
 from collections import defaultdict
 from verl.utils.reward_score.math_reward import last_boxed_only_string, remove_boxed
 from recipe.image_rl.utils import FormattingEvaluator
+import asyncio
+import threading
+import random
 
 # Configuration
 BASE_URLS = [
@@ -30,9 +33,27 @@ MODEL_NAME = os.environ.get("RM_MODEL_PATH", "Qwen/Qwen3-VL-30B-A3B-Instruct")
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
 # Create sync clients for each URL
-clients = [OpenAI(api_key=API_KEY, base_url=url) for url in BASE_URLS]
-client_index = 0
+clients = [AsyncOpenAI(api_key=API_KEY, base_url=url) for url in BASE_URLS]
 
+# Thread-safe client index management
+class ClientManager:
+    def __init__(self, clients):
+        self.clients = clients
+        self.client_count = len(clients)
+        self.index = 0
+        self.lock = threading.Lock()
+        self.request_counts = {i: 0 for i in range(self.client_count)}
+    
+    def get_next_client(self):
+        with self.lock:
+            client = self.clients[self.index]
+            self.request_counts[self.index] += 1
+            self.index = (self.index + 1) % self.client_count
+            return client, self.index - 1 if self.index > 0 else self.client_count - 1
+
+client_manager = ClientManager(clients)
+
+# 기존 프롬프트 템플릿들은 동일하게 유지
 TASK1_TASK3_IMAGE_GENERATOR_SYSTEM_PROMPT_TEMPLATE = """
 You are an AI assistant that answers a batch of yes/no questions.
 
@@ -168,7 +189,7 @@ def image_evaluator_parser(text):
     return idx_to_ans
 
 
-def get_messages(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, task_id):
+def get_messages(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id):
     if task_id == 1:
         system_prompt = TASK1_TASK3_IMAGE_GENERATOR_SYSTEM_PROMPT_TEMPLATE
         user_prompt = TASK1_TASK3_IMAGE_GENERATOR_USER_PROMPT_TEMPLATE.format(questions=vqa_question)
@@ -207,35 +228,31 @@ def get_messages(prompt, gen_img, feedback_text, regen_img, ground_truth_img, fe
     return messages
 
 
-def get_next_client():
-    """Round-robin client selection"""
-    global client_index
-    client = clients[client_index]
-    client_index = (client_index + 1) % len(clients)
-    return client
-
-
-def get_response(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, task_id):
-    """Get response from API with retry logic"""
-    messages = get_messages(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, task_id)
-    
+async def get_response_with_client(client, client_id, messages):
+    """Get response from a specific client with retry logic"""
     for attempt in range(MAX_RETRIES):
         try:
-            client = get_next_client()
-            response = client.chat.completions.create(
+            response = await client.chat.completions.create(
                 model=MODEL_NAME,
                 messages=messages
             )
             return response.choices[0].message.content
         except Exception as e:
             if attempt < MAX_RETRIES - 1:
-                print(f"Exception: {repr(e)}")
-                delay = BASE_DELAY * (2**attempt)
-                print(f"Retrying in {delay} seconds...")
-                time.sleep(delay)
+                print(f"Client {client_id} attempt {attempt+1} failed: {repr(e)}")
+                delay = BASE_DELAY * (2**attempt) + random.uniform(0, 1)  # Add jitter
+                await asyncio.sleep(delay)
             else:
-                print(f"Failed after {MAX_RETRIES} attempts. Error: {e}")
+                print(f"Client {client_id} failed after {MAX_RETRIES} attempts. Error: {e}")
                 return None
+
+
+async def get_response(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id):
+    """Get response from API with load balancing"""
+    messages = get_messages(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id)
+    
+    client, client_id = client_manager.get_next_client()
+    return await get_response_with_client(client, client_id, messages)
 
 
 def compute_reward(response):
@@ -251,26 +268,27 @@ def compute_reward(response):
     return reward_score
 
 
-def compute_score_single(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id, **kwargs):
-    """Sync version of compute_score"""
+async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id):
+    """Async version of compute_score"""
     reward_score = 0.0
     reward_extra_info = {}
 
     if task_id == 1:
         # VLM based reward
-        response = get_response(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, task_id)
+        response = await get_response(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id)
         if response is not None:
             task1_idx_to_ans: dict = image_evaluator_parser(response)
 
             task1_reward_score = sum(task1_idx_to_ans.values())
             task1_ans_count = len(task1_idx_to_ans)
             
-            task1_score_mean = (task1_reward_score / task1_ans_count) if task1_ans_count > 0 else 0.0
+            task1_score_mean = 1.0 if task1_reward_score == task1_ans_count else 0.0
 
             reward_score += task1_score_mean
             reward_extra_info[f"task{task_id}_reward_response"] = response
         else:
             reward_score += 0.0
+            reward_extra_info[f"task{task_id}_reward_response"] = "No response received"
 
     elif task_id == 2:
         task2_reward_score = 0.0
@@ -285,16 +303,16 @@ def compute_score_single(prompt, gen_img, feedback_text, regen_img, ground_truth
         task2_ans_count += 1
 
         # part 1 scoring
-        feedback_parsed_tuple = formatting_evaluator._parse_part1(feedback_tuple) # gt_part1
-        predict_parsed_tuple = formatting_evaluator._parse_part1(part1) # pred_part2
-        predict_decomposed_ans = formatting_evaluator._extract_answer_paragraphs(part2) # pred_paragraphs
+        feedback_parsed_tuple = formatting_evaluator._parse_part1(feedback_tuple)
+        predict_parsed_tuple = formatting_evaluator._parse_part1(part1)
+        predict_decomposed_ans = formatting_evaluator._extract_answer_paragraphs(part2)
 
         part1_reward_dict = formatting_evaluator._calculate_metrics_for_reward(feedback_parsed_tuple, predict_parsed_tuple, predict_decomposed_ans)
-        task2_reward_score += sum(part1_reward_dict.values()) # 3 of values
+        task2_reward_score += sum(part1_reward_dict.values())
         task2_ans_count += len(part1_reward_dict)
 
         # VLM based reward
-        response = get_response(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, task_id)
+        response = await get_response(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id)
         if response is not None:
             try:
                 raw_json = json.loads(response)
@@ -302,7 +320,7 @@ def compute_score_single(prompt, gen_img, feedback_text, regen_img, ground_truth
                 if label_response in ["targeted_only", "no_feedback_needed"]:
                     task2_reward_score += 1.0
                 elif label_response in ["non_target_touched"]:
-                    task2_reward_score += 0.0 # 0.5
+                    task2_reward_score += 0.0
                 elif label_response in ["global_or_irrelevant"]:
                     task2_reward_score += 0.0
                 else:
@@ -315,7 +333,7 @@ def compute_score_single(prompt, gen_img, feedback_text, regen_img, ground_truth
         else:
             task2_reward_score += 0.0
         
-        reward_score += (task2_reward_score / task2_ans_count) if task2_ans_count > 0 else 0.0 # now 5 parts in total
+        reward_score += (task2_reward_score / task2_ans_count) if task2_ans_count > 0 else 0.0
         reward_extra_info[f"task{task_id}_reward_response"] = response
 
     elif task_id == 3:
@@ -330,18 +348,19 @@ def compute_score_single(prompt, gen_img, feedback_text, regen_img, ground_truth
             }
 
         # VLM based reward
-        response = get_response(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, task_id)
+        response = await get_response(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id)
         if response is not None:
             task3_idx_to_ans: dict = image_evaluator_parser(response)
 
             task3_reward_score = sum(task3_idx_to_ans.values())
             task3_ans_count = len(task3_idx_to_ans)
             
-            task3_score_mean = (task3_reward_score / task3_ans_count) if task3_ans_count > 0 else 0.0
+            task3_score_mean = 1.0 if task3_reward_score == task3_ans_count else 0.0
             reward_score += task3_score_mean
             reward_extra_info[f"task{task_id}_reward_response"] = response
         else:
             reward_score += 0.0
+            reward_extra_info[f"task{task_id}_reward_response"] = "No response received"
 
     return {
         "score": reward_score,
@@ -349,36 +368,53 @@ def compute_score_single(prompt, gen_img, feedback_text, regen_img, ground_truth
     }
 
 
-def compute_score_batch_threaded(prompts, gen_imgs, feedback_texts, regen_imgs, ground_truth_imgs, feedback_tuples, vqa_questions, extra_infos, task_ids):
-    """Threaded batch processing for concurrency"""
+async def compute_score_batch_async(prompts, gen_imgs, feedback_texts, regen_imgs, ground_truth_imgs, feedback_tuples, vqa_questions, extra_infos, task_ids):
+    """Improved async batch processing with better load balancing"""
+    n = len(prompts)
+    if n == 0:
+        return []
+
+    # Create semaphore for concurrency control
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
     
-    def process_single_item(args):
-        prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id = args
-        try:
-            ground_truth_img = PIL.Image.open(ground_truth_img).convert("RGB")
-            return compute_score_single(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id)
-        except Exception as e:
-            print(f"Task failed with exception: {e}")
-            return {"score": 0.0, "reward_extra_info": {}}
+    async def process_single_request(idx, args):
+        async with semaphore:
+            (prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id) = args
+            
+            # Load ground truth image
+            ground_truth_img = await asyncio.to_thread(lambda p=ground_truth_img: PIL.Image.open(p).convert("RGB"))
+            
+            # Process the request with request ID for tracking
+            result = await compute_score_single_async(
+                prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id
+            )
+            
+            return idx, result
+
+    # Create tasks for all requests
+    tasks = []
+    for idx, args in enumerate(zip(
+        prompts, gen_imgs, feedback_texts, regen_imgs, ground_truth_imgs, feedback_tuples, vqa_questions, extra_infos, task_ids
+    )):
+        task = asyncio.create_task(process_single_request(idx, args))
+        tasks.append(task)
+
+    # Wait for all tasks to complete
+    results = [None] * n
+    completed_tasks = await asyncio.gather(*tasks, return_exceptions=True)
     
-    # Prepare arguments for ThreadPoolExecutor
-    args_list = list(zip(prompts, gen_imgs, feedback_texts, regen_imgs, ground_truth_imgs, feedback_tuples, vqa_questions, extra_infos, task_ids))
-    
-    # Use ThreadPoolExecutor for concurrent processing
-    with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_REQUESTS) as executor:
-        results = list(executor.map(process_single_item, args_list))
-    
+    for result in completed_tasks:
+        if isinstance(result, Exception):
+            print(f"Task failed with exception: {result}")
+        else:
+            idx, res = result
+            results[idx] = res
+
     return results
 
 
 def compute_score_batch(prompts, gen_imgs, feedback_texts, regen_imgs, ground_truth_imgs, feedback_tuples, vqa_questions, extra_infos, task_ids):
-    """Synchronous batch processing"""
-    return compute_score_batch_threaded(prompts, gen_imgs, feedback_texts, regen_imgs, ground_truth_imgs, feedback_tuples, vqa_questions, extra_infos, task_ids)
-
-
-def compute_score(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id, **kwargs):
-    """Legacy single score computation"""
-    results = compute_score_batch(
-        [prompt], [gen_img], [feedback_text], [regen_img], [ground_truth_img], [feedback_tuple], [vqa_question], [extra_info], [task_id]
+    """Wrapper function to run async batch processing"""
+    return asyncio.run(
+        compute_score_batch_async(prompts, gen_imgs, feedback_texts, regen_imgs, ground_truth_imgs, feedback_tuples, vqa_questions, extra_infos, task_ids)
     )
-    return results[0]
