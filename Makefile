@@ -59,7 +59,7 @@ start-vllm-servers:
 			--gpus all \
 			-v /data:/data \
 			-v /home:/home \
-			-v /data/.cache:/root/.cache/huggingface \
+			-e HF_HOME=${CACHE_PATH} \
 			-e CUDA_VISIBLE_DEVICES=$$GPU,$$(($$GPU + 1)) \
 			-e VLLM_WORKER_MULTIPROC_METHOD=spawn \
 			-p $${PORT}:8000 \
@@ -78,4 +78,36 @@ start-vllm-servers:
 stop-vllm-servers:
 	for GPU in 0 1 2 3 4 5 6 7 ; do \
 		docker stop ${VLLM_CONTAINER_NAME_PREFIX}$$GPU || true ; \
+	done
+
+DYNAMO_CONTAINER_NAME_PREFIX=dynamo-g
+
+start-dynamo-servers:
+	for GPU in 4 ; do \
+		PORT=$$((8000 + $$GPU)) ; \
+		docker run --rm -d --name ${DYNAMO_CONTAINER_NAME_PREFIX}$$GPU \
+			--gpus all \
+			--network host \
+			--shm-size=10G \
+			--ulimit memlock=-1 \
+			--ulimit stack=67108864 \
+			--ulimit nofile=65536:65536 \
+			-w /workspace \
+			--cap-add CAP_SYS_PTRACE \
+			-v /data:/data \
+			-v /home:/home \
+			-e HF_HOME=${CACHE_PATH} \
+			-e CUDA_VISIBLE_DEVICES=$$GPU,$$(($$GPU + 1)) \
+			-e VLLM_WORKER_MULTIPROC_METHOD=spawn \
+			-p $${PORT}:8000 \
+			--ipc=host \
+			dynamo:latest-vllm \
+			bash -lc " \
+				python -m dynamo.frontend --http-port $${PORT} & \
+				python -m dynamo.vllm --model ${MODEL_PATH} \
+					--trust-remote-code \
+					--tensor-parallel-size 2 \
+					--limit-mm-per-prompt.video 0 \
+					--async-scheduling \
+			" ; \
 	done

@@ -17,11 +17,12 @@ from recipe.image_rl.utils import FormattingEvaluator
 import asyncio
 import threading
 import random
+from enum import Enum
 
 # Configuration
 BASE_URLS = [
     # "http://192.169.0.3:8000/v1",
-    # "http://192.169.0.3:8002/v1",
+    # "http://192.169.0.3:8002/v1"
     "http://192.169.0.3:8004/v1",
 ]
 API_KEY = "EMPTY"
@@ -30,28 +31,162 @@ BASE_DELAY = 2
 MAX_CONCURRENT_REQUESTS = 32
 MODEL_NAME = os.environ.get("RM_MODEL_PATH", "Qwen/Qwen3-VL-30B-A3B-Instruct")
 
+# Health checking configuration
+HEALTH_CHECK_INTERVAL = 30  # seconds
+FAILURE_THRESHOLD = 3  # consecutive failures before marking as unhealthy
+RECOVERY_CHECK_INTERVAL = 60  # seconds to wait before checking if unhealthy server recovered
+
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
-# Create sync clients for each URL
-clients = [AsyncOpenAI(api_key=API_KEY, base_url=url) for url in BASE_URLS]
+class ServerStatus(Enum):
+    HEALTHY = "healthy"
+    DEGRADED = "degraded"
+    UNHEALTHY = "unhealthy"
 
-# Thread-safe client index management
+class ServerInfo:
+    def __init__(self, url: str, client: AsyncOpenAI):
+        self.url = url
+        self.client = client
+        self.status = ServerStatus.HEALTHY
+        self.consecutive_failures = 0
+        self.last_success_time = time.time()
+        self.last_failure_time = None
+        self.total_requests = 0
+        self.successful_requests = 0
+        
+    def record_success(self):
+        self.consecutive_failures = 0
+        self.last_success_time = time.time()
+        self.total_requests += 1
+        self.successful_requests += 1
+        if self.status == ServerStatus.UNHEALTHY:
+            print(f"Server {self.url} recovered!")
+        self.status = ServerStatus.HEALTHY
+        
+    def record_failure(self):
+        self.consecutive_failures += 1
+        self.last_failure_time = time.time()
+        self.total_requests += 1
+        
+        if self.consecutive_failures >= FAILURE_THRESHOLD:
+            if self.status != ServerStatus.UNHEALTHY:
+                print(f"Server {self.url} marked as UNHEALTHY after {self.consecutive_failures} consecutive failures")
+            self.status = ServerStatus.UNHEALTHY
+        elif self.consecutive_failures >= 1:
+            self.status = ServerStatus.DEGRADED
+            
+    @property
+    def success_rate(self):
+        if self.total_requests == 0:
+            return 1.0
+        return self.successful_requests / self.total_requests
+        
+    def should_retry_unhealthy(self):
+        """Check if we should retry an unhealthy server"""
+        if self.status != ServerStatus.UNHEALTHY:
+            return True
+        if self.last_failure_time is None:
+            return True
+        return time.time() - self.last_failure_time > RECOVERY_CHECK_INTERVAL
+
+# client manager with failover support
 class ClientManager:
-    def __init__(self, clients):
-        self.clients = clients
-        self.client_count = len(clients)
-        self.index = 0
+    def __init__(self, base_urls: List[str]):
+        self.servers = []
         self.lock = threading.Lock()
-        self.request_counts = {i: 0 for i in range(self.client_count)}
-    
-    def get_next_client(self):
+        self.current_index = 0
+        
+        # Initialize servers
+        for url in base_urls:
+            client = AsyncOpenAI(api_key=API_KEY, base_url=url)
+            server_info = ServerInfo(url, client)
+            self.servers.append(server_info)
+            
+        # Start health monitoring thread
+        self.health_monitor_thread = threading.Thread(target=self._health_monitor, daemon=True)
+        self.health_monitor_thread.start()
+        
+    def get_healthy_servers(self) -> List[ServerInfo]:
+        """Get list of servers that are healthy or degraded (not unhealthy)"""
         with self.lock:
-            client = self.clients[self.index]
-            self.request_counts[self.index] += 1
-            self.index = (self.index + 1) % self.client_count
-            return client, self.index - 1 if self.index > 0 else self.client_count - 1
+            healthy_servers = []
+            for server in self.servers:
+                if server.status in [ServerStatus.HEALTHY, ServerStatus.DEGRADED]:
+                    healthy_servers.append(server)
+                elif server.should_retry_unhealthy():
+                    # Give unhealthy servers a chance to recover
+                    healthy_servers.append(server)
+            return healthy_servers
+    
+    def get_best_server(self) -> Optional[ServerInfo]:
+        """Get the best available server using weighted selection"""
+        healthy_servers = self.get_healthy_servers()
+        
+        if not healthy_servers:
+            print("WARNING: No healthy servers available! Using any available server...")
+            return self.servers[0] if self.servers else None
+            
+        # Sort by status (healthy first) then by success rate
+        healthy_servers.sort(key=lambda s: (
+            s.status.value,  # healthy < degraded < unhealthy
+            -s.success_rate,  # higher success rate first
+            s.consecutive_failures  # fewer failures first
+        ))
+        
+        return healthy_servers[0]
+    
+    def get_next_client_with_fallback(self) -> Optional[tuple]:
+        """Get next client with automatic fallback to healthy servers"""
+        server = self.get_best_server()
+        if server is None:
+            return None, None
+            
+        server_id = self.servers.index(server)
+        return server.client, server_id
+        
+    def record_request_result(self, server_id: int, success: bool, error: Exception = None):
+        """Record the result of a request for server health tracking"""
+        if 0 <= server_id < len(self.servers):
+            server = self.servers[server_id]
+            if success:
+                server.record_success()
+            else:
+                server.record_failure()
+                if error:
+                    print(f"Server {server.url} error: {repr(error)}")
+    
+    def get_server_status(self) -> Dict[str, Any]:
+        """Get current status of all servers"""
+        with self.lock:
+            status = {}
+            for i, server in enumerate(self.servers):
+                status[f"server_{i}"] = {
+                    "url": server.url,
+                    "status": server.status.value,
+                    "consecutive_failures": server.consecutive_failures,
+                    "success_rate": f"{server.success_rate:.2%}",
+                    "total_requests": server.total_requests,
+                    "last_success": server.last_success_time,
+                    "last_failure": server.last_failure_time
+                }
+            return status
+    
+    def _health_monitor(self):
+        """Background thread to monitor server health"""
+        while True:
+            try:
+                # Print server status periodically
+                if time.time() % 120 < 1:  # Every 2 minutes
+                    status = self.get_server_status()
+                    print(f"Server Health Status: {json.dumps(status, indent=2, default=str)}")
+                
+                time.sleep(HEALTH_CHECK_INTERVAL)
+            except Exception as e:
+                print(f"Health monitor error: {e}")
+                time.sleep(HEALTH_CHECK_INTERVAL)
 
-client_manager = ClientManager(clients)
+# Initialize the client manager
+client_manager = ClientManager(BASE_URLS)
 
 # 기존 프롬프트 템플릿들은 동일하게 유지
 TASK1_TASK3_IMAGE_GENERATOR_SYSTEM_PROMPT_TEMPLATE = """
@@ -229,30 +364,61 @@ def get_messages(prompt, gen_img, feedback_text, regen_img, ground_truth_img, fe
 
 
 async def get_response_with_client(client, client_id, messages):
-    """Get response from a specific client with retry logic"""
+    """Get response from a specific client with improved error handling"""
     for attempt in range(MAX_RETRIES):
         try:
             response = await client.chat.completions.create(
                 model=MODEL_NAME,
-                messages=messages
+                messages=messages,
+                max_tokens=2048,
+                timeout=30.0  # Add timeout
             )
+            # Record successful request
+            client_manager.record_request_result(client_id, success=True)
             return response.choices[0].message.content
+            
         except Exception as e:
+            # Record failed request
+            client_manager.record_request_result(client_id, success=False, error=e)
+            
             if attempt < MAX_RETRIES - 1:
                 print(f"Client {client_id} attempt {attempt+1} failed: {repr(e)}")
-                delay = BASE_DELAY * (2**attempt) + random.uniform(0, 1)  # Add jitter
+                delay = BASE_DELAY * (2**attempt) + random.uniform(0, 1)
                 await asyncio.sleep(delay)
             else:
                 print(f"Client {client_id} failed after {MAX_RETRIES} attempts. Error: {e}")
                 return None
 
 
-async def get_response(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id):
-    """Get response from API with load balancing"""
+async def get_response_with_fallback(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id):
+    """Get response with automatic server fallback"""
     messages = get_messages(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id)
     
-    client, client_id = client_manager.get_next_client()
-    return await get_response_with_client(client, client_id, messages)
+    # Try different servers until one succeeds
+    max_server_attempts = len(client_manager.servers)
+    
+    for server_attempt in range(max_server_attempts):
+        client_info = client_manager.get_next_client_with_fallback()
+        if client_info[0] is None:
+            print("No available servers!")
+            break
+            
+        client, client_id = client_info
+        
+        response = await get_response_with_client(client, client_id, messages)
+        if response is not None:
+            return response
+            
+        print(f"Server attempt {server_attempt + 1}/{max_server_attempts} failed, trying next server...")
+    
+    print("All servers failed!")
+    return None
+
+
+# Update the main function to use the new fallback mechanism
+async def get_response(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id):
+    """Get response from API with improved load balancing and failover"""
+    return await get_response_with_fallback(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id)
 
 
 def compute_reward(response):
@@ -369,7 +535,7 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
 
 
 async def compute_score_batch_async(prompts, gen_imgs, feedback_texts, regen_imgs, ground_truth_imgs, feedback_tuples, vqa_questions, extra_infos, task_ids):
-    """Improved async batch processing with better load balancing"""
+    """Async batch processing with better load balancing"""
     n = len(prompts)
     if n == 0:
         return []
@@ -384,7 +550,7 @@ async def compute_score_batch_async(prompts, gen_imgs, feedback_texts, regen_img
             # Load ground truth image
             ground_truth_img = await asyncio.to_thread(lambda p=ground_truth_img: PIL.Image.open(p).convert("RGB"))
             
-            # Process the request with request ID for tracking
+            # Process the request with improved error handling
             result = await compute_score_single_async(
                 prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id
             )
@@ -418,3 +584,8 @@ def compute_score_batch(prompts, gen_imgs, feedback_texts, regen_imgs, ground_tr
     return asyncio.run(
         compute_score_batch_async(prompts, gen_imgs, feedback_texts, regen_imgs, ground_truth_imgs, feedback_tuples, vqa_questions, extra_infos, task_ids)
     )
+
+
+def get_server_health_status():
+    """Get current server health status - useful for monitoring"""
+    return client_manager.get_server_status()
