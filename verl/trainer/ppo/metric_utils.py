@@ -555,7 +555,10 @@ def process_validation_metrics(
                 n_resps = len(valid_vals)
                 
                 if n_resps > 0:
-                    metric[f"mean@{n_resps}"] = np.mean(valid_vals)
+                    try:
+                        metric[f"mean@{n_resps}"] = np.mean(valid_vals)
+                    except Exception as e:
+                        continue
                 else:
                     # If all values are None, skip this metric
                     continue
