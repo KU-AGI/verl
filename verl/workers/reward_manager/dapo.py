@@ -207,9 +207,27 @@ class DAPORewardManager(AbstractRewardManager):
                         "step7": step7_last_idx,
                         "answer": answer_last_idx
                     }
-                else:
-                    raise ValueError(f"Unknown task: {task}")
             except Exception as e:
+                if task == "forward":
+                    step_last_indices = {
+                        "step4": None,
+                        "step5": None,
+                        "step6": None,
+                        "answer": None
+                    }
+                elif task == "retro":
+                    step_last_indices = {
+                        "step5": None,
+                        "step6": None,
+                        "step7": None,
+                        "answer": None
+                    }
+                elif task == "reagent":
+                    step_last_indices = {
+                        "step6": None,
+                        "step7": None,
+                        "answer": None
+                    }
                 reward_tensor[i, valid_response_length - 1] = reward
             
             reward_extra_info["step_last_indices"].append(step_last_indices)
