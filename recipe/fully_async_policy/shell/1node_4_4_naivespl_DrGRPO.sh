@@ -6,7 +6,7 @@ export WANDB_PROJECT="verl-dapo"
 export NCCL_DEBUG="WARN"
 
 project_name='verl-dapo'
-exp_name='naivespl_stepwiseDrGRPO'
+exp_name='naivespl_DrGRPO'
 
 # Ray
 RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
@@ -31,8 +31,8 @@ if [ "$rollout_mode" = "async" ]; then
 fi
 
 # Algorithm parameters
-adv_estimator=stepwise_grpo # stepwise_grpo, grpo
-loss_mode=steplevel # steplevel, vanilla
+adv_estimator=grpo # stepwise_grpo, grpo
+loss_mode=vanilla # steplevel, vanilla
 norm_adv_by_std_in_grpo=False # False for Dr.GRPO, True for standard GRPO
 
 use_kl_in_reward=False
