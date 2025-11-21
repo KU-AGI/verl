@@ -370,6 +370,8 @@ class DataParallelPPOActor(BasePPOActor):
             "position_ids",
             "old_log_probs",
             "advantages",
+            "input_ids",
+            "token_level_rewards",
         ]
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
@@ -380,6 +382,11 @@ class DataParallelPPOActor(BasePPOActor):
 
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
+        non_tensor_select_keys.extend([
+            "step_last_indices",
+            "step_rewards",
+            "task",
+        ])
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
 

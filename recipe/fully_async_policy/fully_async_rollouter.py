@@ -13,6 +13,7 @@
 # limitations under the License.
 import asyncio
 import time
+import re
 from pprint import pformat
 
 import ray
@@ -477,11 +478,11 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         if self.config.algorithm.filter_nonanswered.enable:
             # task = batch_tmp.non_tensor_batch['task'][0]
             response_str_list = [self.tokenizer.decode(output.response_ids) for output in agent_loop_output_list]
-            answered_list = []
+            valid_structure_list = []
             for s in response_str_list:
-                is_answered = await self.has_valid_answer_tag(s)
-                answered_list.append(is_answered)
-            if not all(answered_list):
+                is_valid_structure = await self._validate_structure(s)
+                valid_structure_list.append(is_valid_structure)
+            if not all(valid_structure_list):
                 # print(
                 #     f"[FullyAsyncRollouter] Warning: Generated a sample with invalid answer tag. Task: {task} "
                 #     f"responses: {response_str_list}"
@@ -732,3 +733,42 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         end_idx = s.find("</ANSWER>")
 
         return start_idx < end_idx
+
+    async def _validate_structure(self, text: str) -> bool:
+        # 1. <think> ... </think> 존재 여부 확인
+        think_match = re.search(r"<think>(.*?)</think>", text, re.DOTALL)
+        if not think_match:
+            return False
+        think_content = think_match.group(1)
+
+        # 2. <ANSWER> ... </ANSWER> 존재 여부 확인
+        answer_match = re.findall(r"<ANSWER>(.*?)</ANSWER>", text, re.DOTALL)
+        if len(answer_match) != 1:
+            return False
+
+        # 3. Step 패턴 찾기
+        step_pattern = r"## Step (\d+):"
+        steps = re.findall(step_pattern, think_content)
+
+        if not steps:
+            return False
+
+        # Step 번호가 1부터 N까지 순서대로인지 확인
+        steps = list(map(int, steps))
+        N = len(steps)
+        if steps != list(range(1, N + 1)):
+            return False
+
+        # Step별 블록을 분할
+        step_blocks = re.split(step_pattern, think_content)[1:]  # [num1, block1, num2, block2 ...]
+        # step_blocks 구조: [step_num1, step_content1, step_num2, step_content2, ...]
+
+        # 4. 각 Step 블록에 reflection이 0개 또는 1개인지 검사
+        for i in range(0, len(step_blocks), 2):
+            step_content = step_blocks[i + 1]  # 해당 step의 내용
+            reflection_blocks = re.findall(r"<REFLECTION>(.*?)</REFLECTION>", step_content, re.DOTALL)
+
+            if len(reflection_blocks) > 1:
+                return False  # 하나의 step에 reflection이 2개 이상이면 잘못됨
+
+        return True

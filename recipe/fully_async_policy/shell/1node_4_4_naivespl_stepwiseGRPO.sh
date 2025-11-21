@@ -6,7 +6,7 @@ export WANDB_PROJECT="verl-dapo"
 export NCCL_DEBUG="WARN"
 
 project_name='verl-dapo'
-exp_name='debug'
+exp_name='naivespl_stepwiseGRPO'
 
 # Ray
 RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
@@ -33,6 +33,7 @@ fi
 # Algorithm parameters
 adv_estimator=stepwise_grpo
 loss_mode=steplevel
+norm_adv_by_std_in_grpo=True # False for Dr.GRPO, True for standard GRPO
 
 use_kl_in_reward=False
 kl_coef=0.0
@@ -42,7 +43,7 @@ kl_loss_coef=0.000
 clip_ratio_low=0.2
 clip_ratio_high=0.2
 
-enable_filter_groups=True
+enable_filter_groups=False
 # filter_groups_metric=acc
 filter_groups_metric=seq_final_reward
 max_num_gen_batches=0
@@ -64,7 +65,7 @@ overlong_buffer_len=0 # $((1024 * 4))
 overlong_penalty_factor=1.0
 
 # Training parameters
-loss_agg_mode="seq-mean-token-sum"
+loss_agg_mode="seq-mean-token-sum" # "seq-mean-token-sum-norm"
 
 # Algorithm
 temperature=1.0
@@ -73,8 +74,8 @@ top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
 val_temperature=0.0
 val_top_k=0.0
 val_top_p=1.0
-rollout_strategy="reflection_sampling" # "naive_sampling" | "reflection_sampling"
-strategy_ratio=0.5 # 1.0 means all use above rollout_strategy, 0.0 means all use naive_sampling
+rollout_strategy="naive_sampling" # "naive_sampling" | "reflection_sampling"
+strategy_ratio=0.0 # 1.0 means all use above rollout_strategy, 0.0 means all use naive_sampling
 
 # Performance Related Parameter
 use_dynamic_bsz=True
@@ -131,11 +132,12 @@ python -m recipe.fully_async_policy.fully_async_main \
     algorithm.use_kl_in_reward=${use_kl_in_reward} \
     algorithm.kl_ctrl.kl_coef=${kl_coef} \
     algorithm.filter_groups.enable=${enable_filter_groups} \
-    +algorithm.filter_nonanswered.enable=${enable_filter_groups} \
+    +algorithm.filter_nonanswered.enable=True \
     algorithm.filter_groups.max_num_gen_batches=${max_num_gen_batches} \
     algorithm.filter_groups.metric=${filter_groups_metric} \
     algorithm.rollout_is_threshold=2.0 \
     algorithm.rollout_is=True \
+    algorithm.norm_adv_by_std_in_grpo=${norm_adv_by_std_in_grpo} \
     actor_rollout_ref.actor.strategy=fsdp2 \
     critic.strategy=fsdp2 \
     actor_rollout_ref.actor.policy_loss.loss_mode=${loss_mode} \
@@ -195,7 +197,7 @@ python -m recipe.fully_async_policy.fully_async_main \
     trainer.logger=['console','wandb'] \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
-    trainer.val_before_train=False \
+    trainer.val_before_train=True \
     trainer.default_local_dir="${CKPTS_DIR}" \
     trainer.validation_data_dir="${DUMP_DIR}/val" \
     trainer.test_data_dir="${DUMP_DIR}/test" \

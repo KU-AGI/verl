@@ -144,7 +144,75 @@ class DAPORewardManager(AbstractRewardManager):
                     reward_extra_info["overlong_reward"].append(overlong_reward)
                     reward_extra_info["overlong"].append(overlong_reward < 0)
 
-            reward_tensor[i, valid_response_length - 1] = reward
+            input_ids = data_item.batch["input_ids"][prompt_length:]
+            step4_token_ids = [565, 14822, 220, 19] # "## Step 4"
+            step5_token_ids = [565, 14822, 220, 20] # "## Step 5"
+            step6_token_ids = [565, 14822, 220, 21] # "## Step 6"
+            step7_token_ids = [565, 14822, 220, 22] # "## Step 7"
+            think_end_token_ids = [151668] # "</think>"
+            last_token_ids = [522, 11692, 39351, 29, 151645] # "</ANSWER><|im_end|>"
+            last_index =self._find_subsequence_start(input_ids, last_token_ids)
+            if last_index is None:
+                last_index = valid_response_length -1
+            else:
+                last_index += len(last_token_ids)
+            step_start_indices = {
+                "step4": self._find_subsequence_start(input_ids, step4_token_ids),
+                "step5": self._find_subsequence_start(input_ids, step5_token_ids),
+                "step6": self._find_subsequence_start(input_ids, step6_token_ids),
+                "step7": self._find_subsequence_start(input_ids, step7_token_ids),
+                "think_end": self._find_subsequence_start(input_ids, think_end_token_ids),
+                "last": last_index,
+            }
+            try:
+                if task == "forward":
+                    step4_last_idx = step_start_indices["step5"] - 1
+                    step5_last_idx = step_start_indices["step6"] - 1
+                    step6_last_idx = step_start_indices["think_end"] - 1
+                    answer_last_idx = step_start_indices["last"] - 1
+                    reward_tensor[i, step4_last_idx] = reward_extra_info['step_rewards'][i]['step4']
+                    reward_tensor[i, step5_last_idx] = reward_extra_info['step_rewards'][i]['step5']
+                    reward_tensor[i, step6_last_idx] = reward_extra_info['step_rewards'][i]['step6']
+                    reward_tensor[i, answer_last_idx] = reward_extra_info['step_rewards'][i]['answer']
+                    step_last_indices = {
+                        "step4": step4_last_idx,
+                        "step5": step5_last_idx,
+                        "step6": step6_last_idx,
+                        "answer": answer_last_idx
+                    }
+                elif task == "retro":
+                    step5_last_idx = step_start_indices["step6"] - 1
+                    step6_last_idx = step_start_indices["step7"] - 1
+                    step7_last_idx = step_start_indices["think_end"] - 1
+                    answer_last_idx = step_start_indices["last"] - 1
+                    reward_tensor[i, step5_last_idx] = reward_extra_info['step_rewards'][i]['step5']
+                    reward_tensor[i, step6_last_idx] = reward_extra_info['step_rewards'][i]['step6']
+                    reward_tensor[i, step7_last_idx] = reward_extra_info['step_rewards'][i]['step7']
+                    reward_tensor[i, answer_last_idx] = reward_extra_info['step_rewards'][i]['answer']
+                    step_last_indices = {
+                        "step5": step5_last_idx,
+                        "step6": step6_last_idx,
+                        "step7": step7_last_idx,
+                        "answer": answer_last_idx
+                    }
+                elif task == "reagent":
+                    step6_last_idx = step_start_indices["step7"] - 1
+                    step7_last_idx = step_start_indices["think_end"] - 1
+                    answer_last_idx = step_start_indices["last"] - 1
+                    reward_tensor[i, step6_last_idx] = reward_extra_info['step_rewards'][i]['step6']
+                    reward_tensor[i, step7_last_idx] = reward_extra_info['step_rewards'][i]['step7']
+                    reward_tensor[i, answer_last_idx] = reward_extra_info['step_rewards'][i]['answer']
+                    step_last_indices = {
+                        "step6": step6_last_idx,
+                        "step7": step7_last_idx,
+                        "answer": answer_last_idx
+                    }
+                else:
+                    raise ValueError(f"Unknown task: {task}")
+            except Exception as e:
+                reward_tensor[i, valid_response_length - 1] = reward
+            
+            reward_extra_info["step_last_indices"].append(step_last_indices)
 
             if data_source not in already_print_data_sources:
                 already_print_data_sources[data_source] = 0
@@ -167,3 +235,14 @@ class DAPORewardManager(AbstractRewardManager):
             }
         else:
             return reward_tensor
+
+    def _find_subsequence_start(self, input_ids, step_ids):
+        if not isinstance(step_ids, torch.Tensor):
+            step_ids = torch.tensor(step_ids, dtype=input_ids.dtype)
+
+        # unfold로 sliding windows 생성
+        windows = input_ids.unfold(0, step_ids.numel(), 1)  # (N, len(B))
+        matches = (windows == step_ids).all(dim=1)
+        
+        idx = torch.where(matches)[0]
+        return int(idx[0].item()) if idx.numel() > 0 else None

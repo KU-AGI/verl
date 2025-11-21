@@ -542,13 +542,13 @@ class StepEvaluator():
         step6_has_reflection = False
         has_tagged_smiles = False
         steps_data = self.parse_steps_with_reflections(predicted_rationale)
-        reflection_bonus = 0.
+        reflection_bonus = {}
         for step_key, step_info in steps_data.items():
             if step_info["step"] == 4:
                 has_reflection = len(step_info["reflections"]) > 0
                 if has_reflection:
                     predicted_step4_rationale = step_info["reflections"][-1]
-                    reflection_bonus += 1
+                    reflection_bonus["step4"] = 1
                     step4_initial_rationale = step_info["content"]
                     step4_has_reflection = True
                 else:
@@ -559,7 +559,7 @@ class StepEvaluator():
                 has_reflection = len(step_info["reflections"]) > 0
                 if has_reflection:
                     predicted_step5_rationale = step_info["reflections"][-1]
-                    reflection_bonus += 1
+                    reflection_bonus["step5"] = 1
                     step5_initial_rationale = step_info["content"]
                     step5_has_reflection = True
                 else:
@@ -571,7 +571,7 @@ class StepEvaluator():
                 if has_reflection:
                     predicted_step6_rationale = step_info["reflections"][-1]
                     has_tagged_smiles = ".".join(info["products"]) in predicted_step6_rationale
-                    reflection_bonus += 1
+                    reflection_bonus["step6"] = 1
                     step6_initial_rationale = step_info["content"]
                     step6_has_reflection = True
                 else:
@@ -690,13 +690,13 @@ class StepEvaluator():
         step7_has_reflection = False
 
         steps_data = self.parse_steps_with_reflections(predicted_rationale)
-        reflection_bonus = 0.
+        reflection_bonus = {}
         for step_key, step_info in steps_data.items():
             if step_info["step"] == 5:
                 has_reflection = len(step_info["reflections"]) > 0
                 if has_reflection:
                     predicted_step5_rationale = step_info["reflections"][-1]
-                    reflection_bonus += 1
+                    reflection_bonus["step5"] = 1
                     step5_initial_rationale = step_info["content"]
                     step5_has_reflection = True
                 else:
@@ -707,7 +707,7 @@ class StepEvaluator():
                 has_reflection = len(step_info["reflections"]) > 0
                 if has_reflection:
                     predicted_step6_rationale = step_info["reflections"][-1]
-                    reflection_bonus += 1
+                    reflection_bonus["step6"] = 1
                     step6_initial_rationale = step_info["content"]
                     step6_has_reflection = True
                 else:
@@ -718,7 +718,7 @@ class StepEvaluator():
                 has_reflection = len(step_info["reflections"]) > 0
                 if has_reflection:
                     predicted_step7_rationale = step_info["reflections"][-1]
-                    reflection_bonus += 1
+                    reflection_bonus["step7"] = 1
                     step7_initial_rationale = step_info["content"]
                     step7_has_reflection = True
                 else:
@@ -820,13 +820,13 @@ class StepEvaluator():
         step7_has_reflection = False
 
         steps_data = self.parse_steps_with_reflections(predicted_rationale)
-        reflection_bonus = 0.
+        reflection_bonus = {}
         for step_key, step_info in steps_data.items():
             if step_info["step"] == 6:
                 has_reflection = len(step_info["reflections"]) > 0
                 if has_reflection:
                     predicted_step6_rationale = step_info["reflections"][-1]
-                    reflection_bonus += 1
+                    reflection_bonus["step6"] = 1
                     step6_initial_rationale = step_info["content"]
                     step6_has_reflection = True
                 else:
@@ -837,7 +837,7 @@ class StepEvaluator():
                 has_reflection = len(step_info["reflections"]) > 0
                 if has_reflection:
                     predicted_step7_rationale = step_info["reflections"][-1]
-                    reflection_bonus += 1
+                    reflection_bonus["step7"] = 1
                     step7_initial_rationale = step_info["content"]
                     step7_has_reflection = True
                 else:
@@ -1032,16 +1032,29 @@ class ChemistryEvaluator:
         if match:
             predicted_rationale = match.group(1).strip()
         if task == "forward":
-            step_eval_results, reflection_bonus, content_reward_dict, reflection_decision_reward_dict = self.step_evaluator.calculate_forward_rationale_metrics(info, predicted_rationale)
+            step_eval_results, reflection_bonus_dict, content_reward_dict, reflection_decision_reward_dict = self.step_evaluator.calculate_forward_rationale_metrics(info, predicted_rationale)
         elif task == "retro":
-            step_eval_results, reflection_bonus, content_reward_dict, reflection_decision_reward_dict = self.step_evaluator.calculate_retro_rationale_metrics(info, predicted_rationale)
+            step_eval_results, reflection_bonus_dict, content_reward_dict, reflection_decision_reward_dict = self.step_evaluator.calculate_retro_rationale_metrics(info, predicted_rationale)
         elif task == "reagent":
-            step_eval_results, reflection_bonus, content_reward_dict, reflection_decision_reward_dict = self.step_evaluator.calculate_reagent_rationale_metrics(info, predicted_rationale)
+            step_eval_results, reflection_bonus_dict, content_reward_dict, reflection_decision_reward_dict = self.step_evaluator.calculate_reagent_rationale_metrics(info, predicted_rationale)
         else:
             step_eval_results = {}
-            reflection_bonus = 0.0
+            reflection_bonus_dict = {
+                "DUMMY": 0,
+            }
 
         reward = correct
+
+        step_rewards = {
+            "step1": 0.0,
+            "step2": 0.0,
+            "step3": 0.0,
+            "step4": 0.0,
+            "step5": 0.0,
+            "step6": 0.0,
+            "step7": 0.0,
+            "answer": float(correct),
+        }
 
         reward_metric_dict = {
             f"{task}/reward/answer_correct": correct,
@@ -1053,14 +1066,63 @@ class ChemistryEvaluator:
             content_reward = sum(content_reward_dict.values()) / len(content_reward_dict)
             reward += content_reward
             reward_metric_dict[f"{task}/reward/content_reward"] = content_reward
+            for step_key in content_reward_dict:
+                if "step1" in step_key:
+                    step_rewards["step1"] += content_reward_dict[step_key] / len(content_reward_dict)
+                elif "step2" in step_key:
+                    step_rewards["step2"] += content_reward_dict[step_key] / len(content_reward_dict)
+                elif "step3" in step_key:
+                    step_rewards["step3"] += content_reward_dict[step_key] / len(content_reward_dict)
+                elif "step4" in step_key:
+                    step_rewards["step4"] += content_reward_dict[step_key] / len(content_reward_dict)
+                elif "step5" in step_key:
+                    step_rewards["step5"] += content_reward_dict[step_key] / len(content_reward_dict)
+                elif "step6" in step_key:
+                    step_rewards["step6"] += content_reward_dict[step_key] / len(content_reward_dict)
+                elif "step7" in step_key:
+                    step_rewards["step7"] += content_reward_dict[step_key] / len(content_reward_dict)
         if use_decision_reward:
             decision_reward = sum(reflection_decision_reward_dict.values()) / len(reflection_decision_reward_dict)
             reward += decision_reward
             reward_metric_dict[f"{task}/reward/decision_reward"] = decision_reward
+            for step_key in reflection_decision_reward_dict:
+                if "step1" in step_key:
+                    step_rewards["step1"] += reflection_decision_reward_dict[step_key] / len(reflection_decision_reward_dict)
+                elif "step2" in step_key:
+                    step_rewards["step2"] += reflection_decision_reward_dict[step_key] / len(reflection_decision_reward_dict)
+                elif "step3" in step_key:
+                    step_rewards["step3"] += reflection_decision_reward_dict[step_key] / len(reflection_decision_reward_dict)
+                elif "step4" in step_key:
+                    step_rewards["step4"] += reflection_decision_reward_dict[step_key] / len(reflection_decision_reward_dict)
+                elif "step5" in step_key:
+                    step_rewards["step5"] += reflection_decision_reward_dict[step_key] / len(reflection_decision_reward_dict)
+                elif "step6" in step_key:
+                    step_rewards["step6"] += reflection_decision_reward_dict[step_key] / len(reflection_decision_reward_dict)
+                elif "step7" in step_key:
+                    step_rewards["step7"] += reflection_decision_reward_dict[step_key] / len(reflection_decision_reward_dict)
         if use_reflection_bonus:
-            reflection_bonus_reward = reflection_bonus / len(reflection_decision_reward_dict) * reflection_bonus_weight
+            if len(reflection_bonus_dict) > 0:
+                reflection_bonus_reward = (sum(reflection_bonus_dict.values()) / len(reflection_bonus_dict)) * reflection_bonus_weight
+                for step_key in reflection_bonus_dict:
+                    if "step1" in step_key:
+                        step_rewards["step1"] += reflection_bonus_dict[step_key] * reflection_bonus_weight / len(reflection_bonus_dict)
+                    elif "step2" in step_key:
+                        step_rewards["step2"] += reflection_bonus_dict[step_key] * reflection_bonus_weight / len(reflection_bonus_dict)
+                    elif "step3" in step_key:
+                        step_rewards["step3"] += reflection_bonus_dict[step_key] * reflection_bonus_weight / len(reflection_bonus_dict)
+                    elif "step4" in step_key:
+                        step_rewards["step4"] += reflection_bonus_dict[step_key] * reflection_bonus_weight / len(reflection_bonus_dict)
+                    elif "step5" in step_key:
+                        step_rewards["step5"] += reflection_bonus_dict[step_key] * reflection_bonus_weight / len(reflection_bonus_dict)
+                    elif "step6" in step_key:
+                        step_rewards["step6"] += reflection_bonus_dict[step_key] * reflection_bonus_weight / len(reflection_bonus_dict)
+                    elif "step7" in step_key:
+                        step_rewards["step7"] += reflection_bonus_dict[step_key] * reflection_bonus_weight / len(reflection_bonus_dict)
+            else:
+                reflection_bonus_reward = 0.0
             reward += reflection_bonus_reward
             reward_metric_dict[f"{task}/reward/reflection_bonus_reward"] = reflection_bonus_reward
+
 
         step_eval_results.update(reward_metric_dict)
 
@@ -1070,9 +1132,12 @@ class ChemistryEvaluator:
             pred=pred,
             metrics=step_eval_results
         )
+        result = result.to_dict()
+        result["step_rewards"] = step_rewards
+        result["reflection_decision_reward_dict"] = reflection_decision_reward_dict
 
         # Return dict format for compatibility with existing code
-        return result.to_dict()
+        return result
 
 
 def compute_score(solution_str: str,
