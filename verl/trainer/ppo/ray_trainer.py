@@ -1083,15 +1083,18 @@ class RayPPOTrainer:
 
         # dump generations
         test_data_dir = self.config.trainer.get("test_data_dir", None)
-        if test_data_dir:
-            self._dump_generations(
-                inputs=sample_inputs,
-                outputs=sample_outputs,
-                gts=sample_gts,
-                scores=sample_scores,
-                reward_extra_infos_dict=reward_extra_infos_dict,
-                dump_path=test_data_dir,
-            )
+        try:
+            if test_data_dir:
+                self._dump_generations(
+                    inputs=sample_inputs,
+                    outputs=sample_outputs,
+                    gts=sample_gts,
+                    scores=sample_scores,
+                    reward_extra_infos_dict=reward_extra_infos_dict,
+                    dump_path=test_data_dir,
+                )
+        except Exception as e:
+            print(f"Error dumping generations: {e}")
 
         for key_info, lst in reward_extra_infos_dict.items():
             assert len(lst) == 0 or len(lst) == len(sample_scores), f"{key_info}: {len(lst)=}, {len(sample_scores)=}"

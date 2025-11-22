@@ -16,7 +16,7 @@ RUNTIME_ENV=${RUNTIME_ENV:-"/verl/recipe/fully_async_policy/shell/runtime_env.ya
 HOME="/data"
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
 # very important! please modify the max_position_embeddings in config.json to 32768 after downloading from huggingface
-MODEL_PATH="/data/llm-reaction-reasoning/all_checkpoints/reflection_v4_fullft_all/best.ckpt/hf_model"
+MODEL_PATH="/data/verl/ckpts/verl-dapo/refl_bonus_0.3_2node/global_step_10800/hf_model"
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
 DUMP_DIR=${DUMP_DIR:-"${RAY_DATA_HOME}/dumps/${project_name}/${exp_name}"}
 TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/chem_dapo/syntheticreact_train.parquet"}

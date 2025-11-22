@@ -317,6 +317,8 @@ class PartialSingleTurnAgentLoop(AgentLoopBase):
                                     next_ids = [27, 5996, 28017] # self.tokenizer.encode("<REFLECTION")
                                 else:
                                     next_ids = [27, 5996, 28017] # self.tokenizer.encode("<REFLECTION")
+                                prompt_ids += next_ids
+                                break
                             prompt_ids += next_ids
 
                         sampling_params.pop("stop", None)

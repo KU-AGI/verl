@@ -6,7 +6,7 @@ export WANDB_PROJECT="verl-dapo"
 export NCCL_DEBUG="WARN"
 
 project_name='verl-dapo'
-exp_name='naivespl_GRPO'
+exp_name='reflspl0.3_stepwiseGRPO'
 
 # Ray
 RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
@@ -16,7 +16,7 @@ RUNTIME_ENV=${RUNTIME_ENV:-"/verl/recipe/fully_async_policy/shell/runtime_env.ya
 HOME="/data"
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
 # very important! please modify the max_position_embeddings in config.json to 32768 after downloading from huggingface
-MODEL_PATH="/data/llm-reaction-reasoning/all_checkpoints/reflection_v4_fullft_all/best.ckpt/hf_model"
+MODEL_PATH="/data/verl/ckpts/verl-dapo/refl_bonus_0.3_2node/global_step_10800/hf_model"
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
 DUMP_DIR=${DUMP_DIR:-"${RAY_DATA_HOME}/dumps/${project_name}/${exp_name}"}
 TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/chem_dapo/syntheticreact_train.parquet"}
@@ -31,8 +31,8 @@ if [ "$rollout_mode" = "async" ]; then
 fi
 
 # Algorithm parameters
-adv_estimator=grpo # stepwise_grpo, grpo
-loss_mode=vanilla # steplevel, vanilla
+adv_estimator=stepwise_grpo # stepwise_grpo, grpo
+loss_mode=steplevel # steplevel, vanilla
 norm_adv_by_std_in_grpo=True # False for Dr.GRPO, True for standard GRPO
 
 use_kl_in_reward=False
@@ -74,8 +74,8 @@ top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
 val_temperature=0.0
 val_top_k=0.0
 val_top_p=1.0
-rollout_strategy="naive_sampling" # "naive_sampling" | "reflection_sampling"
-strategy_ratio=0.0 # 1.0 means all use above rollout_strategy, 0.0 means all use naive_sampling
+rollout_strategy="reflection_sampling" # "naive_sampling" | "reflection_sampling"
+strategy_ratio=0.3 # 1.0 means all use above rollout_strategy, 0.0 means all use naive_sampling
 
 # Performance Related Parameter
 use_dynamic_bsz=True

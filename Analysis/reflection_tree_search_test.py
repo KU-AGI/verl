@@ -18,7 +18,7 @@ RDLogger.DisableLog('rdApp.*')
 # ---- 설정 ----
 model = "ReactionReasoner"  # "predictiononly" or "ReactionReasoner"
 tasks = ["forward", "retro", "reagent"]
-# tasks = ["reagent"]
+# tasks = ["forward"]
 max_samples = 10000  # 각 task별 최대 샘플 수
 
 
@@ -236,7 +236,7 @@ for temp in [1.0]:
             all_ground_truths[f"{TEMPERATURE}, {STRATEGY}"] = {}
 
             # 서버별 동시 요청 수
-            PER_SERVER_CONCURRENCY = 1
+            PER_SERVER_CONCURRENCY = 40
 
             if model == "predictiononly":
                 IP_PORTs = [
@@ -251,15 +251,15 @@ for temp in [1.0]:
                 ]
             elif model == "ReactionReasoner":
                 IP_PORTs = [
-                    # "192.169.0.2:8000",
-                    # "192.169.0.2:8001",
-                    # "192.169.0.2:8002",
-                    # "192.169.0.2:8003",
-                    # "192.169.0.2:8004",
-                    # "192.169.0.2:8005",
-                    # "192.169.0.2:8006",
-                    # "192.169.0.2:8007",
-                    "192.169.0.3:8000",
+                    "localhost:8000",
+                    "localhost:8001",
+                    "localhost:8002",
+                    "localhost:8003",
+                    "localhost:8004",
+                    "localhost:8005",
+                    "localhost:8006",
+                    "localhost:8007",
+                    # "192.169.0.3:8000",
                     # "192.169.0.3:8001",
                     # "192.169.0.3:8002",
                     # "192.169.0.3:8003",
@@ -365,8 +365,8 @@ for temp in [1.0]:
                             )
                             choices = getattr(response, "choices", None) or response.get("choices", [])
                             response = choices[0].text
-                            raw_prompt += response
-                            raw_prompt = remove_last_reflection_block(raw_prompt).strip()
+                            raw_prompt += response.strip()
+                            # raw_prompt = remove_last_reflection_block(raw_prompt).strip()
                             step_correct = is_step_correct(step, task, d, raw_prompt)
                             if step_correct:
                                 if step_i == len(refl_steps) - 1:
@@ -378,6 +378,8 @@ for temp in [1.0]:
                                     next_tag = "\n<REFLECTION>"
                                 else:
                                     next_tag = "\n\n<REFLECTION>"
+                                raw_prompt += next_tag
+                                break
                             raw_prompt += next_tag
                         response = client.completions.create(
                             model=model_path,

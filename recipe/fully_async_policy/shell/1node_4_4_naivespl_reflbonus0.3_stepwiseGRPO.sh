@@ -6,7 +6,7 @@ export WANDB_PROJECT="verl-dapo"
 export NCCL_DEBUG="WARN"
 
 project_name='verl-dapo'
-exp_name='naivespl_stepwiseGRPO'
+exp_name='naivespl_reflbonus0.3_stepwiseGRPO'
 
 # Ray
 RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
@@ -31,8 +31,8 @@ if [ "$rollout_mode" = "async" ]; then
 fi
 
 # Algorithm parameters
-adv_estimator=stepwise_grpo # stepwise_grpo, grpo
-loss_mode=steplevel # steplevel, vanilla
+adv_estimator=grpo # stepwise_grpo, grpo
+loss_mode=vanilla # steplevel, vanilla
 norm_adv_by_std_in_grpo=True # False for Dr.GRPO, True for standard GRPO
 
 use_kl_in_reward=False
@@ -55,7 +55,7 @@ use_response_mask_to_reflection_step=False
 use_content_reward=True
 use_decision_reward=True
 use_reflection_bonus=True
-reflection_bonus_weight=0.0
+reflection_bonus_weight=0.3
 
 # Response length parameters
 max_prompt_length=500 # $((1024 * 2))
@@ -65,7 +65,7 @@ overlong_buffer_len=0 # $((1024 * 4))
 overlong_penalty_factor=1.0
 
 # Training parameters
-loss_agg_mode="seq-mean-token-sum" # "seq-mean-token-sum" "seq-mean-token-sum-norm"
+loss_agg_mode="seq-mean-token-sum-norm" # "seq-mean-token-sum" "seq-mean-token-sum-norm"
 
 # Algorithm
 temperature=1.0

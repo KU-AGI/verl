@@ -419,27 +419,27 @@ def compute_stepwise_grpo_outcome_advantage(
                 last_idx_dict = step_last_indices_all[i]
                 task = data.non_tensor_batch['task'][i]
                 if task == "forward":
-                    step4_score = _get_scores_for_step(step_rewards_all[i]['step4'], id2mean[f"{index[i]}_step4"], id2std[f"{index[i]}_step4"])
-                    step5_score = _get_scores_for_step(step_rewards_all[i]['step5'], id2mean[f"{index[i]}_step5"], id2std[f"{index[i]}_step5"])
-                    step6_score = _get_scores_for_step(step_rewards_all[i]['step6'], id2mean[f"{index[i]}_step6"], id2std[f"{index[i]}_step6"])
-                    answer_score = _get_scores_for_step(step_rewards_all[i]['answer'], id2mean[f"{index[i]}_answer"], id2std[f"{index[i]}_answer"])
+                    step4_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['step4']], id2mean[f"{index[i]}_step4"], id2std[f"{index[i]}_step4"])
+                    step5_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['step5']], id2mean[f"{index[i]}_step5"], id2std[f"{index[i]}_step5"])
+                    step6_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['step6']], id2mean[f"{index[i]}_step6"], id2std[f"{index[i]}_step6"])
+                    answer_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['answer']], id2mean[f"{index[i]}_answer"], id2std[f"{index[i]}_answer"])
                     advantage[i, :last_idx_dict['step4']+1] = step4_score
                     advantage[i, last_idx_dict['step4']+1:last_idx_dict['step5']+1] = step5_score
                     advantage[i, last_idx_dict['step5']+1:last_idx_dict['step6']+1] = step6_score
                     advantage[i, last_idx_dict['step6']+1:last_idx_dict['answer']+1] = answer_score
                 elif task == "retro":
-                    step5_score = _get_scores_for_step(step_rewards_all[i]['step5'], id2mean[f"{index[i]}_step5"], id2std[f"{index[i]}_step5"])
-                    step6_score = _get_scores_for_step(step_rewards_all[i]['step6'], id2mean[f"{index[i]}_step6"], id2std[f"{index[i]}_step6"])
-                    step7_score = _get_scores_for_step(step_rewards_all[i]['step7'], id2mean[f"{index[i]}_step7"], id2std[f"{index[i]}_step7"])
-                    answer_score = _get_scores_for_step(step_rewards_all[i]['answer'], id2mean[f"{index[i]}_answer"], id2std[f"{index[i]}_answer"])
+                    step5_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['step5']], id2mean[f"{index[i]}_step5"], id2std[f"{index[i]}_step5"])
+                    step6_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['step6']], id2mean[f"{index[i]}_step6"], id2std[f"{index[i]}_step6"])
+                    step7_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['step7']], id2mean[f"{index[i]}_step7"], id2std[f"{index[i]}_step7"])
+                    answer_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['answer']], id2mean[f"{index[i]}_answer"], id2std[f"{index[i]}_answer"])
                     advantage[i, :last_idx_dict['step5']+1] = step5_score
                     advantage[i, last_idx_dict['step5']+1:last_idx_dict['step6']+1] = step6_score
                     advantage[i, last_idx_dict['step6']+1:last_idx_dict['step7']+1] = step7_score
                     advantage[i, last_idx_dict['step7']+1::last_idx_dict['answer']+1] = answer_score
                 elif task == "reagent":
-                    step6_score = _get_scores_for_step(step_rewards_all[i]['step6'], id2mean[f"{index[i]}_step6"], id2std[f"{index[i]}_step6"])
-                    step7_score = _get_scores_for_step(step_rewards_all[i]['step7'], id2mean[f"{index[i]}_step7"], id2std[f"{index[i]}_step7"])
-                    answer_score = _get_scores_for_step(step_rewards_all[i]['answer'], id2mean[f"{index[i]}_answer"], id2std[f"{index[i]}_answer"])
+                    step6_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['step6']], id2mean[f"{index[i]}_step6"], id2std[f"{index[i]}_step6"])
+                    step7_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['step7']], id2mean[f"{index[i]}_step7"], id2std[f"{index[i]}_step7"])
+                    answer_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['answer']], id2mean[f"{index[i]}_answer"], id2std[f"{index[i]}_answer"])
                     advantage[i, :last_idx_dict['step6']+1] = step6_score
                     advantage[i, last_idx_dict['step6']+1:last_idx_dict['step7']+1] = step7_score
                     advantage[i, last_idx_dict['step7']+1:last_idx_dict['answer']+1] = answer_score
