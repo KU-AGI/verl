@@ -31,9 +31,9 @@ if [ "$rollout_mode" = "async" ]; then
 fi
 
 # Algorithm parameters
-adv_estimator=stepwise_grpo # stepwise_grpo, grpo
-loss_mode=steplevel # steplevel, vanilla
-norm_adv_by_std_in_grpo=False # False for Dr.GRPO, True for standard GRPO
+adv_estimator=stepcumul_grpo # stepwise_grpo, stepcumul_grpo, grpo
+loss_mode=stepcumul # steplevel, stepcumul, vanilla
+norm_adv_by_std_in_grpo=True # False for Dr.GRPO, True for standard GRPO
 
 use_kl_in_reward=False
 kl_coef=0.0
@@ -65,7 +65,7 @@ overlong_buffer_len=0 # $((1024 * 4))
 overlong_penalty_factor=1.0
 
 # Training parameters
-loss_agg_mode="seq-mean-token-sum-norm" # "seq-mean-token-sum" "seq-mean-token-sum-norm"
+loss_agg_mode="seq-mean-token-sum" # "seq-mean-token-sum" "seq-mean-token-sum-norm"
 
 # Algorithm
 temperature=1.0

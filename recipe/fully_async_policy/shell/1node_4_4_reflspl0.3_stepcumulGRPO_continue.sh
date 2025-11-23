@@ -6,7 +6,7 @@ export WANDB_PROJECT="verl-dapo"
 export NCCL_DEBUG="WARN"
 
 project_name='verl-dapo'
-exp_name='reflspl0.1_stepwiseGRPO_continue'
+exp_name='reflspl0.3_stepcumulGRPO_continue'
 
 # Ray
 RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
@@ -31,8 +31,8 @@ if [ "$rollout_mode" = "async" ]; then
 fi
 
 # Algorithm parameters
-adv_estimator=stepwise_grpo # stepwise_grpo, grpo
-loss_mode=steplevel # steplevel, vanilla
+adv_estimator=stepcumul_grpo # stepwise_grpo, stepcumul_grpo, grpo
+loss_mode=stepcumul # steplevel, stepcumul, vanilla
 norm_adv_by_std_in_grpo=True # False for Dr.GRPO, True for standard GRPO
 
 use_kl_in_reward=False
@@ -75,7 +75,7 @@ val_temperature=0.0
 val_top_k=0.0
 val_top_p=1.0
 rollout_strategy="reflection_sampling" # "naive_sampling" | "reflection_sampling"
-strategy_ratio=0.1 # 1.0 means all use above rollout_strategy, 0.0 means all use naive_sampling
+strategy_ratio=0.3 # 1.0 means all use above rollout_strategy, 0.0 means all use naive_sampling
 
 # Performance Related Parameter
 use_dynamic_bsz=True

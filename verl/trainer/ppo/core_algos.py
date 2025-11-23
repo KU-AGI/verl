@@ -106,6 +106,7 @@ class AdvantageEstimator(str, Enum):
     RLOO_VECTORIZED = "rloo_vectorized"
     GRPO_VECTORIZED = "grpo_vectorized"
     STEPWISE_GRPO = "stepwise_grpo"
+    STEPCUMUL_GRPO = "stepcumul_grpo"
 
 
 ADV_ESTIMATOR_REGISTRY: dict[str, Any] = {}
@@ -446,6 +447,171 @@ def compute_stepwise_grpo_outcome_advantage(
                 else:
                     raise ValueError(f"Unknown task type: {task}")
         return advantage, advantage
+
+    except Exception as e:
+        print(f"Exception occurred: {e}. Falling back to standard GRPO computation.")
+        scores = token_level_rewards.sum(dim=-1)
+
+        id2score = defaultdict(list)
+        id2mean = {}
+        id2std = {}
+
+        with torch.no_grad():
+            bsz = scores.shape[0]
+            for i in range(bsz):
+                id2score[index[i]].append(scores[i])
+            for idx in id2score:
+                if len(id2score[idx]) == 1:
+                    id2mean[idx] = torch.tensor(0.0)
+                    id2std[idx] = torch.tensor(1.0)
+                elif len(id2score[idx]) > 1:
+                    scores_tensor = torch.stack(id2score[idx])
+                    id2mean[idx] = torch.mean(scores_tensor)
+                    id2std[idx] = torch.std(scores_tensor)
+                else:
+                    raise ValueError(f"no score in prompt index: {idx}")
+            for i in range(bsz):
+                if norm_adv_by_std_in_grpo:
+                    scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
+                else:
+                    scores[i] = scores[i] - id2mean[index[i]]
+            scores = scores.unsqueeze(-1) * response_mask
+
+        return scores, scores
+
+
+@register_adv_est(AdvantageEstimator.STEPCUMUL_GRPO)  # or simply: @register_adv_est("stepcumul_grpo")
+def compute_stepcumul_grpo_outcome_advantage(
+    data: Any,
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional[AlgoConfig] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute advantage for step-wise GRPO.
+
+    Args:
+        data: `(Any)`
+            additional data required for step-wise GRPO
+        token_level_rewards: `(torch.Tensor)`
+            shape is (bs, response_length)
+        response_mask: `(torch.Tensor)`
+            shape is (bs, response_length)
+        index: `(np.ndarray)`
+            index array for grouping
+        epsilon: `(float)`
+            small value to avoid division by zero
+        norm_adv_by_std_in_grpo: `(bool)`
+            whether to scale the GRPO advantage
+        config: `(Optional[AlgoConfig])`
+            algorithm configuration object
+
+    Note:
+        If norm_adv_by_std_in_grpo is True, the advantage is scaled by the std, as in the original GRPO.
+        If False, the advantage is not scaled, as in Dr.GRPO (https://arxiv.org/abs/2503.20783).
+
+    Returns:
+        advantages: `(torch.Tensor)`
+            shape is (bs, response_length)
+        Returns: `(torch.Tensor)`
+            shape is (bs, response_length)
+    """
+
+    try:
+        def _get_scores_for_step(score, mean, std):
+            score_minus_mean = score - mean
+            if score_minus_mean.item() < 1e-5:
+                score_minus_mean = torch.tensor(0.0, device=mean.device, dtype=mean.dtype)
+            if norm_adv_by_std_in_grpo:
+                return score_minus_mean / (std + epsilon)
+            else:
+                return score_minus_mean
+
+        response_ids = data.batch["responses"]
+        step_rewards_all = data.non_tensor_batch["step_rewards"]
+        step_last_indices_all = data.non_tensor_batch["step_last_indices"]
+
+
+        scores = token_level_rewards.sum(dim=-1)
+        # advantage shape = (8, ) + (token_level_rewards.shape)
+        advantage = torch.zeros((8,) + token_level_rewards.shape, device=token_level_rewards.device, dtype=token_level_rewards.dtype)
+        # transpose 0, 1 dim later to make it (bs, 8, response_length)
+        advantage = advantage.transpose(0, 1)
+
+        response_mask = torch.zeros((8,) + response_mask.shape, device=response_mask.device, dtype=response_mask.dtype)
+        response_mask = response_mask.transpose(0, 1)
+
+        id2score = defaultdict(list)
+        id2mean = {}
+        id2std = {}
+
+        with torch.no_grad():
+            bsz = scores.shape[0]
+            for i in range(bsz):
+                step_rewards = step_rewards_all[i]
+                step_last_indices = step_last_indices_all[i]
+                for step, rew in step_rewards.items():
+                    id2score[f"{index[i]}_{step}"].append(torch.tensor(rew))
+            for idx in id2score:
+                if len(id2score[idx]) == 1:
+                    id2mean[idx] = torch.tensor(0.0)
+                    id2std[idx] = torch.tensor(1.0)
+                elif len(id2score[idx]) > 1:
+                    scores_tensor = torch.stack(id2score[idx])
+                    id2mean[idx] = torch.mean(scores_tensor)
+                    std = torch.std(scores_tensor)
+                    # Treat very small std as zero to avoid numerical instability
+                    if std.item() <= 1e-5:
+                        id2std[idx] = torch.tensor(0.0, device=std.device, dtype=std.dtype)
+                    else:
+                        id2std[idx] = std
+                else:
+                    raise ValueError(f"no score in prompt index: {idx}")
+            for i in range(bsz):
+                last_idx_dict = step_last_indices_all[i]
+                task = data.non_tensor_batch['task'][i]
+                if task == "forward":
+                    step4_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['step4']], id2mean[f"{index[i]}_step4"], id2std[f"{index[i]}_step4"])
+                    step5_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['step5']], id2mean[f"{index[i]}_step5"], id2std[f"{index[i]}_step5"])
+                    step6_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['step6']], id2mean[f"{index[i]}_step6"], id2std[f"{index[i]}_step6"])
+                    answer_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['answer']], id2mean[f"{index[i]}_answer"], id2std[f"{index[i]}_answer"])
+                    advantage[i, 3, :last_idx_dict['step4']+1] = step4_score
+                    advantage[i, 4, :last_idx_dict['step5']+1] = step5_score
+                    advantage[i, 5, :last_idx_dict['step6']+1] = step6_score
+                    advantage[i, 7, :last_idx_dict['answer']+1] = answer_score
+                    response_mask[i, 3, :last_idx_dict['step4']+1] = 1.0
+                    response_mask[i, 4, :last_idx_dict['step5']+1] = 1.0
+                    response_mask[i, 5, :last_idx_dict['step6']+1] = 1.0
+                    response_mask[i, 7, :last_idx_dict['answer']+1] = 1.0
+                elif task == "retro":
+                    step5_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['step5']], id2mean[f"{index[i]}_step5"], id2std[f"{index[i]}_step5"])
+                    step6_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['step6']], id2mean[f"{index[i]}_step6"], id2std[f"{index[i]}_step6"])
+                    step7_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['step7']], id2mean[f"{index[i]}_step7"], id2std[f"{index[i]}_step7"])
+                    answer_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['answer']], id2mean[f"{index[i]}_answer"], id2std[f"{index[i]}_answer"])
+                    advantage[i, 4, :last_idx_dict['step5']+1] = step5_score
+                    advantage[i, 5, :last_idx_dict['step6']+1] = step6_score
+                    advantage[i, 6, :last_idx_dict['step7']+1] = step7_score
+                    advantage[i, 7, :last_idx_dict['answer']+1] = answer_score
+                    response_mask[i, 4, :last_idx_dict['step5']+1] = 1.0
+                    response_mask[i, 5, :last_idx_dict['step6']+1] = 1.0
+                    response_mask[i, 6, :last_idx_dict['step7']+1] = 1.0
+                    response_mask[i, 7, :last_idx_dict['answer']+1] = 1.0
+                elif task == "reagent":
+                    step6_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['step6']], id2mean[f"{index[i]}_step6"], id2std[f"{index[i]}_step6"])
+                    step7_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['step7']], id2mean[f"{index[i]}_step7"], id2std[f"{index[i]}_step7"])
+                    answer_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['answer']], id2mean[f"{index[i]}_answer"], id2std[f"{index[i]}_answer"])
+                    advantage[i, 5, :last_idx_dict['step6']+1] = step6_score
+                    advantage[i, 6, :last_idx_dict['step7']+1] = step7_score
+                    advantage[i, 7, :last_idx_dict['answer']+1] = answer_score
+                    response_mask[i, 5, :last_idx_dict['step6']+1] = 1.0
+                    response_mask[i, 6, :last_idx_dict['step7']+1] = 1.0
+                    response_mask[i, 7, :last_idx_dict['answer']+1] = 1.0
+                else:
+                    raise ValueError(f"Unknown task type: {task}")
+        return advantage, advantage, response_mask
 
     except Exception as e:
         print(f"Exception occurred: {e}. Falling back to standard GRPO computation.")
@@ -1208,6 +1374,103 @@ def compute_policy_loss_steplevel(
     pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
+
+
+@register_policy_loss("stepcumul")  # type: ignore[arg-type]
+def compute_policy_loss_stepcumul(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+    config: Optional[DictConfig | AlgoConfig] = None,
+    rollout_is_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Compute the clipped policy objective and related metrics for PPO.
+
+    Adapted from
+    https://github.com/huggingface/trl/blob/main/trl/trainer/ppo_trainer.py#L1122
+
+    Args:
+        old_log_prob (torch.Tensor):
+            Log-probabilities of actions under the old policy, shape (batch_size, response_length).
+        log_prob (torch.Tensor):
+            Log-probabilities of actions under the current policy, shape (batch_size, response_length).
+        advantages (torch.Tensor):
+            Advantage estimates for each action, shape (batch_size, response_length).
+        response_mask (torch.Tensor):
+            Mask indicating which tokens to include in the loss, shape (batch_size, response_length).
+        loss_agg_mode (str, optional):
+            Aggregation mode for `agg_loss`. Defaults to "token-mean".
+        config: `(verl.trainer.config.ActorConfig)`:
+            config for the actor.
+        rollout_log_probs: `(torch.Tensor)`:
+            log probabilities of actions under the rollout policy, shape (batch_size, response_length).
+    """
+
+    advantages_all = advantages.clone()
+    response_mask_all = response_mask.clone()
+
+    assert config is not None
+    assert not isinstance(config, AlgoConfig)
+    clip_ratio = config.clip_ratio  # Clipping parameter ε for standard PPO. See https://arxiv.org/abs/1707.06347.
+    clip_ratio_low = config.clip_ratio_low if config.clip_ratio_low is not None else clip_ratio
+    clip_ratio_high = config.clip_ratio_high if config.clip_ratio_high is not None else clip_ratio
+    clip_ratio_c = config.get(  # Lower bound of the ratio for dual-clip PPO. See https://arxiv.org/pdf/1912.09729.
+        "clip_ratio_c", 3.0
+    )
+
+    cliprange = clip_ratio
+    cliprange_low = clip_ratio_low
+    cliprange_high = clip_ratio_high
+
+    assert clip_ratio_c > 1.0, (
+        "The lower bound of the clip_ratio_c for dual-clip PPO should be greater than 1.0,"
+        + f" but get the value: {clip_ratio_c}."
+    )
+
+    negative_approx_kl = log_prob - old_log_prob
+    # Clamp negative_approx_kl for stability
+    negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
+    ratio = torch.exp(negative_approx_kl)
+
+    total_loss = 0.
+
+    for step_i in range(advantages_all.shape[1]):
+        advantages = advantages_all[:, step_i, :]
+        response_mask = response_mask_all[:, step_i, :]
+        ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+
+        pg_losses1 = -advantages * ratio
+        if cliprange_low is None:
+            cliprange_low = cliprange
+        if cliprange_high is None:
+            cliprange_high = cliprange
+        pg_losses2 = -advantages * torch.clamp(
+            ratio, 1 - cliprange_low, 1 + cliprange_high
+        )  # - clip(ratio, 1-cliprange, 1+cliprange) * A
+        clip_pg_losses1 = torch.maximum(
+            pg_losses1, pg_losses2
+        )  # max(-ratio * A, -clip(ratio, 1-cliprange, 1+cliprange) * A)
+        pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+
+        pg_losses3 = -advantages * clip_ratio_c
+        clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
+        pg_clipfrac_lower = verl_F.masked_mean(
+            torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), response_mask
+        )
+
+        pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
+
+        # Apply rollout importance sampling weights if provided
+        if rollout_is_weights is not None:
+            pg_losses = pg_losses * rollout_is_weights
+
+        pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+        total_loss += pg_loss
+
+    return total_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
 
 @register_policy_loss("gspo")
