@@ -637,11 +637,11 @@ class StepEvaluator():
         step6_FN = step6_initial_incorrect and step6_has_not_reflection
 
         # Reflection accuracy reward
-        step4_reflection_correct = step4_TP + step4_TN
-        step5_reflection_correct = step5_TP + step5_TN
-        step6_reflection_correct = step6_TP + step6_TN
+        step4_reflection_correct = step4_TP + step4_TN - step4_FP - step4_FN
+        step5_reflection_correct = step5_TP + step5_TN - step5_FP - step5_FN
+        step6_reflection_correct = step6_TP + step6_TN - step6_FP - step6_FN
         total_reflection_correct_list = [step4_reflection_correct, step5_reflection_correct, step6_reflection_correct]
-        reflection_acc = sum(total_reflection_correct_list) / len(total_reflection_correct_list)
+        reflection_ratio = sum(total_reflection_correct_list) / len(total_reflection_correct_list)
 
         content_reward_dict = {
             "forward/step4/has_reactive_atoms_smiles": int(has_reactive_atoms_smiles),
@@ -674,7 +674,7 @@ class StepEvaluator():
             "forward/step4/correct_reflection": int(step4_reflection_correct),
             "forward/step5/correct_reflection": int(step5_reflection_correct),
             "forward/step6/correct_reflection": int(step6_reflection_correct),
-            "forward/total_reflection_acc": reflection_acc,
+            "forward/total_reflection_ratio": reflection_ratio,
         }, reflection_bonus, content_reward_dict, reflection_decision_reward_dict
 
 
@@ -770,11 +770,11 @@ class StepEvaluator():
         step7_FN = step7_initial_incorrect and step7_has_not_reflection
 
         # Reflection accuracy reward
-        step5_reflection_correct = step5_TP + step5_TN
-        step6_reflection_correct = step6_TP + step6_TN
-        step7_reflection_correct = step7_TP + step7_TN
+        step5_reflection_correct = step5_TP + step5_TN - step5_FP - step5_FN
+        step6_reflection_correct = step6_TP + step6_TN - step6_FP - step6_FN
+        step7_reflection_correct = step7_TP + step7_TN - step7_FP - step7_FN
         total_reflection_correct_list = [step5_reflection_correct, step6_reflection_correct, step7_reflection_correct]
-        reflection_acc = sum(total_reflection_correct_list) / len(total_reflection_correct_list)
+        reflection_ratio = sum(total_reflection_correct_list) / len(total_reflection_correct_list)
 
         content_reward_dict = {
             "retro/step5/has_bond_disconnection": int(has_bond_disconnection),
@@ -807,7 +807,7 @@ class StepEvaluator():
             "retro/step5/correct_reflection": int(step5_reflection_correct),
             "retro/step6/correct_reflection": int(step6_reflection_correct),
             "retro/step7/correct_reflection": int(step7_reflection_correct),
-            "retro/total_reflection_acc": reflection_acc,
+            "retro/total_reflection_ratio": reflection_ratio,
         }, reflection_bonus, content_reward_dict, reflection_decision_reward_dict
 
 
@@ -909,10 +909,10 @@ class StepEvaluator():
         step7_FN = step7_initial_incorrect and step7_has_not_reflection
 
         # Reflection accuracy reward
-        step6_reflection_correct = step6_TP + step6_TN
-        step7_reflection_correct = step7_TP + step7_TN
+        step6_reflection_correct = step6_TP + step6_TN - step6_FP - step6_FN
+        step7_reflection_correct = step7_TP + step7_TN - step7_FP - step7_FN
         total_reflection_correct_list = [step6_reflection_correct, step7_reflection_correct]
-        reflection_acc = sum(total_reflection_correct_list) / len(total_reflection_correct_list)
+        reflection_ratio = sum(total_reflection_correct_list) / len(total_reflection_correct_list)
 
         content_reward_dict = {
             "reagent/step6/has_reagents": int(has_reagents),
@@ -937,7 +937,7 @@ class StepEvaluator():
             "reagent/step7/FN": step7_FN,
             "reagent/step6/correct_reflection": int(step6_reflection_correct),
             "reagent/step7/correct_reflection": int(step7_reflection_correct),
-            "reagent/total_reflection_acc": reflection_acc,
+            "reagent/total_reflection_ratio": reflection_ratio,
         }, reflection_bonus, content_reward_dict, reflection_decision_reward_dict
 
 
