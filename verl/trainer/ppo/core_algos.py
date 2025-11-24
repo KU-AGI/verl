@@ -541,8 +541,8 @@ def compute_stepcumul_grpo_outcome_advantage(
         # transpose 0, 1 dim later to make it (bs, 8, response_length)
         advantage = advantage.transpose(0, 1)
 
-        response_mask = torch.zeros((8,) + response_mask.shape, device=response_mask.device, dtype=response_mask.dtype)
-        response_mask = response_mask.transpose(0, 1)
+        new_response_mask = torch.zeros((8,) + response_mask.shape, device=response_mask.device, dtype=response_mask.dtype)
+        new_response_mask = new_response_mask.transpose(0, 1)
 
         id2score = defaultdict(list)
         id2mean = {}
@@ -582,10 +582,10 @@ def compute_stepcumul_grpo_outcome_advantage(
                     advantage[i, 4, :last_idx_dict['step5']+1] = step5_score
                     advantage[i, 5, :last_idx_dict['step6']+1] = step6_score
                     advantage[i, 7, :last_idx_dict['answer']+1] = answer_score
-                    response_mask[i, 3, :last_idx_dict['step4']+1] = 1.0
-                    response_mask[i, 4, :last_idx_dict['step5']+1] = 1.0
-                    response_mask[i, 5, :last_idx_dict['step6']+1] = 1.0
-                    response_mask[i, 7, :last_idx_dict['answer']+1] = 1.0
+                    new_response_mask[i, 3, :last_idx_dict['step4']+1] = 1.0
+                    new_response_mask[i, 4, :last_idx_dict['step5']+1] = 1.0
+                    new_response_mask[i, 5, :last_idx_dict['step6']+1] = 1.0
+                    new_response_mask[i, 7, :last_idx_dict['answer']+1] = 1.0
                 elif task == "retro":
                     step5_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['step5']], id2mean[f"{index[i]}_step5"], id2std[f"{index[i]}_step5"])
                     step6_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['step6']], id2mean[f"{index[i]}_step6"], id2std[f"{index[i]}_step6"])
@@ -595,10 +595,10 @@ def compute_stepcumul_grpo_outcome_advantage(
                     advantage[i, 5, :last_idx_dict['step6']+1] = step6_score
                     advantage[i, 6, :last_idx_dict['step7']+1] = step7_score
                     advantage[i, 7, :last_idx_dict['answer']+1] = answer_score
-                    response_mask[i, 4, :last_idx_dict['step5']+1] = 1.0
-                    response_mask[i, 5, :last_idx_dict['step6']+1] = 1.0
-                    response_mask[i, 6, :last_idx_dict['step7']+1] = 1.0
-                    response_mask[i, 7, :last_idx_dict['answer']+1] = 1.0
+                    new_response_mask[i, 4, :last_idx_dict['step5']+1] = 1.0
+                    new_response_mask[i, 5, :last_idx_dict['step6']+1] = 1.0
+                    new_response_mask[i, 6, :last_idx_dict['step7']+1] = 1.0
+                    new_response_mask[i, 7, :last_idx_dict['answer']+1] = 1.0
                 elif task == "reagent":
                     step6_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['step6']], id2mean[f"{index[i]}_step6"], id2std[f"{index[i]}_step6"])
                     step7_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['step7']], id2mean[f"{index[i]}_step7"], id2std[f"{index[i]}_step7"])
@@ -606,12 +606,12 @@ def compute_stepcumul_grpo_outcome_advantage(
                     advantage[i, 5, :last_idx_dict['step6']+1] = step6_score
                     advantage[i, 6, :last_idx_dict['step7']+1] = step7_score
                     advantage[i, 7, :last_idx_dict['answer']+1] = answer_score
-                    response_mask[i, 5, :last_idx_dict['step6']+1] = 1.0
-                    response_mask[i, 6, :last_idx_dict['step7']+1] = 1.0
-                    response_mask[i, 7, :last_idx_dict['answer']+1] = 1.0
+                    new_response_mask[i, 5, :last_idx_dict['step6']+1] = 1.0
+                    new_response_mask[i, 6, :last_idx_dict['step7']+1] = 1.0
+                    new_response_mask[i, 7, :last_idx_dict['answer']+1] = 1.0
                 else:
                     raise ValueError(f"Unknown task type: {task}")
-        return advantage, advantage, response_mask
+        return advantage, advantage, new_response_mask
 
     except Exception as e:
         print(f"Exception occurred: {e}. Falling back to standard GRPO computation.")
@@ -642,7 +642,7 @@ def compute_stepcumul_grpo_outcome_advantage(
                     scores[i] = scores[i] - id2mean[index[i]]
             scores = scores.unsqueeze(-1) * response_mask
 
-        return scores, scores
+        return scores, scores, response_mask
 
 
 @register_adv_est(AdvantageEstimator.GRPO_VECTORIZED)
@@ -1408,6 +1408,61 @@ def compute_policy_loss_stepcumul(
         rollout_log_probs: `(torch.Tensor)`:
             log probabilities of actions under the rollout policy, shape (batch_size, response_length).
     """
+
+    if advantages.dim() == 2:
+        assert config is not None
+        assert not isinstance(config, AlgoConfig)
+        clip_ratio = config.clip_ratio  # Clipping parameter ε for standard PPO. See https://arxiv.org/abs/1707.06347.
+        clip_ratio_low = config.clip_ratio_low if config.clip_ratio_low is not None else clip_ratio
+        clip_ratio_high = config.clip_ratio_high if config.clip_ratio_high is not None else clip_ratio
+        clip_ratio_c = config.get(  # Lower bound of the ratio for dual-clip PPO. See https://arxiv.org/pdf/1912.09729.
+            "clip_ratio_c", 3.0
+        )
+
+        cliprange = clip_ratio
+        cliprange_low = clip_ratio_low
+        cliprange_high = clip_ratio_high
+
+        assert clip_ratio_c > 1.0, (
+            "The lower bound of the clip_ratio_c for dual-clip PPO should be greater than 1.0,"
+            + f" but get the value: {clip_ratio_c}."
+        )
+
+        negative_approx_kl = log_prob - old_log_prob
+        # Clamp negative_approx_kl for stability
+        negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
+        ratio = torch.exp(negative_approx_kl)
+        ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+
+        pg_losses1 = -advantages * ratio
+        if cliprange_low is None:
+            cliprange_low = cliprange
+        if cliprange_high is None:
+            cliprange_high = cliprange
+        pg_losses2 = -advantages * torch.clamp(
+            ratio, 1 - cliprange_low, 1 + cliprange_high
+        )  # - clip(ratio, 1-cliprange, 1+cliprange) * A
+        clip_pg_losses1 = torch.maximum(
+            pg_losses1, pg_losses2
+        )  # max(-ratio * A, -clip(ratio, 1-cliprange, 1+cliprange) * A)
+        pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+
+        pg_losses3 = -advantages * clip_ratio_c
+        clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
+        pg_clipfrac_lower = verl_F.masked_mean(
+            torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), response_mask
+        )
+
+        pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
+
+        # Apply rollout importance sampling weights if provided
+        if rollout_is_weights is not None:
+            pg_losses = pg_losses * rollout_is_weights
+
+        pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+
+        return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
+
 
     advantages_all = advantages.clone()
     response_mask_all = response_mask.clone()
