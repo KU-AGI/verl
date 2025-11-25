@@ -6,7 +6,7 @@ export WANDB_PROJECT="verl-dapo"
 export NCCL_DEBUG="WARN"
 
 project_name='verl-dapo'
-exp_name='reagent_naiverwd_naivecredit_naivespl_GRPO'
+exp_name='reagent_naiverwd_naivecredit_naivespl_GRPO_temp1.2'
 
 # Ray
 RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
