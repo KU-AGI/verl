@@ -101,6 +101,8 @@ class ImageGenerationRewardManager:
             valid_response_length = response_mask[i].sum()
             score_dict = scores[i]
             reward = score_dict.get("score", 0.0)
+            if reward != -100:
+                reward = reward * 10 # scale up
             
             # Update extra info
             if "reward_extra_info" in score_dict:
@@ -130,8 +132,11 @@ class ImageGenerationRewardManager:
 
         # Store accuracy
         data.batch["acc"] = torch.tensor(rewards, dtype=torch.float32)
-                
-        print(f"[REWARD] Computed {len(rewards)} rewards, mean={sum([reward for reward in rewards if reward != -100])/len([reward for reward in rewards if reward != -100]):.4f}")
+
+        # Compute mean excluding -100 rewards
+        valid_rewards = [reward for reward in rewards if reward != -100]
+        mean_reward = sum(valid_rewards) / len(valid_rewards) if len(valid_rewards) > 0 else 0.0
+        print(f"[REWARD] Computed {len(rewards)} rewards, valid={len(valid_rewards)}, mean={mean_reward:.4f}")
 
         if return_dict:
             return {f"task{task_id}_reward_tensor": reward_tensor, f"task{task_id}_reward_extra_info": reward_extra_info}
