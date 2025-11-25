@@ -575,15 +575,112 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             metrics[f"group_metrics/{task}/zero_std_num"] = 0
         task_group_metrics = defaultdict(list)
         uids = list(set(batch.non_tensor_batch['uid']))
+
+        breakpoint()
         for uid in uids:
             uid_inds = np.where(batch.non_tensor_batch['uid'] == uid)[0]
             task = batch.non_tensor_batch['task'][uid_inds[0]]
             scores = batch.non_tensor_batch['score'][uid_inds]
+            accs = batch.non_tensor_batch['acc'][uid_inds]
+            answer_exact_k = any(accs)
+            answer_exact_all = all(accs)
+            answer_all_same = all(a == accs[0] for a in accs)
+            answer_not_all_same = not answer_all_same
+
+            if task == "forward":
+                step4_accs = batch.non_tensor_batch[f'{task}/step4/has_reactive_atoms_smiles'][uid_inds]
+                step5_accs = batch.non_tensor_batch[f'{task}/step5/has_reactive_atom_bonds'][uid_inds]
+                step6_accs = batch.non_tensor_batch[f'{task}/step6/has_tagged_smiles'][uid_inds]
+
+                step4_exact_k = any(step4_accs)
+                step5_exact_k = any(step5_accs)
+                step6_exact_k = any(step6_accs)
+                step4_exact_all = all(step4_accs)
+                step5_exact_all = all(step5_accs)
+                step6_exact_all = all(step6_accs)
+                step4_all_same = all(a == step4_accs[0] for a in step4_accs)
+                step5_all_same = all(a == step5_accs[0] for a in step5_accs)
+                step6_all_same = all(a == step6_accs[0] for a in step6_accs)
+                step4_not_all_same = not step4_all_same
+                step5_not_all_same = not step5_all_same
+                step6_not_all_same = not step6_all_same
+
+                task_group_metrics[f"group_metrics/{task}/step4/exact_k"].append(step4_exact_k)
+                task_group_metrics[f"group_metrics/{task}/step4/exact_all"].append(step4_exact_all)
+                task_group_metrics[f"group_metrics/{task}/step4/all_same"].append(step4_all_same)
+                task_group_metrics[f"group_metrics/{task}/step4/not_all_same"].append(step4_not_all_same)
+                task_group_metrics[f"group_metrics/{task}/step5/exact_k"].append(step5_exact_k)
+                task_group_metrics[f"group_metrics/{task}/step5/exact_all"].append(step5_exact_all)
+                task_group_metrics[f"group_metrics/{task}/step5/all_same"].append(step5_all_same)
+                task_group_metrics[f"group_metrics/{task}/step5/not_all_same"].append(step5_not_all_same)
+                task_group_metrics[f"group_metrics/{task}/step6/exact_k"].append(step6_exact_k)
+                task_group_metrics[f"group_metrics/{task}/step6/exact_all"].append(step6_exact_all)
+                task_group_metrics[f"group_metrics/{task}/step6/all_same"].append(step6_all_same)
+                task_group_metrics[f"group_metrics/{task}/step6/not_all_same"].append(step6_not_all_same)
+            elif task == "retro":
+                step5_accs = batch.non_tensor_batch[f'{task}/step5/has_bond_disconnection'][uid_inds]
+                step6_accs = batch.non_tensor_batch[f'{task}/step6/has_synthons'][uid_inds]
+                step7_accs = batch.non_tensor_batch[f'{task}/step7/has_synthetic_equivalents'][uid_inds]
+
+                step5_exact_k = any(step5_accs)
+                step6_exact_k = any(step6_accs)
+                step7_exact_k = any(step7_accs)
+                step5_exact_all = all(step5_accs)
+                step6_exact_all = all(step6_accs)
+                step7_exact_all = all(step7_accs)
+                step5_all_same = all(a == step5_accs[0] for a in step5_accs)
+                step6_all_same = all(a == step6_accs[0] for a in step6_accs)
+                step7_all_same = all(a == step7_accs[0] for a in step7_accs)
+                step5_not_all_same = not step5_all_same
+                step6_not_all_same = not step6_all_same
+                step7_not_all_same = not step7_all_same
+
+                task_group_metrics[f"group_metrics/{task}/step5/exact_k"].append(step5_exact_k)
+                task_group_metrics[f"group_metrics/{task}/step5/exact_all"].append(step5_exact_all)
+                task_group_metrics[f"group_metrics/{task}/step5/all_same"].append(step5_all_same)
+                task_group_metrics[f"group_metrics/{task}/step5/not_all_same"].append(step5_not_all_same)
+                task_group_metrics[f"group_metrics/{task}/step6/exact_k"].append(step6_exact_k)
+                task_group_metrics[f"group_metrics/{task}/step6/exact_all"].append(step6_exact_all)
+                task_group_metrics[f"group_metrics/{task}/step6/all_same"].append(step6_all_same)
+                task_group_metrics[f"group_metrics/{task}/step6/not_all_same"].append(step6_not_all_same)
+                task_group_metrics[f"group_metrics/{task}/step7/exact_k"].append(step7_exact_k)
+                task_group_metrics[f"group_metrics/{task}/step7/exact_all"].append(step7_exact_all)
+                task_group_metrics[f"group_metrics/{task}/step7/all_same"].append(step7_all_same)
+                task_group_metrics[f"group_metrics/{task}/step7/not_all_same"].append(step7_not_all_same)
+            elif task == "reagent":
+                step6_accs = batch.non_tensor_batch[f'{task}/step6/has_reagents'][uid_inds]
+                step7_accs = batch.non_tensor_batch[f'{task}/step7/has_correct_reagent_number'][uid_inds]
+
+                step6_exact_k = any(step6_accs)
+                step7_exact_k = any(step7_accs)
+                step6_exact_all = all(step6_accs)
+                step7_exact_all = all(step7_accs)
+                step6_all_same = all(a == step6_accs[0] for a in step6_accs)
+                step7_all_same = all(a == step7_accs[0] for a in step7_accs)
+                step6_not_all_same = not step6_all_same
+                step7_not_all_same = not step7_all_same
+
+                task_group_metrics[f"group_metrics/{task}/step6/exact_k"].append(step6_exact_k)
+                task_group_metrics[f"group_metrics/{task}/step6/exact_all"].append(step6_exact_all)
+                task_group_metrics[f"group_metrics/{task}/step6/all_same"].append(step6_all_same)
+                task_group_metrics[f"group_metrics/{task}/step6/not_all_same"].append(step6_not_all_same)
+                task_group_metrics[f"group_metrics/{task}/step7/exact_k"].append(step7_exact_k)
+                task_group_metrics[f"group_metrics/{task}/step7/exact_all"].append(step7_exact_all)
+                task_group_metrics[f"group_metrics/{task}/step7/all_same"].append(step7_all_same)
+                task_group_metrics[f"group_metrics/{task}/step7/not_all_same"].append(step7_not_all_same)
+            else:
+                raise ValueError(f"Unknown task: {task}")
+
             # print("-" * 100)
             # print(f"scores : {scores.tolist()}")
             # print(f"scores (std): {scores.std().item()}")
             task_group_metrics[f"group_metrics/{task}/reward_mean"].append(scores.mean())
             task_group_metrics[f"group_metrics/{task}/reward_std"].append(scores.std())
+            task_group_metrics[f"group_metrics/{task}/answer/exact_k"].append(answer_exact_k)
+            task_group_metrics[f"group_metrics/{task}/answer/exact_all"].append(answer_exact_all)
+            task_group_metrics[f"group_metrics/{task}/answer/all_same"].append(answer_all_same)
+            task_group_metrics[f"group_metrics/{task}/answer/not_all_same"].append(answer_not_all_same)
+            # current_ids = batch.batch['input_ids'][uid_inds]
             if scores.std() == 0:
                 metrics[f"group_metrics/{task}/zero_std_num"] += 1
         for k, v in task_group_metrics.items():

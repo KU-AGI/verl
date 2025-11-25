@@ -68,7 +68,7 @@ overlong_penalty_factor=1.0
 loss_agg_mode="seq-mean-token-sum" # "seq-mean-token-sum" "seq-mean-token-sum-norm"
 
 # Algorithm
-temperature=1.0
+temperature=1.2
 top_p=1.0
 top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
 val_temperature=0.0
