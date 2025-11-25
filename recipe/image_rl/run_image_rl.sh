@@ -29,16 +29,28 @@ export TORCH_DISTRIBUTED_DEBUG=DETAIL
 
 export RM_MODEL_PATH="Qwen/Qwen3-VL-30B-A3B-Instruct" # OpenGVLab/InternVL3_5-38B
 
+EDIT_TEMPLATE='You are a strict image editing assistant.
+Your task is to modify the provided input image according to the user'"'"'s instruction.
+
+INPUT FORMAT:
+The source image is located between {image_start_tag} and {image_end_tag}.
+
+CRITICAL RULES:
+1. You MUST Look at the image between {image_start_tag} and {image_end_tag} as the ground truth.
+2. Preserve the background, objects, and style from the input image unless explicitly asked to change them.
+3. Do NOT generate a completely new image from scratch.
+4. **You MUST strictly maintain the spatial layout and composition of the source image.**'
+
 # pip install attrdict timm
 RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
 WORKING_DIR=${WORKING_DIR:-"${PWD}"}
-RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/verl/trainer/runtime_env.yaml"}
+RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/recipe/image_rl/runtime_env.yaml"}
 
-GPUS=4 # `nvidia-smi -L | wc -l`
-MODEL_PATH=/data/mllm/ckpt/pretrained # /data/mllm/checkpoints/Janus-Pro-7B
+GPUS=`nvidia-smi -L | wc -l`
+MODEL_PATH=/data/mllm/ckpt/step=016000.ckpt/hf_model # /data/mllm/checkpoints/Janus-Pro-7B
 TRAIN_FILES=/data/mllm/data/train.parquet
 VAL_FILES=/data/mllm/data/val.parquet
-RUN_NAME=debug
+RUN_NAME=grpo_default_reward_b8_n8_lr2e-6_multi_task_new_reward_kl0.04_temp1.2_sampling
 PROJ_NAME=mllm_reasoning
 SAVE_DIR=/data/verl/ckpts/$PROJ_NAME/$RUN_NAME
 
@@ -48,7 +60,7 @@ adv_estimator=grpo_task_skip
 use_kl_in_reward=False
 kl_coef=0.0
 use_kl_loss=True
-kl_loss_coef=0.001
+kl_loss_coef=0.04
 
 clip_ratio_low=0.2
 clip_ratio_high=0.2
@@ -58,8 +70,8 @@ filter_groups_metric=acc
 max_num_gen_batches=10
 
 # Response length parameters
-max_prompt_length=$((1024 * 1)) # 1k
-max_response_length=$((1024 * 2)) # 2k
+max_prompt_length=1000
+max_response_length=2500
 # enable_overlong_buffer=False
 # overlong_buffer_len=$((1024 * 4))
 # overlong_penalty_factor=1.0
@@ -68,12 +80,16 @@ max_response_length=$((1024 * 2)) # 2k
 loss_agg_mode="token-mean"
 
 # Algorithm
-temperature=1.0
-top_p=1.0
-top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
-val_temperature=0.0
-val_top_k=0.0
-val_top_p=1.0
+temperature=1.2
+# txt_top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
+# txt_top_p=1.0
+# img_top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
+# img_top_p=1.0
+val_temperature=1.0
+val_txt_top_k=50
+val_txt_top_p=1.0
+val_img_top_k=4096
+val_img_top_p=1.0
 
 # Performance Related Parameter
 use_dynamic_bsz=False
@@ -82,7 +98,6 @@ use_dynamic_bsz=False
 offload=False
 gen_tp=1
 sp_size=1
-fsdp_size=4 # Must be divisible by (n_gpus_training*n_nodes) and (n_gpus_rollout*n_nodes)
 
 # Fully async specific parameters
 NNODES=${NNODES:-1}
@@ -91,20 +106,17 @@ NGPUS_PER_NODE=${NGPUS_PER_NODE:-$GPUS}
 save_freq=20
 test_freq=20
 total_epochs=1
-rollout_freq=20
-log_val_generations=5
+rollout_freq=1
+log_val_generations=20
 
 # Parameters
-train_prompt_bsz=4
+train_prompt_bsz=$GPUS # 4
 gen_prompt_bsz=$((train_prompt_bsz * 1))
 n_resp_per_prompt=8
-train_prompt_mini_bsz=4
+train_prompt_mini_bsz=$GPUS # 4
 
 # Perf
-fsdp_size=4
-
-max_prompt_length=$((1024 * 1)) # 1k
-max_response_length=$((1024 * 2)) # 2k
+fsdp_size=$GPUS # 4
 
 ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     --working-dir "${WORKING_DIR}" \
@@ -115,20 +127,22 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     data.shuffle=False \
     data.prompt_key=prompt \
     data.train_batch_size=${train_prompt_bsz} \
+    data.gen_batch_size=${gen_prompt_bsz} \
+    data.val_batch_size=${gen_prompt_bsz} \
     data.max_prompt_length=${max_prompt_length} \
     data.max_response_length=${max_response_length} \
-    data.gen_batch_size=${gen_prompt_bsz} \
     data.truncation='left' \
     data.custom_cls.path=recipe/image_rl/image_rl_dataset.py \
     data.custom_cls.name=ImageRLDataset \
-    actor_rollout_ref.model.path=$MODEL_PATH \
+    actor_rollout_ref.model.path=\"${MODEL_PATH}\" \
     actor_rollout_ref.model.trust_remote_code=True \
-    actor_rollout_ref.actor.optim.lr=5e-6 \
+    actor_rollout_ref.actor.optim.lr=2e-6 \
     actor_rollout_ref.actor.optim.warmup_style=constant \
     actor_rollout_ref.actor.strategy=fsdp \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.actor.ulysses_sequence_parallel_size=${sp_size} \
     actor_rollout_ref.actor.use_kl_loss=${use_kl_loss} \
     actor_rollout_ref.actor.kl_loss_coef=${kl_loss_coef} \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
@@ -156,10 +170,12 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     actor_rollout_ref.rollout.mode=sync \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
     actor_rollout_ref.rollout.cfg_weight=5.0 \
+    actor_rollout_ref.rollout.temperature=${temperature} \
     actor_rollout_ref.rollout.n=${n_resp_per_prompt} \
     actor_rollout_ref.rollout.image_token_num_per_image=576 \
-    actor_rollout_ref.rollout.prompt_length=1000 \
-    actor_rollout_ref.rollout.response_length=2500 \
+    actor_rollout_ref.rollout.prompt_length=${max_prompt_length} \
+    actor_rollout_ref.rollout.response_length=${max_response_length} \
+    actor_rollout_ref.rollout.regen_system_prompt='${EDIT_TEMPLATE}' \
     actor_rollout_ref.ref.fsdp_config.model_dtype=bfloat16 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.ref.fsdp_config.use_orig_params=True \
@@ -167,12 +183,19 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     actor_rollout_ref.ref.fsdp_config.optimizer_offload=${offload} \
     actor_rollout_ref.ref.fsdp_config.use_torch_compile=False \
     actor_rollout_ref.ref.fsdp_config.wrap_policy.transformer_layer_cls_to_wrap=['LlamaDecoderLayer'] \
+    actor_rollout_ref.rollout.val_kwargs.n=${n_resp_per_prompt} \
+    actor_rollout_ref.rollout.val_kwargs.temperature=${val_temperature} \
+    actor_rollout_ref.rollout.val_kwargs.val_txt_top_k=${val_txt_top_k} \
+    actor_rollout_ref.rollout.val_kwargs.val_txt_top_p=${val_txt_top_p} \
+    actor_rollout_ref.rollout.val_kwargs.val_img_top_k=${val_img_top_k} \
+    actor_rollout_ref.rollout.val_kwargs.val_img_top_p=${val_img_top_p} \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     +algorithm.max_token_start=-1 \
     algorithm.kl_ctrl.kl_coef=${kl_coef} \
     algorithm.filter_groups.enable=${enable_filter_groups} \
     algorithm.filter_groups.max_num_gen_batches=8 \
     algorithm.filter_groups.metric=${filter_groups_metric} \
+    algorithm.norm_adv_by_std_in_grpo=False \
     +trainer.start_step=0 \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
@@ -188,6 +211,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     trainer.default_local_dir=$SAVE_DIR \
     trainer.rollout_data_dir="$SAVE_DIR/rollout" \
     trainer.rollout_freq=${rollout_freq} \
+    trainer.validation_data_dir="$SAVE_DIR/validation" \
     trainer.log_val_generations=${log_val_generations} \
     reward_model.reward_manager=image_generation \
     custom_reward_function.path=recipe/image_rl/reward_function.py \

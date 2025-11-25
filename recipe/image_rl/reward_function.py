@@ -22,7 +22,7 @@ from enum import Enum
 # Configuration
 BASE_URLS = [
     # "http://192.169.0.3:8000/v1",
-    # "http://192.169.0.3:8002/v1"
+    # "http://192.169.0.3:8002/v1",
     "http://192.169.0.3:8004/v1",
 ]
 API_KEY = "EMPTY"
@@ -293,6 +293,31 @@ FEEDBACK:
 {part3_feedback}
 """.strip()
 
+TASK2_VLM_CHECK_SYSTEM_PROMPT = """You are an AI assistant that answers a batch of yes/no questions.
+
+Protocol:
+1) For each question, output EXACTLY two lines, in order, both starting with "<index> |".
+2) Line 1 (justification): one or two concise sentences; no lists, no newlines, do NOT include "Answer:".
+3) Line 2 (final): exactly "<index> | Answer: Yes" or "<index> | Answer: No".
+4) Preserve the original question order and indices. Do not skip or renumber.
+5) If evidence is insufficient or the question is malformed/ambiguous, include the phrase "Insufficient evidence." in the justification and set the final line to "Answer: No".
+6) Do NOT reveal chain-of-thought; provide only brief conclusions based on observable evidence.
+7) Do not add any extra text before, between, or after answers.
+
+Output template per question (two lines per question):
+<index> | <one or two concise sentences for justification>
+<index> | Answer: Yes or Answer: No""".strip()
+
+TASK2_VLM_CHECK_INPUT_PROMPT = """
+You will receive multiple questions, one per line, in the format "<index> | <question>".
+For each question, follow the protocol and produce EXACTLY two lines using the template:
+
+<index> | <one or two concise sentences for justification>
+<index> | Answer: Yes or Answer: No
+
+Questions:
+{questions}""".strip()
+
 
 def convert_gen_img_to_base64(gen_img: PIL.Image.Image) -> Optional[str]:
     if isinstance(gen_img, str):
@@ -363,6 +388,20 @@ def get_messages(prompt, gen_img, feedback_text, regen_img, ground_truth_img, fe
     return messages
 
 
+def get_messages_task2_align(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id):
+    system_prompt = TASK2_VLM_CHECK_SYSTEM_PROMPT
+    user_prompt = TASK2_VLM_CHECK_INPUT_PROMPT.format(questions=vqa_question)
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": convert_gen_img_to_base64(gen_img)}},
+            {"type": "text", "text": user_prompt}
+        ]}
+    ]
+
+    return messages
+
+
 async def get_response_with_client(client, client_id, messages):
     """Get response from a specific client with improved error handling"""
     for attempt in range(MAX_RETRIES):
@@ -419,6 +458,37 @@ async def get_response_with_fallback(prompt, gen_img, feedback_text, regen_img, 
 async def get_response(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id):
     """Get response from API with improved load balancing and failover"""
     return await get_response_with_fallback(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id)
+
+
+async def get_response_with_fallback_task2_align(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id):
+    """Get response with automatic server fallback"""
+    messages = get_messages_task2_align(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id)
+    
+    # Try different servers until one succeeds
+    max_server_attempts = len(client_manager.servers)
+    
+    for server_attempt in range(max_server_attempts):
+        client_info = client_manager.get_next_client_with_fallback()
+        if client_info[0] is None:
+            print("No available servers!")
+            break
+            
+        client, client_id = client_info
+        
+        response = await get_response_with_client(client, client_id, messages)
+        if response is not None:
+            return response
+            
+        print(f"Server attempt {server_attempt + 1}/{max_server_attempts} failed, trying next server...")
+    
+    print("All servers failed!")
+    return None
+
+
+# Update the main function to use the new fallback mechanism
+async def get_response_task2_align(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id):
+    """Get response from API with improved load balancing and failover"""
+    return await get_response_with_fallback_task2_align(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id)
 
 
 def compute_reward(response):
@@ -498,7 +568,38 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
                 task2_reward_score += 0.0
         else:
             task2_reward_score += 0.0
-        
+
+        # task2 
+        response = await get_response_task2_align(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id)
+        if response is not None:
+            try:
+                q_idx_re  = re.compile(r'^\s*(\d+)\s*\|', re.MULTILINE)
+                ans_line_re = re.compile(r'^\s*(\d+)\s*\|\s*Answer:\s*(Yes|No)\s*$', re.IGNORECASE | re.MULTILINE)
+
+                # 1) questions에서 기대 인덱스 추출 (원래 순서 유지)
+                expected_indices = [int(m.group(1)) for m in q_idx_re.finditer(vqa_question)]
+
+                # 2) 출력에서 정답 라인만 파싱 -> {idx: bool}
+                idx_to_ans = {}
+                for idx_str, yn in ans_line_re.findall(response):
+                    idx = int(idx_str)
+                    idx_to_ans[idx] = (yn.strip().lower() == "yes")  # 중복 있으면 마지막 값 사용
+
+                # 3) 기대 인덱스 순서대로 answers 구성 (모두 있어야 유효)
+                complete = len(idx_to_ans) == len(expected_indices) and all(idx in idx_to_ans for idx in expected_indices)
+                rm_decomposed_answers = [idx_to_ans[idx] for idx in expected_indices] if complete else []
+
+                # predicted answers와 reference answers 비교
+                predict_decomposed_ans = [p.lower() == "yes" for p in predict_decomposed_ans]
+                task2_reward_score += 1.0 if all(rm_decomposed_answers) == all(predict_decomposed_ans) else 0.0
+                task2_ans_count += 1
+
+            except:
+                raw_json = {}
+                task2_reward_score += 0.0
+        else:
+            task2_reward_score += 0.0
+
         reward_score += (task2_reward_score / task2_ans_count) if task2_ans_count > 0 else 0.0
         reward_extra_info[f"task{task_id}_reward_response"] = response
 

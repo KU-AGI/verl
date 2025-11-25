@@ -62,10 +62,10 @@ class ImageUnifiedRollout(BaseRollout):
 
         self.cfg_weight = getattr(config, "cfg_weight", 5.0)
         self.temperature = getattr(config, "temperature", 1.0)
-        self.txt_top_k = getattr(config, "txt_top_k", None)
-        self.txt_top_p = getattr(config, "txt_top_p", None)
-        self.img_top_k = getattr(config, "img_top_k", None)
-        self.img_top_p = getattr(config, "img_top_p", None)
+        self.txt_top_k = getattr(config, "txt_top_k", 50)
+        self.txt_top_p = getattr(config, "txt_top_p", 1.0)
+        self.img_top_k = getattr(config, "img_top_k", 4096)
+        self.img_top_p = getattr(config, "img_top_p", 1.0)
 
         self.img_size = 384
         self.patch_size = 16
@@ -243,11 +243,11 @@ class ImageUnifiedRollout(BaseRollout):
         self.image_end_tag = self.processor.image_end_tag
         self.image_tag = self.processor.image_tag
 
-    def get_sft_format(self, prompt):
+    def get_sft_format(self, prompt, system_prompt=""):
         sft_format = self.processor.apply_sft_template_for_multi_turn_prompts(
             conversations=[{"role": "<|User|>", "content": prompt}, {"role": "<|Assistant|>", "content": ""}],
             sft_format=self.processor.sft_format,
-            system_prompt="",
+            system_prompt=system_prompt.format(image_start_tag=self.image_start_tag, image_end_tag=self.image_end_tag) if system_prompt else "",
         )
         sft_format = sft_format + self.image_start_tag
         return sft_format
@@ -276,9 +276,22 @@ class ImageUnifiedRollout(BaseRollout):
         prompts.batch["task1_input_ids"] = input_ids
         prompts.batch["task1_attention_mask"] = attention_mask
 
-        prompts = self._generate_minibatch_image_generation(prompts)
-        prompts = self._generate_minibatch_text_generation(prompts)
-        prompts = self._generate_minibatch_regen_image_generation(prompts)
+        task_funcs = {
+            1: self._generate_minibatch_image_generation,
+            2: self._generate_minibatch_text_generation,
+            3: self._generate_minibatch_regen_image_generation,
+        }
+
+        task_id_tensor = prompts.batch.get("task_id", None)
+        if task_id_tensor is None:
+            selected_funcs = task_funcs.values()
+        else:
+            task_id = task_id_tensor.view(-1).item()
+            selected_funcs = [task_funcs.get(task_id)]
+
+        for func in selected_funcs:
+            if func is not None:
+                prompts = func(prompts)
 
         # Apply padding to all tensors before moving to CPU
         prompts = self._apply_padding_to_dataproto(prompts)
@@ -300,7 +313,7 @@ class ImageUnifiedRollout(BaseRollout):
         # embedding
         param_ctx = contextlib.nullcontext()
         if isinstance(self.module, FSDP):
-            param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=True)
+            param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=False)
 
         with param_ctx:
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
@@ -325,7 +338,7 @@ class ImageUnifiedRollout(BaseRollout):
         # Postprocessing output embeds
         param_ctx = contextlib.nullcontext()
         if isinstance(self.module, FSDP):
-            param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=True)
+            param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=False)
 
         B, C, H, W = gen_imgs_pixel_values.shape
 
@@ -423,7 +436,7 @@ class ImageUnifiedRollout(BaseRollout):
         input_format = []
         for prompt in data_proto.non_tensor_batch['prompt']:
             _prompt = self.get_sft_format(prompt)
-            input_format.append(_prompt + self.image_tag + self.image_end_tag + "\nFirst, Decompose input prompt: " + f"'{prompt}'" + '\n')
+            input_format.append(_prompt + self.image_tag + self.image_end_tag + "\nFirst, Decompose input prompt\n")
 
         self.processor.tokenizer.pad_token_id = self.processor.pad_id
         
@@ -441,7 +454,7 @@ class ImageUnifiedRollout(BaseRollout):
         # embedding
         param_ctx = contextlib.nullcontext()
         if isinstance(self.module, FSDP):
-            param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=True)
+            param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=False)
 
         gen_imgs_pixel_values = gen_imgs_pixel_values.to(self.device, dtype=torch.bfloat16)
 
@@ -472,7 +485,7 @@ class ImageUnifiedRollout(BaseRollout):
         # Postprocessing output embeds
         param_ctx = contextlib.nullcontext()
         if isinstance(self.module, FSDP):
-            param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=True)
+            param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=False)
 
         with param_ctx:
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
@@ -508,12 +521,13 @@ class ImageUnifiedRollout(BaseRollout):
         # Prepare messages for all images
         input_format = []
         for feedback in feedback_texts:
-            _prefix = self.image_start_tag + self.image_tag + self.image_end_tag + "\n"
+            _prefix = self.image_start_tag + self.image_tag + self.image_end_tag \
+                + "\nPlease edit the image as instructed. Keep all existing objects, background, and layout unchanged. Apply only the required modification.\n"
             if feedback is None:
-                prefix = self.get_sft_format(_prefix + "No need to generate feedback.")
+                prefix = self.get_sft_format(_prefix + "No need to generate feedback.", system_prompt=self.regen_system_prompt)
             else:
-                prefix = self.get_sft_format(_prefix + feedback)
-            input_format.append(prefix) # Add image placeholder at the end            
+                prefix = self.get_sft_format(_prefix + feedback, system_prompt=self.regen_system_prompt)
+            input_format.append(prefix) # Add image placeholder at the end
 
         self.processor.tokenizer.pad_token_id = self.processor.pad_id
 
@@ -535,7 +549,7 @@ class ImageUnifiedRollout(BaseRollout):
         # embedding
         param_ctx = contextlib.nullcontext()
         if isinstance(self.module, FSDP):
-            param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=True)
+            param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=False)
 
         with param_ctx:
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
@@ -571,7 +585,7 @@ class ImageUnifiedRollout(BaseRollout):
         # Postprocessing output embeds
         param_ctx = contextlib.nullcontext()
         if isinstance(self.module, FSDP):
-            param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=True)
+            param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=False)
 
         B, C, H, W = regen_imgs_pixel_values.shape
 
@@ -601,7 +615,7 @@ class ImageUnifiedRollout(BaseRollout):
 
         param_ctx = contextlib.nullcontext()
         if isinstance(self.module, FSDP):
-            param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=True)
+            param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=False)
         
         with param_ctx:
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
@@ -648,7 +662,7 @@ class ImageUnifiedRollout(BaseRollout):
 
         param_ctx = contextlib.nullcontext()
         if isinstance(self.module, FSDP):
-            param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=True)
+            param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=False)
         
         with param_ctx:
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
@@ -701,7 +715,7 @@ class ImageUnifiedRollout(BaseRollout):
 
         param_ctx = contextlib.nullcontext()
         if isinstance(self.module, FSDP):
-            param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=True)
+            param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=False)
         
         with param_ctx:
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
@@ -742,7 +756,7 @@ class ImageUnifiedRollout(BaseRollout):
     def generate_text(self, inputs_embeds: torch.Tensor, attention_masks: torch.Tensor) -> torch.Tensor:
         param_ctx = contextlib.nullcontext()
         if isinstance(self.module, FSDP):
-            param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=True)
+            param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=False)
         
         with param_ctx:
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
@@ -774,7 +788,7 @@ class ImageUnifiedRollout(BaseRollout):
 
         param_ctx = contextlib.nullcontext()
         if isinstance(self.module, FSDP):
-            param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=True)
+            param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=False)
         
         with param_ctx:
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
