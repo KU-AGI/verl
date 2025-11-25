@@ -17,15 +17,23 @@ actor_rollout_ref:
     _target_: recipe.image_rl.config.ImageGenerationRolloutConfig
     cfg_weight: 5.0
     temperature: 1.0
-    txt_top_k: 50
-    txt_top_p: 1.0
-    img_top_k: 4096
-    img_top_p: 1.0
+    txt_top_k: null
+    txt_top_p: null
+    img_top_k: null
+    img_top_p: null
     name: image_unified
     mode: sync
     prompt_length: 1024
     response_length: 1024
+    feedback_system_prompt: "You should give me a feedback on the image generation."
+    regen_system_prompt: "You should refine the image generation."
     image_token_num_per_image: 576
+    val_kwargs:
+      _target_: recipe.image_rl.config.ImageGenerationSamplingConfig
+      val_txt_top_k: 50
+      val_txt_top_p: 1.0
+      val_img_top_k: 4096
+      val_img_top_p: 1.0
 
 reward_model:
   reward_manager: image_generation
@@ -44,6 +52,10 @@ algorithm:
     enable: False # We try to avoid forgetting to set enable
     metric: null # acc / score / seq_reward / seq_final_reward / ...
     max_num_gen_batches: 0 # Non-positive values mean no upper limit
+  # multi_task:
+  #   enable: true
+  #   task_weights: [1.0, 1.0, 1.0]  # task 1, 2, 3 weights
+  #   task_selection: "all"  # "all", "random", "weighted_sample"
 
 trainer:
   project_name: verl-image-rl

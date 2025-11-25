@@ -12,12 +12,26 @@ from verl.utils.fs import copy_to_local
 from verl.utils.import_utils import import_external_libs
 from verl.utils.model import get_generation_config, update_model_config
 
-from verl.workers.config.rollout import RolloutConfig
+from verl.workers.config.rollout import RolloutConfig, SamplingConfig
 
 __all__ = [
     "ImageGenerationRolloutConfig",
     "ImageGenerationHFModelConfig",
 ]
+
+
+@dataclass
+class ImageGenerationSamplingConfig(SamplingConfig):
+    txt_top_k: int = None
+    txt_top_p: float = None
+    img_top_k: int = None
+    img_top_p: float = None
+    val_temperature: float = 1.0
+    val_txt_top_k: int = None
+    val_txt_top_p: float = None
+    val_img_top_k: int = None
+    val_img_top_p: float = None
+
 
 @dataclass
 class ImageGenerationRolloutConfig(RolloutConfig):
@@ -27,7 +41,11 @@ class ImageGenerationRolloutConfig(RolloutConfig):
     txt_top_p: float = 1.0
     img_top_k: int = 4096
     img_top_p: float = 1.0
+    feedback_system_prompt : Optional[str] = None
+    regen_system_prompt : Optional[str] = None
     image_token_num_per_image: int = 576
+    
+    val_kwargs: ImageGenerationSamplingConfig = field(default_factory=ImageGenerationSamplingConfig)
 
 
 @dataclass

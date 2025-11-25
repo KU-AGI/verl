@@ -398,6 +398,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             "prompt_id": prompt_id,
             "uid": uid,
             "prompt": prompt,
+            "rollout_id": list(range(n)),
             "scores": scores,
             "step": [self.global_steps] * n,
         }
@@ -556,18 +557,19 @@ class RayImageGenerationTrainer(RayPPOTrainer):
 
             test_gen_batch = self._get_gen_batch(test_batch)
 
-            # pad to be divisible by dp_size
-            test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_wg.world_size)
-            test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
+            # # pad to be divisible by dp_size
+            # test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_wg.world_size)
+            # test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
 
-            # unpad
-            test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
+            # # unpad
+            # test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
+            test_output_gen_batch = self.actor_rollout_wg.generate_sequences(test_gen_batch)
             print('validation generation end')
 
-            output_imgs = test_output_gen_batch.batch.non_tensor_batch['gen_img_list']
-            output_imgs = [output_img.to('cpu').numpy() if isinstance(output_img, torch.Tensor) else output_img for output_img in output_imgs]
-            output_img_list = [wandb.Image(PIL.Image.fromarray(img), caption=input_texts[i]) for i, img in enumerate(output_imgs)]
-            sample_outputs.extend(output_img_list)
+            prompts = test_output_gen_batch.non_tensor_batch['prompt'].tolist()
+            task1_gen_imgs_pil_list = test_output_gen_batch.non_tensor_batch['task1_gen_imgs_pil_list']
+            task1_gen_imgs_pil_list = [wandb.Image(gen_img, caption=prompts[i]) for i, gen_img in enumerate(task1_gen_imgs_pil_list)]
+            sample_outputs.extend(task1_gen_imgs_pil_list)
 
             test_batch = test_batch.union(test_output_gen_batch)
             
@@ -576,7 +578,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                 test_batch = test_batch.union(reward_tensor)
 
             # evaluate using reward_function
-            reward_tensor = self.val_reward_fn(test_batch, eval=True)
+            reward_tensor = self.val_reward_fn(test_batch, eval=True, task_id=1, return_dict=False)
 
             # Store scores
             scores = reward_tensor.sum(-1).cpu().tolist()
@@ -644,15 +646,15 @@ class RayImageGenerationTrainer(RayPPOTrainer):
         # load checkpoint before doing anything
         self._load_checkpoint()
 
-        # # perform validation before training
-        # # currently, we only support validation using the reward_function.
-        # if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
-        #     val_metrics = self._validate()
-        #     assert val_metrics, f"{val_metrics=}"
-        #     pprint(f"Initial validation metrics: {val_metrics}")
-        #     logger.log(data=val_metrics, step=self.global_steps)
-        #     if self.config.trainer.get("val_only", False):
-        #         return
+        # perform validation before training
+        # currently, we only support validation using the reward_function.
+        if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
+            val_metrics = self._validate()
+            assert val_metrics, f"{val_metrics=}"
+            pprint(f"Initial validation metrics: {val_metrics}")
+            logger.log(data=val_metrics, step=self.global_steps)
+            if self.config.trainer.get("val_only", False):
+                return
 
         if self.config.actor_rollout_ref.rollout.get("skip_rollout", False):
             rollout_skip = RolloutSkip(self.config, self.actor_rollout_wg)
@@ -717,12 +719,13 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = batch.batch["task1_attention_mask"].sum(dim=-1) + batch.batch["task1_response_mask"].sum(dim=-1) + batch.batch["task2_attention_mask"].sum(dim=-1) + batch.batch["task2_response_mask"].sum(dim=-1) + batch.batch["task3_attention_mask"].sum(dim=-1) + batch.batch["task3_response_mask"].sum(dim=-1)
 
+                    # Process all tasks to prepare data for multi-task training
                     for task_id in [1, 2, 3]:
-                        
+
                         batch.batch["attention_mask"] = torch.cat([batch.batch[f"task{task_id}_attention_mask"], batch.batch[f"task{task_id}_response_mask"]], dim=1)
 
-                        # if self.config.trainer.balance_batch:
-                        #     self._balance_batch(batch, metrics=metrics) 
+                        if self.config.trainer.balance_batch:
+                            self._balance_batch(batch, metrics=metrics)
 
                         with marked_timer("reward", timing_raw, color="yellow"):
                             if self.config.reward_model.launch_reward_fn_async:
@@ -736,7 +739,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                             old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
                             entropys = old_log_prob.batch[f"task{task_id}_entropys"]
                             response_masks = batch.batch[f"task{task_id}_response_mask"]
-                            
+
                             loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
                             entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
                             old_log_prob_metrics = {f"actor/task{task_id}_entropy": entropy_agg.detach().item()}
@@ -760,7 +763,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                                 batch = batch.union(ref_log_prob)
 
                         # Not use computing values in RLVR
-                        
+
                         with marked_timer("adv", timing_raw, color="brown"):
                             # we combine with rule-based rm
                             reward_extra_infos_dict: dict[str, list]
@@ -796,43 +799,44 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                                 task_id=task_id
                             )
 
-                        # update critic
-                        if self.use_critic:
-                            with marked_timer("update_critic", timing_raw, color="pink"):
-                                critic_output = self.critic_wg.update_critic(batch)
-                            critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
-                            metrics.update(critic_output_metrics)
-
-                        # implement critic warmup
-                        if self.config.trainer.critic_warmup <= self.global_steps:
-                            # update actor
-                            with marked_timer("update_actor", timing_raw, color="red"):
-                                batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
-                                actor_output = self.actor_rollout_wg.update_actor(batch)
-                            actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
-                            metrics.update(actor_output_metrics)
-
-                        # Log rollout generations if enabled
+                        # Log rollout generations if enabled (per task)
                         rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                         if self.config.trainer.rollout_freq > 0 and (
                             self.global_steps % self.config.trainer.rollout_freq == 0 and rollout_data_dir
                         ):
                             self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir, task_id)
-                            
-                        # Remove universal keys from batch
+
+                        # Remove task-specific attention_mask and task_id for next iteration
                         batch.pop(batch_keys=["attention_mask", "task_id"])
 
-                # # validate
-                # if (
-                #     self.val_reward_fn is not None
-                #     and self.config.trainer.test_freq > 0
-                #     and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
-                # ):
-                #     with marked_timer("testing", timing_raw, color="green"):
-                #         val_metrics: dict = self._validate()
-                #         if is_last_step:
-                #             last_val_metrics = val_metrics
-                #     metrics.update(val_metrics)
+                    # update critic (after all tasks prepared)
+                    if self.use_critic:
+                        with marked_timer("update_critic", timing_raw, color="pink"):
+                            critic_output = self.critic_wg.update_critic(batch)
+                        critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
+                        metrics.update(critic_output_metrics)
+
+                    # implement critic warmup
+                    if self.config.trainer.critic_warmup <= self.global_steps:
+                        # update actor with all tasks together
+                        with marked_timer("update_actor", timing_raw, color="red"):
+                            batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+                            # No task_id set here - actor will process all tasks based on config
+                            actor_output = self.actor_rollout_wg.update_actor(batch)
+                        actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                        metrics.update(actor_output_metrics)
+
+                # validate
+                if (
+                    self.val_reward_fn is not None
+                    and self.config.trainer.test_freq > 0
+                    and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
+                ):
+                    with marked_timer("testing", timing_raw, color="green"):
+                        val_metrics: dict = self._validate()
+                        if is_last_step:
+                            last_val_metrics = val_metrics
+                    metrics.update(val_metrics)
 
                 # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
                 esi_close_to_expiration = should_save_ckpt_esi(

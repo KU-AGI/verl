@@ -501,11 +501,13 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
         from torch.distributed.device_mesh import init_device_mesh
 
         # 1. parse rollout and huggingface model config
-        rollout_config: RolloutConfig = omega_conf_to_dataclass(self.config.rollout)
         if self.config.rollout.name == "image_unified":
+            from recipe.image_rl.config import ImageGenerationRolloutConfig
+            rollout_config: ImageGenerationRolloutConfig = omega_conf_to_dataclass(self.config.rollout)
             from recipe.image_rl.config import ImageGenerationHFModelConfig
             model_config: ImageGenerationHFModelConfig = omega_conf_to_dataclass(self.config.model, dataclass_type=ImageGenerationHFModelConfig)
         else:
+            rollout_config: RolloutConfig = omega_conf_to_dataclass(self.config.rollout)
             model_config: HFModelConfig = omega_conf_to_dataclass(self.config.model, dataclass_type=HFModelConfig)
         self.model_config = model_config
 
