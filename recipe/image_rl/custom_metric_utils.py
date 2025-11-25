@@ -125,22 +125,62 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     non_aborted_sequence_score = sequence_score[non_aborted_mask]
     non_aborted_sequence_reward = sequence_reward[non_aborted_mask]
 
-    score_mean = torch.mean(non_aborted_sequence_score).detach().item()
-    score_max = torch.max(non_aborted_sequence_score).detach().item()
-    score_min = torch.min(non_aborted_sequence_score).detach().item()
+    # Handle case when all samples are aborted (empty tensors)
+    if non_aborted_sequence_score.numel() > 0:
+        score_mean = torch.mean(non_aborted_sequence_score).detach().item()
+        score_max = torch.max(non_aborted_sequence_score).detach().item()
+        score_min = torch.min(non_aborted_sequence_score).detach().item()
+    else:
+        score_mean = 0.0
+        score_max = 0.0
+        score_min = 0.0
 
-    reward_mean = torch.mean(non_aborted_sequence_reward).detach().item()
-    reward_max = torch.max(non_aborted_sequence_reward).detach().item()
-    reward_min = torch.min(non_aborted_sequence_reward).detach().item()
+    if non_aborted_sequence_reward.numel() > 0:
+        reward_mean = torch.mean(non_aborted_sequence_reward).detach().item()
+        reward_max = torch.max(non_aborted_sequence_reward).detach().item()
+        reward_min = torch.min(non_aborted_sequence_reward).detach().item()
+    else:
+        reward_mean = 0.0
+        reward_max = 0.0
+        reward_min = 0.0
 
     valid_adv = torch.masked_select(advantages, response_mask)
     valid_returns = torch.masked_select(returns, response_mask)
 
+    # Handle empty tensors for advantages and returns
+    if valid_adv.numel() > 0:
+        adv_mean = torch.mean(valid_adv).detach().item()
+        adv_max = torch.max(valid_adv).detach().item()
+        adv_min = torch.min(valid_adv).detach().item()
+    else:
+        adv_mean = 0.0
+        adv_max = 0.0
+        adv_min = 0.0
+
+    if valid_returns.numel() > 0:
+        returns_mean = torch.mean(valid_returns).detach().item()
+        returns_max = torch.max(valid_returns).detach().item()
+        returns_min = torch.min(valid_returns).detach().item()
+    else:
+        returns_mean = 0.0
+        returns_max = 0.0
+        returns_min = 0.0
+
     if use_critic:
         values = batch.batch[f"task{task_id}_values"]
         valid_values = torch.masked_select(values, response_mask)
-        return_diff_var = torch.var(valid_returns - valid_values)
-        return_var = torch.var(valid_returns)
+        if valid_values.numel() > 0 and valid_returns.numel() > 0:
+            values_mean = torch.mean(valid_values).detach().item()
+            values_max = torch.max(valid_values).detach().item()
+            values_min = torch.min(valid_values).detach().item()
+            return_diff_var = torch.var(valid_returns - valid_values)
+            return_var = torch.var(valid_returns)
+            vf_explained_var = (1.0 - return_diff_var / (return_var + 1e-5)).detach().item()
+        else:
+            values_mean = 0.0
+            values_max = 0.0
+            values_min = 0.0
+            vf_explained_var = 0.0
 
     # Aborted samples and non-aborted response length statistics
     # response_length_non_aborted/*: statistics computed on non-aborted samples only
@@ -155,7 +195,11 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
             torch.mean(torch.eq(non_aborted_response_length, max_response_length).float()).detach().item()
         )
     else:
-        raise ValueError("All samples are aborted, this should not happen.")
+        non_aborted_response_length_mean = 0.0
+        non_aborted_response_length_max = 0.0
+        non_aborted_response_length_min = 0.0
+        non_aborted_response_length_clip_ratio = 0.0
+        # raise ValueError("All samples are aborted, this should not happen.")
 
     metrics = {
         # score
@@ -167,21 +211,21 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         f"critic/task{task_id}/rewards/max": reward_max,
         f"critic/task{task_id}/rewards/min": reward_min,
         # adv
-        f"critic/task{task_id}/advantages/mean": torch.mean(valid_adv).detach().item(),
-        f"critic/task{task_id}/advantages/max": torch.max(valid_adv).detach().item(),
-        f"critic/task{task_id}/advantages/min": torch.min(valid_adv).detach().item(),
+        f"critic/task{task_id}/advantages/mean": adv_mean,
+        f"critic/task{task_id}/advantages/max": adv_max,
+        f"critic/task{task_id}/advantages/min": adv_min,
         # returns
-        f"critic/task{task_id}/returns/mean": torch.mean(valid_returns).detach().item(),
-        f"critic/task{task_id}/returns/max": torch.max(valid_returns).detach().item(),
-        f"critic/task{task_id}/returns/min": torch.min(valid_returns).detach().item(),
+        f"critic/task{task_id}/returns/mean": returns_mean,
+        f"critic/task{task_id}/returns/max": returns_max,
+        f"critic/task{task_id}/returns/min": returns_min,
         **(
             {
                 # values
-                f"critic/task{task_id}/values/mean": torch.mean(valid_values).detach().item(),
-                f"critic/task{task_id}/values/max": torch.max(valid_values).detach().item(),
-                f"critic/task{task_id}/values/min": torch.min(valid_values).detach().item(),
+                f"critic/task{task_id}/values/mean": values_mean,
+                f"critic/task{task_id}/values/max": values_max,
+                f"critic/task{task_id}/values/min": values_min,
                 # vf explained var
-                f"critic/task{task_id}/vf_explained_var": (1.0 - return_diff_var / (return_var + 1e-5)).detach().item(),
+                f"critic/task{task_id}/vf_explained_var": vf_explained_var,
             }
             if use_critic
             else {}
@@ -265,6 +309,7 @@ def compute_timing_metrics(batch: DataProto, timing_raw: dict[str, float]) -> di
         **{
             f"timing_per_token_ms/task{task_id}/{name}": timing_raw[name] * 1000 / num_tokens_of_section[name]
             for name in set(num_tokens_of_section.keys()) & set(timing_raw.keys())
+            if num_tokens_of_section[name] > 0
         },
     }
 
