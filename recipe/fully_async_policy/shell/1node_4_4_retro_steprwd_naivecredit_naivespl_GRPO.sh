@@ -74,7 +74,7 @@ top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
 val_temperature=0.0
 val_top_k=0.0
 val_top_p=1.0
-rollout_strategy="naive_sampling" # "naive_sampling" | "reflection_sampling"
+rollout_strategy="naive_sampling" # "naive_sampling" | "gt_reflection_sampling" | "random_reflection_sampling"
 strategy_ratio=0.0 # 1.0 means all use above rollout_strategy, 0.0 means all use naive_sampling
 
 # Performance Related Parameter
