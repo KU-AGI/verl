@@ -18,6 +18,7 @@ A unified tracking interface that supports logging data to different backend
 import dataclasses
 import json
 import os
+import time
 from enum import Enum
 from functools import partial
 from pathlib import Path
@@ -70,6 +71,7 @@ class Tracking:
                 settings = wandb.Settings(https_proxy=config["trainer"]["wandb_proxy"])
             entity = os.environ.get("WANDB_ENTITY", None)
             wandb.init(project=project_name, name=experiment_name, entity=entity, config=config, settings=settings)
+            time.sleep(0.3)
             self.logger["wandb"] = wandb
 
         if "trackio" in default_backend:
