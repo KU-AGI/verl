@@ -272,7 +272,6 @@ class PartialSingleTurnAgentLoop(AgentLoopBase):
                 # The samples without partial rollout are returned directly.
                 return output
         with simple_timer("generate_sequences", metrics):
-            breakpoint()
             if self.config.rollout.strategy == "naive_sampling":
                 sampling_params.pop("stop", None)
                 response_ids, log_probs, _, is_cancel = await self.server_manager.generate_for_partial(
