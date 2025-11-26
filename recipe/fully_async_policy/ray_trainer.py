@@ -585,6 +585,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             answer_exact_all = all(accs)
             answer_all_same = all(a == accs[0] for a in accs)
             answer_not_all_same = not answer_all_same
+            answer_not_exact_all = all(not a for a in accs)
 
             if task == "forward":
                 step4_accs = batch.non_tensor_batch[f'{task}/step4/has_reactive_atoms_smiles'][uid_inds]
@@ -603,19 +604,25 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                 step4_not_all_same = not step4_all_same
                 step5_not_all_same = not step5_all_same
                 step6_not_all_same = not step6_all_same
+                step4_not_exact_all = all(not a for a in step4_accs)
+                step5_not_exact_all = all(not a for a in step5_accs)
+                step6_not_exact_all = all(not a for a in step6_accs)
 
                 task_group_metrics[f"group_metrics/{task}/step4/exact_k"].append(step4_exact_k)
                 task_group_metrics[f"group_metrics/{task}/step4/exact_all"].append(step4_exact_all)
                 task_group_metrics[f"group_metrics/{task}/step4/all_same"].append(step4_all_same)
                 task_group_metrics[f"group_metrics/{task}/step4/not_all_same"].append(step4_not_all_same)
+                task_group_metrics[f"group_metrics/{task}/step4/not_exact_all"].append(step4_not_exact_all)
                 task_group_metrics[f"group_metrics/{task}/step5/exact_k"].append(step5_exact_k)
                 task_group_metrics[f"group_metrics/{task}/step5/exact_all"].append(step5_exact_all)
                 task_group_metrics[f"group_metrics/{task}/step5/all_same"].append(step5_all_same)
                 task_group_metrics[f"group_metrics/{task}/step5/not_all_same"].append(step5_not_all_same)
+                task_group_metrics[f"group_metrics/{task}/step5/not_exact_all"].append(step5_not_exact_all)
                 task_group_metrics[f"group_metrics/{task}/step6/exact_k"].append(step6_exact_k)
                 task_group_metrics[f"group_metrics/{task}/step6/exact_all"].append(step6_exact_all)
                 task_group_metrics[f"group_metrics/{task}/step6/all_same"].append(step6_all_same)
                 task_group_metrics[f"group_metrics/{task}/step6/not_all_same"].append(step6_not_all_same)
+                task_group_metrics[f"group_metrics/{task}/step6/not_exact_all"].append(step6_not_exact_all)
             elif task == "retro":
                 step5_accs = batch.non_tensor_batch[f'{task}/step5/has_bond_disconnection'][uid_inds]
                 step6_accs = batch.non_tensor_batch[f'{task}/step6/has_synthons'][uid_inds]
@@ -633,19 +640,25 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                 step5_not_all_same = not step5_all_same
                 step6_not_all_same = not step6_all_same
                 step7_not_all_same = not step7_all_same
+                step5_not_exact_all = all(not a for a in step5_accs)
+                step6_not_exact_all = all(not a for a in step6_accs)
+                step7_not_exact_all = all(not a for a in step7_accs)
 
                 task_group_metrics[f"group_metrics/{task}/step5/exact_k"].append(step5_exact_k)
                 task_group_metrics[f"group_metrics/{task}/step5/exact_all"].append(step5_exact_all)
                 task_group_metrics[f"group_metrics/{task}/step5/all_same"].append(step5_all_same)
                 task_group_metrics[f"group_metrics/{task}/step5/not_all_same"].append(step5_not_all_same)
+                task_group_metrics[f"group_metrics/{task}/step5/not_exact_all"].append(step5_not_exact_all)
                 task_group_metrics[f"group_metrics/{task}/step6/exact_k"].append(step6_exact_k)
                 task_group_metrics[f"group_metrics/{task}/step6/exact_all"].append(step6_exact_all)
                 task_group_metrics[f"group_metrics/{task}/step6/all_same"].append(step6_all_same)
                 task_group_metrics[f"group_metrics/{task}/step6/not_all_same"].append(step6_not_all_same)
+                task_group_metrics[f"group_metrics/{task}/step6/not_exact_all"].append(step6_not_exact_all)
                 task_group_metrics[f"group_metrics/{task}/step7/exact_k"].append(step7_exact_k)
                 task_group_metrics[f"group_metrics/{task}/step7/exact_all"].append(step7_exact_all)
                 task_group_metrics[f"group_metrics/{task}/step7/all_same"].append(step7_all_same)
                 task_group_metrics[f"group_metrics/{task}/step7/not_all_same"].append(step7_not_all_same)
+                task_group_metrics[f"group_metrics/{task}/step7/not_exact_all"].append(step7_not_exact_all)
             elif task == "reagent":
                 step6_accs = batch.non_tensor_batch[f'{task}/step6/has_reagents'][uid_inds]
                 step7_accs = batch.non_tensor_batch[f'{task}/step7/has_correct_reagent_number'][uid_inds]
@@ -658,15 +671,19 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                 step7_all_same = all(a == step7_accs[0] for a in step7_accs)
                 step6_not_all_same = not step6_all_same
                 step7_not_all_same = not step7_all_same
+                step6_not_exact_all = all(not a for a in step6_accs)
+                step7_not_exact_all = all(not a for a in step7_accs)
 
                 task_group_metrics[f"group_metrics/{task}/step6/exact_k"].append(step6_exact_k)
                 task_group_metrics[f"group_metrics/{task}/step6/exact_all"].append(step6_exact_all)
                 task_group_metrics[f"group_metrics/{task}/step6/all_same"].append(step6_all_same)
                 task_group_metrics[f"group_metrics/{task}/step6/not_all_same"].append(step6_not_all_same)
+                task_group_metrics[f"group_metrics/{task}/step6/not_exact_all"].append(step6_not_exact_all)
                 task_group_metrics[f"group_metrics/{task}/step7/exact_k"].append(step7_exact_k)
                 task_group_metrics[f"group_metrics/{task}/step7/exact_all"].append(step7_exact_all)
                 task_group_metrics[f"group_metrics/{task}/step7/all_same"].append(step7_all_same)
                 task_group_metrics[f"group_metrics/{task}/step7/not_all_same"].append(step7_not_all_same)
+                task_group_metrics[f"group_metrics/{task}/step7/not_exact_all"].append(step7_not_exact_all)
             else:
                 raise ValueError(f"Unknown task: {task}")
 
