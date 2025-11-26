@@ -696,6 +696,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             task_group_metrics[f"group_metrics/{task}/answer/exact_all"].append(answer_exact_all)
             task_group_metrics[f"group_metrics/{task}/answer/all_same"].append(answer_all_same)
             task_group_metrics[f"group_metrics/{task}/answer/not_all_same"].append(answer_not_all_same)
+            task_group_metrics[f"group_metrics/{task}/answer/not_exact_all"].append(answer_not_exact_all)
             # current_ids = batch.batch['input_ids'][uid_inds]
             if scores.std() == 0:
                 metrics[f"group_metrics/{task}/zero_std_num"] += 1
