@@ -576,7 +576,6 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         task_group_metrics = defaultdict(list)
         uids = list(set(batch.non_tensor_batch['uid']))
 
-        breakpoint()
         for uid in uids:
             uid_inds = np.where(batch.non_tensor_batch['uid'] == uid)[0]
             task = batch.non_tensor_batch['task'][uid_inds[0]]
