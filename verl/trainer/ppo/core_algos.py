@@ -384,7 +384,6 @@ def compute_stepwise_grpo_outcome_advantage(
         response_ids = data.batch["responses"]
         step_rewards_all = data.non_tensor_batch["step_rewards"]
         step_last_indices_all = data.non_tensor_batch["step_last_indices"]
-        breakpoint()
 
 
 
