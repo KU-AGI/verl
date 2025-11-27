@@ -427,19 +427,19 @@ def compute_stepwise_grpo_outcome_advantage(
                     try:
                         step4_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['step4']], id2mean[f"{index[i]}_step4"], id2std[f"{index[i]}_step4"])
                     except:
-                        step4_score = -1.0
+                        step4_score = 0.0
                     try:
                         step5_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['step5']], id2mean[f"{index[i]}_step5"], id2std[f"{index[i]}_step5"])
                     except:
-                        step5_score = -1.0
+                        step5_score = 0.0
                     try:
                         step6_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['step6']], id2mean[f"{index[i]}_step6"], id2std[f"{index[i]}_step6"])
                     except:
-                        step6_score = -1.0
+                        step6_score = 0.0
                     try:
                         answer_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['answer']], id2mean[f"{index[i]}_answer"], id2std[f"{index[i]}_answer"])
                     except:
-                        answer_score = -1.0
+                        answer_score = 0.0
                     try:
                         advantage[i, :last_idx_dict['step4']+1] = step4_score
                     except:
@@ -460,19 +460,19 @@ def compute_stepwise_grpo_outcome_advantage(
                     try:
                         step5_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['step5']], id2mean[f"{index[i]}_step5"], id2std[f"{index[i]}_step5"])
                     except:
-                        step5_score = -1.0
+                        step5_score = 0.0
                     try:
                         step6_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['step6']], id2mean[f"{index[i]}_step6"], id2std[f"{index[i]}_step6"])
                     except:
-                        step6_score = -1.0
+                        step6_score = 0.0
                     try:
                         step7_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['step7']], id2mean[f"{index[i]}_step7"], id2std[f"{index[i]}_step7"])
                     except:
-                        step7_score = -1.0
+                        step7_score = 0.0
                     try:
                         answer_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['answer']], id2mean[f"{index[i]}_answer"], id2std[f"{index[i]}_answer"])
                     except:
-                        answer_score = -1.0
+                        answer_score = 0.0
                     try:
                         advantage[i, :last_idx_dict['step5']+1] = step5_score
                     except:
@@ -493,15 +493,15 @@ def compute_stepwise_grpo_outcome_advantage(
                     try:
                         step6_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['step6']], id2mean[f"{index[i]}_step6"], id2std[f"{index[i]}_step6"])
                     except:
-                        step6_score = -1.0
+                        step6_score = 0.0
                     try:
                         step7_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['step7']], id2mean[f"{index[i]}_step7"], id2std[f"{index[i]}_step7"])
                     except:
-                        step7_score = -1.0
+                        step7_score = 0.0
                     try:
                         answer_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['answer']], id2mean[f"{index[i]}_answer"], id2std[f"{index[i]}_answer"])
                     except:
-                        answer_score = -1.0
+                        answer_score = 0.0
                     try:
                         advantage[i, :last_idx_dict['step6']+1] = step6_score
                     except:
