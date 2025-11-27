@@ -568,10 +568,12 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
                 task2_reward_score += 0.0
         else:
             task2_reward_score += 0.0
+        
+        reward_extra_info[f"task{task_id}_reward_response"] = response
 
-        # task2 
-        response = await get_response_task2_align(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id)
-        if response is not None:
+        # task2 align
+        align_response = await get_response_task2_align(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id)
+        if align_response is not None:
             try:
                 q_idx_re  = re.compile(r'^\s*(\d+)\s*\|', re.MULTILINE)
                 ans_line_re = re.compile(r'^\s*(\d+)\s*\|\s*Answer:\s*(Yes|No)\s*$', re.IGNORECASE | re.MULTILINE)
@@ -581,7 +583,7 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
 
                 # 2) 출력에서 정답 라인만 파싱 -> {idx: bool}
                 idx_to_ans = {}
-                for idx_str, yn in ans_line_re.findall(response):
+                for idx_str, yn in ans_line_re.findall(align_response):
                     idx = int(idx_str)
                     idx_to_ans[idx] = (yn.strip().lower() == "yes")  # 중복 있으면 마지막 값 사용
 
@@ -601,7 +603,7 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
             task2_reward_score += 0.0
 
         reward_score += (task2_reward_score / task2_ans_count) if task2_ans_count > 0 else 0.0
-        reward_extra_info[f"task{task_id}_reward_response"] = response
+        reward_extra_info[f"task{task_id}_reward_align_response"] = align_response
 
     elif task_id == 3:
         formatting_evaluator = FormattingEvaluator()
