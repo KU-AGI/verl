@@ -384,7 +384,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
     def _dump_generations(self, uid, prompt_id, prompt, gen_imgs_pil_list, feedback_texts, regen_imgs_pil_list,
-            gts_imgs, gts_tuples, gts_vqas, scores, reward_extra_infos_dict, dump_path, task_id
+            gts_imgs, gts_tuples, gts_vqas, scores, reward_extra_infos_dict, dump_path
         ):
         """Dump rollout/validation samples as JSONL."""
         os.makedirs(dump_path, exist_ok=True)
@@ -399,7 +399,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             "uid": uid,
             "prompt": prompt,
             "rollout_id": list(range(n)),
-            "scores": scores,
+            **scores,
             "step": [self.global_steps] * n,
         }
 
@@ -413,7 +413,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
         
         # save_num = self.reward_kwargs.get("img_saving", {}).get("num", n)
         for i in range(n): # (min(n, save_num)):
-            
+
             # Set uid
             id = uid[i]
 
@@ -423,50 +423,68 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             with open(os.path.join(image_dir, f"text_{pid}_{id}_{i}.txt"), 'w', encoding='utf-8') as f:
                 f.write(f"Sample {pid}'s {i}th {id}\n")
                 f.write("=" * 40 + "\n")
-                
-                # Save input text
-                f.write(f"Input Text: {prompt[i]}\n")
 
-                if task_id == 1:
-                    # Save generated image
+                # Save input text
+                f.write(f"Input Text: {prompt[i]}\n\n")
+
+                # Save generated image (Task 1)
+                if gen_imgs_pil_list is not None and len(gen_imgs_pil_list) > i:
                     save_path = os.path.join(image_dir, f"gen_img_{pid}_{id}_{i}.png")
                     PIL.Image.fromarray(gen_imgs_pil_list[i].astype(np.uint8)).save(save_path)
-                    f.write(f"Generated Image:\nimg_{pid}_{id}.png\n\n")
-                    task1_reward_response = reward_extra_infos_dict["task1_reward_response"][i]
-                    f.write(f"Response of task1 reward:\n{task1_reward_response}\n\n")
+                    f.write(f"Generated Image: gen_img_{pid}_{id}_{i}.png\n")
+                    if "task1_reward_response" in reward_extra_infos_dict and len(reward_extra_infos_dict["task1_reward_response"]) > i:
+                        task1_reward_response = reward_extra_infos_dict["task1_reward_response"][i]
+                        f.write(f"Task1 Reward Response:\n{task1_reward_response}\n")
+                    if "task1_scores" in scores and len(scores["task1_scores"]) > i:
+                        task1_score = scores["task1_scores"][i]
+                        f.write(f"Task1 Score: {task1_score}\n")
+                    f.write("\n")
 
-                    # Save GT image
-                    ground_truth_path = os.path.join(image_dir, f"ground_truth_{pid}_{id}_{i}.png")
-                    PIL.Image.open(gts_imgs[i]).convert("RGB").save(ground_truth_path)
-                    f.write(f"Ground Truth:\nground_truth_{pid}_{id}.png\n\n")
+                # Save feedback text (Task 2)
+                if feedback_texts is not None and len(feedback_texts) > i:
+                    f.write(f"Feedback Text:\n{feedback_texts[i]}\n")
+                    if "task2_reward_response" in reward_extra_infos_dict and len(reward_extra_infos_dict["task2_reward_response"]) > i:
+                        task2_reward_response = reward_extra_infos_dict["task2_reward_response"][i]
+                        f.write(f"Task2 Reward Response:\n{task2_reward_response}\n")
+                    if "task2_scores" in scores and len(scores["task2_scores"]) > i:
+                        task2_score = scores["task2_scores"][i]
+                        f.write(f"Task2 Score: {task2_score}\n")
+                    f.write("\n")
 
-                elif task_id == 2:
-                    # Save feedback text
-                    f.write(f"Feedback of {pid}'s {i}th {id}:\n{feedback_texts[i]}\n\n")
-                    ground_truth_tuple, ground_truth_vqa_question = gts_tuples[i], gts_vqas[i]
-                    f.write(f"Ground Truth:\nTuple:\n{ground_truth_tuple}\nVQA:\n{ground_truth_vqa_question}\n\n")
-                    task2_reward_response = reward_extra_infos_dict["task2_reward_response"][i]
-                    f.write(f"Response task2 reward:\n{task2_reward_response}\n\n")
-
-                elif task_id == 3:
-                    # Save regen image
+                # Save regenerated image (Task 3)
+                if regen_imgs_pil_list is not None and len(regen_imgs_pil_list) > i:
                     regen_path = os.path.join(image_dir, f"regen_img_{pid}_{id}_{i}.png")
                     PIL.Image.fromarray(regen_imgs_pil_list[i].astype(np.uint8)).save(regen_path)
-                    f.write(f"Regenerated Image:\nregen_img_{pid}_{id}_{i}.png\n\n")
-                    task3_reward_response = reward_extra_infos_dict["task3_reward_response"][i]
-                    f.write(f"Response task3 reward:\n{task3_reward_response}\n\n")
+                    f.write(f"Regenerated Image: regen_img_{pid}_{id}_{i}.png\n")
+                    if "task3_reward_response" in reward_extra_infos_dict and len(reward_extra_infos_dict["task3_reward_response"]) > i:
+                        task3_reward_response = reward_extra_infos_dict["task3_reward_response"][i]
+                        f.write(f"Task3 Reward Response:\n{task3_reward_response}\n")
+                    if "task3_scores" in scores and len(scores["task3_scores"]) > i:
+                        task3_score = scores["task3_scores"][i]
+                        f.write(f"Task3 Score: {task3_score}\n")
+                    f.write("\n")
 
-                    # Save GT image
-                    ground_truth_path = os.path.join(image_dir, f"ground_truth_{pid}_{id}_{i}.png")
-                    PIL.Image.open(gts_imgs[i]).convert("RGB").save(ground_truth_path)
-                    f.write(f"Ground Truth:\nground_truth_{pid}_{id}_{i}.png\n\n")
+                # Save ground truth image
+                if gts_imgs is not None and len(gts_imgs) > i and gts_imgs[i] is not None:
+                    ground_truth_path = os.path.join(image_dir, f"ground_truth_{pid}_{id}.png")
+                    if not os.path.exists(ground_truth_path):
+                        PIL.Image.open(gts_imgs[i]).convert("RGB").save(ground_truth_path)
+                        f.write(f"Ground Truth Image: ground_truth_{pid}_{id}.png\n\n")
 
-                f.write("\n" + "=" * 40 + "\n\n")
+                # Save ground truth tuples and VQA
+                if gts_tuples is not None and len(gts_tuples) > i:
+                    ground_truth_tuple = gts_tuples[i]
+                    f.write(f"Ground Truth Tuple:\n{ground_truth_tuple}\n")
+                if gts_vqas is not None and len(gts_vqas) > i:
+                    ground_truth_vqa_question = gts_vqas[i]
+                    f.write(f"Ground Truth VQA:\n{ground_truth_vqa_question}\n\n")
+
+                f.write("=" * 40 + "\n\n")
         
         print(f"Dumped generations to {filename}")
 
     def _log_rollout_data(
-        self, batch: DataProto, reward_extra_infos_dict: dict, timing_raw: dict, rollout_data_dir: str, task_id: int = 1
+        self, batch: DataProto, reward_extra_infos_dict: dict, timing_raw: dict, rollout_data_dir: str
     ):
         """Log rollout data to disk.
         Args:
@@ -474,7 +492,6 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             reward_extra_infos_dict (dict): Additional reward information to log
             timing_raw (dict): Timing information for profiling
             rollout_data_dir (str): Directory path to save the rollout data
-            task_id (int): Task id
         """
         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
             prompt_id = batch.non_tensor_batch['prompt_id'].tolist()
@@ -486,13 +503,19 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             gts_imgs = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
             gts_tuples = [item.non_tensor_batch.get("reward_model", {}).get("tuple", None) for item in batch]
             gts_vqas = [item.non_tensor_batch.get("reward_model", {}).get("vqa_question", None) for item in batch]
-            scores = batch.batch[f"task{task_id}_token_level_scores"].sum(-1).cpu().tolist()
+
+            scores = {}
+            # Add all task scores
+            for tid in [1, 2, 3]:
+                key = f"task{tid}_token_level_scores"
+                if key in batch.batch:
+                    scores[f"task{tid}_scores"] = batch.batch[key].sum(-1).cpu().tolist()
 
             reward_extra_infos_to_dump = reward_extra_infos_dict.copy()
 
-            dump_path = os.path.join(rollout_data_dir, f"task_{task_id}")
+            dump_path = rollout_data_dir
             os.makedirs(dump_path, exist_ok=True)
-            
+
             self._dump_generations(
                 prompt_id=prompt_id,
                 uid=uid,
@@ -506,7 +529,6 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                 scores=scores,
                 reward_extra_infos_dict=reward_extra_infos_to_dump,
                 dump_path=dump_path,
-                task_id=task_id
             )
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
@@ -717,7 +739,9 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                     batch = batch.union(gen_batch_output)
 
                     # compute global_valid tokens
-                    batch.meta_info["global_token_num"] = batch.batch["task1_attention_mask"].sum(dim=-1) + batch.batch["task1_response_mask"].sum(dim=-1) + batch.batch["task2_attention_mask"].sum(dim=-1) + batch.batch["task2_response_mask"].sum(dim=-1) + batch.batch["task3_attention_mask"].sum(dim=-1) + batch.batch["task3_response_mask"].sum(dim=-1)
+                    batch.meta_info["global_token_num"] = batch.batch["task1_attention_mask"].sum(dim=-1) + batch.batch["task1_response_mask"].sum(dim=-1) \
+                                                        + batch.batch["task2_attention_mask"].sum(dim=-1) + batch.batch["task2_response_mask"].sum(dim=-1) \
+                                                        + batch.batch["task3_attention_mask"].sum(dim=-1) + batch.batch["task3_response_mask"].sum(dim=-1)
 
                     # Process all tasks to prepare data for multi-task training
                     for task_id in [1, 2, 3]:
@@ -804,7 +828,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                         if self.config.trainer.rollout_freq > 0 and (
                             self.global_steps % self.config.trainer.rollout_freq == 0 and rollout_data_dir
                         ):
-                            self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir, task_id)
+                            self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
 
                         # Remove task-specific attention_mask and task_id for next iteration
                         batch.pop(batch_keys=["attention_mask", "task_id"])
