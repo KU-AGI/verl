@@ -14,7 +14,7 @@ from verl.utils.device import get_device_id, get_device_name
 from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
 from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.py_functional import append_to_dict
-from verl.utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_batch
+from recipe.image_rl.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_batch
 from verl.utils.torch_functional import logprobs_from_logits
 from verl.workers.actor import BasePPOActor
 from verl.workers.config import ActorConfig
@@ -330,16 +330,33 @@ class DataParallelImageGenerationActor(BasePPOActor):
 
         task_id = data.batch["task_id"].view(-1)[0].item()
 
-        # batch_keys
-        select_batch_keys = [
-            "task1_input_ids", "task1_attention_mask", "task1_gen_imgs_pixel_values", "task1_gen_img_tokens", "task1_response_mask",
-            "task2_input_ids", "task2_attention_mask", "task2_feedback_ids", "task2_response_mask",
-            "task3_input_ids", "task3_attention_mask", "task3_regen_imgs_pixel_values", "task3_regen_img_tokens", "task3_response_mask",
-            "task_id"
-        ]
-
-        # non_tensor_batch_keys
-        non_tensor_batch_keys = ["task2_feedback_texts"]
+        # Selected batch keys based on task_id
+        if task_id == 1:
+            select_batch_keys = [
+                "task1_input_ids", "task1_attention_mask", "task1_gen_imgs_pixel_values", 
+                "task1_gen_img_tokens", "task1_response_mask", "task_id"
+            ]
+            non_tensor_batch_keys = []
+        elif task_id == 2:
+            select_batch_keys = [
+                "task1_input_ids", "task1_attention_mask", "task1_gen_imgs_pixel_values", 
+                "task1_gen_img_tokens", "task1_response_mask",
+                "task2_input_ids", "task2_attention_mask", "task2_feedback_ids", 
+                "task2_response_mask", "task_id"
+            ]
+            non_tensor_batch_keys = ["task2_feedback_texts"]
+        elif task_id == 3:
+            select_batch_keys = [
+                "task1_input_ids", "task1_attention_mask", "task1_gen_imgs_pixel_values", 
+                "task1_gen_img_tokens", "task1_response_mask",
+                "task2_input_ids", "task2_attention_mask", "task2_feedback_ids", 
+                "task2_response_mask",
+                "task3_input_ids", "task3_attention_mask", "task3_regen_imgs_pixel_values", 
+                "task3_regen_img_tokens", "task3_response_mask", "task_id"
+            ]
+            non_tensor_batch_keys = []
+        else:
+            raise ValueError(f"Unknown task_id: {task_id}")
 
         data = data.select(batch_keys=select_batch_keys, non_tensor_batch_keys=non_tensor_batch_keys)
 
