@@ -597,6 +597,9 @@ def compute_stepcumul_grpo_outcome_advantage(
             score_minus_mean = score - mean
             if score_minus_mean.item() < 1e-5:
                 score_minus_mean = torch.tensor(0.0, device=mean.device, dtype=mean.dtype)
+            if std.item() < 1e-5:
+                print("Warning: std is too small, setting score_minus_mean to zero to avoid numerical instability.")
+                score_minus_mean = torch.tensor(0.0, device=mean.device, dtype=mean.dtype)
             if norm_adv_by_std_in_grpo:
                 return score_minus_mean / (std + epsilon)
             else:
