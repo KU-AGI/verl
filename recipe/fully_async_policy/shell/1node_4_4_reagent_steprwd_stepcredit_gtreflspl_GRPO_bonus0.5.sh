@@ -6,7 +6,7 @@ export WANDB_PROJECT="verl-dapo"
 export NCCL_DEBUG="WARN"
 
 project_name='verl-dapo'
-exp_name='reagent_steprwd_naivecredit_rdreflspl_GRPO_temp1.2_sync10_k4'
+exp_name='reagent_steprwd_naivecredit_gtreflspl_GRPO_bonus0.5'
 
 # Ray
 RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
@@ -31,8 +31,8 @@ if [ "$rollout_mode" = "async" ]; then
 fi
 
 # Algorithm parameters
-adv_estimator=grpo # stepwise_grpo, stepcumul_grpo, grpo
-loss_mode=vanilla # steplevel, stepcumul, vanilla
+adv_estimator=stepwise_grpo # stepwise_grpo, stepcumul_grpo, grpo
+loss_mode=steplevel # steplevel, stepcumul, vanilla
 norm_adv_by_std_in_grpo=True # False for Dr.GRPO, True for standard GRPO
 
 use_kl_in_reward=False
@@ -55,7 +55,7 @@ use_response_mask_to_reflection_step=False
 use_content_reward=True
 use_decision_reward=True
 use_reflection_bonus=True
-reflection_bonus_weight=0.3
+reflection_bonus_weight=0.5
 
 # Response length parameters
 max_prompt_length=500 # $((1024 * 2))
@@ -74,8 +74,8 @@ top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
 val_temperature=0.0
 val_top_k=0.0
 val_top_p=1.0
-rollout_strategy="random_reflection_sampling" # "naive_sampling" | "gt_reflection_sampling" | "random_reflection_sampling"
-strategy_ratio=0.7 # 1.0 means all use above rollout_strategy, 0.0 means all use naive_sampling
+rollout_strategy="gt_reflection_sampling" # "naive_sampling" | "gt_reflection_sampling" | "random_reflection_sampling"
+strategy_ratio=0.5 # 1.0 means all use above rollout_strategy, 0.0 means all use naive_sampling
 
 # Performance Related Parameter
 use_dynamic_bsz=True
@@ -99,12 +99,12 @@ gen_prompt_bsz=1
 n_resp_per_prompt=4
 train_prompt_mini_bsz=16
 total_rollout_steps=$(((512*100000)))
-test_freq=2
+test_freq=4
 staleness_threshold=0.0
-trigger_parameter_sync_step=10
+trigger_parameter_sync_step=5
 require_batches=3
 partial_rollout=False
-save_freq=$((test_freq * trigger_parameter_sync_step * 60))
+save_freq=$((test_freq * trigger_parameter_sync_step * 120))
 
 
 # ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \

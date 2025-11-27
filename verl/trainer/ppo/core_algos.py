@@ -384,6 +384,7 @@ def compute_stepwise_grpo_outcome_advantage(
         response_ids = data.batch["responses"]
         step_rewards_all = data.non_tensor_batch["step_rewards"]
         step_last_indices_all = data.non_tensor_batch["step_last_indices"]
+        breakpoint()
 
 
 
@@ -443,19 +444,19 @@ def compute_stepwise_grpo_outcome_advantage(
                     try:
                         advantage[i, :last_idx_dict['step4']+1] = step4_score
                     except:
-                        advantage[i, :] = -1.0
+                        advantage[i, :] = 0.0
                     try:
                         advantage[i, last_idx_dict['step4']+1:last_idx_dict['step5']+1] = step5_score
                     except:
-                        advantage[i, :] = -1.0
+                        advantage[i, :] = 0.0
                     try:
                         advantage[i, last_idx_dict['step5']+1:last_idx_dict['step6']+1] = step6_score
                     except:
-                        advantage[i, :] = -1.0
+                        advantage[i, :] = 0.0
                     try:
                         advantage[i, last_idx_dict['step6']+1:last_idx_dict['answer']+1] = answer_score
                     except:
-                        advantage[i, :] = -1.0
+                        advantage[i, :] = 0.0
                 elif task == "retro":
                     try:
                         step5_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['step5']], id2mean[f"{index[i]}_step5"], id2std[f"{index[i]}_step5"])
@@ -476,19 +477,19 @@ def compute_stepwise_grpo_outcome_advantage(
                     try:
                         advantage[i, :last_idx_dict['step5']+1] = step5_score
                     except:
-                        advantage[i, :] = -1.0
+                        advantage[i, :] = 0.0
                     try:
                         advantage[i, last_idx_dict['step5']+1:last_idx_dict['step6']+1] = step6_score
                     except:
-                        advantage[i, :] = -1.0
+                        advantage[i, :] = 0.0
                     try:
                         advantage[i, last_idx_dict['step6']+1:last_idx_dict['step7']+1] = step7_score
                     except:
-                        advantage[i, :] = -1.0
+                        advantage[i, :] = 0.0
                     try:
                         advantage[i, last_idx_dict['step7']+1:last_idx_dict['answer']+1] = answer_score
                     except:
-                        advantage[i, :] = -1.0
+                        advantage[i, :] = 0.0
                 elif task == "reagent":
                     try:
                         step6_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['step6']], id2mean[f"{index[i]}_step6"], id2std[f"{index[i]}_step6"])
@@ -505,15 +506,15 @@ def compute_stepwise_grpo_outcome_advantage(
                     try:
                         advantage[i, :last_idx_dict['step6']+1] = step6_score
                     except:
-                        advantage[i, :] = -1.0
+                        advantage[i, :] = 0.0
                     try:
                         advantage[i, last_idx_dict['step6']+1:last_idx_dict['step7']+1] = step7_score
                     except:
-                        advantage[i, :] = -1.0
+                        advantage[i, :] = 0.0
                     try:
                         advantage[i, last_idx_dict['step7']+1:last_idx_dict['answer']+1] = answer_score
                     except:
-                        advantage[i, :] = -1.0
+                        advantage[i, :] = 0.0
                 else:
                     raise ValueError(f"Unknown task type: {task}")
         return advantage, advantage
