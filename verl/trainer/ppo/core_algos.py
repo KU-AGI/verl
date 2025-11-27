@@ -376,6 +376,8 @@ def compute_stepwise_grpo_outcome_advantage(
             if score_minus_mean.item() < 1e-5:
                 score_minus_mean = torch.tensor(0.0, device=mean.device, dtype=mean.dtype)
             if norm_adv_by_std_in_grpo:
+                # if (score_minus_mean / (std + epsilon)) > 1e3:
+                #     breakpoint()
                 return score_minus_mean / (std + epsilon)
             else:
                 return score_minus_mean
@@ -424,21 +426,21 @@ def compute_stepwise_grpo_outcome_advantage(
                 last_idx_dict = step_last_indices_all[i]
                 task = data.non_tensor_batch['task'][i]
                 if task == "forward":
-                    try:
-                        step4_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['step4']], id2mean[f"{index[i]}_step4"], id2std[f"{index[i]}_step4"])
-                    except:
+                    if step_last_indices_all[i]['step4']:
+                        step4_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['step4']:].sum(), id2mean[f"{index[i]}_step4"], id2std[f"{index[i]}_step4"])
+                    else:
                         step4_score = 0.0
-                    try:
-                        step5_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['step5']], id2mean[f"{index[i]}_step5"], id2std[f"{index[i]}_step5"])
-                    except:
+                    if step_last_indices_all[i]['step5']:
+                        step5_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['step5']:].sum(), id2mean[f"{index[i]}_step5"], id2std[f"{index[i]}_step5"])
+                    else:
                         step5_score = 0.0
-                    try:
-                        step6_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['step6']], id2mean[f"{index[i]}_step6"], id2std[f"{index[i]}_step6"])
-                    except:
+                    if step_last_indices_all[i]['step6']:
+                        step6_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['step6']:].sum(), id2mean[f"{index[i]}_step6"], id2std[f"{index[i]}_step6"])
+                    else:
                         step6_score = 0.0
-                    try:
-                        answer_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['answer']], id2mean[f"{index[i]}_answer"], id2std[f"{index[i]}_answer"])
-                    except:
+                    if step_last_indices_all[i]['answer']:
+                        answer_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['answer']:].sum(), id2mean[f"{index[i]}_answer"], id2std[f"{index[i]}_answer"])
+                    else:
                         answer_score = 0.0
                     try:
                         advantage[i, :last_idx_dict['step4']+1] = step4_score
@@ -457,21 +459,21 @@ def compute_stepwise_grpo_outcome_advantage(
                     except:
                         advantage[i, :] = 0.0
                 elif task == "retro":
-                    try:
-                        step5_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['step5']], id2mean[f"{index[i]}_step5"], id2std[f"{index[i]}_step5"])
-                    except:
+                    if step_last_indices_all[i]['step5']:
+                        step5_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['step5']:].sum(), id2mean[f"{index[i]}_step5"], id2std[f"{index[i]}_step5"])
+                    else:
                         step5_score = 0.0
-                    try:
-                        step6_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['step6']], id2mean[f"{index[i]}_step6"], id2std[f"{index[i]}_step6"])
-                    except:
+                    if step_last_indices_all[i]['step6']:
+                        step6_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['step6']:].sum(), id2mean[f"{index[i]}_step6"], id2std[f"{index[i]}_step6"])
+                    else:
                         step6_score = 0.0
-                    try:
-                        step7_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['step7']], id2mean[f"{index[i]}_step7"], id2std[f"{index[i]}_step7"])
-                    except:
+                    if step_last_indices_all[i]['step7']:
+                        step7_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['step7']:].sum(), id2mean[f"{index[i]}_step7"], id2std[f"{index[i]}_step7"])
+                    else:
                         step7_score = 0.0
-                    try:
-                        answer_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['answer']], id2mean[f"{index[i]}_answer"], id2std[f"{index[i]}_answer"])
-                    except:
+                    if step_last_indices_all[i]['answer']:
+                        answer_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['answer']:].sum(), id2mean[f"{index[i]}_answer"], id2std[f"{index[i]}_answer"])
+                    else:
                         answer_score = 0.0
                     try:
                         advantage[i, :last_idx_dict['step5']+1] = step5_score
@@ -490,17 +492,17 @@ def compute_stepwise_grpo_outcome_advantage(
                     except:
                         advantage[i, :] = 0.0
                 elif task == "reagent":
-                    try:
-                        step6_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['step6']], id2mean[f"{index[i]}_step6"], id2std[f"{index[i]}_step6"])
-                    except:
+                    if step_last_indices_all[i]['step6']:
+                        step6_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['step6']:].sum(), id2mean[f"{index[i]}_step6"], id2std[f"{index[i]}_step6"])
+                    else:
                         step6_score = 0.0
-                    try:
-                        step7_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['step7']], id2mean[f"{index[i]}_step7"], id2std[f"{index[i]}_step7"])
-                    except:
+                    if step_last_indices_all[i]['step7']:
+                        step7_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['step7']:].sum(), id2mean[f"{index[i]}_step7"], id2std[f"{index[i]}_step7"])
+                    else:
                         step7_score = 0.0
-                    try:
-                        answer_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['answer']], id2mean[f"{index[i]}_answer"], id2std[f"{index[i]}_answer"])
-                    except:
+                    if step_last_indices_all[i]['answer']:
+                        answer_score = _get_scores_for_step(token_level_rewards[i, step_last_indices_all[i]['answer']:].sum(), id2mean[f"{index[i]}_answer"], id2std[f"{index[i]}_answer"])
+                    else:
                         answer_score = 0.0
                     try:
                         advantage[i, :last_idx_dict['step6']+1] = step6_score
