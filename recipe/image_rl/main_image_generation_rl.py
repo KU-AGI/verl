@@ -24,6 +24,7 @@ from omegaconf import OmegaConf, open_dict
 
 from verl.experimental.dataset.sampler import AbstractSampler
 from recipe.image_rl.ray_image_generation_trainer import RayImageGenerationTrainer
+from recipe.image_rl.dapo_ray_image_generation_trainer import RayImageGenerationDAPOTrainer
 from recipe.image_rl.reward import load_reward_manager, get_custom_reward_fn
 
 from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
@@ -245,7 +246,8 @@ class TaskRunner:
 
         resource_pool_manager = self.init_resource_pool_mgr(config)
 
-        trainer = RayImageGenerationTrainer(
+        # trainer = RayImageGenerationTrainer(
+        trainer = RayImageGenerationDAPOTrainer(
             config=config,
             tokenizer=tokenizer,
             processor=processor,
