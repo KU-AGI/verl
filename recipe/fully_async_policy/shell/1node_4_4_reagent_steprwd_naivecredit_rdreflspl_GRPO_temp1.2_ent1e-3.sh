@@ -6,7 +6,7 @@ export WANDB_PROJECT="verl-dapo"
 export NCCL_DEBUG="WARN"
 
 project_name='verl-dapo'
-exp_name='reagent_steprwd_stepcredit_gtreflspl_GRPO_temp1.2'
+exp_name='reagent_steprwd_naivecredit_rdreflspl_GRPO_temp1.2_ent1e-3'
 
 # Ray
 RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
@@ -31,8 +31,8 @@ if [ "$rollout_mode" = "async" ]; then
 fi
 
 # Algorithm parameters
-adv_estimator=stepwise_grpo # stepwise_grpo, stepcumul_grpo, grpo
-loss_mode=steplevel # steplevel, stepcumul, vanilla
+adv_estimator=grpo # stepwise_grpo, stepcumul_grpo, grpo
+loss_mode=vanilla # steplevel, stepcumul, vanilla
 norm_adv_by_std_in_grpo=True # False for Dr.GRPO, True for standard GRPO
 
 use_kl_in_reward=False
@@ -74,7 +74,7 @@ top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
 val_temperature=0.0
 val_top_k=0.0
 val_top_p=1.0
-rollout_strategy="gt_reflection_sampling" # "naive_sampling" | "gt_reflection_sampling" | "random_reflection_sampling"
+rollout_strategy="random_reflection_sampling" # "naive_sampling" | "gt_reflection_sampling" | "random_reflection_sampling"
 strategy_ratio=0.7 # 1.0 means all use above rollout_strategy, 0.0 means all use naive_sampling
 
 # Performance Related Parameter
@@ -96,7 +96,7 @@ n_gpus_training=$((NGPUS_PER_NODE - n_gpus_rollout))
 # (train_prompt_mini_bsz * require_batches * n_resp_per_prompt) % total_trainer_gpus == 0 must be satisfied
 train_prompt_bsz=0
 gen_prompt_bsz=1
-n_resp_per_prompt=8
+n_resp_per_prompt=4
 train_prompt_mini_bsz=16
 total_rollout_steps=$(((512*100000)))
 test_freq=1
@@ -163,7 +163,7 @@ python -m recipe.fully_async_policy.fully_async_main \
     actor_rollout_ref.actor.fsdp_config.param_offload=${actor_offload} \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=${actor_offload} \
     actor_rollout_ref.actor.fsdp_config.fsdp_size=${fsdp_size} \
-    actor_rollout_ref.actor.entropy_coeff=0 \
+    actor_rollout_ref.actor.entropy_coeff=0.001 \
     actor_rollout_ref.actor.grad_clip=1.0 \
     actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=${sp_size} \
