@@ -34,11 +34,11 @@ RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
 WORKING_DIR=${WORKING_DIR:-"${PWD}"}
 RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/recipe/image_rl/runtime_env.yaml"}
 
-GPUS=4 # `nvidia-smi -L | wc -l`
+GPUS=`nvidia-smi -L | wc -l`
 MODEL_PATH=/data/mllm/ckpt/pretrained # /data/mllm/checkpoints/Janus-Pro-7B
 TRAIN_FILES=/data/mllm/data/train.parquet
 VAL_FILES=/data/mllm/data/val.parquet
-RUN_NAME=dapo_b4_n8_kl0.1
+RUN_NAME=dapo_b4_n8_lr2e-6_temp1.2_kl0.04_no_std
 PROJ_NAME=mllm_reasoning
 SAVE_DIR=/data/verl/ckpts/$PROJ_NAME/$RUN_NAME
 
@@ -69,7 +69,7 @@ loss_agg_mode="token-mean"
 
 # Algorithm
 cfg_weight=5.0
-temperature=1.0
+temperature=1.2
 # txt_top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
 # txt_top_p=1.0
 # img_top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
@@ -87,7 +87,7 @@ use_dynamic_bsz=False
 offload=False
 gen_tp=1
 sp_size=1
-fsdp_size=4 # Must be divisible by (n_gpus_training*n_nodes) and (n_gpus_rollout*n_nodes)
+fsdp_size=$GPUS # Must be divisible by (n_gpus_training*n_nodes) and (n_gpus_rollout*n_nodes)
 
 # Fully async specific parameters
 NNODES=${NNODES:-1}
@@ -103,7 +103,7 @@ log_val_generations=20
 train_prompt_bsz=$GPUS # 4
 gen_prompt_bsz=$((train_prompt_bsz * 2))
 n_resp_per_prompt=8
-train_prompt_mini_bsz=$GPUS # 4
+train_prompt_mini_bsz=#$GPUS # 4
 
 # Perf
 fsdp_size=$GPUS # 4
@@ -125,7 +125,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     data.custom_cls.name=ImageRLDataset \
     actor_rollout_ref.model.path=$MODEL_PATH \
     actor_rollout_ref.model.trust_remote_code=True \
-    actor_rollout_ref.actor.optim.lr=5e-6 \
+    actor_rollout_ref.actor.optim.lr=2e-6 \
     actor_rollout_ref.actor.optim.warmup_style=constant \
     actor_rollout_ref.actor.strategy=fsdp \
     actor_rollout_ref.model.use_remove_padding=True \
@@ -181,7 +181,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     algorithm.filter_groups.enable=${enable_filter_groups} \
     algorithm.filter_groups.max_num_gen_batches=${max_num_gen_batches} \
     algorithm.filter_groups.metric=${filter_groups_metric} \
-    algorithm.norm_adv_by_std_in_grpo=True \
+    algorithm.norm_adv_by_std_in_grpo=False \
     +trainer.start_step=0 \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
