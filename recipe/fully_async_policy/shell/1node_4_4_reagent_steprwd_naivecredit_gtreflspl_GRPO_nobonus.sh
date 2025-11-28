@@ -6,7 +6,7 @@ export WANDB_PROJECT="verl-dapo"
 export NCCL_DEBUG="WARN"
 
 project_name='verl-dapo'
-exp_name='reagent_steprwd_stepcredit_gtreflspl_GRPO_bonus0.5'
+exp_name='reagent_steprwd_naivecredit_gtreflspl_GRPO_nobonus'
 
 # Ray
 RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
@@ -31,8 +31,8 @@ if [ "$rollout_mode" = "async" ]; then
 fi
 
 # Algorithm parameters
-adv_estimator=stepwise_grpo # stepwise_grpo, stepcumul_grpo, grpo
-loss_mode=steplevel # steplevel, stepcumul, vanilla
+adv_estimator=grpo # stepwise_grpo, stepcumul_grpo, grpo
+loss_mode=vanilla # steplevel, stepcumul, vanilla
 norm_adv_by_std_in_grpo=True # False for Dr.GRPO, True for standard GRPO
 
 use_kl_in_reward=False
@@ -54,8 +54,8 @@ use_response_mask_to_reflection_step=False
 # Reward related parameters
 use_content_reward=True
 use_decision_reward=True
-use_reflection_bonus=True
-reflection_bonus_weight=0.5
+use_reflection_bonus=False
+reflection_bonus_weight=0.0
 
 # Response length parameters
 max_prompt_length=500 # $((1024 * 2))

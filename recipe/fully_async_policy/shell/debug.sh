@@ -99,12 +99,12 @@ gen_prompt_bsz=1
 n_resp_per_prompt=8
 train_prompt_mini_bsz=16
 total_rollout_steps=$(((512*100000)))
-test_freq=1
+test_freq=2
 staleness_threshold=0.0
-trigger_parameter_sync_step=100
+trigger_parameter_sync_step=10
 require_batches=3
 partial_rollout=False
-save_freq=$((test_freq * trigger_parameter_sync_step * 6))
+save_freq=$((test_freq * trigger_parameter_sync_step * 60))
 
 
 # ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \

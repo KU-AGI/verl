@@ -480,7 +480,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             response_str_list = [self.tokenizer.decode(output.response_ids) for output in agent_loop_output_list]
             valid_structure_list = []
             for s in response_str_list:
-                is_valid_structure = await self._validate_structure(s)
+                is_valid_structure = await self._validate_structure(s, task)
                 valid_structure_list.append(is_valid_structure)
             if not all(valid_structure_list):
                 # print(
@@ -734,7 +734,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
 
         return start_idx < end_idx
 
-    async def _validate_structure(self, text: str) -> bool:
+    async def _validate_structure(self, text: str, task: str) -> bool:
         # 1. <think> ... </think> 존재 여부 확인
         think_match = re.search(r"<think>(.*?)</think>", text, re.DOTALL)
         if not think_match:
@@ -763,12 +763,31 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         step_blocks = re.split(step_pattern, think_content)[1:]  # [num1, block1, num2, block2 ...]
         # step_blocks 구조: [step_num1, step_content1, step_num2, step_content2, ...]
 
-        # 4. 각 Step 블록에 reflection이 0개 또는 1개인지 검사
+        # 4. 각 step에서 reflection 개수 확인 (0 또는 1개)
+        reflections_by_step = {}
         for i in range(0, len(step_blocks), 2):
-            step_content = step_blocks[i + 1]  # 해당 step의 내용
-            reflection_blocks = re.findall(r"<REFLECTION>(.*?)</REFLECTION>", step_content, re.DOTALL)
+            step_num = int(step_blocks[i])
+            step_content = step_blocks[i + 1]
+            ref_blocks = re.findall(r"<REFLECTION>(.*?)</REFLECTION>", step_content, re.DOTALL)
+            if len(ref_blocks) > 1:
+                return False  # 하나 step에 reflection 2개 이상 금지
+            reflections_by_step[step_num] = len(ref_blocks)
 
-            if len(reflection_blocks) > 1:
-                return False  # 하나의 step에 reflection이 2개 이상이면 잘못됨
+        # ---------------------------------------------------------------
+        # 5. task 규칙에 따른 reflection step 존재 검증
+        # ---------------------------------------------------------------
 
-        return True
+        if task == "forward":
+            allowed_steps = {4, 5, 6}
+        elif task == "retro":
+            allowed_steps = {5, 6, 7}
+        elif task == "reagent":
+            allowed_steps = {6, 7}
+        else:
+            raise ValueError(f"Unknown task type: {task}")
+
+        for step, count in reflections_by_step.items():
+            if count == 1 and step not in allowed_steps:
+                return False
+
+        return True 

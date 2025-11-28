@@ -20,6 +20,7 @@ from abc import ABC, abstractmethod
 from enum import Enum
 from rdkit import Chem, RDLogger
 from collections import defaultdict
+from pprint import pprint
 
 RDLogger.DisableLog('rdApp.*')
 
@@ -542,7 +543,11 @@ class StepEvaluator():
         step6_has_reflection = False
         has_tagged_smiles = False
         steps_data = self.parse_steps_with_reflections(predicted_rationale)
-        reflection_bonus = {}
+        reflection_bonus = {
+            "step4": 0,
+            "step5": 0,
+            "step6": 0,
+        }
         for step_key, step_info in steps_data.items():
             if step_info["step"] == 4:
                 has_reflection = len(step_info["reflections"]) > 0
@@ -637,9 +642,9 @@ class StepEvaluator():
         step6_FN = step6_initial_incorrect and step6_has_not_reflection
 
         # Reflection accuracy reward
-        step4_reflection_correct = step4_TP + step4_TN - step4_FP - step4_FN
-        step5_reflection_correct = step5_TP + step5_TN - step5_FP - step5_FN
-        step6_reflection_correct = step6_TP + step6_TN - step6_FP - step6_FN
+        step4_reflection_correct = step4_TP - step4_FP
+        step5_reflection_correct = step5_TP - step5_FP
+        step6_reflection_correct = step6_TP - step6_FP
         total_reflection_correct_list = [step4_reflection_correct, step5_reflection_correct, step6_reflection_correct]
         reflection_ratio = sum(total_reflection_correct_list) / len(total_reflection_correct_list)
 
@@ -690,7 +695,11 @@ class StepEvaluator():
         step7_has_reflection = False
 
         steps_data = self.parse_steps_with_reflections(predicted_rationale)
-        reflection_bonus = {}
+        reflection_bonus = {
+            "step5": 0,
+            "step6": 0,
+            "step7": 0,
+        }
         for step_key, step_info in steps_data.items():
             if step_info["step"] == 5:
                 has_reflection = len(step_info["reflections"]) > 0
@@ -770,9 +779,9 @@ class StepEvaluator():
         step7_FN = step7_initial_incorrect and step7_has_not_reflection
 
         # Reflection accuracy reward
-        step5_reflection_correct = step5_TP + step5_TN - step5_FP - step5_FN
-        step6_reflection_correct = step6_TP + step6_TN - step6_FP - step6_FN
-        step7_reflection_correct = step7_TP + step7_TN - step7_FP - step7_FN
+        step5_reflection_correct = step5_TP - step5_FP
+        step6_reflection_correct = step6_TP - step6_FP
+        step7_reflection_correct = step7_TP - step7_FP
         total_reflection_correct_list = [step5_reflection_correct, step6_reflection_correct, step7_reflection_correct]
         reflection_ratio = sum(total_reflection_correct_list) / len(total_reflection_correct_list)
 
@@ -820,7 +829,10 @@ class StepEvaluator():
         step7_has_reflection = False
 
         steps_data = self.parse_steps_with_reflections(predicted_rationale)
-        reflection_bonus = {}
+        reflection_bonus = {
+            "step6": 0,
+            "step7": 0,
+        }
         for step_key, step_info in steps_data.items():
             if step_info["step"] == 6:
                 has_reflection = len(step_info["reflections"]) > 0
@@ -861,6 +873,11 @@ class StepEvaluator():
             if SMILESValidator.exact_match(reagent_pred, reagent_gt):
                 has_reagents_initial = True
                 break
+
+        if step6_has_reflection:
+            # any of the initial reagents overlaps with reflection reagents, has_reagents=False
+            if len(set(reagent_list) & set(reagent_list_initial)) > 0:
+                has_reagents = False
 
 
         # Metric 4: Correct reagent number
@@ -909,8 +926,10 @@ class StepEvaluator():
         step7_FN = step7_initial_incorrect and step7_has_not_reflection
 
         # Reflection accuracy reward
-        step6_reflection_correct = step6_TP + step6_TN - step6_FP - step6_FN
-        step7_reflection_correct = step7_TP + step7_TN - step7_FP - step7_FN
+        # step6_reflection_correct = step6_TP + step6_TN - step6_FP - step6_FN
+        # step7_reflection_correct = step7_TP + step7_TN - step7_FP - step7_FN
+        step6_reflection_correct = step6_TP - step6_FP
+        step7_reflection_correct = step7_TP - step7_FP
         total_reflection_correct_list = [step6_reflection_correct, step7_reflection_correct]
         reflection_ratio = sum(total_reflection_correct_list) / len(total_reflection_correct_list)
 
@@ -963,7 +982,7 @@ class ChemistryEvaluator:
         correct_score, pred = self.is_correct_strict_tag(solution_str, ground_truth)
         return correct_score == 1, pred
 
-    def validate_structure(self, text: str) -> bool:
+    def validate_structure(self, text: str, task: str) -> bool:
         # 1. <think> ... </think> 존재 여부 확인
         think_match = re.search(r"<think>(.*?)</think>", text, re.DOTALL)
         if not think_match:
@@ -992,15 +1011,34 @@ class ChemistryEvaluator:
         step_blocks = re.split(step_pattern, think_content)[1:]  # [num1, block1, num2, block2 ...]
         # step_blocks 구조: [step_num1, step_content1, step_num2, step_content2, ...]
 
-        # 4. 각 Step 블록에 reflection이 0개 또는 1개인지 검사
+        # 4. 각 step에서 reflection 개수 확인 (0 또는 1개)
+        reflections_by_step = {}
         for i in range(0, len(step_blocks), 2):
-            step_content = step_blocks[i + 1]  # 해당 step의 내용
-            reflection_blocks = re.findall(r"<REFLECTION>(.*?)</REFLECTION>", step_content, re.DOTALL)
+            step_num = int(step_blocks[i])
+            step_content = step_blocks[i + 1]
+            ref_blocks = re.findall(r"<REFLECTION>(.*?)</REFLECTION>", step_content, re.DOTALL)
+            if len(ref_blocks) > 1:
+                return False  # 하나 step에 reflection 2개 이상 금지
+            reflections_by_step[step_num] = len(ref_blocks)
 
-            if len(reflection_blocks) > 1:
-                return False  # 하나의 step에 reflection이 2개 이상이면 잘못됨
+        # ---------------------------------------------------------------
+        # 5. task 규칙에 따른 reflection step 존재 검증
+        # ---------------------------------------------------------------
 
-        return True
+        if task == "forward":
+            allowed_steps = {4, 5, 6}
+        elif task == "retro":
+            allowed_steps = {5, 6, 7}
+        elif task == "reagent":
+            allowed_steps = {6, 7}
+        else:
+            raise ValueError(f"Unknown task type: {task}")
+
+        for step, count in reflections_by_step.items():
+            if count == 1 and step not in allowed_steps:
+                return False
+
+        return True 
 
 
     def compute_score(self,
@@ -1013,10 +1051,10 @@ class ChemistryEvaluator:
                       reflection_bonus_weight=0.0
                       ) -> Union[EvaluationResult, Dict[str, Any]]:
         """Compute comprehensive evaluation score."""
-        correct_structure = self.validate_structure(solution_str)
+        task = extra_info['task']
+        correct_structure = self.validate_structure(solution_str, task)
         correct, pred = self.verify(solution_str, ground_truth, extra_info)
 
-        task = extra_info['task']
         info = {
             "products": extra_info['products'],
             "reactants": extra_info['reactants'],
@@ -1123,7 +1161,23 @@ class ChemistryEvaluator:
             reward += reflection_bonus_reward
             reward_metric_dict[f"{task}/reward/reflection_bonus_reward"] = reflection_bonus_reward
 
+        # print("="*100)
+        # print("=== predicted_rational ===\n", solution_str)
+        # print("-"*100)
+        # pprint(step_eval_results)
+        # print("-"*100)
+        # pprint(reflection_bonus_dict)
+        # print("-"*100)
+        # pprint(content_reward_dict)
+        # print("-"*100)
+        # pprint(reflection_decision_reward_dict)
+        # print("-"*100)
+        # pprint(step_rewards)
+        # print("-"*100)
+        # pprint(extra_info['reagents'])
+        # print("="*100)
 
+        
         step_eval_results.update(reward_metric_dict)
 
         result = EvaluationResult(
