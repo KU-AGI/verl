@@ -261,7 +261,6 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
 
             with marked_timer("step", timing_raw):
                 with marked_timer("gen", timing_raw, color="red"):
-                    # breakpoint()
                     epoch, batch = self._get_samples_from_queue()
                     if batch is None:
                         break

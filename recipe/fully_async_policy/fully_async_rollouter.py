@@ -735,11 +735,25 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         return start_idx < end_idx
 
     async def _validate_structure(self, text: str, task: str) -> bool:
-        # 1. <think> ... </think> 존재 여부 확인
-        think_match = re.search(r"<think>(.*?)</think>", text, re.DOTALL)
-        if not think_match:
+        # 1. <think> ... </think> 태그 페어 및 개수 검증
+        open_think_tags = re.findall(r"<think>", text)
+        close_think_tags = re.findall(r"</think>", text)
+        # 각각 정확히 1회만 등장해야 함
+        if len(open_think_tags) != 1 or len(close_think_tags) != 1:
             return False
-        think_content = think_match.group(1)
+        open_pos = text.find("<think>")
+        close_pos = text.find("</think>")
+        # 순서 및 위치 검증
+        if open_pos == -1 or close_pos == -1 or close_pos < open_pos:
+            return False
+        # 추가적인 잘못된 패턴(예: 중첩 시작 태그 후 단일 종료 태그) 방지:
+        # "<think>" 이후 다시 "<think>" 가 나오면 잘못된 구조
+        if text.find("<think>", open_pos + len("<think>")) != -1:
+            return False
+        # 추출
+        think_content = text[open_pos + len("<think>"):close_pos]
+        if think_content.strip() == "":
+            return False
 
         # 2. <ANSWER> ... </ANSWER> 존재 여부 확인
         answer_match = re.findall(r"<ANSWER>(.*?)</ANSWER>", text, re.DOTALL)
@@ -790,4 +804,4 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             if count == 1 and step not in allowed_steps:
                 return False
 
-        return True 
+        return True
