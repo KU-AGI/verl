@@ -362,7 +362,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     concatenated = []
-    args.train = True
+    args.val = True
 
     # tasks = ["forward", "retro", "reagent"]
     tasks = ["reagent"]
@@ -402,7 +402,7 @@ if __name__ == "__main__":
     if args.train:
         dataset = concatenated.map(function=append_info, load_from_cache_file=False)
         dataset = dataset.filter(lambda x: x["data_source"] is not None)
-        dataset.to_parquet(os.path.join(args.output_dir, f"{args.dir_name}", "syntheticreact_reagent_train_reverse.parquet"))
+        dataset.to_parquet(os.path.join(args.output_dir, f"{args.dir_name}", "syntheticreact_train.parquet"))
     elif args.val:
         dataset = concatenated.map(function=append_info, load_from_cache_file=False)
         # dataset = dataset.filter(lambda x: x["data_source"] is not None)
