@@ -164,11 +164,11 @@ def append_reagent_info(data):
     prompt = [
         {'role': 'system', 'content': 'You are a chemist.'},
         {'role': 'user', 'content': f"""Please suggest some possible reagents that could have been used in the following chemical reaction {'.'.join(data["reactants"])}>>{'.'.join(data["products"])}."""}
-    ],
+    ]
     reactants = data['reactants']
     reagents = data['reagents']
     reward_model = {
-        'ground_truth': 'DUMMY',
+        'ground_truth': '<think>\n\n</think>\n\n<ANSWER>\nDUMMY_REAGENT\n</ANSWER>',
         'style': 'rule'
     }
     rxn_str = data['rxn_str']
@@ -225,7 +225,6 @@ if __name__ == "__main__":
             continue
         if len(item['reagents']) == 0:
             continue
-        item['rationale'] = "DUMMY"
         new_data.append(item)
 
 
