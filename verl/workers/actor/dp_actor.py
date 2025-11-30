@@ -364,7 +364,7 @@ class DataParallelPPOActor(BasePPOActor):
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
 
-        log_probs_all = []
+        # log_probs_all = []
         select_keys = [
             "prompts",
             "responses",
@@ -437,7 +437,7 @@ class DataParallelPPOActor(BasePPOActor):
                     entropy, log_prob = self._forward_micro_batch(
                         model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                     )
-                    log_probs_all.append(log_prob)
+                    # log_probs_all.append(log_prob)
 
                     # for fully_async_policy recipe
                     if hasattr(self.config, "use_rollout_log_probs") and self.config.use_rollout_log_probs:
