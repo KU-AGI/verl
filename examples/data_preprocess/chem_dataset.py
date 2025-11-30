@@ -362,9 +362,10 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     concatenated = []
-    args.test = True
+    args.train = True
 
-    tasks = ["forward", "retro", "reagent"]
+    # tasks = ["forward", "retro", "reagent"]
+    tasks = ["reagent"]
     for task in tasks:
         if args.train:
             dataset_paths = sorted(glob(os.path.join(f"{args.train_dir}/{task}", "*.json")))
@@ -379,6 +380,8 @@ if __name__ == "__main__":
             raise ValueError("Either --train or --val or --test must be specified")
 
         dataset = concatenate_datasets([load_dataset("json", data_files=dataset_path, split="train", keep_in_memory=False) for dataset_path in dataset_paths])
+        # reverse dataset row order
+        dataset = dataset.select(list(reversed(range(len(dataset)))))
 
         dataset = dataset.add_column("task", [task] * len(dataset))
         dataset = dataset.map(map_messages, fn_kwargs={"split": split}, load_from_cache_file=False)
@@ -399,7 +402,7 @@ if __name__ == "__main__":
     if args.train:
         dataset = concatenated.map(function=append_info, load_from_cache_file=False)
         dataset = dataset.filter(lambda x: x["data_source"] is not None)
-        dataset.to_parquet(os.path.join(args.output_dir, f"{args.dir_name}", "syntheticreact_train.parquet"))
+        dataset.to_parquet(os.path.join(args.output_dir, f"{args.dir_name}", "syntheticreact_reagent_train_reverse.parquet"))
     elif args.val:
         dataset = concatenated.map(function=append_info, load_from_cache_file=False)
         # dataset = dataset.filter(lambda x: x["data_source"] is not None)

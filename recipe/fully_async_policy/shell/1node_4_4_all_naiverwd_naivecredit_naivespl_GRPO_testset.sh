@@ -6,7 +6,7 @@ export WANDB_PROJECT="verl-dapo"
 export NCCL_DEBUG="WARN"
 
 project_name='verl-dapo'
-exp_name='reagent_steprwd_naivecredit_naivespl_GRPO_nobonus_onpolicy'
+exp_name='all_naiverwd_naivecredit_naivespl_GRPO_testset'
 
 # Ray
 RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
@@ -19,7 +19,7 @@ RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
 MODEL_PATH="/data/llm-reaction-reasoning/all_checkpoints/reflection_v4_fullft_all/best.ckpt/hf_model"
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
 DUMP_DIR=${DUMP_DIR:-"${RAY_DATA_HOME}/dumps/${project_name}/${exp_name}"}
-TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/chem_dapo/syntheticreact_reagent_train.parquet"}
+TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/chem_dapo/syntheticreact_test.parquet"}
 VAL_FILE=${VAL_FILE:-"${RAY_DATA_HOME}/data/chem_dapo/syntheticreact_val.parquet"}
 TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/chem_dapo/syntheticreact_test.parquet"}
 
@@ -52,8 +52,8 @@ balance_task=False
 use_response_mask_to_reflection_step=False
 
 # Reward related parameters
-use_content_reward=True
-use_decision_reward=True
+use_content_reward=False
+use_decision_reward=False
 use_reflection_bonus=False
 reflection_bonus_weight=0.0
 
@@ -99,12 +99,12 @@ gen_prompt_bsz=1
 n_resp_per_prompt=4
 train_prompt_mini_bsz=16
 total_rollout_steps=$(((512*100000)))
-test_freq=20
+test_freq=6
 staleness_threshold=0.0
-trigger_parameter_sync_step=1
-require_batches=1
+trigger_parameter_sync_step=10
+require_batches=3
 partial_rollout=False
-save_freq=$((test_freq * trigger_parameter_sync_step * 60))
+save_freq=$((test_freq * trigger_parameter_sync_step * 20))
 
 
 # ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
