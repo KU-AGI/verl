@@ -6,7 +6,7 @@ export WANDB_PROJECT="verl-dapo"
 export NCCL_DEBUG="WARN"
 
 project_name='verl-dapo'
-exp_name='reagent_naiverwd_naivecredit_naivespl_GRPO_temp1.2'
+exp_name='reagent_steprwd_naivecredit_naivespl_GRPO_nobonus_onpolicy'
 
 # Ray
 RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
@@ -52,8 +52,8 @@ balance_task=False
 use_response_mask_to_reflection_step=False
 
 # Reward related parameters
-use_content_reward=False
-use_decision_reward=False
+use_content_reward=True
+use_decision_reward=True
 use_reflection_bonus=False
 reflection_bonus_weight=0.0
 
@@ -96,15 +96,15 @@ n_gpus_training=$((NGPUS_PER_NODE - n_gpus_rollout))
 # (train_prompt_mini_bsz * require_batches * n_resp_per_prompt) % total_trainer_gpus == 0 must be satisfied
 train_prompt_bsz=0
 gen_prompt_bsz=1
-n_resp_per_prompt=8
+n_resp_per_prompt=4
 train_prompt_mini_bsz=16
 total_rollout_steps=$(((512*100000)))
-test_freq=1
+test_freq=20
 staleness_threshold=0.0
-trigger_parameter_sync_step=100
-require_batches=3
+trigger_parameter_sync_step=1
+require_batches=1
 partial_rollout=False
-save_freq=$((test_freq * trigger_parameter_sync_step * 6))
+save_freq=$((test_freq * trigger_parameter_sync_step * 60))
 
 
 # ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \

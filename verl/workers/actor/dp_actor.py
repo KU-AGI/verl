@@ -38,6 +38,8 @@ from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
 from verl.workers.actor import BasePPOActor
 from verl.workers.config import ActorConfig
+from .utils import *
+from collections import defaultdict
 
 __all__ = ["DataParallelPPOActor"]
 
@@ -356,13 +358,15 @@ class DataParallelPPOActor(BasePPOActor):
         return log_probs, entropys
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
-    def update_policy(self, data: DataProto):
+    def update_policy(self, data: DataProto, tokenizer):
         # make sure we are in training mode
         self.actor_module.train()
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
 
+        log_probs_all = []
         select_keys = [
+            "prompts",
             "responses",
             "response_mask",
             "input_ids",
@@ -433,6 +437,7 @@ class DataParallelPPOActor(BasePPOActor):
                     entropy, log_prob = self._forward_micro_batch(
                         model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                     )
+                    log_probs_all.append(log_prob)
 
                     # for fully_async_policy recipe
                     if hasattr(self.config, "use_rollout_log_probs") and self.config.use_rollout_log_probs:
@@ -458,6 +463,43 @@ class DataParallelPPOActor(BasePPOActor):
                     # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
                     # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
                     policy_loss_fn = get_policy_loss_fn(loss_mode)
+
+
+                # prompt_len = micro_batch.batch['prompts'].shape[1]
+                # all_log_probs = {
+                #     "forward": defaultdict(list),
+                #     "retro": defaultdict(list),
+                #     "reagent": defaultdict(list),
+                # }
+
+                # for micro_i, input_ids in enumerate(micro_batch.batch['input_ids'][:, prompt_len:]):
+                #     task = micro_batch.non_tensor_batch['task'][micro_i]
+                #     if task == "reagent":
+                #         kind, index = find_after_step(input_ids, step_idx=6)
+                #         if kind == "reflection":
+                #             all_log_probs["reagent"]["step6_reflection_log_probs"].append(log_prob[micro_i, index].item())
+                #             all_log_probs["reagent"]["step6_reflection_old_log_probs"].append(old_log_prob[micro_i, index].item())
+                #             all_log_probs["reagent"]["step6_reflection_negative_approx_kl"].append(
+                #                 (old_log_prob[micro_i, index] - log_prob[micro_i, index]).item()
+                #             )
+                #         elif kind == "next_step" or kind == "answer":
+                #             all_log_probs["reagent"]["step6_next_step_log_probs"].append(log_prob[micro_i, index].item())
+                #             all_log_probs["reagent"]["step6_next_step_old_log_probs"].append(old_log_prob[micro_i, index].item())
+                #             all_log_probs["reagent"]["step6_next_step_negative_approx_kl"].append(
+                #                 (old_log_prob[micro_i, index] - log_prob[micro_i, index]).item()
+                #             )
+
+                # for task in all_log_probs.keys():
+                #     for key in all_log_probs[task].keys():
+                #         if len(all_log_probs[task][key]) > 0:
+                #             micro_batch_metrics[f"actor/{task}/{key}_mean"] = (
+                #                 sum(all_log_probs[task][key]) / len(all_log_probs[task][key])
+                #             )
+                #             micro_batch_metrics[f"actor/{task}/{key}_min"] = min(all_log_probs[task][key])
+                #             micro_batch_metrics[f"actor/{task}/{key}_max"] = max(all_log_probs[task][key])
+
+
+
 
                     # Compute policy loss (all functions return 4 values)
                     pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(

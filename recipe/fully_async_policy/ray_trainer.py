@@ -444,7 +444,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             norm_adv_by_std_in_grpo = self.config.algorithm.get(
                 "norm_adv_by_std_in_grpo", True
             )  # GRPO adv normalization factor
-
+            # breakpoint()
             batch = compute_advantage(
                 batch,
                 adv_estimator=self.config.algorithm.adv_estimator,
@@ -454,6 +454,72 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                 norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                 config=self.config.algorithm,
             )
+        # breakpoint()
+        # for uid in list(set(batch.non_tensor_batch['uid'])):
+        #     uid_inds = np.where(batch.non_tensor_batch['uid'] == uid)[0]
+        #     input_ids = batch.batch['input_ids'][uid_inds]
+        #     advantages = batch.batch['advantages'][uid_inds]
+        #     responses = batch.batch['responses'][uid_inds]
+        #     token_level_rewards = batch.batch['token_level_rewards'][uid_inds]
+        #     reagents_all = batch.non_tensor_batch['reagents'][uid_inds]
+        #     step_rewards_all = batch.non_tensor_batch['step_rewards'][uid_inds]
+        #     content_rewards_all = batch.non_tensor_batch['reagent/reward/content_reward'][uid_inds]
+        #     decision_rewards_all = batch.non_tensor_batch['reagent/reward/decision_reward'][uid_inds]
+        #     reflection_bonus_rewards_all = batch.non_tensor_batch['reagent/reward/reflection_bonus_reward'][uid_inds]
+        #     answer_correct_all = batch.non_tensor_batch['reagent/reward/answer_correct'][uid_inds]
+        #     valid_structure_all = batch.non_tensor_batch['reagent/reward/valid_structure'][uid_inds]
+
+        #     for i in range(len(uid_inds)):
+        #         print(f"=== uid: {uid} | sample {i} ===")
+        #         print("responses: ", self.tokenizer.decode(responses[i], skip_special_tokens=True))
+        #         print("reagents: ", ".".join(reagents_all[i]))
+        #         print("step_rewards: ", step_rewards_all[i])
+        #         print("content_rewards: ", content_rewards_all[i])
+        #         print("decision_rewards: ", decision_rewards_all[i])
+        #         print("reflection_bonus_rewards: ", reflection_bonus_rewards_all[i])
+        #         print("answer_correct: ", answer_correct_all[i])
+        #         print("valid_structure: ", valid_structure_all[i])
+        #         print("advantages: ", advantages[i].tolist())
+        #         # print("token_level_rewards: ", token_level_rewards[i].tolist())
+        #         print("-"*50)
+
+        #     print("="*100)
+
+            # break
+
+
+
+
+# uid = list(set(batch.non_tensor_batch['uid']))[18]
+# uid_inds = np.where(batch.non_tensor_batch['uid'] == uid)[0]
+# input_ids = batch.batch['input_ids'][uid_inds]
+# responses = batch.batch['responses'][uid_inds]
+# token_level_rewards = batch.batch['token_level_rewards'][uid_inds]
+# reagents_all = batch.non_tensor_batch['reagents'][uid_inds]
+# step_rewards_all = batch.non_tensor_batch['step_rewards'][uid_inds]
+# content_rewards_all = batch.non_tensor_batch['reagent/reward/content_reward'][uid_inds]
+# decision_rewards_all = batch.non_tensor_batch['reagent/reward/decision_reward'][uid_inds]
+# reflection_bonus_rewards_all = batch.non_tensor_batch['reagent/reward/reflection_bonus_reward'][uid_inds]
+# answer_correct_all = batch.non_tensor_batch['reagent/reward/answer_correct'][uid_inds]
+# valid_structure_all = batch.non_tensor_batch['reagent/reward/valid_structure'][uid_inds]
+
+# for i in range(len(uid_inds)):
+#     print(f"=== uid: {uid} | sample {i} ===")
+#     if "<REFLECTION>" in self.tokenizer.decode(responses[i], skip_special_tokens=True):
+#         print("responses: ", self.tokenizer.decode(responses[i], skip_special_tokens=True))
+#         print("valid", validate_structure(self.tokenizer.decode(responses[i], skip_special_tokens=True), "reagent"))
+#         print("reagents: ", ".".join(reagents_all[i]))
+#         print("step_rewards: ", step_rewards_all[i])
+#         print("content_rewards: ", content_rewards_all[i])
+#         print("decision_rewards: ", decision_rewards_all[i])
+#         print("reflection_bonus_rewards: ", reflection_bonus_rewards_all[i])
+#         print("answer_correct: ", answer_correct_all[i])
+#         print("valid_structure: ", valid_structure_all[i])
+#         # print("token_level_rewards: ", token_level_rewards[i].tolist())
+#         print("-"*50)
+# print("="*100)
+
+
 
         # update critic
         if self.use_critic:

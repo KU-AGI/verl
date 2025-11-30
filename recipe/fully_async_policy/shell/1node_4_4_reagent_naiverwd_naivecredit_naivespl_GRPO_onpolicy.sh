@@ -6,7 +6,7 @@ export WANDB_PROJECT="verl-dapo"
 export NCCL_DEBUG="WARN"
 
 project_name='verl-dapo'
-exp_name='debug'
+exp_name='reagent_naiverwd_naivecredit_naivespl_GRPO_onpolicy'
 
 # Ray
 RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
@@ -52,10 +52,10 @@ balance_task=False
 use_response_mask_to_reflection_step=False
 
 # Reward related parameters
-use_content_reward=True
-use_decision_reward=True
-use_reflection_bonus=True
-reflection_bonus_weight=1000
+use_content_reward=False
+use_decision_reward=False
+use_reflection_bonus=False
+reflection_bonus_weight=0.0
 
 # Response length parameters
 max_prompt_length=500 # $((1024 * 2))
@@ -74,8 +74,8 @@ top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
 val_temperature=0.0
 val_top_k=0.0
 val_top_p=1.0
-rollout_strategy="gt_reflection_sampling" # "naive_sampling" | "gt_reflection_sampling" | "random_reflection_sampling"
-strategy_ratio=1.0 # 1.0 means all use above rollout_strategy, 0.0 means all use naive_sampling
+rollout_strategy="naive_sampling" # "naive_sampling" | "gt_reflection_sampling" | "random_reflection_sampling"
+strategy_ratio=0.0 # 1.0 means all use above rollout_strategy, 0.0 means all use naive_sampling
 
 # Performance Related Parameter
 use_dynamic_bsz=True
@@ -96,7 +96,7 @@ n_gpus_training=$((NGPUS_PER_NODE - n_gpus_rollout))
 # (train_prompt_mini_bsz * require_batches * n_resp_per_prompt) % total_trainer_gpus == 0 must be satisfied
 train_prompt_bsz=0
 gen_prompt_bsz=1
-n_resp_per_prompt=8
+n_resp_per_prompt=4
 train_prompt_mini_bsz=16
 total_rollout_steps=$(((512*100000)))
 test_freq=20
@@ -197,7 +197,7 @@ python -m recipe.fully_async_policy.fully_async_main \
     trainer.logger=['console','wandb'] \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
-    trainer.val_before_train=False \
+    trainer.val_before_train=True \
     trainer.default_local_dir="${CKPTS_DIR}" \
     trainer.validation_data_dir="${DUMP_DIR}/val" \
     trainer.test_data_dir="${DUMP_DIR}/test" \

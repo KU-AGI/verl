@@ -983,11 +983,25 @@ class ChemistryEvaluator:
         return correct_score == 1, pred
 
     def validate_structure(self, text: str, task: str) -> bool:
-        # 1. <think> ... </think> 존재 여부 확인
-        think_match = re.search(r"<think>(.*?)</think>", text, re.DOTALL)
-        if not think_match:
+        # 1. <think> ... </think> 태그 페어 및 개수 검증
+        open_think_tags = re.findall(r"<think>", text)
+        close_think_tags = re.findall(r"</think>", text)
+        # 각각 정확히 1회만 등장해야 함
+        if len(open_think_tags) != 1 or len(close_think_tags) != 1:
             return False
-        think_content = think_match.group(1)
+        open_pos = text.find("<think>")
+        close_pos = text.find("</think>")
+        # 순서 및 위치 검증
+        if open_pos == -1 or close_pos == -1 or close_pos < open_pos:
+            return False
+        # 추가적인 잘못된 패턴(예: 중첩 시작 태그 후 단일 종료 태그) 방지:
+        # "<think>" 이후 다시 "<think>" 가 나오면 잘못된 구조
+        if text.find("<think>", open_pos + len("<think>")) != -1:
+            return False
+        # 추출
+        think_content = text[open_pos + len("<think>"):close_pos]
+        if think_content.strip() == "":
+            return False
 
         # 2. <ANSWER> ... </ANSWER> 존재 여부 확인
         answer_match = re.findall(r"<ANSWER>(.*?)</ANSWER>", text, re.DOTALL)
@@ -1038,7 +1052,7 @@ class ChemistryEvaluator:
             if count == 1 and step not in allowed_steps:
                 return False
 
-        return True 
+        return True
 
 
     def compute_score(self,
@@ -1214,3 +1228,91 @@ def compute_score(solution_str: str,
     )
     # result is already a dict from compute_score method
     return result
+
+
+if __name__ == "__main__":
+    solution_str = """<think>
+## Step 1: Understanding molecular roles  
+The reactant is Sc1cccc(Br)c1.CC(C)=CCBr and the product is CC(C)=CCSc1cccc(Br)c1. The reaction involves the formation of a thioether bond between the aryl group (Sc1cccc(Br)c1) and the alkyl chain (CC(C)=CCBr), indicating a coupling between a sulfur-containing nucleophile and an electrophilic carbon center.
+
+## Step 2: Analysis of main functional groups  
+The reactant contains a bromoaryl group (Br attached to an aromatic ring) and a bromoalkyl group (Br attached to a carbon chain). The product contains a thioether linkage (S–C), suggesting that a sulfur nucleophile has reacted with an electrophilic carbon center. The presence of bromine in both reactants indicates that it may act as a leaving group in the reaction.
+
+## Step 3: Predict possible reaction mechanisms  
+The formation of a thioether bond suggests an S_N2 mechanism or a transition-metal-catalyzed coupling. Given the presence of bromine, which is a good leaving group, the reaction could proceed via nucleophilic substitution or through a palladium- or copper-catalyzed cross-coupling. The introduction of sulfur implies that a thiolate nucleophile is involved, likely generated from a thiol by deprotonation.
+
+## Step 4: Δ analysis  
+The functional group/substructure change (Δ) between reactant and product involves the introduction of a quaternary nitrogen (masked SMILES `_CSc_`) and the removal of H-pyrrole nitrogens (masked SMILES `S_`). This indicates that the sulfur atom from the thiolate nucleophile has been incorporated into the product, forming a new S–C bond.
+
+## Step 5: Derivation of required functions  
+The reaction requires a strong base to deprotonate a thiol, generating a thiolate nucleophile. It also requires an electrophilic carbon center with a good leaving group, such as bromide. Additionally, if transition-metal catalysis is involved, the reagent must provide a suitable catalyst like palladium or copper.
+
+## Step 6: Generation of candidate reagents  
+The candidate reagents are as follows:  
+1. [Al].[Al]  
+2. CC(=O)[O-].C[O-]  
+3. O=C([O-])[O-].[K+]
+
+<REFLECTION>
+Wait, considering that the reaction requires a sulfur nucleophile (or a thiolate) and possibly a transition‑metal catalyst, the candidate reagents listed ([Al].[Al], CC(=O)[O-].C[O-], O=C([O-])[O-].[K+]) do not provide sulfur or an appropriate base or catalyst for forming the thioether bond.
+It should be
+1. CCCC[SnH](CCCC)CCCC.C[O-]
+2. [Pd+2].O=P([O-])([O-])[O-]
+3. [Na+].[OH-]
+</REFLECTION>
+
+## Step 7: Selection of reagents  
+The reagent 3 is the most suitable reagent for the reaction, since it provides both a strong base ([OH-]) to generate the thiolate nucleophile and a cation ([Na+]) to stabilize the anion and enhance solubility. This combination supports the formation of the thioether bond through nucleophilic substitution.
+</think>
+
+<ANSWER>
+[Na+].[OH-]
+</ANSWER>"""
+
+
+    ground_truth = "O=C([O-])[O-].[K+]"
+    extra_info = {
+        'class_name': 'Carboxylic acid + amine reaction',
+        'products': ['CC(C)N(C)c1nc2cc(C(=O)NC(C)(C)C)ccc2[nH]c1=O'],
+        'reactants': ['CC(C)N(C)c1nc2cc(C(=O)O)ccc2[nH]c1=O', 'CC(C)(C)N'],
+        'reagents': ['O=C([O-])[O-]', '[K+]'],
+        'rxn_str': 'CC(C)(C)N.CC(C)N(C)c1nc2cc(C(=O)O)ccc2[nH]c1=O.CCCP1(=O)OP(=O)(CCC)OP(=O)(CCC)O1.ClCCl>>CC(C)N(C)c1nc2cc(C(=O)NC(C)(C)C)ccc2[nH]c1=O',
+        'supporting_info': {
+            'forward': {
+                'canonical_intermediate': '',
+                'generated_substructure_from_precursor': ['DUMMY'],
+                'intermediate_smiles': '',
+                'masked_smiles': ['DUMMY'],
+                'product_changes_tagged': '',
+                'reactive_atom_bonds': [['', '', '']],
+                'reactive_atoms_smiles_str': ''
+            },
+            'reagent': {
+                'correct_reagent_number': '2',
+                'generated_substructure_list': ['DUMMY'],
+                'masked_smiles': ['DUMMY'],
+                'removed_substructure_list': ['DUMMY']
+            },
+            'retro': {
+                'atom_mapping': 'DUMMY',
+                'bond_list': [['', '', '']],
+                'masked_smiles': ['DUMMY'],
+                'synthetic_equivalents': [''],
+                'synthons_list': [''],
+                'synthons_list_new': ['']
+            }
+        },
+        'task': 'reagent',
+        'yields': [],
+        'rollout_reward_scores': {}
+    }
+    score = compute_score(
+        solution_str,
+        ground_truth,
+        extra_info,
+        use_content_reward=True,
+        use_decision_reward=True,
+        use_reflection_bonus=True,
+        reflection_bonus_weight=0.5
+    )
+    pprint(score)
