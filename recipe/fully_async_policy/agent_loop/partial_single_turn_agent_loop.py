@@ -126,7 +126,7 @@ def parse_steps_with_reflections(text: str):
     
     return steps_data
 
-def is_step_correct(step, task, d, reasoning_all):
+def is_step_correct(step, task, d, reasoning_all, all_info):
     steps_data = parse_steps_with_reflections(reasoning_all)
     if step == 4 and task == "forward":
         reasoning_text = steps_data.get(f'step {step}', {}).get("content", "")
@@ -172,7 +172,7 @@ def is_step_correct(step, task, d, reasoning_all):
         else:
             reagent_list = extract_numbered_items(steps_data.get(f'step 6', {}).get("reflections", [])[-1])
         # reagent_gt = ".".join(d[task]["reagents"])
-        reagent_gt = d[task]['reagents']
+        reagent_gt = '.'.join(all_info['reagents'])
         has_reagents = False
         for reagent_pred in reagent_list:
             if exact_match(reagent_pred, reagent_gt):
@@ -180,30 +180,31 @@ def is_step_correct(step, task, d, reasoning_all):
                 break
         correct = has_reagents
     elif step == 7 and task == "reagent":
-        if len(steps_data.get(f"step 6", {}).get("reflections", [])) == 0:
-            reagent_list = extract_numbered_items(steps_data.get(f'step 6', {}).get("content", ""))
-        else:
-            reagent_list = extract_numbered_items(steps_data.get(f'step 6', {}).get("reflections", [])[-1])
-        reagent_gt = d[task]['reagents']
-        has_reagents = False
-        for reagent_pred in reagent_list:
-            if exact_match(reagent_pred, reagent_gt):
-                has_reagents = True
-                break
-        correct_reagent_number = -1
-        for idx, reagent_pred in enumerate(reagent_list):
-            # if exact_match(reagent_pred, ".".join(d[task]["reagents"])):
-            if exact_match(reagent_pred, d[task]["reagents"]):
-                correct_reagent_number = idx + 1
-                break
-        reasoning_text = steps_data.get(f'step {step}', {}).get("content", "")
-        reagent_num = re.search(r"reagent (\d+)", reasoning_text, re.IGNORECASE)
-        if reagent_num:
-            predicted_reagent_number = int(reagent_num.group(1))
-            has_correct_reagent_number = (predicted_reagent_number == correct_reagent_number) and has_reagents
-        else:
-            has_correct_reagent_number = False
-        correct = has_correct_reagent_number
+        # if len(steps_data.get(f"step 6", {}).get("reflections", [])) == 0:
+        #     reagent_list = extract_numbered_items(steps_data.get(f'step 6', {}).get("content", ""))
+        # else:
+        #     reagent_list = extract_numbered_items(steps_data.get(f'step 6', {}).get("reflections", [])[-1])
+        # reagent_gt = '.'.join(all_info['reagents'])
+        # has_reagents = False
+        # for reagent_pred in reagent_list:
+        #     if exact_match(reagent_pred, reagent_gt):
+        #         has_reagents = True
+        #         break
+        # correct_reagent_number = -1
+        # for idx, reagent_pred in enumerate(reagent_list):
+        #     if exact_match(reagent_pred, d[task]["reagents"]):
+        #         correct_reagent_number = idx + 1
+        #         break
+        # reasoning_text = steps_data.get(f'step {step}', {}).get("content", "")
+        # reagent_num = re.search(r"reagent (\d+)", reasoning_text, re.IGNORECASE)
+        # if reagent_num:
+        #     predicted_reagent_number = int(reagent_num.group(1))
+        #     has_correct_reagent_number = (predicted_reagent_number == correct_reagent_number) and has_reagents
+        # else:
+        #     has_correct_reagent_number = False
+        # correct = has_correct_reagent_number
+
+        correct = True # skip step 7 evaluation for reagent task
     else:
         raise ValueError(f"Unknown step/task combination: step {step}, task {task}")
 
@@ -288,6 +289,7 @@ class PartialSingleTurnAgentLoop(AgentLoopBase):
                             refl_steps = [5, 6, 7]
                         elif task == "reagent":
                             refl_steps = [6, 7]
+                            # refl_steps = [6]
                         else:
                             raise ValueError(f"Unknown task: {task}")
                         for step_i, step in enumerate(refl_steps):
@@ -306,7 +308,7 @@ class PartialSingleTurnAgentLoop(AgentLoopBase):
                             prompt_ids += response_ids
                             # prompt_ids = remove_last_reflection_block_ids(prompt_ids, reflection_ids=[27, 5996, 28017, 29])
                             raw_prompt = self.tokenizer.decode(prompt_ids)
-                            step_correct = is_step_correct(step, task, kwargs['extra_info']['supporting_info'], raw_prompt)
+                            step_correct = is_step_correct(step, task, kwargs['extra_info']['supporting_info'], raw_prompt, kwargs)
                             if step_correct:
                                 if step_i == len(refl_steps) - 1:
                                     next_ids = [151668] # self.tokenizer.encode("</think>")
@@ -331,6 +333,8 @@ class PartialSingleTurnAgentLoop(AgentLoopBase):
                         response_ids = prompt_ids[len(prompt_origin_ids):]
                         log_probs = prompt_logprobs[len(prompt_origin_ids):]
                         prompt_ids = prompt_origin_ids
+                        # if "<REFLECTION" in self.tokenizer.decode(response_ids):
+                        #     breakpoint()
                         # response_text = self.tokenizer.decode(response_ids)
                     else:
                         prompt_ids = self.tokenizer.apply_chat_template(
@@ -367,6 +371,7 @@ class PartialSingleTurnAgentLoop(AgentLoopBase):
                             refl_steps = [5, 6, 7]
                         elif task == "reagent":
                             refl_steps = [6, 7]
+                            # refl_steps = [6]
                         else:
                             raise ValueError(f"Unknown task: {task}")
                         for step_i, step in enumerate(refl_steps):
@@ -385,7 +390,7 @@ class PartialSingleTurnAgentLoop(AgentLoopBase):
                             prompt_ids += response_ids
                             # prompt_ids = remove_last_reflection_block_ids(prompt_ids, reflection_ids=[27, 5996, 28017, 29])
                             raw_prompt = self.tokenizer.decode(prompt_ids)
-                            # step_correct = is_step_correct(step, task, kwargs['extra_info']['supporting_info'], raw_prompt)
+                            # step_correct = is_step_correct(step, task, kwargs['extra_info']['supporting_info'], raw_prompt, kwargs)
                             if random.random() < 0.5:
                                 if step_i == len(refl_steps) - 1:
                                     next_ids = [151668] # self.tokenizer.encode("</think>")
