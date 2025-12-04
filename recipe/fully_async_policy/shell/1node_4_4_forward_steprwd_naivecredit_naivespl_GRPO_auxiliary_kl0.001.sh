@@ -6,7 +6,7 @@ export WANDB_PROJECT="verl-dapo"
 export NCCL_DEBUG="WARN"
 
 project_name='verl-dapo'
-exp_name='forward_steprwd_naivecredit_naivespl_GRPO_auxiliary'
+exp_name='forward_steprwd_naivecredit_naivespl_GRPO_auxiliary_kl0.001'
 
 # Ray
 RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
@@ -37,8 +37,8 @@ norm_adv_by_std_in_grpo=True # False for Dr.GRPO, True for standard GRPO
 
 use_kl_in_reward=False
 kl_coef=0.0
-use_kl_loss=False
-kl_loss_coef=0.000
+use_kl_loss=True
+kl_loss_coef=0.001
 
 clip_ratio_low=0.2
 clip_ratio_high=0.2
@@ -53,7 +53,7 @@ use_response_mask_to_reflection_step=False
 
 # Reward related parameters
 use_content_reward=True
-use_decision_reward=True
+use_decision_reward=False
 use_reflection_bonus=False
 reflection_bonus_weight=0.0
 
