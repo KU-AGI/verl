@@ -874,10 +874,10 @@ class StepEvaluator():
                 has_reagents_initial = True
                 break
 
-        if step6_has_reflection:
-            # any of the initial reagents overlaps with reflection reagents, has_reagents=False
-            if len(set(reagent_list) & set(reagent_list_initial)) > 0:
-                has_reagents = False
+        # if step6_has_reflection:
+        #     # any of the initial reagents overlaps with reflection reagents, has_reagents=False
+        #     if len(set(reagent_list) & set(reagent_list_initial)) > 0:
+        #         has_reagents = False
 
 
         # Metric 4: Correct reagent number
@@ -928,10 +928,10 @@ class StepEvaluator():
         # Reflection accuracy reward
         # step6_reflection_correct = step6_TP + step6_TN - step6_FP - step6_FN
         # step7_reflection_correct = step7_TP + step7_TN - step7_FP - step7_FN
-        # step6_reflection_correct = step6_TP - step6_FP
-        # step7_reflection_correct = step7_TP - step7_FP
-        step6_reflection_correct = step6_TP and has_reagents
-        step7_reflection_correct = step7_TP and has_correct_reagent_number
+        step6_reflection_correct = step6_TP - step6_FP
+        step7_reflection_correct = step7_TP - step7_FP
+        # step6_reflection_correct = step6_TP and has_reagents
+        # step7_reflection_correct = step7_TP and has_correct_reagent_number
         total_reflection_correct_list = [step6_reflection_correct, step7_reflection_correct]
         reflection_ratio = sum(total_reflection_correct_list) / len(total_reflection_correct_list)
 

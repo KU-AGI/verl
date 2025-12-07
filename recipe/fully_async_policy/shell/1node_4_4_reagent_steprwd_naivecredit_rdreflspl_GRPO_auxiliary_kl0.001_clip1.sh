@@ -6,7 +6,7 @@ export WANDB_PROJECT="verl-dapo"
 export NCCL_DEBUG="WARN"
 
 project_name='verl-dapo'
-exp_name='reagent_steprwd_naivecredit_gtreflspl1.0_GRPO_auxiliary_nodecisionrwd'
+exp_name='reagent_steprwd_naivecredit_rdreflspl_GRPO_auxiliary_kl0.001_clip1'
 
 # Ray
 RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
@@ -37,12 +37,13 @@ norm_adv_by_std_in_grpo=True # False for Dr.GRPO, True for standard GRPO
 
 use_kl_in_reward=False
 kl_coef=0.0
-use_kl_loss=False
-kl_loss_coef=0.000
+use_kl_loss=True
+kl_loss_coef=0.001
 
-clip_ratio_low=0.2
-clip_ratio_high=0.2
+clip_ratio_low=1.0
+clip_ratio_high=1.0
 
+atleast_one_reflection=False
 enable_filter_groups=False
 # filter_groups_metric=acc
 filter_groups_metric=seq_final_reward
@@ -53,7 +54,7 @@ use_response_mask_to_reflection_step=False
 
 # Reward related parameters
 use_content_reward=True
-use_decision_reward=False
+use_decision_reward=True
 use_reflection_bonus=False
 reflection_bonus_weight=0.0
 
@@ -74,8 +75,8 @@ top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
 val_temperature=0.0
 val_top_k=0.0
 val_top_p=1.0
-rollout_strategy="gt_reflection_sampling" # "naive_sampling" | "gt_reflection_sampling" | "random_reflection_sampling"
-strategy_ratio=1.0 # 1.0 means all use above rollout_strategy, 0.0 means all use naive_sampling
+rollout_strategy="random_reflection_sampling" # "naive_sampling" | "gt_reflection_sampling" | "random_reflection_sampling"
+strategy_ratio=0.5 # 1.0 means all use above rollout_strategy, 0.0 means all use naive_sampling
 
 # Performance Related Parameter
 use_dynamic_bsz=True
@@ -133,6 +134,7 @@ python -m recipe.fully_async_policy.fully_async_main \
     algorithm.kl_ctrl.kl_coef=${kl_coef} \
     algorithm.filter_groups.enable=${enable_filter_groups} \
     +algorithm.filter_nonanswered.enable=True \
+    +algorithm.atleast_one_reflection.enable=${atleast_one_reflection} \
     algorithm.filter_groups.max_num_gen_batches=${max_num_gen_batches} \
     algorithm.filter_groups.metric=${filter_groups_metric} \
     algorithm.rollout_is_threshold=2.0 \
