@@ -50,6 +50,8 @@ from verl.utils.metric import (
 )
 from verl.utils.rollout_skip import RolloutSkip
 
+import re
+from typing import List, Dict
 from collections import Counter, defaultdict
 
 
@@ -646,12 +648,17 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             uid_inds = np.where(batch.non_tensor_batch['uid'] == uid)[0]
             task = batch.non_tensor_batch['task'][uid_inds[0]]
             scores = batch.non_tensor_batch['score'][uid_inds]
+            all_responses = [self.tokenizer.decode(batch.batch['responses'][idx]).replace("<|endoftext|>", "") for idx in uid_inds]
+            all_parsed = [self._parse_steps_with_reflections(resp) for resp in all_responses]
             accs = batch.non_tensor_batch['acc'][uid_inds]
             answer_exact_k = any(accs)
             answer_exact_all = all(accs)
             answer_all_same = all(a == accs[0] for a in accs)
             answer_not_all_same = not answer_all_same
             answer_not_exact_all = all(not a for a in accs)
+
+            scores_all_same = all(s == scores[0] for s in scores)
+            scores_not_all_same = not scores_all_same
 
             if task == "forward":
                 step4_accs = batch.non_tensor_batch[f'{task}/step4/has_reactive_atoms_smiles'][uid_inds]
@@ -750,6 +757,19 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                 task_group_metrics[f"group_metrics/{task}/step7/all_same"].append(step7_all_same)
                 task_group_metrics[f"group_metrics/{task}/step7/not_all_same"].append(step7_not_all_same)
                 task_group_metrics[f"group_metrics/{task}/step7/not_exact_all"].append(step7_not_exact_all)
+
+                step6_reflection_ratio = 0
+                for parsed in all_parsed:
+                    if "step 6" in parsed.keys():
+                        if len(parsed['step 6']['reflections']) > 0:
+                            step6_reflection_ratio += 1 / len(all_parsed)
+                task_group_metrics[f"group_metrics/{task}/step6/avg_reflection_count"].append(step6_reflection_ratio)
+                step7_reflection_ratio = 0
+                for parsed in all_parsed:
+                    if "step 7" in parsed.keys():
+                        if len(parsed['step 7']['reflections']) > 0:
+                            step7_reflection_ratio += 1 / len(all_parsed)
+                task_group_metrics[f"group_metrics/{task}/step7/avg_reflection_count"].append(step7_reflection_ratio)
             else:
                 raise ValueError(f"Unknown task: {task}")
 
@@ -758,6 +778,8 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             # print(f"scores (std): {scores.std().item()}")
             task_group_metrics[f"group_metrics/{task}/reward_mean"].append(scores.mean())
             task_group_metrics[f"group_metrics/{task}/reward_std"].append(scores.std())
+            task_group_metrics[f"group_metrics/{task}/reward_all_same"].append(scores_all_same)
+            task_group_metrics[f"group_metrics/{task}/reward_not_all_same"].append(scores_not_all_same)
             task_group_metrics[f"group_metrics/{task}/answer/exact_k"].append(answer_exact_k)
             task_group_metrics[f"group_metrics/{task}/answer/exact_all"].append(answer_exact_all)
             task_group_metrics[f"group_metrics/{task}/answer/all_same"].append(answer_all_same)
@@ -829,3 +851,48 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                     else:
                         out[k] = seq + [None] * (batch_size - len(seq))
         return out
+
+    def _parse_steps_with_reflections(self, text: str) -> List[Dict]:
+        """
+        주어진 문자열을 Step 단위로 파싱하고,
+        각 Step에 포함된 <REFLECTION> 블록을 추출한다.
+        
+        반환 형식:
+        [
+            {
+                "step": int,
+                "content": str,        # REFLECTION 제외 Step 본문
+                "reflections": [str]   # REFLECTION 블록 내용 리스트
+            },
+            ...
+        ]
+        """
+        # Step 헤더 매칭
+        step_pattern = re.compile(r"(## Step (\d+))")
+        matches = list(step_pattern.finditer(text))
+        
+        steps_data = {}
+        
+        for i, match in enumerate(matches):
+            step_header = match.group(1)
+            step_num = int(match.group(2))
+            
+            # Step 구간의 끝 위치 계산
+            start_pos = match.end()
+            end_pos = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+            step_body = text[start_pos:end_pos].strip()
+            
+            # REFLECTION 블록 추출
+            reflection_pattern = re.compile(r"<REFLECTION>(.*?)</REFLECTION>", re.DOTALL)
+            reflections = reflection_pattern.findall(step_body)
+            
+            # REFLECTION 블록 제거 후 순수 Step 본문
+            cleaned_body = reflection_pattern.sub("", step_body).strip()
+            
+            steps_data[f'step {step_num}'] = {
+                "step": step_num,
+                "content": cleaned_body,
+                "reflections": [r.strip() for r in reflections]
+            }
+        
+        return steps_data

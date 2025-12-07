@@ -6,7 +6,7 @@ export WANDB_PROJECT="verl-dapo"
 export NCCL_DEBUG="WARN"
 
 project_name='verl-dapo'
-exp_name='debug'
+exp_name='reagent_reflrwd_naivecredit_naivespl_GRPO_auxiliary_nocontent_kl0.005_clip2'
 
 # Ray
 RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
@@ -38,11 +38,12 @@ norm_adv_by_std_in_grpo=True # False for Dr.GRPO, True for standard GRPO
 use_kl_in_reward=False
 kl_coef=0.0
 use_kl_loss=True
-kl_loss_coef=0.001
+kl_loss_coef=0.005
 
-clip_ratio_low=1.0
-clip_ratio_high=1.0
+clip_ratio_low=2.0
+clip_ratio_high=2.0
 
+atleast_one_reflection=False
 enable_filter_groups=False
 # filter_groups_metric=acc
 filter_groups_metric=seq_final_reward
@@ -99,12 +100,12 @@ gen_prompt_bsz=1
 n_resp_per_prompt=4
 train_prompt_mini_bsz=16
 total_rollout_steps=$(((512*100000)))
-test_freq=4
+test_freq=6
 staleness_threshold=0.0
-trigger_parameter_sync_step=5
-require_batches=2
+trigger_parameter_sync_step=10
+require_batches=3
 partial_rollout=False
-save_freq=$((test_freq * trigger_parameter_sync_step * 200))
+save_freq=$((test_freq * trigger_parameter_sync_step * 20))
 
 
 # ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
@@ -133,7 +134,7 @@ python -m recipe.fully_async_policy.fully_async_main \
     algorithm.kl_ctrl.kl_coef=${kl_coef} \
     algorithm.filter_groups.enable=${enable_filter_groups} \
     +algorithm.filter_nonanswered.enable=True \
-    +algorithm.atleast_one_reflection.enable=True \
+    +algorithm.atleast_one_reflection.enable=${atleast_one_reflection} \
     algorithm.filter_groups.max_num_gen_batches=${max_num_gen_batches} \
     algorithm.filter_groups.metric=${filter_groups_metric} \
     algorithm.rollout_is_threshold=2.0 \
@@ -198,7 +199,7 @@ python -m recipe.fully_async_policy.fully_async_main \
     trainer.logger=['console','wandb'] \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
-    trainer.val_before_train=False \
+    trainer.val_before_train=True \
     trainer.default_local_dir="${CKPTS_DIR}" \
     trainer.validation_data_dir="${DUMP_DIR}/val" \
     trainer.test_data_dir="${DUMP_DIR}/test" \
