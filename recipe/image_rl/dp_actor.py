@@ -469,7 +469,7 @@ class DataParallelImageGenerationActor(BasePPOActor):
         
         # Multi-task configuration
         multi_task_config = self.config.get("multi_task", {})
-        enable_multi_task = multi_task_config.get("enable", True)
+        enable_multi_task = multi_task_config.get("enable", False) # False for GRPO, True for DAPO
         task_weights = multi_task_config.get("task_weights", [1.0, 1.0, 1.0])
         task_selection = multi_task_config.get("task_selection", "all")
         
