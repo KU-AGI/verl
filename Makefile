@@ -82,7 +82,9 @@ stop-vllm-servers:
 
 DYNAMO_CONTAINER_NAME_PREFIX=dynamo-g
 
-start-dynamo-servers:
+# https://github.com/ai-dynamo/dynamo/blob/main/examples/backends/vllm/launch/agg_multimodal.sh
+# -e DYN_REQUEST_PLANE: NATS default 1MB max payload limit (multimodal base64 images can exceed this)
+start-dynamo-vllm-servers:
 	for GPU in 4 ; do \
 		PORT=$$((8000 + $$GPU)) ; \
 		docker run --rm -d --name ${DYNAMO_CONTAINER_NAME_PREFIX}$$GPU \
@@ -99,15 +101,52 @@ start-dynamo-servers:
 			-e HF_HOME=${CACHE_PATH} \
 			-e CUDA_VISIBLE_DEVICES=$$GPU,$$(($$GPU + 1)) \
 			-e VLLM_WORKER_MULTIPROC_METHOD=spawn \
+			-e DYN_REQUEST_PLANE=tcp \
 			-p $${PORT}:8000 \
 			--ipc=host \
 			dynamo:latest-vllm \
 			bash -lc " \
 				python -m dynamo.frontend --http-port $${PORT} & \
-				python -m dynamo.vllm --model ${MODEL_PATH} \
+				python -m dynamo.vllm \
+					--enable-multimodal \
+					--model ${MODEL_PATH} \
+					--enforce-eager \
+					--connector none \
 					--trust-remote-code \
 					--tensor-parallel-size 2 \
-					--limit-mm-per-prompt.video 0 \
-					--async-scheduling \
+			" ; \
+	done
+
+# https://github.com/ai-dynamo/dynamo/blob/main/examples/backends/vllm/launch/agg_multimodal.sh
+# -e DYN_REQUEST_PLANE: NATS default 1MB max payload limit (multimodal base64 images can exceed this)
+start-dynamo-trt-servers:
+	for GPU in 4 ; do \
+		PORT=$$((8000 + $$GPU)) ; \
+		docker run --rm -d --name ${DYNAMO_CONTAINER_NAME_PREFIX}$$GPU \
+			--gpus all \
+			--network host \
+			--shm-size=10G \
+			--ulimit memlock=-1 \
+			--ulimit stack=67108864 \
+			--ulimit nofile=65536:65536 \
+			-w /workspace \
+			--cap-add CAP_SYS_PTRACE \
+			-v /data:/data \
+			-v /home:/home \
+			-e HF_HOME=${CACHE_PATH} \
+			-e CUDA_VISIBLE_DEVICES=$$GPU,$$(($$GPU + 1)) \
+			-e VLLM_WORKER_MULTIPROC_METHOD=spawn \
+			-e DYN_REQUEST_PLANE=tcp \
+			-p $${PORT}:8000 \
+			--ipc=host \
+			dynamo:latest-trtllm \
+			bash -lc " \
+				python -c 'import transformers; print(transformers.__version__)' && \
+				python -m dynamo.frontend --http-port $${PORT} & \
+				python -m dynamo.trtllm \
+					--model-path ${MODEL_PATH} \
+					--served-model-name ${MODEL_PATH} \
+					--modality "multimodal" \
+					--tensor-parallel-size 2 \
 			" ; \
 	done
