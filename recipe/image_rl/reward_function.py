@@ -18,6 +18,7 @@ import asyncio
 import threading
 import random
 from enum import Enum
+import torch
 
 # Configuration
 BASE_URLS = [
@@ -28,7 +29,7 @@ BASE_URLS = [
 API_KEY = "EMPTY"
 MAX_RETRIES = 3
 BASE_DELAY = 2
-MAX_CONCURRENT_REQUESTS = 32
+MAX_CONCURRENT_REQUESTS = 8
 MODEL_NAME = os.environ.get("RM_MODEL_PATH", "Qwen/Qwen3-VL-30B-A3B-Instruct")
 
 # Health checking configuration
@@ -319,18 +320,40 @@ Questions:
 {questions}""".strip()
 
 
-def convert_gen_img_to_base64(gen_img: PIL.Image.Image) -> Optional[str]:
+def convert_gen_img_to_base64(gen_img) -> Optional[str]:
+    """Convert image to base64 data URL.
+    
+    Supports: PIL.Image, str (file path), np.ndarray, torch.Tensor
+    """
     if isinstance(gen_img, str):
         gen_img = PIL.Image.open(gen_img)
+    elif isinstance(gen_img, torch.Tensor):
+        gen_img = gen_img.detach().cpu().numpy()
+        # Convert [C, H, W] -> [H, W, C] if channel-first
+        if gen_img.ndim == 3 and gen_img.shape[0] in (1, 3, 4):
+            gen_img = np.transpose(gen_img, (1, 2, 0))
+        # Normalize if float
+        if gen_img.dtype in (np.float32, np.float64):
+            gen_img = np.clip((gen_img + 1) / 2 * 255, 0, 255)
+        gen_img = gen_img.astype(np.uint8)
+        if gen_img.shape[-1] == 1:
+            gen_img = gen_img.squeeze(-1)
+        gen_img = PIL.Image.fromarray(gen_img)
     elif isinstance(gen_img, np.ndarray):
-        gen_img = np.array(gen_img, dtype=np.uint8)
+        # Convert [C, H, W] -> [H, W, C] if channel-first
+        if gen_img.ndim == 3 and gen_img.shape[0] in (1, 3, 4):
+            gen_img = np.transpose(gen_img, (1, 2, 0))
+        # Normalize if float
+        if gen_img.dtype in (np.float32, np.float64):
+            gen_img = np.clip((gen_img + 1) / 2 * 255, 0, 255)
+        gen_img = gen_img.astype(np.uint8)
+        if gen_img.ndim == 3 and gen_img.shape[-1] == 1:
+            gen_img = gen_img.squeeze(-1)
         gen_img = PIL.Image.fromarray(gen_img)
 
-    """Convert gen_img to base64 data URL."""
     if not isinstance(gen_img, PIL.Image.Image):
         raise TypeError(f"Unsupported image type: {type(gen_img)}")
 
-    # Convert PIL.Image → base64 data URL
     buffer = BytesIO()
     gen_img.save(buffer, format="PNG")
     img_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
@@ -410,7 +433,7 @@ async def get_response_with_client(client, client_id, messages):
                 model=MODEL_NAME,
                 messages=messages,
                 max_tokens=2048,
-                timeout=30.0  # Add timeout
+                timeout=60.0  # Add timeout
             )
             # Record successful request
             client_manager.record_request_result(client_id, success=True)
@@ -651,7 +674,7 @@ async def compute_score_batch_async(prompts, gen_imgs, feedback_texts, regen_img
             (prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id) = args
             
             # Load ground truth image
-            ground_truth_img = await asyncio.to_thread(lambda p=ground_truth_img: PIL.Image.open(p).convert("RGB"))
+            ground_truth_img = await asyncio.to_thread(lambda p=ground_truth_img: PIL.Image.open(p).convert("RGB")) if ground_truth_img is not None else ground_truth_img
             
             # Process the request with improved error handling
             result = await compute_score_single_async(

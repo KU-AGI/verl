@@ -14,13 +14,14 @@
 
 import contextlib
 import torch
-import torch.distributed
+import torch.distributed as dist
 from tensordict import TensorDict
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 from verl import DataProto
 from .base import BaseRollout
+from verl.single_controller.base.decorator import register
 
 from transformers import GenerationConfig
 import numpy as np
@@ -39,8 +40,103 @@ from torch.distributed.device_mesh import DeviceMesh
 from verl.workers.config import HFModelConfig, RolloutConfig
 from recipe.image_rl.config import ImageGenerationHFModelConfig
 from recipe.image_rl.utils import FormattingEvaluator
+import asyncio
+import logging
 
 __all__ = ['ImageUnifiedRollout']
+
+logger = logging.getLogger(__name__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+EDIT_TEMPLATE="""You are a strict image editing assistant.
+Your task is to revise a *failed* generated image according to the user's instruction and the original generation intent.
+
+INPUT FORMAT:
+1. The source image is located between {image_start_tag} and {image_end_tag}.
+2. The original text-to-image generation prompt will be provided after the keyword 'INPUT_PROMPT:'
+3. Step-by-step feedback will be provided after the keyword 'FEEDBACK:'.
+   - The feedback will be a sequence of instructions, each starting with 'Step X:' (e.g., 'Step 1:', 'Step 2:', ...).
+   - You MUST follow ALL steps in order and produce a final image that satisfies the entire sequence, not just an intermediate step.
+
+CRITICAL RULES:
+1. You MUST Look at the image between {image_start_tag} and {image_end_tag} as the ground truth.
+2. Preserve the background, objects, and style from the input image unless explicitly asked to change them.
+3. Do NOT generate a completely new image from scratch.
+4. **You MUST strictly maintain the spatial layout and composition of the source image.**
+5. You MUST also reference the INPUT_PROMPT as the original intended content of the image, but the visible source image remains the primary ground truth.
+6. When applying FEEDBACK, carefully execute each step one by one while keeping previous changes consistent, and ensure the final result reflects all steps combined."""
+
+class _HFModelWrapper:
+    """
+    Simple wrapper to provide vLLM-compatible interface for HuggingFace models.
+    This allows ImageUnifiedRollout to be compatible with code expecting vLLM's inference_engine structure.
+    """
+    def __init__(self, module: nn.Module):
+        self.worker = self._WorkerWrapper(module)
+
+    class _WorkerWrapper:
+        def __init__(self, module: nn.Module):
+            self.model_runner = self._ModelRunnerWrapper(module)
+
+        class _ModelRunnerWrapper:
+            def __init__(self, module: nn.Module):
+                self.model = self._ModelWithLoadWeights(module)
+
+            class _ModelWithLoadWeights:
+                """
+                Wrapper that adds vLLM-compatible load_weights method to HuggingFace models.
+                """
+                def __init__(self, module: nn.Module):
+                    self._module = module
+
+                def load_weights(self, weights):
+                    """
+                    Load weights into the model. Compatible with vLLM's load_weights interface.
+
+                    Args:
+                        weights: Iterator/list of (name, tensor) tuples
+                    """
+                    import logging
+                    logger = logging.getLogger(__name__)
+
+                    # Get the actual module (unwrap FSDP if needed)
+                    actual_module = self._module
+                    if hasattr(actual_module, '_fsdp_wrapped_module'):
+                        actual_module = actual_module._fsdp_wrapped_module
+
+                    state_dict = actual_module.state_dict()
+
+                    for name, tensor in weights:
+                        if name in state_dict:
+                            # Get the parameter from the actual module
+                            param = dict(actual_module.named_parameters()).get(name)
+                            if param is not None:
+                                # Update the parameter in-place
+                                param.data.copy_(tensor)
+                            else:
+                                # It might be a buffer
+                                buffer = dict(actual_module.named_buffers()).get(name)
+                                if buffer is not None:
+                                    buffer.copy_(tensor)
+                                else:
+                                    logger.debug(f"Parameter or buffer {name} not found in model")
+                        else:
+                            # Use debug level for expected missing parameters (vision/generation components)
+                            # These are expected to be missing in vLLM rollout models
+                            logger.debug(f"Parameter {name} not found in model state_dict")
+
+                def __getattr__(self, name):
+                    """Forward all other attribute access to the wrapped module."""
+                    if name in ['_module', 'load_weights']:
+                        return object.__getattribute__(self, name)
+                    return getattr(self._module, name)
+
+                def __setattr__(self, name, value):
+                    """Forward all attribute setting to the wrapped module, except _module."""
+                    if name == '_module':
+                        object.__setattr__(self, name, value)
+                    else:
+                        setattr(self._module, name, value)
 
 class ImageUnifiedRollout(BaseRollout):
     def __init__(
@@ -58,6 +154,11 @@ class ImageUnifiedRollout(BaseRollout):
         self.model_config = model_config
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+        print(f"[ImageUnifiedRollout] Using device: {self.device}")
+
+        # Create inference_engine with vLLM-compatible interface for weight syncing
+        self.inference_engine = _HFModelWrapper(module)
+
         self.generation_config = None
 
         self.cfg_weight = getattr(config, "cfg_weight", 5.0)
@@ -74,11 +175,11 @@ class ImageUnifiedRollout(BaseRollout):
         self.response_length = getattr(config, "response_length", 1024)
 
         self.feedback_system_prompt = getattr(config, "feedback_system_prompt", "")
-        self.regen_system_prompt = getattr(config, "regen_system_prompt", "")
+        # self.regen_system_prompt = getattr(config, "regen_system_prompt", "")
+        self.regen_system_prompt = EDIT_TEMPLATE
         self.formatter = FormattingEvaluator()
 
         self.image_token_num_per_image = getattr(config, "image_token_num_per_image", 576)
-        self.max_reflect_len = getattr(config, "max_reflect_len", 1024)
 
     def _pad_tensor_left(self, tensor: torch.Tensor, target_length: int, pad_value: int) -> torch.Tensor:
         """Left padding for input tensors"""
@@ -252,7 +353,7 @@ class ImageUnifiedRollout(BaseRollout):
         sft_format = sft_format + self.image_start_tag
         return sft_format
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         self.module.eval()
 
@@ -286,7 +387,7 @@ class ImageUnifiedRollout(BaseRollout):
         if task_id_tensor is None:
             selected_funcs = task_funcs.values()
         else:
-            task_id = task_id_tensor.view(-1).item()
+            task_id = task_id_tensor.view(-1)[0].item()
             selected_funcs = [task_funcs.get(task_id)]
 
         for func in selected_funcs:
@@ -318,6 +419,7 @@ class ImageUnifiedRollout(BaseRollout):
         with param_ctx:
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                 input_embeds = self.module.language_model.get_input_embeddings()(input_ids)
+                input_embeds = input_embeds.to(dtype=torch.bfloat16)
 
         # For computing logits: input (especially input text embedding)
         data_proto.batch["task1_input_embeds"] = input_embeds
@@ -462,6 +564,8 @@ class ImageUnifiedRollout(BaseRollout):
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                 text_embeds = self.module.language_model.get_input_embeddings()(batched_total_ids)
                 image_embeds = self.module.aligner(self.module.vision_model(gen_imgs_pixel_values))
+                text_embeds = text_embeds.to(dtype=torch.bfloat16)
+                image_embeds = image_embeds.to(dtype=torch.bfloat16)
 
         # merge text and image embeds
         merged_embeds = self.merge_text_and_image_embeds(text_embeds, image_embeds, all_image_start_indices)
@@ -490,6 +594,7 @@ class ImageUnifiedRollout(BaseRollout):
         with param_ctx:
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                 text_embeds = self.module.language_model.get_input_embeddings()(feedback_ids)
+                text_embeds = text_embeds.to(dtype=torch.bfloat16)
 
         data_proto.batch["task2_response_mask"] = outputs["attention_mask"]
         print(f"[TEXT_GEN] Completed feedback generation")
@@ -516,17 +621,23 @@ class ImageUnifiedRollout(BaseRollout):
         print(f"[REGEN] Processing regen for {batch_size} images in batch")
 
         # Parse feedback texts
+        prompts = [prompt for prompt in data_proto.non_tensor_batch['prompt']]
         feedback_texts = [self.formatter._split_text_into_parts(feedback)[-1] for feedback in data_proto.non_tensor_batch['task2_feedback_texts']]
 
         # Prepare messages for all images
         input_format = []
-        for feedback in feedback_texts:
-            _prefix = self.image_start_tag + self.image_tag + self.image_end_tag \
-                + "\nPlease edit the image as instructed. Keep all existing objects, background, and layout unchanged. Apply only the required modification.\n"
+        for (prompt, feedback) in zip(prompts, feedback_texts): # data_proto.non_tensor_batch['prompt'] 들어가야함
+            _prefix =(
+                f"{self.image_start_tag}{self.image_tag}{self.image_end_tag}\n"
+                "Please edit the image as instructed.\n"
+                "The FEEDBACK will be given as multiple steps (Step 1, Step 2, ...). "
+                "You MUST apply all steps in order and produce a final image reflecting all changes.\n"
+                "INPUT_PROMPT: {prompt}\n"
+                "FEEDBACK: \n{feedback}")
             if feedback is None:
-                prefix = self.get_sft_format(_prefix + "No need to generate feedback.", system_prompt=self.regen_system_prompt)
+                prefix = self.get_sft_format(_prefix.format(prompt=prompt, feedback="No need to generate feedback."), system_prompt=self.regen_system_prompt)
             else:
-                prefix = self.get_sft_format(_prefix + feedback, system_prompt=self.regen_system_prompt)
+                prefix = self.get_sft_format(_prefix.format(prompt=prompt, feedback=feedback), system_prompt=self.regen_system_prompt)
             input_format.append(prefix) # Add image placeholder at the end
 
         self.processor.tokenizer.pad_token_id = self.processor.pad_id
@@ -560,6 +671,8 @@ class ImageUnifiedRollout(BaseRollout):
 
                 image_embeds = self.module.gen_aligner(self.module.gen_embed(image_ids))
                 text_embeds = self.module.language_model.get_input_embeddings()(batched_total_ids)
+                image_embeds = image_embeds.to(dtype=torch.bfloat16)
+                text_embeds = text_embeds.to(dtype=torch.bfloat16)
 
         # merge text and image embeds
         merged_embeds = self.merge_text_and_image_embeds(text_embeds, image_embeds, all_image_start_indices)
@@ -620,6 +733,7 @@ class ImageUnifiedRollout(BaseRollout):
         with param_ctx:
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                 pad_embed = self.module.language_model.get_input_embeddings()(pad_id).unsqueeze(0)
+                pad_embed = pad_embed.to(dtype=torch.bfloat16)
 
         start_marker = torch.tensor([100601], device=input_ids.device) # <|User|>
         end_marker = torch.tensor([100602], device=input_ids.device) # <|Assistant|>
@@ -702,7 +816,7 @@ class ImageUnifiedRollout(BaseRollout):
             
         return next_token 
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def generate_img(self, inputs_embeds: torch.Tensor, attention_masks: torch.Tensor, generator: torch.Generator = None) -> torch.Tensor:
         batch_size = inputs_embeds.shape[0] // 2
         generated_tokens = torch.zeros((batch_size, self.image_token_num_per_image), dtype=torch.int, device=self.device)
@@ -744,6 +858,7 @@ class ImageUnifiedRollout(BaseRollout):
 
                     next_token_pair = next_token.repeat(1, 2).view(-1)
                     inputs_embeds = self.module.prepare_gen_img_embeds(next_token_pair).unsqueeze(1)
+                    inputs_embeds = inputs_embeds.to(dtype=torch.bfloat16)
 
                     attention_mask = torch.cat([attention_mask, torch.ones((attention_mask.shape[0], 1), dtype=torch.long, device=self.device)], dim=1)
 
@@ -752,7 +867,7 @@ class ImageUnifiedRollout(BaseRollout):
 
         return generated_tokens
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def generate_text(self, inputs_embeds: torch.Tensor, attention_masks: torch.Tensor) -> torch.Tensor:
         param_ctx = contextlib.nullcontext()
         if isinstance(self.module, FSDP):
@@ -763,14 +878,13 @@ class ImageUnifiedRollout(BaseRollout):
                 outputs = self.module.language_model.generate(
                     inputs_embeds=inputs_embeds,
                     attention_mask=attention_masks,
-                    max_new_tokens=self.max_reflect_len,
+                    max_new_tokens=self.response_length,
                     use_cache=True,
                     do_sample=True,
                     pad_token_id=self.processor.tokenizer.eos_token_id,
                     eos_token_id=self.processor.tokenizer.eos_token_id,
                     bos_token_id=self.processor.tokenizer.bos_token_id,
                 )
-
 
         answer = self.processor.tokenizer.batch_decode(outputs, skip_special_tokens=True)
 
@@ -793,6 +907,7 @@ class ImageUnifiedRollout(BaseRollout):
         with param_ctx:
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                 pad_embed = self.module.language_model.get_input_embeddings()(pad_id).unsqueeze(0)
+                pad_embed = pad_embed.to(dtype=torch.bfloat16)
 
         start_marker = torch.tensor([100593, 185], device=input_ids.device) # <end_of_image>\n
         end_marker = torch.tensor([100602], device=input_ids.device) # <|Assistant|>
