@@ -79,7 +79,6 @@ actor_rollout_ref:
       val_txt_top_p: 1.0
       val_img_top_k: 4096
       val_img_top_p: 1.0
-    use_sglang_for_task2: False
     calculate_log_probs: true
 
 reward_model:
