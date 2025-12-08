@@ -131,7 +131,7 @@ class ImageGenerationRewardManager:
                 already_printed[data_source] = already_printed.get(data_source, 0) + 1
 
         # Store accuracy
-        data.batch["acc"] = torch.tensor(rewards, dtype=torch.float32)
+        data.batch[f"task{task_id}_acc"] = torch.tensor(rewards, dtype=torch.float32)
 
         # Compute mean excluding -100 rewards
         valid_rewards = [reward for reward in rewards if reward != -100]
