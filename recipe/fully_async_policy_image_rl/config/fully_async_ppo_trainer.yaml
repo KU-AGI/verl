@@ -1,0 +1,114 @@
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+async_training:
+
+  # Maximum samples staleness threshold
+  staleness_threshold: 0.1
+
+  # Frequency of parameter synchronization between rollouter and trainer, 
+  # One step means trainer obtains a batch of required samples
+  trigger_parameter_sync_step: 4
+  
+  # The number of ppo_mini_batches that the FullyAsyncTrainer obtains once
+  require_batches: 1
+
+  # When synchronizing parameters, whether to interrupt rollouter and perform partial rollout
+  partial_rollout: True
+
+  # Whether to use rollout log probs for training
+  use_rollout_log_probs: True
+
+  # compute_prox_log_prob
+  compute_prox_log_prob: False
+
+
+# Rollout config
+rollout:
+
+  # Number of nodes used in the rollout
+  nnodes: 1
+
+  # Number of GPUs per node                     
+  n_gpus_per_node: 8
+
+  # number of responses (i.e. num sample times). > 1 for grpo
+  n: 4
+
+  # total rollout samples # TODO rename to total_rollout_samples
+  total_rollout_steps: 100
+
+  # Number of epochs in training 
+  total_epochs: 10
+
+  # Test frequency, how many times a parameter update triggers a validation
+  test_freq: 1
+
+data:
+  # Number of samples generated, currently only support 1
+  gen_batch_size: 1
+
+actor_rollout_ref:
+  actor:
+    use_rollout_log_probs: ${oc.select:async_training.use_rollout_log_probs, True}
+    optim:
+      warmup_style: constant
+  rollout:
+    _target_: recipe.image_rl.config.ImageGenerationRolloutConfig
+    cfg_weight: 5.0
+    temperature: 1.0
+    txt_top_k: null
+    txt_top_p: null
+    img_top_k: null
+    img_top_p: null
+    name: image_unified
+    mode: sync
+    prompt_length: 1024
+    response_length: 1024
+    feedback_system_prompt: "You should give me a feedback on the image generation."
+    regen_system_prompt: "You should refine the image generation."
+    image_token_num_per_image: 576
+    val_kwargs:
+      _target_: recipe.image_rl.config.ImageGenerationSamplingConfig
+      val_txt_top_k: 50
+      val_txt_top_p: 1.0
+      val_img_top_k: 4096
+      val_img_top_p: 1.0
+    use_sglang_for_task2: False
+    calculate_log_probs: true
+
+reward_model:
+  reward_manager: image_generation
+  overlong_buffer: 
+    enable: False
+    len: 0
+    penalty_factor: 0.0
+    log: False
+  reward_kwargs:
+    img_saving: null
+
+algorithm:
+  filter_groups:
+    _target_: verl.trainer.config.FilterGroupsConfig
+    enable: False
+    metric: null
+    max_num_gen_batches: 0
+  rollout_correction:
+    rollout_is: token
+    rollout_is_threshold: 2.0
+    rollout_is_batch_normalize: false
+    rollout_rs: null
+    rollout_rs_threshold: null
+    rollout_rs_threshold_lower: null
+    rollout_token_veto_threshold: null
+    bypass_mode: false
+    use_policy_gradient: false
+
+trainer:
+  project_name: verl-image-rl
+  rollout_freq: 20

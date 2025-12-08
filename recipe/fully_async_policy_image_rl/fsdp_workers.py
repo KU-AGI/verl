@@ -21,15 +21,18 @@ import torch.distributed
 from omegaconf import DictConfig
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
+from recipe.fully_async_policy_image_rl.fsdp2_utils import fsdp2_sharded_load_from_cpu, fsdp2_sharded_save_to_cpu
 from verl.single_controller.base.decorator import Dispatch, register
 from verl.utils.device import (
+    get_device_id,
     get_device_name,
     get_torch_device,
 )
 from verl.utils.fsdp_utils import (
     fsdp_version,
 )
-from verl.workers.fsdp_workers import ActorRolloutRefWorker, AsyncActorRolloutRefWorker, CriticWorker
+from verl import DataProto
+# from verl.workers.fsdp_workers import ActorRolloutRefWorker, AsyncActorRolloutRefWorker, CriticWorker
 from recipe.image_rl.image_generation_worker import ImageGenerationActorRolloutRefWorker, ImageGenerationAsyncActorRolloutRefWorker
 
 logger = logging.getLogger(__file__)
@@ -74,9 +77,9 @@ class DetachNcclSync(ImageGenerationAsyncActorRolloutRefWorker):
         if self._is_rollout:
             inference_model = get_inference_model(self.rollout)
 
-            from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
+            # from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
 
-            patch_vllm_moe_model_weight_loader(inference_model)
+            # patch_vllm_moe_model_weight_loader(inference_model)
         for key, shape, dtype in self._weights_info:
             tensor = torch.empty(shape, dtype=dtype, device=get_torch_device().current_device())
             if self._is_actor:
@@ -120,10 +123,32 @@ class DetachActorWorker(DetachNcclSync):
             )
         params = self._get_actor_params()
         ret = []
+        # Filter to only include language_model parameters for rollout sync
+        # Vision model and generation model parameters are not needed in vLLM rollout
         for key, tensor in params.items():
+            # Only sync language_model parameters - skip vision and generation components
+            if key.startswith(('vision_model.', 'gen_vision_model.', 'gen_head.', 'gen_embed.')):
+                continue
             ret.append((key, tensor.size(), tensor.dtype))
         self._weights_info = ret
         return ret
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def save_model_to_cpu(self, n):
+        if not hasattr(self, "cpu_saved_models"):
+            self.cpu_saved_models = {}
+        self.cpu_saved_models[n] = fsdp2_sharded_save_to_cpu(self.actor_module_fsdp)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def restore_model_from_cpu(self, n):
+        if n in self.cpu_saved_models:
+            cpu_sharded_state, global_spec = self.cpu_saved_models[n]
+            fsdp2_sharded_load_from_cpu(self.actor_module_fsdp, cpu_sharded_state, global_spec)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def clear_cpu_model(self, n):
+        if n in self.cpu_saved_models:
+            del self.cpu_saved_models[n]
 
 
 class DetachAsyncRolloutWorker(DetachNcclSync):
@@ -135,3 +160,14 @@ class DetachAsyncRolloutWorker(DetachNcclSync):
     def set_actor_weights_info(self, weights_info):
         assert self._is_rollout
         self._weights_info = weights_info
+
+    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
+    def generate_sequences(self, prompts: DataProto) -> DataProto:
+        """Generate sequences using ImageUnifiedRollout."""
+        print(f"[DetachAsyncRolloutWorker.generate_sequences] Called!")
+        assert self._is_rollout and self.rollout is not None
+        prompts = prompts.to(get_device_id())
+        output = self.rollout.generate_sequences(prompts=prompts)
+        output = output.to("cpu")
+        get_torch_device().empty_cache()
+        return output
