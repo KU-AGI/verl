@@ -182,7 +182,23 @@ class TaskRunner:
 
     def add_reward_model_worker(self, config):
         """Add reward model worker if enabled."""
-        pass
+        from verl.trainer.ppo.ray_trainer import Role
+
+        if config.reward_model.enable:
+            use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
+            if use_legacy_worker_impl in ["auto", "enable"]:
+                if config.reward_model.strategy in {"fsdp", "fsdp2"}:
+                    from recipe.image_rl.image_generation_worker import ImageGenerationRewardModelWorker
+                elif config.reward_model.strategy == "megatron":
+                    raise NotImplementedError("Megatron backend is not supported for image generation")
+                else:
+                    raise NotImplementedError
+
+            self.role_worker_mapping[Role.RewardModel] = ray.remote(ImageGenerationRewardModelWorker)
+            if config.reward_model.enable_resource_pool:
+                self.mapping[Role.RewardModel] = "reward_pool"
+            else:
+                self.mapping[Role.RewardModel] = "global_pool"
 
     def add_ref_policy_worker(self, config, ref_policy_cls):
         """Add reference policy worker if KL loss or KL reward is used."""
