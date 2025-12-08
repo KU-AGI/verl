@@ -1,7 +1,7 @@
 working_dir: ./
 excludes: [
   "/.git/",
-  "verl/third_party/",
+  "verl/third_party/dynamo",
   "bench/"
 ]
 env_vars:
