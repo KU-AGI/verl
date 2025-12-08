@@ -1,4 +1,4 @@
-from datasets import load_dataset, load_from_disk, concatenate_datasets
+from datasets import Dataset, load_dataset, load_from_disk, concatenate_datasets
 import argparse
 import os, json, re, random
 from glob import glob
@@ -306,14 +306,16 @@ def map_messages(x, split):
 
 def append_info(data):
     try:
-        messages = data.pop("messages")
-        answer = data.pop("answers")
-        rationale = data.pop("rationale")
+        messages = data.pop("messages", None)
+        answer = data.pop("answers", None)
+        rationale = data.pop("rationale", None)
 
-        solution = ["<think>\n" + rationale + "</think>\n\n" + "<ANSWER>\n" + answer + "\n</ANSWER>"]
+        solution = ["<think>\n" + rationale + "</think>\n\n" + "<ANSWER>\n" + answer + "\n</ANSWER>"] if rationale is not None else ["<think>\n" + "DUMMY" + "</think>\n\n" + "<ANSWER>\n" + answer + "\n</ANSWER>"]
         solution = "".join(solution)
 
-        if data["task"] == "forward":
+        if data.get("info", None) is not None:
+            supporting_info = data.pop("info")
+        elif data["task"] == "forward":
             supporting_info = extract_forward_info(rationale)
         elif data["task"] == "retro":
             supporting_info = extract_retro_info(rationale)
@@ -364,8 +366,7 @@ if __name__ == "__main__":
     concatenated = []
     args.val = True
 
-    # tasks = ["forward", "retro", "reagent"]
-    tasks = ["reagent"]
+    tasks = ["forward", "retro", "reagent"]
     for task in tasks:
         if args.train:
             dataset_paths = sorted(glob(os.path.join(f"{args.train_dir}/{task}", "*.json")))
@@ -379,7 +380,25 @@ if __name__ == "__main__":
         else:
             raise ValueError("Either --train or --val or --test must be specified")
 
-        dataset = concatenate_datasets([load_dataset("json", data_files=dataset_path, split="train", keep_in_memory=False) for dataset_path in dataset_paths])
+        try:
+            dataset = concatenate_datasets([load_dataset("json", data_files=dataset_path, split="train", keep_in_memory=False) for dataset_path in dataset_paths])
+        except:
+            data_list = []
+            for dataset_path in dataset_paths:
+                with open(dataset_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                
+                for d in data:
+                    for k, v in d["info"].items():
+                        if isinstance(d["info"][k], list):
+                            for key in d["info"][k]:
+                                d["info"]
+                        d["info"][k] = str(v)
+                
+                data_list.extend(data)
+            
+            dataset = Dataset.from_list(data_list)
+
         # reverse dataset row order
         dataset = dataset.select(list(reversed(range(len(dataset)))))
 
