@@ -25,7 +25,7 @@ from typing import Optional
 import numpy as np
 import torch
 from tensordict import TensorDict
-from tensordict.utils import LinkedList
+# from tensordict.utils import LinkedList
 from torch import nn
 from transformers import (
     AutoConfig,
@@ -740,7 +740,7 @@ def extract_multi_modal_inputs_tensordict(batch_data: TensorDict):
     multi_modal_inputs = {}
     for key in ["pixel_values", "image_grid_thw", "pixel_values_videos", "video_grid_thw"]:
         if key in batch_data:
-            assert isinstance(batch_data[key], LinkedList), f"{key} must be a LinkedList"
+            # assert isinstance(batch_data[key], LinkedList), f"{key} must be a LinkedList"
             tensors = []
             for tensor in batch_data[key]:
                 if tensor is not None:

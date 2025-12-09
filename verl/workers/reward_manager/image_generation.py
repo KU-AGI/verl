@@ -101,8 +101,8 @@ class ImageGenerationRewardManager:
             valid_response_length = response_mask[i].sum()
             score_dict = scores[i]
             reward = score_dict.get("score", 0.0)
-            if reward != -100:
-                reward = reward * 10 # scale up
+            # if reward != -100:
+            #     reward = reward * 10 # scale up
             
             # Update extra info
             if "reward_extra_info" in score_dict:

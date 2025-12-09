@@ -26,6 +26,7 @@ from recipe.fully_async_policy_image_rl.detach_utils import (
     ValidateMetrics,
     assemble_batch_from_rollout_samples,
 )
+from recipe.image_rl.reward import load_reward_manager
 from recipe.fully_async_policy_image_rl.message_queue import MessageQueueClient
 from recipe.fully_async_policy_image_rl.ray_trainer import FullyAsyncRayPPOTrainer
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
@@ -59,20 +60,15 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         self.tokenizer = tokenizer
         self.processor = processor
         self.config = config
-
-        # Load reward functions internally to avoid Ray serialization issues
-        from recipe.image_rl.reward import load_reward_manager
-        print("[FullyAsyncTrainer] Loading reward functions...")
         self.reward_fn = load_reward_manager(
             config, tokenizer, processor, num_examine=0, **config.reward_model.get("reward_kwargs", {})
         )
         self.val_reward_fn = load_reward_manager(
             config, tokenizer, processor, num_examine=1, **config.reward_model.get("reward_kwargs", {})
         )
-
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
-        assert not self.hybrid_engine
 
+        assert not self.hybrid_engine
         self.role_worker_mapping = role_worker_mapping
         self.resource_pool_manager = resource_pool_manager
         self.use_reference_policy = need_reference_policy(self.role_worker_mapping)
@@ -341,19 +337,19 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                 self.logger.log(data=val_data.timing_raw, step=val_data.param_version)
             self.global_steps += 1
 
-        # final parameter sync and validate
-        if val_data is None or val_data.metrics is None:
-            self._trigger_parameter_sync_after_step(validate=True, global_steps=self.global_steps - 1)
-            ray.get(self.param_synchronizer.wait_last_valid.remote())
-            val_data = self.message_queue_client.get_validate_sync()
-            if val_data:
-                val_data: ValidateMetrics = ray.cloudpickle.loads(val_data)
-                if val_data.metrics:
-                    self.logger.log(data=val_data.metrics, step=val_data.param_version)
-                    pprint(f"[FullyAsyncTrainer] Final validation metrics: {val_data.metrics}")
-                self.logger.log(data=val_data.timing_raw, step=val_data.param_version)
-        else:
-            pprint(f"[FullyAsyncTrainer] Final validation metrics: {val_data.metrics}")
+        # # final parameter sync and validate
+        # if val_data is None or val_data.metrics is None:
+        #     self._trigger_parameter_sync_after_step(validate=True, global_steps=self.global_steps - 1)
+        #     ray.get(self.param_synchronizer.wait_last_valid.remote())
+        #     val_data = self.message_queue_client.get_validate_sync()
+        #     if val_data:
+        #         val_data: ValidateMetrics = ray.cloudpickle.loads(val_data)
+        #         if val_data.metrics:
+        #             self.logger.log(data=val_data.metrics, step=val_data.param_version)
+        #             pprint(f"[FullyAsyncTrainer] Final validation metrics: {val_data.metrics}")
+        #         self.logger.log(data=val_data.timing_raw, step=val_data.param_version)
+        # else:
+        #     pprint(f"[FullyAsyncTrainer] Final validation metrics: {val_data.metrics}")
         self.progress_bar.close()
 
         self._check_save_checkpoint(True, timing_raw)  # TODO: check checkpoint

@@ -166,7 +166,7 @@ class RolloutSample:
     full_batch: Any
 
     # AgentLoopOutput from generation
-    agent_loop_output_list: list[Any]  # AgentLoopOutput
+    agent_loop_output_list: list[AgentLoopOutput]
 
     # Metadata
     sample_id: str
@@ -174,6 +174,7 @@ class RolloutSample:
 
     # Processing metadata
     processing_times: list[float]
+    tool_calls: list[float]
     param_version: int
     param_version_start: list[int]
     param_version_end: list[int]
