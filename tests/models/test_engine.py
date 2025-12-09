@@ -24,7 +24,14 @@ import ray
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForTokenClassification, Qwen3Config, Qwen3MoeConfig
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoModelForTokenClassification,
+    AutoTokenizer,
+    Qwen3Config,
+    Qwen3MoeConfig,
+)
 
 from verl import DataProto
 from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
@@ -40,15 +47,15 @@ from verl.workers.config import (
     McoreEngineConfig,
     McoreOptimizerConfig,
 )
-from verl.workers.roles import ActorWorker, CriticWorker
-from verl.workers.roles.utils.losses import ppo_loss, sft_loss
+from verl.workers.engine_workers import ActorWorker, CriticWorker
+from verl.workers.utils.losses import ppo_loss
 
 
 @pytest.mark.parametrize("strategy", ["megatron", "fsdp", "fsdp2"])
 def test_actor_engine(strategy):
     ray.init()
 
-    path = os.path.expanduser("~/models/Qwen/Qwen2.5-0.5B-Instruct")
+    path = os.path.expanduser("~/models/Qwen/Qwen2.5-0.5B")
     model_config = HFModelConfig(path=path)
 
     if strategy == "megatron":
@@ -110,6 +117,7 @@ def test_actor_engine(strategy):
     data = DataProto.from_single_dict(
         {
             "input_ids": input_ids,
+            "prompts": input_ids[:, :response_length],
             "attention_mask": attention_mask,
             "position_ids": position_ids,
             "responses": responses,
@@ -118,7 +126,7 @@ def test_actor_engine(strategy):
         meta_info={"temperature": 1.0, "global_token_num": global_token_num},
     )
 
-    sft_loss_ = partial(sft_loss, config=config)
+    # sft_loss_ = partial(sft_loss, config=config)
 
     # eval
     output = wg.compute_log_prob(data)
@@ -136,11 +144,12 @@ def test_actor_engine(strategy):
 
     data = data.union(output)
 
-    wg.set_loss_fn(sft_loss_)
+    # TODO: sft_loss_ is not compatible with ActorWorker until we replace DataProto with torch.jagged TensorDict
+    # wg.set_loss_fn(sft_loss_)
 
     # train for one step
-    metrics = wg.update_actor(data)
-    print(metrics)
+    # metrics = wg.update_actor(data)
+    # print(metrics)
 
     # add ppo data
     data.batch["advantages"] = torch.rand_like(responses, dtype=torch.float32)
@@ -162,9 +171,11 @@ def create_model():
 
     config = Qwen3Config(num_hidden_layers=2, num_labels=1)
     model = AutoModelForTokenClassification.from_config(config)
+    tokenizer = AutoTokenizer.from_pretrained(os.path.expanduser("~/models/Qwen/Qwen3-0.6B"))
     assert model.config.num_labels == 1
     path = os.path.expanduser("~/models/test_model")
     model.save_pretrained(path)
+    tokenizer.save_pretrained(path)
     config.save_pretrained(path)
     return path
 
@@ -174,7 +185,7 @@ def test_critic_engine(strategy):
     ray.init()
 
     path = create_model()
-    model_config = HFModelConfig(path=path, load_tokenizer=False)
+    model_config = HFModelConfig(path=path, load_tokenizer=True)
 
     if strategy == "megatron":
         engine_config = McoreEngineConfig(
@@ -235,6 +246,7 @@ def test_critic_engine(strategy):
     data = DataProto.from_single_dict(
         {
             "input_ids": input_ids,
+            "prompts": input_ids[:, :response_length],
             "attention_mask": attention_mask,
             "position_ids": position_ids,
             "responses": responses,
@@ -330,7 +342,7 @@ def _worker(rank: int, world_size: int, rendezvous_file: str, strategy: str, mod
     engine.initialize()
 
     # get per tensor parameter
-    per_tensor_params = engine.get_per_tensor_param()
+    per_tensor_params, _ = engine.get_per_tensor_param()
 
     ref_state_dict = ref_model.state_dict()
 

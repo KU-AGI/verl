@@ -21,7 +21,7 @@ tensorflow/my_graph/*
 
 # Distribution / packaging
 .Python
-env/
+# env/
 build/
 develop-eggs/
 dist/
@@ -114,6 +114,9 @@ ENV/
 # vim
 *.swp
 
+# emacs
+*~
+
 # ckpt
 *.lock
 
@@ -125,6 +128,5 @@ ENV/
 logs
 log
 outputs
-output
 .history
 Janus/*
