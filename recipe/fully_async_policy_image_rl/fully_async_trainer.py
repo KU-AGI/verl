@@ -34,7 +34,7 @@ from verl.trainer.ppo.ray_trainer import ResourcePoolManager
 from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
 from verl.utils.debug import marked_timer
 import torch
-
+from recipe.image_rl.custom_metric_utils import reduce_metrics # custom metric
 
 @ray.remote(num_cpus=10)
 class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
@@ -140,56 +140,6 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         Returns:
             tuple: (epoch, batch_dict, gen_batch_output)
         """
-        # print(
-        #     f"[FullyAsyncTrainer] Requesting {self.required_samples} samples from queue",
-        #     flush=True,
-        # )
-
-        # # Collect samples using a simple loop calling get_sample
-        # consumer_start = time.time()
-        # queue_samples = []
-        # queue_len = 0
-        # while len(queue_samples) < self.required_samples:
-        #     # Get a single sample and wait until there is a sample or None is received
-        #     sample, queue_len = self.message_queue_client.get_sample_sync()
-
-        #     if sample is None:
-        #         print(
-        #             f"[FullyAsyncTrainer] Detected termination signal (None), stopping sample collection. "
-        #             f"Collected {len(queue_samples)}/{self.required_samples} samples"
-        #         )
-        #         break
-
-        #     queue_samples.append(sample)
-
-        #     if len(queue_samples) % 64 == 0:
-        #         print(
-        #             f"[FullyAsyncTrainer] Collected {len(queue_samples)}/{self.required_samples} samples. "
-        #             f"mq_len: {queue_len}"
-        #         )
-
-        # consumer_end = time.time()
-
-        # if not queue_samples or len(queue_samples) < self.required_samples:
-        #     print("[FullyAsyncTrainer] not enough samples collected after loop")
-        #     return None, None
-        # total_wait_time = consumer_end - consumer_start
-
-        # print(
-        #     f"[FullyAsyncTrainer] Loop collection completed: {len(queue_samples)}/{self.required_samples} samples, "
-        #     f"total wait time: {total_wait_time:.2f} seconds."
-        #     f"mq_len: {queue_len}"
-        # )
-
-        # queue_samples = [ray.cloudpickle.loads(x) for x in queue_samples]
-        # # Assemble batch - now working directly with RolloutSample objects
-        # if self.config.trainer.balance_batch:
-        #     batch = assemble_batch_from_rollout_samples(queue_samples, self.tokenizer, self.config, self._balance_batch)
-        # else:
-        #     batch = assemble_batch_from_rollout_samples(queue_samples, self.tokenizer, self.config, None)
-
-        # batch.meta_info["fully_async/total_wait_time"] = total_wait_time
-        # return 0, batch
 
         print(
             f"[FullyAsyncTrainer] Requesting {self.required_samples} samples from queue",
@@ -340,7 +290,30 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                         )
                         # Remove universal keys from batch
                         batch.pop(batch_keys=["task_id"])
-                # self._log_rollout(batch, reward_extra_infos_dict, timing_raw)
+                
+                    # update critic
+                    if self.use_critic:
+                        with marked_timer("update_critic", timing_raw, color="pink"):
+                            critic_output = self.critic_wg.update_critic(batch)
+                        critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
+                        metrics.update(critic_output_metrics)
+
+                    # implement critic warmup
+                    if self.config.trainer.critic_warmup <= self.global_steps:
+                        # update actor
+                        with marked_timer("update_actor", timing_raw, color="red"):
+                            batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+                            actor_output = self.actor_rollout_wg.update_actor(batch)
+                        actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                        metrics.update(actor_output_metrics)
+
+                    # Log rollout generations if enabled (per task)
+                    rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+                    if self.config.trainer.rollout_freq > 0 and (
+                        self.global_steps % self.config.trainer.rollout_freq == 0 and rollout_data_dir
+                    ):
+                        self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
+                
                 self._check_save_checkpoint(False, timing_raw)
 
             self._collect_metrics(batch, 0, metrics, timing_raw)

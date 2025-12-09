@@ -77,17 +77,6 @@ class MessageQueue:
         Returns:
             bool: Whether the sample was successfully put into the queue
         """
-        # async with self._lock:
-        #     # If queue is full, remove the oldest sample (rarely happens)
-        #     is_drop = False
-        #     if len(self.queue) >= self.max_queue_size:
-        #         self.queue.popleft()
-        #         self.dropped_samples += 1
-        #         is_drop = True
-        #         logger.warning("Queue full, dropped sample")
-        #     self.queue.append(sample)
-        #     self.total_produced += 1
-
         async with self._lock:
             is_drop = False
             if len(self.queue) >= self.max_queue_size:
@@ -128,8 +117,24 @@ class MessageQueue:
                 return None
 
             # Get one sample
+            # queue에는 (sample, sample_count) 형태로 들어 있음
             data = self.queue.popleft()
-            self.total_consumed += 1
+
+            # 여기서 sample_count만 꺼내서 통계 업데이트
+            if isinstance(data, tuple) and len(data) == 2:
+                _, sample_count = data
+            else:
+                sample_count = 1  # 혹시 모를 예외 대비
+
+            # sample_count 감소
+            self.total_sample_count -= sample_count
+            if self.total_sample_count < 0:
+                self.total_sample_count = 0
+
+            # consumed 개수도 sample 기준으로
+            self.total_consumed += sample_count
+
+            # 리턴 형태는 원래대로 유지해야 함
             return data, len(self.queue)
 
     async def get_sample_count(self) -> int:
@@ -168,6 +173,7 @@ class MessageQueue:
         async with self._lock:
             cleared_count = len(self.queue)
             self.queue.clear()
+            self.total_sample_count = 0
             logger.info(f"Cleared {cleared_count} samples from queue")
 
     async def shutdown(self):
@@ -228,11 +234,6 @@ class MessageQueueClient:
     def __init__(self, queue_actor: Any):
         self.queue_actor = queue_actor
 
-    # async def put_sample(self, sample: Any, param_version: int) -> bool:
-    #     """Put batch into queue (async)"""
-    #     future = self.queue_actor.put_sample.remote(sample, param_version)
-    #     return await asyncio.wrap_future(future.future())
-
     async def put_sample(self, sample: Any, param_version: int, sample_count: int = 1) -> bool:
         """Put batch into queue (async)"""
         future = self.queue_actor.put_sample.remote(sample, param_version, sample_count)
@@ -283,11 +284,6 @@ class MessageQueueClient:
         """Get memory usage statistics (async)"""
         future = self.queue_actor.get_memory_usage.remote()
         return await asyncio.wrap_future(future.future())
-
-    # # Synchronous version of the method (deprecated)
-    # def put_sample_sync(self, sample: Any, param_version: int) -> bool:
-    #     """Put batch into queue (sync - deprecated, use put_sample instead)"""
-    #     return ray.get(self.queue_actor.put_sample.remote(sample, param_version))
 
     def put_sample_sync(self, sample: Any, param_version: int, sample_count: int = 1) -> bool:
         """Put batch into queue (sync - deprecated, use put_sample instead)"""

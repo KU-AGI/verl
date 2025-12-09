@@ -237,19 +237,19 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 f",reset staleness_samples to: {self.staleness_samples}"
                 f",idle_ratio: {idle_ratio}"
             )
-            val_metrics = None
-            if (
-                self.val_reward_fn is not None
-                and self.config.rollout.test_freq > 0
-                and self.current_param_version % self.config.rollout.test_freq == 0
-                and self.current_param_version > 0  # don't test here in the initial parameter sync
-            ) or (validate and self.val_reward_fn is not None):
-                with marked_timer("rollouter/validate_time", timing_raw, color="green"):
-                    val_metrics: dict = self._validate()
-            data = ValidateMetrics(
-                timing_raw=timing_raw, metrics=val_metrics, global_steps=global_steps, param_version=version
-            )
-            await self.message_queue_client.put_validate(ray.cloudpickle.dumps(data))
+            # val_metrics = None
+            # if (
+            #     self.val_reward_fn is not None
+            #     and self.config.rollout.test_freq > 0
+            #     and self.current_param_version % self.config.rollout.test_freq == 0
+            #     and self.current_param_version > 0  # don't test here in the initial parameter sync
+            # ) or (validate and self.val_reward_fn is not None):
+            #     with marked_timer("rollouter/validate_time", timing_raw, color="green"):
+            #         val_metrics: dict = self._validate()
+            # data = ValidateMetrics(
+            #     timing_raw=timing_raw, metrics=val_metrics, global_steps=global_steps, param_version=version
+            # )
+            # await self.message_queue_client.put_validate(ray.cloudpickle.dumps(data))
 
             self.version_start_time = time.time()
 
@@ -307,47 +307,6 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             config=self.config,
             worker_group=self.rollout_wg,
         )
-
-    # # Add samples to the pending_queue
-    # async def _feed_samples(self):
-    #     continuous_iterator = self._create_continuous_iterator()
-
-    #     for epoch, batch_dict in continuous_iterator:
-    #         # Similar to _prepare_generate_batch: Separate data
-    #         full_batch = prepare_single_generation_data(
-    #             batch_dict, self.global_steps, self.config.actor_rollout_ref.rollout.n
-    #         )
-
-    #         sample_id = f"sample_{epoch}_{self.global_steps}"
-
-    #         rollout_sample = RolloutSample(
-    #             full_batch=full_batch,
-    #             agent_loop_output_list=[None] * self.config.actor_rollout_ref.rollout.n,
-    #             sample_id=sample_id,
-    #             epoch=epoch,
-    #             param_version=0,
-    #             param_version_start=[],
-    #             param_version_end=[],
-    #             processing_times=[],
-    #             rollout_status={},
-    #         )
-
-    #         await self.pending_queue.put(rollout_sample)
-
-    #         # Check if have reached the last step
-    #         if self.global_steps >= self.total_rollout_steps:
-    #             print(
-    #                 f"[FullyAsyncRollouter][Feed] "
-    #                 f"Maximum count has been reached, stop adding new samples"
-    #                 f"{self.global_steps} >= {self.total_rollout_steps}"
-    #             )
-    #             break
-
-    #         self.global_steps += 1
-
-    #     # End signal
-    #     await self.pending_queue.put("DONE")
-    #     print(f"[FullyAsyncRollouter][Feed] Sample addition is complete, {self.global_steps} samples have been added")
 
     # Add samples to the pending_queue
     async def _feed_samples(self):
@@ -414,184 +373,6 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
 
         await self.pending_queue.put(rollout_sample)
         # print(f"[FullyAsyncRollouter][Feed] Sent chunk batch size: {batch_size}")
-
-    # async def _processor_worker(self):
-    #     """
-    #     Streaming worker coroutines, a sample is submitted for processing without waiting for batches
-    #     """
-    #     while True:
-    #         # 먼저 pause 체크 (sample 가져오기 전에)
-    #         if self.paused or await self._should_pause_generation():
-    #             print(
-    #                 f"[FullyAsyncRollouter][Processor] Pause triggered. "
-    #                 f"staleness_samples: {self.staleness_samples}, "
-    #                 f"active: {self.active_sample_count}, "
-    #                 f"max: {self.max_required_samples}"
-    #             )
-    #             async with self.lock:
-    #                 self.paused = True
-                
-    #             # 진행 중인 task 완료 대기
-    #             while self.active_tasks:
-    #                 async with self.lock:
-    #                     # After acquiring the lock, the number of active_tasks may change, need to be verified again
-    #                     if self.active_tasks:
-    #                         done_tasks, self.active_tasks = await asyncio.wait(
-    #                             self.active_tasks, return_when=asyncio.FIRST_COMPLETED
-    #                         )
-    #                     for task in done_tasks:
-    #                         await task
-
-    #             async with self.lock:
-    #                 while self.paused:
-    #                     self.idle_start_time = time.time()
-    #                     await self.condition.wait()
-    #             continue
-
-    #         sample_from_cancel_queue = False
-    #         if not self.cancel_queue.empty():
-    #             rollout_sample = await self.cancel_queue.get()
-    #             sample_from_cancel_queue = True
-    #             async with self.lock:
-    #                 self.cancel_queue_sample_count -= len(rollout_sample.full_batch)
-    #         else:
-    #             rollout_sample = await self.pending_queue.get()
-
-    #         # "DONE" 체크
-    #         if rollout_sample == "DONE":
-    #             print(
-    #                 "[FullyAsyncRollouter][Processor] Received end signal, waiting for remaining tasks to complete..."
-    #             )
-    #             while self.active_tasks:
-    #                 async with self.lock:
-    #                     if self.active_tasks:
-    #                         done_tasks, self.active_tasks = await asyncio.wait(
-    #                             self.active_tasks, return_when=asyncio.FIRST_COMPLETED
-    #                         )
-    #                     for task in done_tasks:
-    #                         await task
-    #             break
-
-    #         batch_size = len(rollout_sample.full_batch)
-
-    #         # concurrent 체크
-    #         while self.active_sample_count >= self.max_concurrent_samples:
-    #             async with self.lock:
-    #                 if self.active_tasks:
-    #                     done_tasks, self.active_tasks = await asyncio.wait(
-    #                         self.active_tasks, return_when=asyncio.FIRST_COMPLETED
-    #                     )
-    #                 for task in done_tasks:
-    #                     await task
-
-    #         async with self.lock:
-    #             while self.paused:
-    #                 await self.condition.wait()
-                
-    #             # active count만 증가, staleness는 증가 안 함
-    #             self.active_sample_count += batch_size
-    #             task = asyncio.create_task(
-    #                 self._process_single_sample_streaming(rollout_sample),
-    #                 name=rollout_sample.sample_id,
-    #             )
-    #             self.active_tasks.add(task)
-
-    #         if sample_from_cancel_queue:
-    #             self.cancel_queue.task_done()
-    #         else:
-    #             self.pending_queue.task_done()
-
-
-    # async def _process_single_sample_streaming(self, rollout_sample: RolloutSample):
-    #     """Process a single sample streamingly"""
-    #     batch_size = len(rollout_sample.full_batch)
-        
-    #     rollout_sample.full_batch.non_tensor_batch["param_version"] = np.array(
-    #         [self.current_param_version] * batch_size, dtype=object
-    #     )
-    #     agent_loop_output_list = await self.async_rollout_manager.generate_single_sample_async(
-    #         rollout_sample.full_batch, rollout_sample.agent_loop_output_list
-    #     )
-    #     rollout_sample.agent_loop_output_list = agent_loop_output_list
-
-    #     is_cancel = False
-    #     for agent_loop in agent_loop_output_list:
-    #         if not is_cancel and agent_loop.is_cancel:
-    #             is_cancel = True
-
-    #     # async with self.lock:
-    #     #     self.active_sample_count -= batch_size
-        
-    #     if is_cancel:
-    #         async with self.lock:
-    #             self.cancel_queue_sample_count += batch_size
-    #         await self.cancel_queue.put(rollout_sample)
-    #     else:
-    #         async with self.lock:
-    #             self.staleness_samples += batch_size
-    #             self.result_queue_sample_count += batch_size
-    #         rollout_sample.param_version = self.current_param_version
-    #         rollout_sample.rollout_status = await self.get_statistics()
-    #         await self.result_queue.put(rollout_sample)
-
-
-    async def _process_single_sample_streaming(self, rollout_sample: RolloutSample):
-        """Process a single sample streamingly"""
-        batch_size = len(rollout_sample.full_batch)
-
-        # 현재 param_version 스냅샷
-        current_version = self.current_param_version
-
-        # DataProto non_tensor_batch 에 np.ndarray 로 param_version 넣기
-        rollout_sample.full_batch.non_tensor_batch["param_version"] = np.full(
-            (batch_size,), current_version, dtype=np.int64
-        )
-
-        print(
-            f"[Rollouter][Process] start sample_id={rollout_sample.sample_id}, "
-            f"batch_size={batch_size}, param_version={current_version}"
-        )
-        print(f"[Rollouter][Process] before generate_single_sample_async, sample_id={rollout_sample.sample_id}")
-
-        # 1) 실제 rollout 실행
-        agent_loop_output_list = await self.async_rollout_manager.generate_single_sample_async(
-            rollout_sample.full_batch,
-            rollout_sample.agent_loop_output_list,
-        )
-
-        print(f"[Rollouter][Process] after generate_single_sample_async, sample_id={rollout_sample.sample_id}")
-
-        rollout_sample.agent_loop_output_list = agent_loop_output_list
-
-        # 2) cancel 여부 체크
-        is_cancel = any(
-            getattr(agent_loop, "is_cancel", False) for agent_loop in agent_loop_output_list
-        )
-
-        if is_cancel:
-            # cancel 큐로 그냥 넘김
-            async with self.lock:
-                self.cancel_queue_sample_count += batch_size
-            await self.cancel_queue.put(rollout_sample)
-            print(f"[Rollouter][Process] put to cancel_queue, sample_id={rollout_sample.sample_id}")
-        else:
-            # staleness / result_queue 카운트 올리기
-            async with self.lock:
-                self.staleness_samples += batch_size
-                self.result_queue_sample_count += batch_size
-
-            rollout_sample.param_version = current_version
-            rollout_sample.rollout_status = await self.get_statistics()
-
-            # result_queue 로 push
-            await self.result_queue.put(rollout_sample)
-            print(
-                f"[Rollouter][Process] put to result_queue, sample_id={rollout_sample.sample_id}, "
-                f"result_queue_size={self.result_queue.qsize()}, "
-                f"result_queue_sample_count={self.result_queue_sample_count}, "
-                f"staleness_samples={self.staleness_samples}"
-            )
-
 
     async def _processor_worker(self):
         """
@@ -693,37 +474,68 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             else:
                 self.pending_queue.task_done()
 
+    async def _process_single_sample_streaming(self, rollout_sample: RolloutSample):
+        """Process a single sample streamingly"""
+        batch_size = len(rollout_sample.full_batch)
 
-    # async def _consumer_worker(self):
-    #     """
-    #     The consumer coroutine is responsible for obtaining the processing results
-    #     from the result queue and putting them into the message queue
-    #     """
-    #     while True:
-    #         rollout_sample = await self.result_queue.get()
-    #         batch_size = len(rollout_sample.full_batch)
+        # 현재 param_version 스냅샷
+        current_version = self.current_param_version
 
-    #         async with self.lock:
-    #             self.result_queue_sample_count -= batch_size
-            
-    #         rollout_sample = merge_rollout_sample(self.config, self.tokenizer, rollout_sample, self.processor)
+        # DataProto non_tensor_batch 에 np.ndarray 로 param_version 넣기
+        rollout_sample.full_batch.non_tensor_batch["param_version"] = np.full(
+            (batch_size,), current_version, dtype=np.int64
+        )
 
-    #         success = await self.message_queue_client.put_sample(
-    #             sample=ray.cloudpickle.dumps(rollout_sample),
-    #             param_version=rollout_sample.param_version,
-    #             sample_count=batch_size,
-    #         )
-    #         if success:
-    #             self.total_generated_samples += batch_size
-    #             async with self.lock:
-    #                 self.staleness_samples -= batch_size
-    #         else:
-    #             async with self.lock:
-    #                 self.staleness_samples -= batch_size
-    #             self.dropped_stale_samples += batch_size
+        print(
+            f"[Rollouter][Process] start sample_id={rollout_sample.sample_id}, "
+            f"batch_size={batch_size}, param_version={current_version}"
+        )
 
-    #         self.result_queue.task_done()
+        # 1) 실제 rollout 실행
+        agent_loop_output_list = await self.async_rollout_manager.generate_single_sample_async(
+            rollout_sample.full_batch,
+            rollout_sample.agent_loop_output_list,
+        )
 
+        print(f"[Rollouter][Process] after generate, sample_id={rollout_sample.sample_id}")
+
+        rollout_sample.agent_loop_output_list = agent_loop_output_list
+
+        # 2) cancel 여부 체크
+        is_cancel = any(
+            getattr(agent_loop, "is_cancel", False) for agent_loop in agent_loop_output_list
+        )
+
+        if is_cancel:
+            # cancel 큐로 넘김
+            async with self.lock:
+                self.cancel_queue_sample_count += batch_size
+            await self.cancel_queue.put(rollout_sample)
+            print(f"[Rollouter][Process] put to cancel_queue, sample_id={rollout_sample.sample_id}")
+        else:
+            # staleness / result_queue 카운트 올리기
+            async with self.lock:
+                self.staleness_samples += batch_size
+                self.result_queue_sample_count += batch_size
+                # 간단한 snapshot만 저장 (blocking call 없이)
+                rollout_status_snapshot = {
+                    "param_version": current_version,
+                    "staleness_samples": self.staleness_samples,
+                    "active_sample_count": self.active_sample_count,
+                    "result_queue_sample_count": self.result_queue_sample_count,
+                    "total_generated_samples": self.total_generated_samples,
+                }
+
+            rollout_sample.param_version = current_version
+            rollout_sample.rollout_status = rollout_status_snapshot
+
+            # result_queue 로 push
+            await self.result_queue.put(rollout_sample)
+            print(
+                f"[Rollouter][Process] put to result_queue, sample_id={rollout_sample.sample_id}, "
+                f"result_queue_size={self.result_queue.qsize()}, "
+                f"staleness_samples={self.staleness_samples}"
+            )
 
     async def _consumer_worker(self):
         """
@@ -733,61 +545,54 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         print("[Rollouter][Consumer] consumer worker started")
 
         while True:
-            try:
-                rollout_sample = await self.result_queue.get()
-                batch_size = len(rollout_sample.full_batch)
+            # try:
+            rollout_sample = await self.result_queue.get()
+            batch_size = len(rollout_sample.full_batch)
 
-                print(
-                    f"[Rollouter][Consumer] got sample_id={rollout_sample.sample_id}, "
-                    f"batch_size={batch_size}, result_queue_size(before dec)={self.result_queue.qsize()}"
-                )
+            print(
+                f"[Rollouter][Consumer] got sample_id={rollout_sample.sample_id}, "
+                f"batch_size={batch_size}, result_queue_size(before dec)={self.result_queue.qsize()}"
+            )
 
-                # result_queue_sample_count 감소
+            # result_queue_sample_count 감소
+            async with self.lock:
+                self.result_queue_sample_count -= batch_size
+
+            # merge
+            rollout_sample = merge_rollout_sample(
+                self.config, self.tokenizer, rollout_sample, self.processor
+            )
+
+            if self.message_queue_client is None:
+                print("[Rollouter][Consumer] ERROR: message_queue_client is None")
+            success = await self.message_queue_client.put_sample(
+                sample=ray.cloudpickle.dumps(rollout_sample),
+                param_version=rollout_sample.param_version,
+                sample_count=batch_size,
+            )
+
+            if success:
                 async with self.lock:
-                    self.result_queue_sample_count -= batch_size
-
-                # merge
-                rollout_sample = merge_rollout_sample(
-                    self.config, self.tokenizer, rollout_sample, self.processor
+                    self.total_generated_samples += batch_size
+                    self.staleness_samples -= batch_size
+                print(
+                    f"[Rollouter][Consumer] put_sample success, "
+                    f"sample_id={rollout_sample.sample_id}, "
+                    f"total_generated_samples={self.total_generated_samples}, "
+                    f"staleness_samples={self.staleness_samples}"
+                )
+            else:
+                async with self.lock:
+                    self.staleness_samples -= batch_size
+                    self.dropped_stale_samples += batch_size
+                print(
+                    f"[Rollouter][Consumer] put_sample FAILED(stale), "
+                    f"sample_id={rollout_sample.sample_id}, "
+                    f"staleness_samples={self.staleness_samples}, "
+                    f"dropped_stale_samples={self.dropped_stale_samples}"
                 )
 
-                if self.message_queue_client is None:
-                    print("[Rollouter][Consumer] ERROR: message_queue_client is None")
-                success = await self.message_queue_client.put_sample(
-                    sample=ray.cloudpickle.dumps(rollout_sample),
-                    param_version=rollout_sample.param_version,
-                    sample_count=batch_size,
-                )
-
-                if success:
-                    async with self.lock:
-                        self.total_generated_samples += batch_size
-                        self.staleness_samples -= batch_size
-                    print(
-                        f"[Rollouter][Consumer] put_sample success, "
-                        f"sample_id={rollout_sample.sample_id}, "
-                        f"total_generated_samples={self.total_generated_samples}, "
-                        f"staleness_samples={self.staleness_samples}"
-                    )
-                else:
-                    async with self.lock:
-                        self.staleness_samples -= batch_size
-                        self.dropped_stale_samples += batch_size
-                    print(
-                        f"[Rollouter][Consumer] put_sample FAILED(stale), "
-                        f"sample_id={rollout_sample.sample_id}, "
-                        f"staleness_samples={self.staleness_samples}, "
-                        f"dropped_stale_samples={self.dropped_stale_samples}"
-                    )
-
-                self.result_queue.task_done()
-
-            except Exception as e:
-                # 여기서 예외 나면 consumer_worker 가 조용히 죽어버려서 전체가 멈어버림
-                import traceback
-                print(f"[Rollouter][Consumer] ERROR in consumer_worker: {repr(e)}")
-                traceback.print_exc()
-
+            self.result_queue.task_done()
 
     async def _streaming_generation_main(self):
         """The main entry method for stream processing"""
@@ -909,8 +714,20 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
     async def _should_pause_generation(self) -> bool:
         """Determine whether the build should be paused"""
         queue_stats = self.message_queue_client.get_statistics_sync()
-        queue_size = queue_stats["queue_size"]
+        
+        queue_size: int = queue_stats["queue_size"]                 # 배치 개수
+        sample_count: int = queue_stats.get("sample_count", 0)      # 전체 샘플 개수
 
+        # 0. MQ도 비었고, active도 없으면 => 생성이 필요한 상태
+        if sample_count == 0 and self.active_sample_count == 0:
+            if self.paused:
+                print(
+                    "[FullyAsyncRollouter][ShouldPause] "
+                    "resume because queue is empty and no active samples"
+                )
+            return False
+
+        # 1. MQ 자체가 꽉 찼으면(배치 기준) 일단 멈추기
         if queue_size >= self.max_queue_size:
             if not self.paused:
                 print(
@@ -919,35 +736,56 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 )
             return True
 
-        # staleness_samples = 완료된 sample 중 아직 소비되지 않은 것
-        # + active_sample_count = 현재 생성 중인 것 (곧 완료될 것)
-        total_in_flight = self.staleness_samples + self.active_sample_count
-        
+        # 2. 실제 in-flight: MQ 안의 샘플 + 현재 생성 중인 샘플
+        total_in_flight = sample_count + self.active_sample_count
+
         if total_in_flight >= self.max_required_samples:
             if not self.paused:
                 print(
                     f"[FullyAsyncRollouter][ShouldPause] "
-                    f"due to staleness({self.staleness_samples}) + active({self.active_sample_count}) "
-                    f"= {total_in_flight} >= max_required_samples({self.max_required_samples})"
+                    f"due to in_flight({total_in_flight}) = "
+                    f"mq_sample({sample_count}) + active({self.active_sample_count}) "
+                    f">= max_required_samples({self.max_required_samples})"
                 )
             return True
 
         return False
 
     async def pause(self):
-        """pause rollout"""
         print("[FullyAsyncRollouter][Public][Pause]")
+        
+        # 1. paused 플래그 설정
         async with self.lock:
             self.paused = True
-            # Cancel all rollout tasks
-            if self.config.async_training.partial_rollout:
-                await self.async_rollout_manager.cancel()
-            if self.active_tasks:
-                await asyncio.gather(*self.active_tasks, return_exceptions=True)
-                self.active_tasks.clear()
-                print("[FullyAsyncRollouter][Public][Pause] All active tasks completed")
-            await self.async_rollout_manager.reset_prefix_cache()
-            self.monitor_loop_trigger = False
+        
+        # 2. (옵션) partial_rollout이면 내부 cancel
+        if self.config.async_training.partial_rollout:
+            await self.async_rollout_manager.cancel()
+
+        # 3. active_tasks 가 비기를 기다리되, 로그는 적게
+        last_logged_count = None
+        last_logged_time = 0.0
+        log_interval = 10.0      # 최소 10초 간격으로만 로그
+        sleep_interval = 0.5     # polling 간격은 0.5초 정도
+
+        while True:
+            async with self.lock:
+                remaining = len(self.active_tasks)
+
+            if remaining == 0:
+                break
+
+            now = time.time()
+            # 1) 이전과 다른 개수거나
+            # 2) 마지막 로그 이후 log_interval 초가 지났을 때만 로그 출력
+            if remaining != last_logged_count or (now - last_logged_time) >= log_interval:
+                print(f"[FullyAsyncRollouter][Pause] Waiting for {remaining} active tasks...")
+                last_logged_count = remaining
+                last_logged_time = now
+
+            await asyncio.sleep(sleep_interval)
+
+        print("[FullyAsyncRollouter][Public][Pause] All active tasks completed")
 
     async def resume(self, dependency_ref: ObjectRef = None):
         if dependency_ref is not None:

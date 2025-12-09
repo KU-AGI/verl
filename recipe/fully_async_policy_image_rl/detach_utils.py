@@ -327,9 +327,26 @@ def assemble_batch_from_rollout_samples(
     if balance_batch:
         balance_batch(final_batch, metrics={})
 
-    # Calculate the global valid token number
+    # # Calculate the global valid token number
+    # if "attention_mask" in final_batch.batch:
+    #     final_batch.meta_info["global_token_num"] = torch.sum(final_batch.batch["attention_mask"], dim=-1).tolist()
+
     if "attention_mask" in final_batch.batch:
-        final_batch.meta_info["global_token_num"] = torch.sum(final_batch.batch["attention_mask"], dim=-1).tolist()
+        attention_mask = final_batch.batch["attention_mask"]
+
+        # dim 에 따라 안전하게 token_lens 만들기 (항상 1D [B]로)
+        if attention_mask.dim() == 0:
+            # 완전 scalar면 그냥 길이 1짜리로 감싸기
+            token_lens = attention_mask.view(1)
+        elif attention_mask.dim() == 1:
+            # [T] 한 개 시퀀스 -> 전체를 하나의 샘플로 보고 sum
+            token_lens = attention_mask.sum().view(1)  # shape [1]
+        else:
+            # [B, T] 또는 [B, ... , T] 인 경우, 첫 dim = batch 로 보고 나머지 다 펼쳐서 합
+            token_lens = attention_mask.view(attention_mask.shape[0], -1).sum(dim=-1)  # shape [B]
+
+        # meta_info 에는 항상 List[int] 로 저장
+        final_batch.meta_info["global_token_num"] = [int(x) for x in token_lens.cpu().tolist()]
 
     # Collect statistics
     param_versions = [rs.param_version for rs in rollout_samples]
@@ -345,7 +362,12 @@ def assemble_batch_from_rollout_samples(
     }
     processing_time_stats = {f"fully_async/{key}": value for key, value in processing_time_stats.items()}
 
-    param_version_diff = [abs(a - b) for a, b in zip(rs.param_version_end, rs.param_version_start, strict=False)]
+    # param_version_diff = [abs(a - b) for a, b in zip(rs.param_version_end, rs.param_version_start, strict=False)]
+    param_version_diff = [
+        abs(a - b)
+        for rs in rollout_samples
+        for a, b in zip(rs.param_version_end, rs.param_version_start, strict=False)
+    ]
     num_diff0 = param_version_diff.count(0)
     partial_stats = {
         "fully_async/partial/total_partial_num": len(param_version_diff) - num_diff0,

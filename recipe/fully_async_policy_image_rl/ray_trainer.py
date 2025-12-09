@@ -49,9 +49,6 @@ from verl.trainer.ppo.utils import Role
 from verl.utils.checkpoint.checkpoint_manager import should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
-from verl.utils.metric import (
-    reduce_metrics,
-)
 from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.torch_functional import masked_mean
 from recipe.image_rl.ray_image_generation_trainer import RayImageGenerationTrainer
@@ -377,6 +374,22 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                         # Remove universal keys from batch
                         batch.pop(batch_keys=["task_id"])
                     
+                    # update critic
+                    if self.use_critic:
+                        with marked_timer("update_critic", timing_raw, color="pink"):
+                            critic_output = self.critic_wg.update_critic(batch)
+                        critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
+                        metrics.update(critic_output_metrics)
+
+                    # implement critic warmup
+                    if self.config.trainer.critic_warmup <= self.global_steps:
+                        # update actor
+                        with marked_timer("update_actor", timing_raw, color="red"):
+                            batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+                            actor_output = self.actor_rollout_wg.update_actor(batch)
+                        actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                        metrics.update(actor_output_metrics)
+                    
                     # Log rollout generations if enabled (per task)
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if self.config.trainer.rollout_freq > 0 and (
@@ -448,6 +461,12 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
         # which won't affect the advantage calculation (since it's based on uid),
         # but might affect the loss calculation (due to the change of mini-batching).
         # TODO: Decouple the DP balancing and mini-batching.
+
+        # compute global_valid tokens
+        batch.batch["attention_mask"] = batch.batch["task1_attention_mask"].sum(dim=-1) + batch.batch["task1_response_mask"].sum(dim=-1) \
+                                      + batch.batch["task2_attention_mask"].sum(dim=-1) + batch.batch["task2_response_mask"].sum(dim=-1) \
+                                      + batch.batch["task3_attention_mask"].sum(dim=-1) + batch.batch["task3_response_mask"].sum(dim=-1)
+        
         if self.config.trainer.balance_batch:
             self._balance_batch(batch, metrics=metrics)
 
@@ -571,21 +590,6 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                 task_id=task_id
             )
 
-        # update critic
-        if self.use_critic:
-            with marked_timer("update_critic", timing_raw, color="pink"):
-                critic_output = self.critic_wg.update_critic(batch)
-            critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
-            metrics.update(critic_output_metrics)
-
-        # implement critic warmup
-        if self.config.trainer.critic_warmup <= self.global_steps:
-            # update actor
-            with marked_timer("update_actor", timing_raw, color="red"):
-                batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
-                actor_output = self.actor_rollout_wg.update_actor(batch)
-            actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
-            metrics.update(actor_output_metrics)
         return batch, reward_extra_infos_dict
 
     def _log_rollout(self, batch, reward_extra_infos_dict, timing_raw):
