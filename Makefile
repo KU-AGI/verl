@@ -64,7 +64,7 @@ start-vllm-servers:
 			-e VLLM_WORKER_MULTIPROC_METHOD=spawn \
 			-p $${PORT}:8000 \
 			--ipc=host \
-			vllm/vllm-openai:v0.11.0 \
+			vllm/vllm-openai:v0.12.0 \
 			--model ${MODEL_PATH} \
 			--served-model-name ${MODEL_PATH} \
 			--trust-remote-code \
