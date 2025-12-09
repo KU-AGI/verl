@@ -48,8 +48,8 @@ def load_deepspeed_ckpt(model, ckpt_path, dtype='bf16'):
 
 if __name__ == "__main__":
     base_model_path = "/data/mllm/checkpoints/Janus-Pro-7B"
-    finetuned_ckpt_dir = "/data/mllm/ckpt/step=016000.ckpt" # latest, zero_to_fp32.py
-    save_path = "/data/mllm/ckpt/step=016000.ckpt/hf_model"
+    finetuned_ckpt_dir = "/data/mllm/ckpt/step=012000.ckpt" # latest, zero_to_fp32.py
+    save_path = "/data/mllm/ckpt/step=012000.ckpt/hf_model"
 
     # 1. Base processor 로드
     print("Loading base processor...")
