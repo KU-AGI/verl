@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
 
+# Designate log path
+LOG_DIR=${LOG_DIR:-"logs"}
+mkdir -p "${LOG_DIR}"
+SCRIPT_LOG="${LOG_DIR}/script_$(date +%Y%m%d_%H%M%S).log"
+
+# Save log files
+exec > >(tee -a "${SCRIPT_LOG}")
+exec 2>&1
+
 project_name='mllm_reasoning'
 exp_name='fully_async_test'
 
@@ -95,12 +104,12 @@ fsdp_size=1 # Must be divisible by (n_gpus_training*n_nodes) and (n_gpus_rollout
 
 train_prompt_bsz=0
 gen_prompt_bsz=1
-n_resp_per_prompt=6
-train_prompt_mini_bsz=8
+n_resp_per_prompt=8
+train_prompt_mini_bsz=6
 total_rollout_steps=$(((512*100)))
 staleness_threshold=0.0
 trigger_parameter_sync_step=4
-require_batches=6
+require_batches=8
 partial_rollout=False
 
 test_freq=20
