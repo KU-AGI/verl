@@ -777,13 +777,18 @@ class RayImageGenerationDAPOTrainer(RayPPOTrainer):
 
                         # Reward computation
                         with marked_timer("reward", timing_raw, "yellow"):
-                            if self.use_rm and "rm_scores" not in new_batch.batch.keys():
+                            if self.use_rm:
                                 reward_tensor = self.rm_wg.compute_rm_score(new_batch)
                                 new_batch = new_batch.union(reward_tensor)
 
-                            reward_tensor, reward_extra_infos_dict = compute_reward(
-                                new_batch, self.reward_fn, eval=False, task_id=task_id
-                            )
+                            if self.config.reward_model.launch_reward_fn_async:
+                                future_reward = compute_reward_async.remote(
+                                    data=new_batch, config=self.config, tokenizer=self.tokenizer, processor=self.processor
+                                )
+                            else:
+                                reward_tensor, reward_extra_infos_dict = compute_reward(
+                                    new_batch, self.reward_fn, eval=False, task_id=task_id
+                                )
                             new_batch.batch[f"task{task_id}_token_level_scores"] = reward_tensor
 
                             if reward_extra_infos_dict:

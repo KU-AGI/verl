@@ -752,6 +752,11 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                             self._balance_batch(batch, metrics=metrics)
 
                         with marked_timer("reward", timing_raw, color="yellow"):
+                            # compute reward model score
+                            if self.use_rm:
+                                reward_tensor = self.rm_wg.compute_rm_score(batch)
+                                batch = batch.union(reward_tensor)
+
                             if self.config.reward_model.launch_reward_fn_async:
                                 future_reward = compute_reward_async.remote(data=batch, config=self.config, tokenizer=self.tokenizer, processor=self.processor)
                             else:

@@ -187,7 +187,9 @@ class TaskRunner:
         if config.reward_model.enable:
             use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
             if use_legacy_worker_impl in ["auto", "enable"]:
-                if config.reward_model.strategy in {"fsdp", "fsdp2"}:
+                if config.reward_model.strategy == "vllm":
+                    from recipe.image_rl.image_generation_reward_worker_vllm import ImageGenerationRewardModelWorker
+                elif config.reward_model.strategy in {"fsdp", "fsdp2"}:
                     from recipe.image_rl.image_generation_worker import ImageGenerationRewardModelWorker
                 elif config.reward_model.strategy == "megatron":
                     raise NotImplementedError("Megatron backend is not supported for image generation")
@@ -232,7 +234,7 @@ class TaskRunner:
         actor_rollout_cls, ray_worker_group_cls = self.add_actor_rollout_worker(config)
         ### self.add_critic_worker(config)
 
-        ### self.add_reward_model_worker(config)
+        self.add_reward_model_worker(config)
 
         # Add a reference policy worker if KL loss or KL reward is used.
         self.add_ref_policy_worker(config, actor_rollout_cls)
@@ -262,8 +264,8 @@ class TaskRunner:
 
         resource_pool_manager = self.init_resource_pool_mgr(config)
 
-        # trainer = RayImageGenerationTrainer(
-        trainer = RayImageGenerationDAPOTrainer(
+        trainer = RayImageGenerationTrainer(
+        # trainer = RayImageGenerationDAPOTrainer(
             config=config,
             tokenizer=tokenizer,
             processor=processor,
