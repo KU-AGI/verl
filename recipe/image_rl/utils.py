@@ -82,18 +82,19 @@ class FormattingEvaluator:
         """
         metrics = {}
         
-        # 1. [Accuracy] Part 1 내용 정확도
+        # Part 1: F1 score
         gt_contents = {content for _, content in gt_part1}
         pred_contents = {content for _, content in pred_part1}
         correct_matches = len(gt_contents.intersection(pred_contents))
         total_gt = len(gt_part1)
-        metrics['part1_accuracy'] = correct_matches / total_gt if total_gt > 0 else 0.0
+
+        precision = correct_matches / len(pred_part1) if len(pred_part1) > 0 else 0.0
+        recall = correct_matches / total_gt if total_gt > 0 else 0.0
+        metrics['part1_accuracy'] = (2 * precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
         
-        # 3. [0/1 Score] Pred Part 1과 Pred Part 2의 항목 개수 일치 여부 (내부 일관성)
+        # Part 2: Pred Part 1과 Pred Part 2의 항목 개수 일치 여부 (내부 일관성)
         metrics['internal_consistency_ok'] = 1 if len(pred_part1) == len(pred_paragraphs) else 0
-        
-        # 4. [0/1 Score] GT Part 1과 Pred Part 1의 항목 개수 일치 여부 (생성 완전성)
-        metrics['part1_length_match_ok'] = 1 if len(gt_part1) == len(pred_part1) else 0
+
         final_metrics = {k: v.item() if isinstance(v, torch.Tensor) else v for k, v in metrics.items()}
         
         return final_metrics

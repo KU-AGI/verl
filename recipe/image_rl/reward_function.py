@@ -19,6 +19,8 @@ import threading
 import random
 from enum import Enum
 import torch
+import aiohttp
+from recipe.image_rl.gdino_regex import _CONNECTORS, SKIP_KEYWORDS, _COMPILED_RELATIONS
 
 # Configuration
 BASE_URLS = [
@@ -36,6 +38,14 @@ MODEL_NAME = os.environ.get("RM_MODEL_PATH", "Qwen/Qwen3-VL-30B-A3B-Instruct")
 HEALTH_CHECK_INTERVAL = 30  # seconds
 FAILURE_THRESHOLD = 3  # consecutive failures before marking as unhealthy
 RECOVERY_CHECK_INTERVAL = 60  # seconds to wait before checking if unhealthy server recovered
+
+# Detector configuration
+DETECTOR_URLS = [
+    "http://192.169.0.3:8084",
+    "http://192.169.0.3:8085"
+]
+DETECTOR_TIMEOUT = 30.0
+DETECTOR_MAX_RETRIES = 2
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
@@ -433,6 +443,7 @@ async def get_response_with_client(client, client_id, messages):
                 model=MODEL_NAME,
                 messages=messages,
                 max_tokens=2048,
+                extra_body={"repetition_penalty": 1.2},
                 timeout=60.0  # Add timeout
             )
             # Record successful request
@@ -527,29 +538,294 @@ def compute_reward(response):
     return reward_score
 
 
+def parse_lines(text):
+    if not isinstance(text, str): return []
+    return [(int(m.group(1)), m.group(2).strip()) for line in text.strip().split("\n") if (m := re.match(r"(\d+)\s*\|\s*(.*)", line))]
+
+
+def verify_detection_single(feedback_tuple: list) -> List[Dict[str, Any]]: # 
+    parsed_tup = parse_lines(feedback_tuple)
+    
+    results = []
+    for num, content in parsed_tup: # [(1, 'entity - whole (banana)'), ...]
+        info = None
+        if 'spatial' in content:
+            if m := re.search(r'\((.*?)\)', content): # (obj1, obj2, relation) 파싱
+                parts = [p.strip() for p in m.group(1).split(',')]
+                if len(parts) >= 3: # Spatial
+                    s, o = parts[0], parts[1]
+                    r_text = ", ".join(parts[2:]) # 관계 텍스트 (예: "is on the left of")
+                    
+                    cs = re.sub(r"_\d+$", "", _CONNECTORS.sub('', s).strip())
+                    co = re.sub(r"_\d+$", "", _CONNECTORS.sub('', o).strip())
+                    
+                    # Subject/Object가 방향 지시어면 스킵
+                    if not (cs.lower() in SKIP_KEYWORDS or co.lower() in SKIP_KEYWORDS or cs.startswith('[')):
+                        
+                        # [핵심] 정규식 리스트를 순회하며 매칭 확인
+                        # 매칭되면 'c'(Canonical Name, 예: "left of")를 반환
+                        canonical_rel = next((c for c, p, _ in _COMPILED_RELATIONS if p.search(r_text)), None)
+                        
+                        if canonical_rel:
+                            # Prompt는 GDino가 이해하기 쉬운 단순 형태로 구성 (필요시 canonical_rel 사용 가능)
+                            info = {
+                                "subject": cs,
+                                "object": co,
+                                "relation": canonical_rel,  # <--- 여기에 통일된 단어("left of")가 들어감
+                                "tuple_idx": num,
+                                "type": "spatial"
+                            }
+
+        elif 'count' in content:
+            if m := re.search(r'\((.*?)\)', content):
+                parts = [p.strip() for p in m.group(1).split(',')]
+                if len(parts) >= 2: # Counting
+                    s, expr = parts[0], parts[1]
+                    cs = re.sub(r"_\d+$", "", _CONNECTORS.sub('', s).strip())
+                    if not (cs.lower() in SKIP_KEYWORDS or cs.startswith('[')) and re.search(r'\d', expr):
+                        info = {
+                            "subject": cs, 
+                            "object": cs, 
+                            "num": expr, 
+                            "tuple_idx": num,
+                            "type": "counting"
+                        }
+        
+        if info is not None:    
+            results.append(info)
+
+    return results # [], [info1, info2, ...]
+
+    
+async def request_detector_single(detection_list: List[Dict[str, Any]], img) -> Dict[str, Any]:
+    """
+    Send detection requests to GDino detector API.
+    
+    Args:
+        detection_list: List of detection info dicts with keys like:
+            - type: "spatial" or "counting" (will be converted to "numeracy")
+            - subject, object, relation (for spatial)
+            - object, num (for counting/numeracy)
+            - tuple_idx: original tuple index
+        img: PIL Image or path to image
+    
+    Returns:
+        Dict with:
+            - results: Dict[tuple_idx, bool] mapping tuple indices to detection results
+            - details: List of full detection responses
+            - errors: List of any errors encountered
+    """
+    if not detection_list:
+        return {"results": {}, "details": [], "errors": []}
+    
+    # Convert image to base64
+    img_base64 = convert_gen_img_to_base64(img)
+    # Remove data URL prefix if present (API expects raw base64)
+    if img_base64.startswith("data:"):
+        img_base64 = img_base64.split(",", 1)[1]
+    
+    # Prepare info_list for API request
+    info_list = []
+    idx_mapping = {}  # Map API index to tuple_idx
+    
+    for i, det_info in enumerate(detection_list):
+        api_info = {}
+        det_type = det_info.get("type", "")
+        
+        if det_type == "spatial":
+            api_info = {
+                "type": "spatial",
+                "subject": det_info.get("subject"),
+                "object": det_info.get("object"),
+                "relation": det_info.get("relation")
+            }
+        elif det_type in ["counting", "numeracy"]:
+            api_info = {
+                "type": "numeracy",
+                "object": det_info.get("object"),
+                "num": str(det_info.get("num", ""))
+            }
+        else:
+            continue
+            
+        info_list.append(api_info)
+        idx_mapping[len(info_list) - 1] = det_info.get("tuple_idx", i)
+    
+    if not info_list:
+        return {"results": {}, "details": [], "errors": ["No valid detection items"]}
+    
+    # Prepare request payload
+    payload = {
+        "info_list": info_list,
+        "img_url": img_base64
+    }
+    
+    results = {}
+    details = []
+    errors = []
+    
+    # Try each detector URL with failover
+    async with aiohttp.ClientSession() as session:
+        for url_idx, base_url in enumerate(DETECTOR_URLS):
+            try:
+                detect_url = f"{base_url}/detect"
+                
+                for attempt in range(DETECTOR_MAX_RETRIES):
+                    try:
+                        async with session.post(
+                            detect_url,
+                            json=payload,
+                            timeout=aiohttp.ClientTimeout(total=DETECTOR_TIMEOUT)
+                        ) as response:
+                            if response.status == 200:
+                                data = await response.json()
+                                api_results = data.get("results", [])
+                                
+                                # Parse results
+                                for api_idx, result_list in enumerate(api_results):
+                                    if api_idx in idx_mapping and result_list:
+                                        tuple_idx = idx_mapping[api_idx]
+                                        result = result_list[0]  # First result per info item
+                                        
+                                        results[tuple_idx] = result.get("det_judge", False)
+                                        details.append({
+                                            "tuple_idx": tuple_idx,
+                                            "det_judge": result.get("det_judge", False),
+                                            "det_reason": result.get("det_reason", ""),
+                                            "det_info": result.get("det_info", {}),
+                                            "vis_data": result.get("vis_data")
+                                        })
+                                
+                                # Success - return results
+                                return {
+                                    "results": results,
+                                    "details": details,
+                                    "errors": errors
+                                }
+                            else:
+                                error_text = await response.text()
+                                errors.append(f"Server {url_idx} returned {response.status}: {error_text[:200]}")
+                                
+                    except asyncio.TimeoutError:
+                        errors.append(f"Server {url_idx} attempt {attempt+1} timed out")
+                    except aiohttp.ClientError as e:
+                        errors.append(f"Server {url_idx} attempt {attempt+1} client error: {str(e)}")
+                    
+                    if attempt < DETECTOR_MAX_RETRIES - 1:
+                        await asyncio.sleep(0.5 * (attempt + 1))
+                        
+            except Exception as e:
+                errors.append(f"Server {url_idx} failed: {str(e)}")
+                continue
+    
+    # All servers failed
+    return {
+        "results": results,
+        "details": details,
+        "errors": errors if errors else ["All detector servers failed"]
+    }
+
+
+async def request_detector_batch(detection_requests: List[tuple]) -> List[Dict[str, Any]]:
+    """
+    Batch process multiple detection requests concurrently.
+    
+    Args:
+        detection_requests: List of (detection_list, img) tuples
+    
+    Returns:
+        List of detection results corresponding to each request
+    """
+    if not detection_requests:
+        return []
+    
+    # Create semaphore to limit concurrent detector requests
+    semaphore = asyncio.Semaphore(4)  # Limit concurrent detector calls
+    
+    async def process_single(idx, det_list, img):
+        async with semaphore:
+            result = await request_detector_single(det_list, img)
+            return idx, result
+    
+    tasks = [
+        asyncio.create_task(process_single(i, det_list, img))
+        for i, (det_list, img) in enumerate(detection_requests)
+    ]
+    
+    results = [None] * len(detection_requests)
+    completed = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    for item in completed:
+        if isinstance(item, Exception):
+            print(f"Detector batch request failed: {item}")
+        else:
+            idx, result = item
+            results[idx] = result
+    
+    return results
+
+
 async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id):
     """Async version of compute_score"""
     reward_score = 0.0
     reward_extra_info = {}
 
-    if task_id == 1:
+    if task_id == 1: # Total score: 3.0
         # VLM based reward
+        task1_vlm_reward_score = 0.0
         response = await get_response(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id)
         if response is not None:
             task1_idx_to_ans: dict = image_evaluator_parser(response)
 
-            task1_reward_score = sum(task1_idx_to_ans.values())
+            task1_vlm_reward_score_sum = sum(task1_idx_to_ans.values())
             task1_ans_count = len(task1_idx_to_ans)
-            
-            task1_score_mean = 1.0 if task1_reward_score == task1_ans_count else 0.0
 
-            reward_score += task1_score_mean
+            task1_vlm_reward_score = 1.0 if task1_vlm_reward_score_sum == task1_ans_count else 0.0
+
+            reward_score += task1_vlm_reward_score
             reward_extra_info[f"task{task_id}_reward_response"] = response
         else:
             reward_score += 0.0
             reward_extra_info[f"task{task_id}_reward_response"] = "No response received"
 
-    elif task_id == 2:
+        # Detector based reward - always populate for batch consistency
+        detection_results = verify_detection_single(feedback_tuple)
+        detector_response = {"results": {}, "details": [], "errors": ["No spatial/counting tuples found"]}
+
+        detector_reward = 0.0
+        if detection_results:
+            detector_response = await request_detector_single(detection_results, gen_img)
+
+            # Calculate detector bonus: +1 if all detections are True
+            det_results_dict = detector_response.get("results", {})
+            det_details_list = detector_response.get("details", [])
+            if det_results_dict:
+                all_true = all(det_results_dict.values())
+                detector_reward = 1.0 if all_true else 0.0
+                reward_score += detector_reward
+                reward_extra_info[f"task{task_id}_detector_reward"] = detector_reward
+                reward_extra_info[f"task{task_id}_detector_details"] = det_details_list
+            else:
+                reward_score += 0.0
+                reward_extra_info[f"task{task_id}_detector_reward"] = 0.0
+                reward_extra_info[f"task{task_id}_detector_details"] = det_details_list
+        else:
+            reward_score += 0.0
+            reward_extra_info[f"task{task_id}_detector_reward"] = 0.0
+            reward_extra_info[f"task{task_id}_detector_details"] = det_details_list
+
+        # Always set detector_response for batch consistency
+        reward_extra_info[f"task{task_id}_detector_response"] = detector_response
+
+        # Bonus if both perfect
+        if task1_vlm_reward_score == 1 and detector_reward == 1:
+            reward_score += 1.0  # bonus for both perfect
+            reward_extra_info[f"task{task_id}_vlm_detector_bonus"] = 1.0
+        else:
+            reward_score += 0.0
+            reward_extra_info[f"task{task_id}_vlm_detector_bonus"] = 0.0
+
+    elif task_id == 2: # Total score: 1.0 (normalized)
         task2_reward_score = 0.0
         task2_ans_count = 0
         
@@ -628,31 +904,74 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
         reward_score += (task2_reward_score / task2_ans_count) if task2_ans_count > 0 else 0.0
         reward_extra_info[f"task{task_id}_reward_align_response"] = align_response
 
-    elif task_id == 3:
+    elif task_id == 3: # Total score: 3.0
         formatting_evaluator = FormattingEvaluator()
         last = formatting_evaluator._split_text_into_parts(feedback_text)[-1]
         if last is not None and "No need to generate feedback.".lower() in last.lower():
             reward_score = -100
             reward_extra_info[f"task{task_id}_reward_response"] = "None"
+            # Always populate detector_response for batch consistency
+            reward_extra_info[f"task{task_id}_detector_response"] = {"results": {}, "details": [], "errors": ["Skipped: No feedback needed"]}
+            reward_extra_info[f"task{task_id}_detector_reward"] = 0.0
+            reward_extra_info[f"task{task_id}_detector_details"] = []
+
+            reward_extra_info[f"task{task_id}_vlm_detector_bonus"] = 0.0
             return {
                 "score": reward_score,
                 "reward_extra_info": reward_extra_info,
             }
 
         # VLM based reward
+        task3_vlm_reward_score = 0.0
         response = await get_response(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id)
         if response is not None:
             task3_idx_to_ans: dict = image_evaluator_parser(response)
 
-            task3_reward_score = sum(task3_idx_to_ans.values())
-            task3_ans_count = len(task3_idx_to_ans)
-            
-            task3_score_mean = 1.0 if task3_reward_score == task3_ans_count else 0.0
-            reward_score += task3_score_mean
+            task3_vlm_reward_score_sum = sum(task3_idx_to_ans.values())
+            task3_ans_count = len(task3_vlm_reward_score_sum)
+
+            task3_vlm_reward_score = 1.0 if task3_vlm_reward_score_sum == task3_ans_count else 0.0
+            reward_score += task3_vlm_reward_score
             reward_extra_info[f"task{task_id}_reward_response"] = response
         else:
             reward_score += 0.0
             reward_extra_info[f"task{task_id}_reward_response"] = "No response received"
+
+        # Detector based reward - always populate for batch consistency
+        detection_results = verify_detection_single(feedback_tuple)
+        detector_response = {"results": {}, "details": [], "errors": ["No spatial/counting tuples found"]}
+
+        detector_reward = 0.0
+        if detection_results:
+            detector_response = await request_detector_single(detection_results, gen_img)
+
+            # Calculate detector bonus: +1 if all detections are True
+            det_results_dict = detector_response.get("results", {})
+            det_details_list = detector_response.get("details", [])
+            if det_results_dict:
+                all_true = all(det_results_dict.values())
+                detector_reward = 1.0 if all_true else 0.0
+                reward_score += detector_reward
+                reward_extra_info[f"task{task_id}_detector_reward"] = detector_reward
+                reward_extra_info[f"task{task_id}_detector_details"] = det_details_list
+            else:
+                reward_score += 0.0
+                reward_extra_info[f"task{task_id}_detector_reward"] = 0.0
+                reward_extra_info[f"task{task_id}_detector_details"] = det_details_list
+        else:
+            reward_score += 0.0
+            reward_extra_info[f"task{task_id}_detector_reward"] = 0.0
+            reward_extra_info[f"task{task_id}_detector_details"] = det_details_list
+
+        # Always set detector_response for batch consistency
+        reward_extra_info[f"task{task_id}_detector_response"] = detector_response
+
+        # Bonus if both perfect
+        if task3_vlm_reward_score == 1 and detector_reward == 1:
+            reward_score += 1.0  # bonus for both perfect
+            reward_extra_info[f"task{task_id}_vlm_detector_bonus"] = 1.0
+        else:
+            reward_extra_info[f"task{task_id}_vlm_detector_bonus"] = 0.0
 
     return {
         "score": reward_score,
@@ -705,8 +1024,14 @@ async def compute_score_batch_async(prompts, gen_imgs, feedback_texts, regen_img
     return results
 
 
-def compute_score_batch(prompts, gen_imgs, feedback_texts, regen_imgs, ground_truth_imgs, feedback_tuples, vqa_questions, extra_infos, task_ids):
-    """Wrapper function to run async batch processing"""
+# Make this async to work with the async reward loop
+async def compute_score_batch(prompts, gen_imgs, feedback_texts, regen_imgs, ground_truth_imgs, feedback_tuples, vqa_questions, extra_infos, task_ids):
+    """Async batch processing - directly calls the async implementation"""
+    return await compute_score_batch_async(prompts, gen_imgs, feedback_texts, regen_imgs, ground_truth_imgs, feedback_tuples, vqa_questions, extra_infos, task_ids)
+
+
+def compute_score_batch_sync(prompts, gen_imgs, feedback_texts, regen_imgs, ground_truth_imgs, feedback_tuples, vqa_questions, extra_infos, task_ids):
+    """Synchronous wrapper for non-async contexts"""
     return asyncio.run(
         compute_score_batch_async(prompts, gen_imgs, feedback_texts, regen_imgs, ground_truth_imgs, feedback_tuples, vqa_questions, extra_infos, task_ids)
     )
