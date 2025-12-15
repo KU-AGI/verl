@@ -35,7 +35,7 @@ WORKING_DIR=${WORKING_DIR:-"${PWD}"}
 RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/recipe/image_rl/runtime_env.yaml"}
 
 GPUS=4 # `nvidia-smi -L | wc -l`
-MODEL_PATH=/data/mllm/ckpt/pretrained # /data/mllm/checkpoints/Janus-Pro-7B
+MODEL_PATH=/data/mllm/ckpt/step=012000.ckpt/hf_model # /data/mllm/checkpoints/Janus-Pro-7B
 TRAIN_FILES=/data/mllm/data/train.parquet
 VAL_FILES=/data/mllm/data/val.parquet
 RUN_NAME=dapo_b4_n8_lr2e-6_temp1.2_kl0.04_no_std
@@ -182,6 +182,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     algorithm.filter_groups.max_num_gen_batches=${max_num_gen_batches} \
     algorithm.filter_groups.metric=${filter_groups_metric} \
     algorithm.norm_adv_by_std_in_grpo=${norm_adv_by_std_in_grpo} \
+    trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
     trainer.val_before_train=False \
     trainer.project_name=$PROJ_NAME \

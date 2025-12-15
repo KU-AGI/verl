@@ -43,8 +43,19 @@ def create_resource_pool_manager(config, roles: list) -> ResourcePoolManager:
     resource_pool_spec = {}
     mapping = {}
 
-    # Actor/Critic resource pool
-    if any(role in roles for role in [Role.Actor, Role.Critic, Role.RefPolicy, Role.RewardModel]):
+    # Check if we need separate reward model pool for vLLM
+    use_vllm_reward = (
+        config.reward_model.enable 
+        and config.reward_model.strategy == "vllm"
+        and Role.RewardModel in roles
+    )
+
+    # Actor/Critic resource pool (excluding RewardModel if using vLLM)
+    trainer_roles = [Role.Actor, Role.Critic, Role.RefPolicy]
+    if not use_vllm_reward:
+        trainer_roles.append(Role.RewardModel)
+    
+    if any(role in roles for role in trainer_roles):
         assert config.trainer.n_gpus_per_node > 0, "config.trainer.n_gpus_per_node must be greater than 0"
         assert config.trainer.nnodes > 0, "config.trainer.nnodes must be greater than 0"
 
@@ -52,9 +63,23 @@ def create_resource_pool_manager(config, roles: list) -> ResourcePoolManager:
         resource_pool_spec["trainer_pool"] = trainer_pool
 
         # Map training-related roles to the same resource pool
-        for role in [Role.Actor, Role.Critic, Role.RefPolicy, Role.RewardModel]:
+        for role in trainer_roles:
             if role in roles:
                 mapping[role] = "trainer_pool"
+
+    # Separate reward model pool for vLLM with TP > 1
+    if use_vllm_reward:
+        # Get tensor parallel size from config
+        tp_size = config.reward_model.model.get("tensor_parallel_size", 4)
+        
+        # Create a pool where a SINGLE worker has access to ALL TP GPUs
+        # Key insight: we use [tp_size] meaning 1 node with tp_size GPUs
+        # and max_colocate_count=1 in the worker group
+        reward_pool = [tp_size]  # Single "node" with tp_size GPUs
+        resource_pool_spec["reward_pool"] = reward_pool
+        mapping[Role.RewardModel] = "reward_pool"
+        
+        print(f"[ResourcePool] Created separate reward_pool for vLLM with TP={tp_size}")
 
     # Rollout resource pool
     if Role.Rollout in roles:
@@ -104,8 +129,13 @@ def create_role_worker_mapping(config):
     }
 
     if config.reward_model.enable:
-        if config.reward_model.strategy in ["fsdp", "fsdp2"]:
+        if config.reward_model.strategy == "vllm":
+            # Use the vLLM worker that supports TP > 1
+            from recipe.image_rl.image_generation_reward_worker_vllm import ImageGenerationRewardModelWorker
+
+        elif config.reward_model.strategy in ["fsdp", "fsdp2"]:
             from recipe.image_rl.image_generation_worker import ImageGenerationRewardModelWorker
+
         # TODO megatron support
         else:
             raise NotImplementedError(f"Unsupported reward model strategy: {config.reward_model.strategy}")
@@ -117,6 +147,47 @@ def create_role_worker_mapping(config):
         role_worker_mapping[Role.RefPolicy] = ray.remote(DetachActorWorker)
 
     return role_worker_mapping, ray_worker_group_cls
+
+
+def create_vllm_reward_worker_group(config, ray_worker_group_cls):
+    """
+    Create a special worker group for vLLM reward model with full GPU visibility.
+    
+    This creates a SINGLE worker that can see all tensor_parallel_size GPUs,
+    rather than N workers each seeing 1 GPU.
+    """
+    from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool
+    
+    tp_size = config.reward_model.model.get("tensor_parallel_size", 4)
+    
+    print(f"[vLLM RewardModel] Creating worker with TP={tp_size}")
+    
+    # Import the worker class
+    from recipe.image_rl.image_generation_reward_worker_vllm import ImageGenerationRewardModelWorker
+    
+    # Create resource pool with ALL TP GPUs for a single worker
+    # Use process_on_nodes to specify which node(s) to use
+    resource_pool = RayResourcePool(
+        process_on_nodes=[0],  # Use first node
+        num_gpus_per_node=tp_size,
+        max_colocate_count=1,  # Single worker gets all GPUs
+        name="reward_model_vllm_pool",
+    )
+    
+    # Create class wrapper with config
+    reward_cls = RayClassWithInitArgs(
+        cls=ImageGenerationRewardModelWorker,
+        config=config.reward_model,
+    )
+    
+    # Create worker group
+    worker_group = ray_worker_group_cls(
+        resource_pool=resource_pool,
+        ray_cls_with_init=reward_cls,
+        name_prefix="reward_model",
+    )
+    
+    return worker_group
 
 
 @ray.remote(num_cpus=1)

@@ -104,6 +104,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         self.total_train_steps = None
         self.progress_bar = None
         self.trigger_parameter_sync_step = config.async_training.trigger_parameter_sync_step
+        self.last_ckpt_version = 0
 
         # required_samples use ppo_mini_batch_size*require_batches as the minimum number of samples.
         self.require_batches = config.async_training.require_batches
@@ -279,13 +280,17 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                         # compute reward model score
                         if self.use_rm:
                             reward_tensor = self.rm_wg.compute_rm_score(batch)
+                            # Remove existing response_masks to allow overwriting with modified masks from reward computation
+                            for task_id in [1, 2, 3]:
+                                if f"task{task_id}_response_mask" in batch.batch:
+                                    batch.batch.pop(f"task{task_id}_response_mask")
                             batch = batch.union(reward_tensor)
 
-                        if self.config.reward_model.launch_reward_fn_async:
-                            # Pass None for reward_fn to avoid pickle issues - it will be loaded inside the remote worker
-                            future_reward = compute_reward_async.remote(data=batch, config=self.config, tokenizer=self.tokenizer, processor=self.processor, reward_fn=None, task_id=task_id)
-                        else:
-                            reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn, eval=False, task_id=task_id)
+                        # Contained in _process_batch_common after
+                        # elif self.config.reward_model.launch_reward_fn_async:
+                        #     future_reward = compute_reward_async.remote(data=batch, config=self.config, tokenizer=self.tokenizer, processor=self.processor)
+                        # else:
+                        #     reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn, eval=False)
 
                     for task_id in [1, 2, 3]:
                         batch.batch["task_id"] = torch.tensor([task_id for _ in range(len(batch))], dtype=int)
@@ -331,19 +336,19 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                 f"{time_str}"
             )
             self._trigger_parameter_sync_after_step(global_steps=self.global_steps)
-            self._log_validation_data()
+            # self._log_validation_data()
             self._check_save_checkpoint(timing_raw)
             self.global_steps += 1
 
-        # final parameter sync and validate
-        # 1. waiting remaining validate task
-        ray.get(self.param_synchronizer.wait_last_valid.remote())
-        self._log_validation_data()
-        # 2. perform addtional parameter_sync and validate if trainer already updated
-        if self.current_param_version % self.config.rollout.test_freq != 0 or self.local_trigger_step > 1:
-            self._trigger_parameter_sync_after_step(validate=True, global_steps=self.global_steps)
-            ray.get(self.param_synchronizer.wait_last_valid.remote())
-            self._log_validation_data()
+        # # final parameter sync and validate
+        # # 1. waiting remaining validate task
+        # ray.get(self.param_synchronizer.wait_last_valid.remote())
+        # self._log_validation_data()
+        # # 2. perform addtional parameter_sync and validate if trainer already updated
+        # if self.current_param_version % self.config.rollout.test_freq != 0 or self.local_trigger_step > 1:
+        #     self._trigger_parameter_sync_after_step(validate=True, global_steps=self.global_steps)
+        #     ray.get(self.param_synchronizer.wait_last_valid.remote())
+        #     self._log_validation_data()
         self.progress_bar.close()
 
         self._check_save_checkpoint(timing_raw)

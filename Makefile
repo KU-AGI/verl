@@ -72,6 +72,7 @@ start-vllm-servers:
 			--port 8000 \
 			--tensor-parallel-size 2 \
 			--limit-mm-per-prompt.video 0 \
+			--gpu-memory-utilization 0.7 \
 			--async-scheduling ; \
 	done
 
@@ -150,3 +151,34 @@ start-dynamo-trt-servers:
 					--tensor-parallel-size 2 \
 			" ; \
 	done
+
+GDINO_CONTAINER_NAME=gdino-server-g
+GDINO_MODEL_PATH=IDEA-Research/grounding-dino-base
+
+start-gdino-server:
+	for GPU in 4 5 ; do \
+		GDINO_PORT=$$((8080 + $$GPU)) ; \
+		docker run --rm -d --name $(GDINO_CONTAINER_NAME)$$GPU \
+			--gpus all \
+			-v /data:/data \
+			-v /home:/home \
+			-v ${PWD}:/workspace \
+			-e HF_HOME=${CACHE_PATH} \
+			-e CUDA_VISIBLE_DEVICES=$$GPU \
+			-p $$GDINO_PORT:8080 \
+			--ipc=host \
+			verlai/verl:app-verl0.5-transformers4.55.4-vllm0.10.0-mcore0.13.0-te2.2 \
+			bash -c " \
+				pip install fastapi uvicorn && \
+				cd /workspace/recipe/image_rl && \
+				python detector.py \
+					--gdino_ckpt_path $(GDINO_MODEL_PATH) \
+					--host 0.0.0.0 \
+					--port 8080 \
+			" ; \
+		done
+
+stop-gdino-server:
+	for GPU in 4 5 ; do \
+		docker stop $(GDINO_CONTAINER_NAME)$$GPU || true ; \
+		done

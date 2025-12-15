@@ -432,9 +432,6 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                     save_path = os.path.join(image_dir, f"gen_img_{pid}_{id}_{i}.png")
                     PIL.Image.fromarray(gen_imgs_pil_list[i].astype(np.uint8)).save(save_path)
                     f.write(f"Generated Image: gen_img_{pid}_{id}_{i}.png\n")
-                    if "task1_reward_response" in reward_extra_infos_dict and len(reward_extra_infos_dict["task1_reward_response"]) > i:
-                        task1_reward_response = reward_extra_infos_dict["task1_reward_response"][i]
-                        f.write(f"Task1 Reward Response:\n{task1_reward_response}\n")
                     if "task1_scores" in scores and len(scores["task1_scores"]) > i:
                         task1_score = scores["task1_scores"][i]
                         f.write(f"Task1 Score: {task1_score}\n")
@@ -443,9 +440,6 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                 # Save feedback text (Task 2)
                 if feedback_texts is not None and len(feedback_texts) > i:
                     f.write(f"Feedback Text:\n{feedback_texts[i]}\n")
-                    if "task2_reward_response" in reward_extra_infos_dict and len(reward_extra_infos_dict["task2_reward_response"]) > i:
-                        task2_reward_response = reward_extra_infos_dict["task2_reward_response"][i]
-                        f.write(f"Task2 Reward Response:\n{task2_reward_response}\n")
                     if "task2_scores" in scores and len(scores["task2_scores"]) > i:
                         task2_score = scores["task2_scores"][i]
                         f.write(f"Task2 Score: {task2_score}\n")
@@ -456,9 +450,6 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                     regen_path = os.path.join(image_dir, f"regen_img_{pid}_{id}_{i}.png")
                     PIL.Image.fromarray(regen_imgs_pil_list[i].astype(np.uint8)).save(regen_path)
                     f.write(f"Regenerated Image: regen_img_{pid}_{id}_{i}.png\n")
-                    if "task3_reward_response" in reward_extra_infos_dict and len(reward_extra_infos_dict["task3_reward_response"]) > i:
-                        task3_reward_response = reward_extra_infos_dict["task3_reward_response"][i]
-                        f.write(f"Task3 Reward Response:\n{task3_reward_response}\n")
                     if "task3_scores" in scores and len(scores["task3_scores"]) > i:
                         task3_score = scores["task3_scores"][i]
                         f.write(f"Task3 Score: {task3_score}\n")
@@ -478,6 +469,10 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                 if gts_vqas is not None and len(gts_vqas) > i:
                     ground_truth_vqa_question = gts_vqas[i]
                     f.write(f"Ground Truth VQA:\n{ground_truth_vqa_question}\n\n")
+
+                for key, value in reward_extra_infos_dict.items():
+                    if key in value and len(value[key]) > i:
+                        f.write(f"Reward Extra Infos:\n{key}:\n{value[key][i]}\n\n")
 
                 f.write("=" * 40 + "\n\n")
         

@@ -236,21 +236,21 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 f",reset staleness_samples to: {self.staleness_samples}"
                 f",idle_ratio: {idle_ratio}"
             )
-            val_metrics = None
-            if (
-                self.val_reward_fn is not None
-                and self.config.rollout.test_freq > 0
-                and self.current_param_version % self.config.rollout.test_freq == 0
-                and self.current_param_version > 0  # don't test here in the initial parameter sync
-            ) or (validate and self.val_reward_fn is not None):
-                with marked_timer("rollouter/validate_time", timing_raw, color="green"):
-                    val_metrics: dict = self._validate()
-            data = ValidateMetrics(
-                timing_raw=timing_raw, metrics=val_metrics, global_steps=global_steps, param_version=version
-            )
-            await self.message_queue_client.put_validate(ray.cloudpickle.dumps(data))
+            # val_metrics = None
+            # if (
+            #     self.val_reward_fn is not None
+            #     and self.config.rollout.test_freq > 0
+            #     and self.current_param_version % self.config.rollout.test_freq == 0
+            #     and self.current_param_version > 0  # don't test here in the initial parameter sync
+            # ) or (validate and self.val_reward_fn is not None):
+            #     with marked_timer("rollouter/validate_time", timing_raw, color="green"):
+            #         val_metrics: dict = self._validate()
+            # data = ValidateMetrics(
+            #     timing_raw=timing_raw, metrics=val_metrics, global_steps=global_steps, param_version=version
+            # )
+            # await self.message_queue_client.put_validate(ray.cloudpickle.dumps(data))
 
-            self.version_start_time = time.time()
+            # self.version_start_time = time.time()
 
     async def save_checkpoint(self, local_global_step_folder: str):
         # WARNING!: Due to the asynchronous nature, there are some in-flight samples
@@ -460,9 +460,6 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             if self.paused or await self._should_pause_generation():
                 async with self.lock:
                     self.paused = True
-
-                # Wait for resume signal
-                async with self.lock:
                     self.idle_start_time = time.time()
                     while self.paused:
                         await self.condition.wait()
@@ -538,65 +535,72 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
 
     async def _process_single_sample_streaming(self, rollout_sample: RolloutSample):
         """Process a single sample streamingly"""
-        batch_size = len(rollout_sample.full_batch)
-        current_version = self.current_param_version
+        try:
+            batch_size = len(rollout_sample.full_batch)
+            current_version = self.current_param_version
 
-        # Set param_version in non_tensor_batch
-        rollout_sample.full_batch.non_tensor_batch["param_version"] = np.full(
-            (batch_size,), current_version, dtype=np.int64
-        )
-
-        # Execute rollout
-        agent_loop_output_list = await self.async_rollout_manager.generate_single_sample_async(
-            rollout_sample.full_batch,
-            rollout_sample.agent_loop_output_list,
-        )
-
-        rollout_sample.agent_loop_output_list = agent_loop_output_list
-
-        # Check if cancelled
-        is_cancel = any(
-            getattr(agent_loop, "is_cancel", False) for agent_loop in agent_loop_output_list
-        )
-
-        if is_cancel:
-            # Put back to cancel queue
-            # await self.cancel_queue.put(rollout_sample)
-            async with self.lock:
-                self.cancel_sample_count += batch_size
-            await self.cancel_queue.put(rollout_sample)
-        else:
-            # Merge rollout sample directly here (instead of consumer worker)
-            rollout_sample.param_version = current_version
-            rollout_sample.rollout_status = {
-                "param_version": current_version,
-                "staleness_samples": self.staleness_samples,
-                "total_generated_samples": self.total_generated_samples,
-            }
-            
-            # Merge rollout sample
-            rollout_sample = merge_rollout_sample(
-                self.config, self.tokenizer, rollout_sample, self.processor
+            # Set param_version in non_tensor_batch
+            rollout_sample.full_batch.non_tensor_batch["param_version"] = np.full(
+                (batch_size,), current_version, dtype=np.int64
             )
 
-            # Put directly to message queue
-            success = await self.message_queue_client.put_sample(
-                sample=ray.cloudpickle.dumps(rollout_sample),
-                param_version=rollout_sample.param_version,
-                sample_count=batch_size,
+            # Execute rollout
+            agent_loop_output_list = await self.async_rollout_manager.generate_single_sample_async(
+                rollout_sample.full_batch,
+                rollout_sample.agent_loop_output_list,
             )
 
+            rollout_sample.agent_loop_output_list = agent_loop_output_list
+
+            # Check if cancelled
+            is_cancel = any(
+                getattr(agent_loop, "is_cancel", False) for agent_loop in agent_loop_output_list
+            )
+
+            if is_cancel:
+                # Put back to cancel queue
+                # await self.cancel_queue.put(rollout_sample)
+                async with self.lock:
+                    self.active_sample_count -= batch_size
+                    self.cancel_sample_count += batch_size
+                await self.cancel_queue.put(rollout_sample)
+            else:
+                # Merge rollout sample directly here (instead of consumer worker)
+                rollout_sample.param_version = current_version
+                rollout_sample.rollout_status = {
+                    "param_version": current_version,
+                    "staleness_samples": self.staleness_samples,
+                    "total_generated_samples": self.total_generated_samples,
+                }
+                
+                # Merge rollout sample
+                rollout_sample = merge_rollout_sample(
+                    self.config, self.tokenizer, rollout_sample, self.processor
+                )
+
+                # Put directly to message queue
+                success = await self.message_queue_client.put_sample(
+                    sample=ray.cloudpickle.dumps(rollout_sample),
+                    param_version=rollout_sample.param_version,
+                    sample_count=batch_size,
+                )
+
+                async with self.lock:
+                    if success:
+                        self.total_generated_samples += batch_size
+                        self.staleness_samples -= batch_size
+                    else:
+                        self.staleness_samples -= batch_size
+                        self.dropped_stale_samples += batch_size
+
+                    self.active_sample_count -= batch_size
+
+            self.processed_sample_count += 1
+
+        finally:
+            current_task = asyncio.current_task()
             async with self.lock:
-                if success:
-                    self.total_generated_samples += batch_size
-                    self.staleness_samples -= batch_size
-                else:
-                    self.staleness_samples -= batch_size
-                    self.dropped_stale_samples += batch_size
-
-                self.active_sample_count -= batch_size
-
-        self.processed_sample_count += 1
+                self.active_tasks.discard(current_task)
 
     async def _streaming_generation_main(self):
         """The main entry method for stream processing"""
@@ -701,7 +705,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 last_stats_time = current_time
 
             # Trigger rollout recovery
-            if self.monitor_loop_trigger:
+            if self.monitor_loop_trigger and not self.paused:
                 if not await self._should_pause_generation():
                     async with self.lock:
                         self.paused = False
@@ -738,6 +742,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         # Set paused flag
         async with self.lock:
             self.paused = True
+            self.monitor_loop_trigger = False
 
         # Cancel all rollout tasks if partial_rollout is enabled
         if self.config.async_training.partial_rollout:
@@ -751,22 +756,28 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
 
         while True:
             async with self.lock:
-                remaining = len(self.active_tasks)
+                remaining_samples = self.active_sample_count
+                remaining_tasks = len(self.active_tasks)
 
-            if remaining == 0:
+            if remaining_samples == 0:
                 break
 
             now = time.time()
-            if remaining != last_logged_count or (now - last_logged_time) >= log_interval:
-                print(f"[FullyAsyncRollouter][Pause] Waiting for {remaining} active tasks...")
-                last_logged_count = remaining
+            if (
+                remaining_samples != last_logged_count
+                or (now - last_logged_time) >= log_interval
+            ):
+                print(
+                    "[FullyAsyncRollouter][Pause] Waiting for "
+                    f"{remaining_samples} active samples "
+                    f"(task set size={remaining_tasks})..."
+                )
+                last_logged_count = remaining_samples
                 last_logged_time = now
 
             await asyncio.sleep(sleep_interval)
 
-        print("[FullyAsyncRollouter][Public][Pause] All active tasks completed")
-
-        self.monitor_loop_trigger = False
+        print("[FullyAsyncRollouter][Public][Pause] All active samples completed")
 
     async def resume(self, dependency_ref: ObjectRef = None):
         if dependency_ref is not None:
@@ -775,6 +786,9 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         async with self.lock:
             self.paused = False
             self.monitor_loop_trigger = True
+            self.condition.notify_all()
+
+        async with self.condition:
             self.condition.notify_all()
 
             if self.config.async_training.partial_rollout:
@@ -786,6 +800,8 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         stats = {
             # monitor stats
             "monitor/active_tasks_size": len(self.active_tasks),
+            "monitor/active_sample_count": self.active_sample_count,
+            "monitor/cancel_sample_count": self.cancel_sample_count,
             "monitor/queue/pending_queue_size": self.pending_queue.qsize(),
             "monitor/queue/cancel_queue_size": self.cancel_queue.qsize(),
             "monitor/queue/mq_queue_size": queue_stats["queue_size"],

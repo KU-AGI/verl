@@ -479,10 +479,12 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
         with marked_timer("reward", timing_raw, color="yellow"):
             # compute reward model score
             if self.use_rm:
-                reward_tensor = self.rm_wg.compute_rm_score(batch)
-                batch = batch.union(reward_tensor)
+                # Already processed in before
+                # reward_tensor = self.rm_wg.compute_rm_score(batch)
+                # batch = batch.union(reward_tensor)
+                reward_tensor = batch[f"task{task_id}_reward_tensor"]
 
-            if self.config.reward_model.launch_reward_fn_async:
+            elif self.config.reward_model.launch_reward_fn_async:
                 # Pass None for reward_fn to avoid pickle issues - it will be loaded inside the remote worker
                 future_reward = compute_reward_async.remote(data=batch, config=self.config, tokenizer=self.tokenizer, processor=self.processor, reward_fn=None, task_id=task_id)
             else:
