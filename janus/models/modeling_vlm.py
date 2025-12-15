@@ -434,10 +434,23 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
 
         # Find image token positions
         pos_list = []
-        for ids in task2_input_ids:
-            pos = (ids == self.processor.image_id).nonzero(as_tuple=False)[0].item()
-            pos_list.append([pos])
+        invalid_mask = []
+        for i, ids in enumerate(task2_input_ids):
+            pos_tensor = (ids == self.processor.image_id).nonzero(as_tuple=False)
+            if pos_tensor.numel() == 0:
+                # No image placeholder found, mark this sample as invalid
+                print(f"[WARNING] No image placeholder token (id={self.processor.image_id}) found in task2_input_ids[{i}]. Excluding from training.")
+                pos_list.append([0])  # Use dummy position
+                invalid_mask.append(i)
+            else:
+                pos = pos_tensor[0].item()
+                pos_list.append([pos])
         task2_image_start_indices = pos_list
+
+        # Zero out response_mask for invalid samples to exclude from loss calculation
+        if len(invalid_mask) > 0 and "task2_response_mask" in batch:
+            for idx in invalid_mask:
+                batch["task2_response_mask"][idx] = 0
 
         task2_merged_embeds = self._merge_text_and_image_embeds(
             task2_text_embeds, task2_image_embeds, task2_image_start_indices
@@ -471,10 +484,23 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
 
         # Find image token positions
         pos_list = []
-        for ids in task3_input_ids:
-            pos = (ids == self.processor.image_id).nonzero(as_tuple=False)[0].item()
-            pos_list.append([pos])
+        invalid_mask = []
+        for i, ids in enumerate(task3_input_ids):
+            pos_tensor = (ids == self.processor.image_id).nonzero(as_tuple=False)
+            if pos_tensor.numel() == 0:
+                # No image placeholder found, mark this sample as invalid
+                print(f"[WARNING] No image placeholder token (id={self.processor.image_id}) found in task3_input_ids[{i}]. Excluding from training.")
+                pos_list.append([0])  # Use dummy position
+                invalid_mask.append(i)
+            else:
+                pos = pos_tensor[0].item()
+                pos_list.append([pos])
         task3_image_start_indices = pos_list
+
+        # Zero out response_mask for invalid samples to exclude from loss calculation
+        if len(invalid_mask) > 0 and "task3_response_mask" in batch:
+            for idx in invalid_mask:
+                batch["task3_response_mask"][idx] = 0
 
         task3_merged_embeds = self._merge_text_and_image_embeds(
             task3_text_embeds, task3_image_embeds, task3_image_start_indices
@@ -1030,10 +1056,23 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
 
         # Find image token positions
         pos_list = []
-        for ids in task2_input_ids:
-            pos = (ids == self.processor.image_id).nonzero(as_tuple=False)[0].item()
-            pos_list.append([pos])
+        invalid_mask = []
+        for i, ids in enumerate(task2_input_ids):
+            pos_tensor = (ids == self.processor.image_id).nonzero(as_tuple=False)
+            if pos_tensor.numel() == 0:
+                # No image placeholder found, mark this sample as invalid
+                print(f"[WARNING] No image placeholder token (id={self.processor.image_id}) found in task2_input_ids[{i}]. Excluding from training.")
+                pos_list.append([0])  # Use dummy position
+                invalid_mask.append(i)
+            else:
+                pos = pos_tensor[0].item()
+                pos_list.append([pos])
         task2_image_start_indices = pos_list
+
+        # Zero out response_mask for invalid samples to exclude from loss calculation
+        if len(invalid_mask) > 0 and "task2_response_mask" in batch:
+            for idx in invalid_mask:
+                batch["task2_response_mask"][idx] = 0
 
         task2_merged_embeds = self._merge_text_and_image_embeds(
             task2_text_embeds, task2_image_embeds, task2_image_start_indices
@@ -1067,10 +1106,23 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
 
         # Find image token positions
         pos_list = []
-        for ids in task3_input_ids:
-            pos = (ids == self.processor.image_id).nonzero(as_tuple=False)[0].item()
-            pos_list.append([pos])
+        invalid_mask = []
+        for i, ids in enumerate(task3_input_ids):
+            pos_tensor = (ids == self.processor.image_id).nonzero(as_tuple=False)
+            if pos_tensor.numel() == 0:
+                # No image placeholder found, mark this sample as invalid
+                print(f"[WARNING] No image placeholder token (id={self.processor.image_id}) found in task3_input_ids[{i}]. Excluding from training.")
+                pos_list.append([0])  # Use dummy position
+                invalid_mask.append(i)
+            else:
+                pos = pos_tensor[0].item()
+                pos_list.append([pos])
         task3_image_start_indices = pos_list
+
+        # Zero out response_mask for invalid samples to exclude from loss calculation
+        if len(invalid_mask) > 0 and "task3_response_mask" in batch:
+            for idx in invalid_mask:
+                batch["task3_response_mask"][idx] = 0
 
         task3_merged_embeds = self._merge_text_and_image_embeds(
             task3_text_embeds, task3_image_embeds, task3_image_start_indices
