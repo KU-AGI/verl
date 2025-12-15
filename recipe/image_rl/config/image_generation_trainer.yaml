@@ -34,9 +34,32 @@ actor_rollout_ref:
       val_txt_top_p: 1.0
       val_img_top_k: 4096
       val_img_top_p: 1.0
+    calculate_log_probs: true # REQUIRED: Enable log prob calculation
 
 reward_model:
   reward_manager: image_generation
+  enable: true
+  strategy: "vllm"  # fsdp -> vllm
+
+  micro_batch_size: 1
+  ppo_micro_batch_size_per_gpu: 1
+
+  model:
+    path: "Qwen/Qwen3-VL-30B-A3B-Instruct"
+    trust_remote_code: true
+
+  rollout:
+    name: "vllm"
+    mode: "async"
+    dtype: "bfloat16"
+    tensor_parallel_size: 2
+    gpu_memory_utilization: 0.85
+    max_length: 2048
+    max_tokens: 2048
+    max_num_seqs: 64
+    max_concurrent_requests: 16
+    enforce_eager: true
+
   overlong_buffer: 
     enable: False # We try to avoid forgetting to set enable
     len: 0
@@ -44,7 +67,6 @@ reward_model:
     log: False
   reward_kwargs:
     img_saving: null
-    #   num: 4
 
 algorithm:
   filter_groups:

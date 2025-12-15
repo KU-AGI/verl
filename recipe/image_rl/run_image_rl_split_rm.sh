@@ -42,6 +42,14 @@ RUN_NAME=grpo_b12_n8_kl0.04_temp1.2 # grpo_default_reward_b8_n8_lr2e-6_multi_tas
 PROJ_NAME=mllm_reasoning
 SAVE_DIR=/data/verl/ckpts/$PROJ_NAME/$RUN_NAME
 
+# # Rollout Correction parameters
+# rollout_is=token
+# rollout_is_threshold=2.0
+# rollout_rs=null
+# rollout_rs_threshold=null
+# rollout_rs_threshold_lower=null
+# rollout_token_veto_threshold=null
+
 # Algorithm parameters
 adv_estimator=grpo_task_skip
 
@@ -87,6 +95,7 @@ use_dynamic_bsz=False
 # infer_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 3))
 offload=False
 gen_tp=1
+rm_gen_tp=2
 sp_size=1
 
 # Fully async specific parameters
@@ -100,10 +109,10 @@ rollout_freq=1
 log_val_generations=20
 
 # Parameters
-train_prompt_bsz=$GPUS
+train_prompt_bsz=12 # $GPUS
 gen_prompt_bsz=$((train_prompt_bsz * 1))
 n_resp_per_prompt=8
-train_prompt_mini_bsz=$GPUS
+train_prompt_mini_bsz=12 # $GPUS
 
 # Perf
 fsdp_size=$GPUS
@@ -200,6 +209,16 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     trainer.rollout_freq=${rollout_freq} \
     trainer.validation_data_dir="$SAVE_DIR/validation" \
     trainer.log_val_generations=${log_val_generations} \
+    reward_model.reward_manager=image_generation \
+    reward_model.enable=True \
+    reward_model.strategy=vllm \
+    reward_model.micro_batch_size=${train_prompt_mini_bsz} \
+    reward_model.ppo_micro_batch_size_per_gpu=1 \
+    reward_model.model.path=\"${RM_MODEL_PATH}\" \
+    reward_model.model.trust_remote_code=True \
+    reward_model.rollout.tensor_model_parallel_size=${rm_gen_tp} \
+    reward_model.rollout.gpu_memory_utilization=0.6 \
+    reward_model.rollout.max_length=2048 \
     reward_model.reward_manager=image_generation \
     custom_reward_function.path=recipe/image_rl/reward_function.py \
     custom_reward_function.name=compute_score_batch \
