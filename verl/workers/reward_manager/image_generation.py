@@ -57,9 +57,9 @@ class ImageGenerationRewardManager:
         feedback_texts = data.non_tensor_batch.get('task2_feedback_texts', [])
         regen_imgs_pil_list = data.non_tensor_batch.get('task3_regen_imgs_pil_list', [])
         ground_truth = data.non_tensor_batch.get('reward_model', {})
-        
+
         print(f"[VERIFY] Processing batch of {len(prompt)} samples")
-        
+
         # Prepare batch data
         prompts = prompt
         gen_imgs = [gen_imgs_pil_list[i] if i < len(gen_imgs_pil_list) else None for i in range(len(data))]
@@ -70,11 +70,21 @@ class ImageGenerationRewardManager:
         vqa_questions = [ground_truth[i]["vqa_question"] if i < len(ground_truth) else None for i in range(len(data))]
         extra_infos = [data.non_tensor_batch.get("extra_info", {})] * len(data)
         task_ids = [task_id] * len(data)
-        
+
         # Call batch processing function
-        scores = self.compute_score(
-            prompts, gen_imgs, feedback_texts_padded, regen_imgs, ground_truth_imgs, feedback_tuples, vqa_questions, extra_infos, task_ids
-        )
+        # Check if compute_score is async (coroutine function)
+        import inspect
+        if inspect.iscoroutinefunction(self.compute_score):
+            # If async, we need to run it in a sync context
+            import asyncio
+            scores = asyncio.run(self.compute_score(
+                prompts, gen_imgs, feedback_texts_padded, regen_imgs, ground_truth_imgs, feedback_tuples, vqa_questions, extra_infos, task_ids
+            ))
+        else:
+            # If sync, call directly
+            scores = self.compute_score(
+                prompts, gen_imgs, feedback_texts_padded, regen_imgs, ground_truth_imgs, feedback_tuples, vqa_questions, extra_infos, task_ids
+            )
 
         return scores
 
