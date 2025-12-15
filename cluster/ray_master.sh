@@ -7,7 +7,7 @@ export GLOO_SOCKET_IFNAME="bond-srv.1518"
 # ray stop --force
 # rm -rf /tmp/ray
 
-ray start --head \
+RAY_memory_monitor_refresh_ms=0 ray start --head \
   --node-ip-address=$MASTER_ADDR \
   --port=$MASTER_PORT \
   --dashboard-host=0.0.0.0 \

@@ -6,7 +6,7 @@ export GLOO_SOCKET_IFNAME="bond-srv.1518"
 # ray stop --force
 # rm -rf /tmp/ray
 
-ray start \
-  --node-ip-address=$MASTER_ADDR \
+RAY_memory_monitor_refresh_ms=0 ray start \
+  --node-ip-address=$WORKER_ADDR \
   --address=${MASTER_ADDR}:${MASTER_PORT} \
   --num-gpus=${NUM_GPUS}
