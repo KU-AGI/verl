@@ -1,4 +1,5 @@
-export MASTER_ADDR= # $(hostname -I | awk '{print $1}')
+export MASTER_ADDR= # master ip
+export WORKER_ADDR=$(hostname -I | awk '{print $1}')
 export MASTER_PORT=6379
 export NUM_GPUS=8
 export GLOO_SOCKET_IFNAME="bond-srv.1518"
