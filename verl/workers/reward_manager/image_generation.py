@@ -110,6 +110,8 @@ class ImageGenerationRewardManager:
         for i in range(len(data)):
             valid_response_length = response_mask[i].sum()
             score_dict = scores[i]
+            if score_dict is None:
+                print(f"[WARNING] score_dict is None for sample {i}, using default reward 0.0")
             reward = score_dict.get("score", 0.0)
             # if reward != -100:
             #     reward = reward * 10 # scale up

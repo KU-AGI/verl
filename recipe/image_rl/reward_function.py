@@ -31,7 +31,7 @@ BASE_URLS = [
 API_KEY = "EMPTY"
 MAX_RETRIES = 3
 BASE_DELAY = 2
-MAX_CONCURRENT_REQUESTS = 8
+MAX_CONCURRENT_REQUESTS = 4
 MODEL_NAME = os.environ.get("RM_MODEL_PATH", "Qwen/Qwen3-VL-30B-A3B-Instruct")
 
 # Health checking configuration
@@ -44,7 +44,8 @@ DETECTOR_URLS = [
     "http://192.169.0.3:8084",
     "http://192.169.0.3:8085"
 ]
-DETECTOR_TIMEOUT = 30.0
+DETECTOR_TIMEOUT = 300000.0
+
 DETECTOR_MAX_RETRIES = 2
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
@@ -444,7 +445,7 @@ async def get_response_with_client(client, client_id, messages):
                 messages=messages,
                 max_tokens=2048,
                 extra_body={"repetition_penalty": 1.2},
-                timeout=60.0  # Add timeout
+                timeout=300000.0  # Add timeout
             )
             # Record successful request
             client_manager.record_request_result(client_id, success=True)
@@ -791,6 +792,7 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
         # Detector based reward - always populate for batch consistency
         detection_results = verify_detection_single(feedback_tuple)
         detector_response = {"results": {}, "details": [], "errors": ["No spatial/counting tuples found"]}
+        det_details_list = []
 
         detector_reward = 0.0
         if detection_results:
@@ -847,6 +849,11 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
         task2_ans_count += len(part1_reward_dict)
 
         # VLM based reward
+        # Part 0: Summarize 단계 metric 추가 (251216)
+        # task2_reward_score += 1, task2_ans_count += 1
+        # Part 1: 추가해야됨 (251216)
+        # Part 2: 추가해야됨 (251216)
+        # Part 3: feedback reward (얘는 밑에 완성됨)
         response = await get_response(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id)
         if response is not None:
             try:
@@ -928,7 +935,7 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
             task3_idx_to_ans: dict = image_evaluator_parser(response)
 
             task3_vlm_reward_score_sum = sum(task3_idx_to_ans.values())
-            task3_ans_count = len(task3_vlm_reward_score_sum)
+            task3_ans_count = len(task3_idx_to_ans)
 
             task3_vlm_reward_score = 1.0 if task3_vlm_reward_score_sum == task3_ans_count else 0.0
             reward_score += task3_vlm_reward_score
@@ -940,6 +947,7 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
         # Detector based reward - always populate for batch consistency
         detection_results = verify_detection_single(feedback_tuple)
         detector_response = {"results": {}, "details": [], "errors": ["No spatial/counting tuples found"]}
+        det_details_list = []
 
         detector_reward = 0.0
         if detection_results:

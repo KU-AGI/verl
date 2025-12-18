@@ -177,7 +177,7 @@ def compute_reward(data: DataProto, reward_fn: AbstractRewardManager, eval: bool
     Returns:
         Tuple of reward tensor and extra info dictionary.
     """
-    reward_result = reward_fn(data, task_id, eval, return_dict=True)
+    reward_result = reward_fn(data, task_id=task_id, eval=eval, return_dict=True)
     reward_tensor = reward_result[f"task{task_id}_reward_tensor"]
     reward_extra_infos_dict = reward_result.get(f"task{task_id}_reward_extra_info", {})
 

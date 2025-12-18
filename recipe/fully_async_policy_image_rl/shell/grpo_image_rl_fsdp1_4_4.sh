@@ -1,8 +1,17 @@
 #!/usr/bin/env bash
-set -xeuo pipefail
+set -euo pipefail
+
+# Designate log path
+LOG_DIR=${LOG_DIR:-"logs"}
+mkdir -p "${LOG_DIR}"
+SCRIPT_LOG="${LOG_DIR}/script_$(date +%Y%m%d_%H%M%S).log"
+
+# Save log files
+exec > >(tee -a "${SCRIPT_LOG}")
+exec 2>&1
 
 project_name='mllm_reasoning'
-exp_name='fully_async_test'
+exp_name='fully_async_nipa_test'
 
 export NCCL_IB_GID_INDEX=0
 export NCCL_CUDA_DEVICE_MAX_CONNECTIONS=8
@@ -14,8 +23,7 @@ export NCCL_IB_TIMEOUT=300
 
 # export VLLM_ATTENTION_BACKEND=XFORMERS
 export HYDRA_FULL_ERROR=1
-export NCCL_DEBUG=OFF
-export TORCH_DISTRIBUTED_DEBUG=DETAIL
+# export TORCH_DISTRIBUTED_DEBUG=DETAIL
 
 # Ray
 RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
@@ -26,7 +34,7 @@ RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/recipe/fully_async_policy_image_rl/sh
 HOME="/data"
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
 # very important! please modify the max_position_embeddings in config.json to 32768 after downloading from huggingface
-MODEL_PATH=/data/mllm/ckpt/pretrained # /data/mllm/checkpoints/Janus-Pro-7B
+MODEL_PATH=/data/mllm/ckpt/step=012000.ckpt/hf_model # /data/mllm/checkpoints/Janus-Pro-7B
 RM_MODEL_PATH=Qwen/Qwen3-VL-30B-A3B-Instruct # OpenGVLab/InternVL3_5-38B
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
 TRAIN_FILES=/data/mllm/data/train.parquet
@@ -95,8 +103,8 @@ fsdp_size=4 # Must be divisible by (n_gpus_training*n_nodes) and (n_gpus_rollout
 train_prompt_bsz=0
 gen_prompt_bsz=1
 n_resp_per_prompt=8
-train_prompt_mini_bsz=256
-train_prompt_micro_bsz=64
+train_prompt_mini_bsz=128
+train_prompt_micro_bsz=8
 total_rollout_steps=$(((512*100)))
 staleness_threshold=3.0
 trigger_parameter_sync_step=10
@@ -125,7 +133,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     data.custom_cls.path=recipe/image_rl/image_rl_dataset.py \
     data.custom_cls.name=ImageRLDataset \
     actor_rollout_ref.nccl_timeout=120000000 \
-    actor_rollout_ref.model.path="${MODEL_PATH}" \
+    actor_rollout_ref.model.path=\"${MODEL_PATH}\" \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.optim.warmup_style=constant \
     actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
