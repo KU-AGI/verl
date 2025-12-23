@@ -1,0 +1,10 @@
+model: /home/work/AGILAB/mllm_reasoning/data/checkpoints/Qwen3-VL-30B-A3B-Instruct
+served-model-name: Qwen/Qwen3-VL-30B-A3B-Instruct
+trust-remote-cod: true
+tensor-parallel-size: 2
+limit-mm-per-prompt.video: 0
+gpu-memory-utilization: 0.7
+async-scheduling: true
+enforce-eager: true
+max-num-batched-tokens: 4096
+max-num-seqs: 128
