@@ -459,50 +459,60 @@ class ImageUnifiedRollout(BaseRollout):
         return data_proto
 
     def expand_image_placeholders(self, input_ids_tensor, gen_imgs_pixel_values):
+        image_id = self.processor.image_id
+        pad_id = self.processor.pad_id
+        k = self.image_token_num_per_image
+
         processed_sequences = []
-        all_image_start_indices = []
-        output_start_indices = []
+        shifted_output_start_indices = []
+        shifted_all_image_start_indices = []
         images_to_batch = []
 
+        tmp_output_start = []
+        tmp_img_starts = []
+        lengths = []
+
         for input_ids, images in zip(input_ids_tensor, gen_imgs_pixel_values):
+            mask = (input_ids == image_id)
+            num_images = int(mask.sum().item())
 
-            # Find positions of image placeholders
-            img_positions = (input_ids == self.processor.image_id).nonzero(as_tuple=True)[0]
-            num_images_in_input = len(img_positions)
+            output_start = int(len(input_ids) + num_images * (k - 1))
+            tmp_output_start.append(output_start)
 
-            # output_start_index
-            output_start_idx = len(input_ids) + num_images_in_input * (self.image_token_num_per_image - 1)
-            output_start_indices.append(output_start_idx)
+            counts = torch.where(
+                mask,
+                torch.full_like(input_ids, k),
+                torch.ones_like(input_ids),
+            )
 
-            # expand sequence
-            mask = (input_ids == self.processor.image_id)
-            counts = torch.where(mask, self.image_token_num_per_image, 1)
-            expanded_len = counts.sum().item()
+            expanded_seq = input_ids.repeat_interleave(counts)
 
-            expanded_seq = torch.empty(expanded_len, dtype=torch.long, device=self.device)
-            all_image_positions = []
-
-            pos = 0
-            for i, token in enumerate(input_ids):
-                if token == self.processor.image_id:
-                    all_image_positions.append(pos)
-                    expanded_seq[pos:pos + self.image_token_num_per_image] = self.processor.image_id
-                    pos += self.image_token_num_per_image
-                else:
-                    expanded_seq[pos] = token
-                    pos += 1
+            starts = counts.cumsum(0) - counts
+            img_starts = starts[mask].tolist()
+            tmp_img_starts.append(img_starts)
 
             processed_sequences.append(expanded_seq)
-            all_image_start_indices.append(all_image_positions)
+            lengths.append(expanded_seq.numel())
             images_to_batch.append(images)
 
-        # padding
-        batched_total_ids = torch.stack(processed_sequences, dim=0)
-        batched_attention_mask = torch.where(batched_total_ids == self.processor.pad_id, 0, 1)
+        # 2) left padding + shift 보정
+        max_len = max(lengths)
+        B = len(processed_sequences)
 
+        batched_total_ids = torch.full((B, max_len), pad_id, dtype=torch.long, device=self.device)
+
+        for i, seq in enumerate(processed_sequences):
+            length = seq.numel()
+            shift = max_len - length
+            batched_total_ids[i, shift:] = seq
+
+            shifted_output_start_indices.append(tmp_output_start[i] + shift)
+            shifted_all_image_start_indices.append([p + shift for p in tmp_img_starts[i]])
+
+        batched_attention_mask = (batched_total_ids != pad_id).to(dtype=torch.long)
         images_to_batch = torch.cat(images_to_batch, dim=0)
 
-        return batched_total_ids, batched_attention_mask, output_start_indices, all_image_start_indices, images_to_batch
+        return batched_total_ids, batched_attention_mask, shifted_output_start_indices, shifted_all_image_start_indices, images_to_batch
 
     def merge_text_and_image_embeds(self, text_embeds: torch.Tensor, image_embeds: torch.Tensor, all_image_start_indices: List[List[int]]):
 
