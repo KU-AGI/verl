@@ -492,18 +492,18 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 self.processed_sample_count += 1
                 return
         
-        if self.config.algorithm.atleast_one_reflection.enable:
-            response_str_list = [self.tokenizer.decode(output.response_ids) for output in agent_loop_output_list]
-            # if any of response_str_list does not contain <REFLECTION>, drop it
-            if not any("<REFLECTION>" in s for s in response_str_list):
-                # print(
-                #     f"[FullyAsyncRollouter] Warning: Generated a sample without reflection. Task: {task} "
-                #     f"responses: {response_str_list}"
-                # )
-                # Do not use this sample: drop it and return early without enqueuing
-                self.dropped_stale_samples += 1
-                self.processed_sample_count += 1
-                return
+        # if self.config.algorithm.atleast_one_reflection.enable:
+        #     response_str_list = [self.tokenizer.decode(output.response_ids) for output in agent_loop_output_list]
+        #     # if any of response_str_list does not contain <REFLECTION>, drop it
+        #     if not any("<REFLECTION>" in s for s in response_str_list):
+        #         # print(
+        #         #     f"[FullyAsyncRollouter] Warning: Generated a sample without reflection. Task: {task} "
+        #         #     f"responses: {response_str_list}"
+        #         # )
+        #         # Do not use this sample: drop it and return early without enqueuing
+        #         self.dropped_stale_samples += 1
+        #         self.processed_sample_count += 1
+        #         return
 
         self.staleness_samples += 1
         is_cancel = False

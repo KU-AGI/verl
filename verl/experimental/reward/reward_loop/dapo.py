@@ -57,7 +57,7 @@ class DAPORewardLoopManager(RewardLoopManagerBase):
         extra_info = data_item.non_tensor_batch.get("extra_info", {})
 
         response_str = await self.loop.run_in_executor(
-            None, lambda: self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
+            None, lambda: self.tokenizer.decode(valid_response_ids, skip_special_tokens=False).replace("<|endoftext|>", "")
         )
         if self.is_async_reward_score:
             result = await self.compute_score(

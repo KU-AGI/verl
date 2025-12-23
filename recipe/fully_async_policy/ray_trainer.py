@@ -661,77 +661,110 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             scores_not_all_same = not scores_all_same
 
             if task == "forward":
-                step4_accs = batch.non_tensor_batch[f'{task}/step4/has_reactive_atoms_smiles'][uid_inds]
-                step5_accs = batch.non_tensor_batch[f'{task}/step5/has_reactive_atom_bonds'][uid_inds]
-                step6_accs = batch.non_tensor_batch[f'{task}/step6/has_tagged_smiles'][uid_inds]
+                accs_1 = batch.non_tensor_batch[f'{task}/correct_molecular_role'][uid_inds]
+                accs_2 = batch.non_tensor_batch[f'{task}/correct_precursor_stat'][uid_inds]
+                accs_3 = batch.non_tensor_batch[f'{task}/correct_reactant_funcgroup'][uid_inds]
+                accs_4 = batch.non_tensor_batch[f'{task}/correct_template'][uid_inds]
 
-                step4_exact_k = any(step4_accs)
-                step5_exact_k = any(step5_accs)
-                step6_exact_k = any(step6_accs)
-                step4_exact_all = all(step4_accs)
-                step5_exact_all = all(step5_accs)
-                step6_exact_all = all(step6_accs)
-                step4_all_same = all(a == step4_accs[0] for a in step4_accs)
-                step5_all_same = all(a == step5_accs[0] for a in step5_accs)
-                step6_all_same = all(a == step6_accs[0] for a in step6_accs)
-                step4_not_all_same = not step4_all_same
-                step5_not_all_same = not step5_all_same
-                step6_not_all_same = not step6_all_same
-                step4_not_exact_all = all(not a for a in step4_accs)
-                step5_not_exact_all = all(not a for a in step5_accs)
-                step6_not_exact_all = all(not a for a in step6_accs)
+                exact_k_1 = any(accs_1)
+                exact_k_2 = any(accs_2)
+                exact_k_3 = any(accs_3)
+                exact_k_4 = any(accs_4)
+                exact_all_1 = all(accs_1)
+                exact_all_2 = all(accs_2)
+                exact_all_3 = all(accs_3)
+                exact_all_4 = all(accs_4)
+                all_same_1 = all(a == accs_1[0] for a in accs_1)
+                all_same_2 = all(a == accs_2[0] for a in accs_2)
+                all_same_3 = all(a == accs_3[0] for a in accs_3)
+                all_same_4 = all(a == accs_4[0] for a in accs_4)
+                not_all_same_1 = not all_same_1
+                not_all_same_2 = not all_same_2
+                not_all_same_3 = not all_same_3
+                not_all_same_4 = not all_same_4
+                not_exact_all_1 = all(not a for a in accs_1)
+                not_exact_all_2 = all(not a for a in accs_2)
+                not_exact_all_3 = all(not a for a in accs_3)
+                not_exact_all_4 = all(not a for a in accs_4)
 
-                task_group_metrics[f"group_metrics/{task}/step4/exact_k"].append(step4_exact_k)
-                task_group_metrics[f"group_metrics/{task}/step4/exact_all"].append(step4_exact_all)
-                task_group_metrics[f"group_metrics/{task}/step4/all_same"].append(step4_all_same)
-                task_group_metrics[f"group_metrics/{task}/step4/not_all_same"].append(step4_not_all_same)
-                task_group_metrics[f"group_metrics/{task}/step4/not_exact_all"].append(step4_not_exact_all)
-                task_group_metrics[f"group_metrics/{task}/step5/exact_k"].append(step5_exact_k)
-                task_group_metrics[f"group_metrics/{task}/step5/exact_all"].append(step5_exact_all)
-                task_group_metrics[f"group_metrics/{task}/step5/all_same"].append(step5_all_same)
-                task_group_metrics[f"group_metrics/{task}/step5/not_all_same"].append(step5_not_all_same)
-                task_group_metrics[f"group_metrics/{task}/step5/not_exact_all"].append(step5_not_exact_all)
-                task_group_metrics[f"group_metrics/{task}/step6/exact_k"].append(step6_exact_k)
-                task_group_metrics[f"group_metrics/{task}/step6/exact_all"].append(step6_exact_all)
-                task_group_metrics[f"group_metrics/{task}/step6/all_same"].append(step6_all_same)
-                task_group_metrics[f"group_metrics/{task}/step6/not_all_same"].append(step6_not_all_same)
-                task_group_metrics[f"group_metrics/{task}/step6/not_exact_all"].append(step6_not_exact_all)
+                task_group_metrics[f"group_metrics/{task}/correct_molecular_role/exact_k"].append(exact_k_1)
+                task_group_metrics[f"group_metrics/{task}/correct_molecular_role/exact_all"].append(exact_all_1)
+                task_group_metrics[f"group_metrics/{task}/correct_molecular_role/all_same"].append(all_same_1)
+                task_group_metrics[f"group_metrics/{task}/correct_molecular_role/not_all_same"].append(not_all_same_1)
+                task_group_metrics[f"group_metrics/{task}/correct_molecular_role/not_exact_all"].append(not_exact_all_1)
+                task_group_metrics[f"group_metrics/{task}/correct_precursor_stat/exact_k"].append(exact_k_2)
+                task_group_metrics[f"group_metrics/{task}/correct_precursor_stat/exact_all"].append(exact_all_2)
+                task_group_metrics[f"group_metrics/{task}/correct_precursor_stat/all_same"].append(all_same_2)
+                task_group_metrics[f"group_metrics/{task}/correct_precursor_stat/not_all_same"].append(not_all_same_2)
+                task_group_metrics[f"group_metrics/{task}/correct_precursor_stat/not_exact_all"].append(not_exact_all_2)
+                task_group_metrics[f"group_metrics/{task}/correct_reactant_funcgroup/exact_k"].append(exact_k_3)
+                task_group_metrics[f"group_metrics/{task}/correct_reactant_funcgroup/exact_all"].append(exact_all_3)
+                task_group_metrics[f"group_metrics/{task}/correct_reactant_funcgroup/all_same"].append(all_same_3)
+                task_group_metrics[f"group_metrics/{task}/correct_reactant_funcgroup/not_all_same"].append(not_all_same_3)
+                task_group_metrics[f"group_metrics/{task}/correct_reactant_funcgroup/not_exact_all"].append(not_exact_all_3)
+                task_group_metrics[f"group_metrics/{task}/correct_template/exact_k"].append(exact_k_4)
+                task_group_metrics[f"group_metrics/{task}/correct_template/exact_all"].append(exact_all_4)
+                task_group_metrics[f"group_metrics/{task}/correct_template/all_same"].append(all_same_4)
+                task_group_metrics[f"group_metrics/{task}/correct_template/not_all_same"].append(not_all_same_4)
+                task_group_metrics[f"group_metrics/{task}/correct_template/not_exact_all"].append(not_exact_all_4)
             elif task == "retro":
-                step5_accs = batch.non_tensor_batch[f'{task}/step5/has_bond_disconnection'][uid_inds]
-                step6_accs = batch.non_tensor_batch[f'{task}/step6/has_synthons'][uid_inds]
-                step7_accs = batch.non_tensor_batch[f'{task}/step7/has_synthetic_equivalents'][uid_inds]
+                accs_1 = batch.non_tensor_batch[f'{task}/correct_product_funcgroup'][uid_inds]
+                accs_2 = batch.non_tensor_batch[f'{task}/correct_product_stat'][uid_inds]
+                accs_3 = batch.non_tensor_batch[f'{task}/correct_bond_disconnect'][uid_inds]
+                accs_4 = batch.non_tensor_batch[f'{task}/correct_synthon'][uid_inds]
+                accs_5 = batch.non_tensor_batch[f'{task}/correct_synthetic_equivalent'][uid_inds]
 
-                step5_exact_k = any(step5_accs)
-                step6_exact_k = any(step6_accs)
-                step7_exact_k = any(step7_accs)
-                step5_exact_all = all(step5_accs)
-                step6_exact_all = all(step6_accs)
-                step7_exact_all = all(step7_accs)
-                step5_all_same = all(a == step5_accs[0] for a in step5_accs)
-                step6_all_same = all(a == step6_accs[0] for a in step6_accs)
-                step7_all_same = all(a == step7_accs[0] for a in step7_accs)
-                step5_not_all_same = not step5_all_same
-                step6_not_all_same = not step6_all_same
-                step7_not_all_same = not step7_all_same
-                step5_not_exact_all = all(not a for a in step5_accs)
-                step6_not_exact_all = all(not a for a in step6_accs)
-                step7_not_exact_all = all(not a for a in step7_accs)
+                exact_k_1 = any(accs_1)
+                exact_k_2 = any(accs_2)
+                exact_k_3 = any(accs_3)
+                exact_k_4 = any(accs_4)
+                exact_k_5 = any(accs_5)
+                exact_all_1 = all(accs_1)
+                exact_all_2 = all(accs_2)
+                exact_all_3 = all(accs_3)
+                exact_all_4 = all(accs_4)
+                exact_all_5 = all(accs_5)
+                all_same_1 = all(a == accs_1[0] for a in accs_1)
+                all_same_2 = all(a == accs_2[0] for a in accs_2)
+                all_same_3 = all(a == accs_3[0] for a in accs_3)
+                all_same_4 = all(a == accs_4[0] for a in accs_4)
+                all_same_5 = all(a == accs_5[0] for a in accs_5)
+                not_all_same_1 = not all_same_1
+                not_all_same_2 = not all_same_2
+                not_all_same_3 = not all_same_3
+                not_all_same_4 = not all_same_4
+                not_all_same_5 = not all_same_5
+                not_exact_all_1 = all(not a for a in accs_1)
+                not_exact_all_2 = all(not a for a in accs_2)
+                not_exact_all_3 = all(not a for a in accs_3)
+                not_exact_all_4 = all(not a for a in accs_4)
+                not_exact_all_5 = all(not a for a in accs_5)
+                task_group_metrics[f"group_metrics/{task}/correct_product_funcgroup/exact_k"].append(exact_k_1)
+                task_group_metrics[f"group_metrics/{task}/correct_product_funcgroup/exact_all"].append(exact_all_1)
+                task_group_metrics[f"group_metrics/{task}/correct_product_funcgroup/all_same"].append(all_same_1)
+                task_group_metrics[f"group_metrics/{task}/correct_product_funcgroup/not_all_same"].append(not_all_same_1)
+                task_group_metrics[f"group_metrics/{task}/correct_product_funcgroup/not_exact_all"].append(not_exact_all_1)
+                task_group_metrics[f"group_metrics/{task}/correct_product_stat/exact_k"].append(exact_k_2)
+                task_group_metrics[f"group_metrics/{task}/correct_product_stat/exact_all"].append(exact_all_2)
+                task_group_metrics[f"group_metrics/{task}/correct_product_stat/all_same"].append(all_same_2)
+                task_group_metrics[f"group_metrics/{task}/correct_product_stat/not_all_same"].append(not_all_same_2)
+                task_group_metrics[f"group_metrics/{task}/correct_product_stat/not_exact_all"].append(not_exact_all_2)
+                task_group_metrics[f"group_metrics/{task}/correct_bond_disconnect/exact_k"].append(exact_k_3)
+                task_group_metrics[f"group_metrics/{task}/correct_bond_disconnect/exact_all"].append(exact_all_3)
+                task_group_metrics[f"group_metrics/{task}/correct_bond_disconnect/all_same"].append(all_same_3)
+                task_group_metrics[f"group_metrics/{task}/correct_bond_disconnect/not_all_same"].append(not_all_same_3)
+                task_group_metrics[f"group_metrics/{task}/correct_bond_disconnect/not_exact_all"].append(not_exact_all_3)
+                task_group_metrics[f"group_metrics/{task}/correct_synthon/exact_k"].append(exact_k_4)
+                task_group_metrics[f"group_metrics/{task}/correct_synthon/exact_all"].append(exact_all_4)
+                task_group_metrics[f"group_metrics/{task}/correct_synthon/all_same"].append(all_same_4)
+                task_group_metrics[f"group_metrics/{task}/correct_synthon/not_all_same"].append(not_all_same_4)
+                task_group_metrics[f"group_metrics/{task}/correct_synthon/not_exact_all"].append(not_exact_all_4)
+                task_group_metrics[f"group_metrics/{task}/correct_synthetic_equivalent/exact_k"].append(exact_k_5)
+                task_group_metrics[f"group_metrics/{task}/correct_synthetic_equivalent/exact_all"].append(exact_all_5)
+                task_group_metrics[f"group_metrics/{task}/correct_synthetic_equivalent/all_same"].append(all_same_5)
+                task_group_metrics[f"group_metrics/{task}/correct_synthetic_equivalent/not_all_same"].append(not_all_same_5)
+                task_group_metrics[f"group_metrics/{task}/correct_synthetic_equivalent/not_exact_all"].append(not_exact_all_5)
 
-                task_group_metrics[f"group_metrics/{task}/step5/exact_k"].append(step5_exact_k)
-                task_group_metrics[f"group_metrics/{task}/step5/exact_all"].append(step5_exact_all)
-                task_group_metrics[f"group_metrics/{task}/step5/all_same"].append(step5_all_same)
-                task_group_metrics[f"group_metrics/{task}/step5/not_all_same"].append(step5_not_all_same)
-                task_group_metrics[f"group_metrics/{task}/step5/not_exact_all"].append(step5_not_exact_all)
-                task_group_metrics[f"group_metrics/{task}/step6/exact_k"].append(step6_exact_k)
-                task_group_metrics[f"group_metrics/{task}/step6/exact_all"].append(step6_exact_all)
-                task_group_metrics[f"group_metrics/{task}/step6/all_same"].append(step6_all_same)
-                task_group_metrics[f"group_metrics/{task}/step6/not_all_same"].append(step6_not_all_same)
-                task_group_metrics[f"group_metrics/{task}/step6/not_exact_all"].append(step6_not_exact_all)
-                task_group_metrics[f"group_metrics/{task}/step7/exact_k"].append(step7_exact_k)
-                task_group_metrics[f"group_metrics/{task}/step7/exact_all"].append(step7_exact_all)
-                task_group_metrics[f"group_metrics/{task}/step7/all_same"].append(step7_all_same)
-                task_group_metrics[f"group_metrics/{task}/step7/not_all_same"].append(step7_not_all_same)
-                task_group_metrics[f"group_metrics/{task}/step7/not_exact_all"].append(step7_not_exact_all)
             elif task == "reagent":
                 step6_accs = batch.non_tensor_batch[f'{task}/step6/has_reagents'][uid_inds]
                 step7_accs = batch.non_tensor_batch[f'{task}/step7/has_correct_reagent_number'][uid_inds]

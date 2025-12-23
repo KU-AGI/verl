@@ -587,14 +587,15 @@ class AgentLoopWorkerBase:
         ##############################################################################
         
         reward_extra_keys = [
-            "forward/step4/has_reactive_atoms_smiles",
-            "forward/step5/has_reactive_atom_bonds",
-            "forward/step6/has_tagged_smiles",
-            "retro/step5/has_bond_disconnection",
-            "retro/step6/has_synthons",
-            "retro/step7/has_synthetic_equivalents",
-            "reagent/step6/has_reagents",
-            "reagent/step7/has_correct_reagent_number"
+            "forward/correct_molecular_role",
+            "forward/correct_precursor_stat",
+            "forward/correct_reactant_funcgroup",
+            "forward/correct_template",
+            "retro/correct_product_funcgroup",
+            "retro/correct_product_stat",
+            "retro/correct_bond_disconnect",
+            "retro/correct_synthon",
+            "retro/correct_synthetic_equivalent",
         ]
         for key in reward_extra_keys:
             for info in reward_extra_infos:

@@ -13,7 +13,7 @@
 # limitations under the License.
 # Adapted from https://github.com/EleutherAI/lm-evaluation-harness/blob/main/lm_eval/tasks/hendrycks_math/utils.py
 
-import re
+import re, json, ast
 from typing import Optional, Dict, Any, Tuple, Set, List, Union
 from dataclasses import dataclass, field
 from abc import ABC, abstractmethod
@@ -21,6 +21,7 @@ from enum import Enum
 from rdkit import Chem, RDLogger
 from collections import defaultdict
 from pprint import pprint
+from nltk.translate.bleu_score import corpus_bleu
 
 RDLogger.DisableLog('rdApp.*')
 
@@ -420,7 +421,7 @@ class TaskEvaluator:
         return metrics
 
 
-class StepEvaluator():
+class StepEvaluatorV10():
     def __init__(self):
         pass
 
@@ -962,6 +963,378 @@ class StepEvaluator():
         }, reflection_bonus, content_reward_dict, reflection_decision_reward_dict
 
 
+
+class StepEvaluator():
+    def __init__(self):
+        pass
+
+    def parse_reactant_reagent_in_forward(self, input_str):
+        """
+        Parses a string of the format "... reactant XX ... reagent YY" and extracts XX and YY.
+
+        Returns:
+            (reactant, reagent): tuple of strings, or (None, None) if not found.
+        """
+        reactant_match = re.search(r"reactant\s+([^\s]+)", input_str, re.IGNORECASE)
+        reagent_match = re.search(r"reagent\s+([^\s]+)", input_str, re.IGNORECASE)
+        reactant = reactant_match.group(1) if reactant_match else None
+        reagent = reagent_match.group(1) if reagent_match else None
+        
+        reactant = reactant.replace(",", "") if reactant else None
+        reagent = reagent.replace(",", "") if reagent else None
+        reactant = reactant.replace("`", "") if reactant else None
+        reagent = reagent.replace("`", "") if reagent else None
+        reactant = reactant.replace("**", "") if reactant else None
+        reagent = reagent.replace("**", "") if reagent else None
+        reactant = reactant.replace("<", "") if reactant else None
+        reagent = reagent.replace(">", "") if reagent else None
+        reactant = reactant.replace("*", "") if reactant else None
+        reagent = reagent.replace("*", "") if reagent else None
+
+        reactant = reactant.strip(".") if reactant else None
+        reagent = reagent.strip(".") if reagent else None
+        return reactant, reagent
+
+
+    def parse_reactant_product_in_reagent(self, input_str):
+        """
+        Parses a string of the format "... reactant is XX ... product is YY" and extracts XX and YY.
+
+        Returns:
+            (reactant, product): tuple of strings, or (None, None) if not found.
+        """
+        reactant_match = re.search(r"reactant\s+is\s+([^\s]+)", input_str, re.IGNORECASE)
+        product_match = re.search(r"product\s+is\s+([^\s]+)", input_str, re.IGNORECASE)
+        reactant = reactant_match.group(1) if reactant_match else None
+        product = product_match.group(1) if product_match else None
+        
+        reactant = reactant.replace(",", "") if reactant else None
+        product = product.replace(",", "") if product else None
+        reactant = reactant.replace("`", "") if reactant else None
+        product = product.replace("`", "") if product else None
+        reactant = reactant.replace("**", "") if reactant else None
+        product = product.replace("**", "") if product else None
+        reactant = reactant.replace("<", "") if reactant else None
+        product = product.replace(">", "") if product else None
+        reactant = reactant.replace("*", "") if reactant else None
+        product = product.replace("*", "") if product else None
+
+        reactant = reactant.strip(".") if reactant else None
+        product = product.strip(".") if product else None
+        return reactant, product
+
+
+    def extract_numbered_items(self, text: str) -> list:
+        pattern = re.compile(r"^\s*\d+\.\s*(.+)$", re.MULTILINE)
+        items = pattern.findall(text)
+        return [item.strip().strip('`') for item in items]
+
+
+    def _exact_match(self, ot_smi, gt_smi):
+        if ot_smi == "" and gt_smi == "":
+            return 1
+        m_out = Chem.MolFromSmiles(ot_smi)
+        m_gt = Chem.MolFromSmiles(gt_smi)
+
+        try:
+            if Chem.MolToInchi(m_out) == Chem.MolToInchi(m_gt):
+                return 1
+        except:
+            pass
+        return 0
+
+
+    def extract_json_in_tags(self, rationale: str, tag: str) -> str:
+        match = re.search(fr"<{tag}>(.*?)</{tag}>", rationale, re.DOTALL)
+        if match:
+            try:
+                json_str = match.group(1).strip()
+                json_dict = json.loads(json_str)
+            except:
+                json_dict = {}
+        else:
+            json_dict = {}
+        return json_dict
+
+
+    def calcualte_forward_rationale_metrics(self, info, GT_rationale, predicted_rationale):
+        molecular_role_dict = self.extract_json_in_tags(predicted_rationale, "MOLECULAR_ROLE")
+        precursor_stat_dict = self.extract_json_in_tags(predicted_rationale, "PRECURSOR_STAT")
+        reactant_funcgroup_dict = self.extract_json_in_tags(predicted_rationale, "REACTANT_FUNCGROUP")
+        template_dict = self.extract_json_in_tags(predicted_rationale, "TEMPLATE")
+
+
+        # Metric 1: Molecular role
+        try:
+            gt_molecular_role_dict = {
+                "reactant": info["reactant_str"],
+                "reagent": info["reagent_str"],
+                "solvent": info["solvent_str"],
+            }
+            correct_molecular_role = True
+            for molecule_type, gt_smiles in gt_molecular_role_dict.items():
+                pred_smiles = molecular_role_dict.get(molecule_type, "")
+                if not self._exact_match(pred_smiles, gt_smiles):
+                    correct_molecular_role = False
+                    break
+        except:
+            correct_molecular_role = False
+
+
+        # Metric 2: Precursor statistics
+        try:
+            gt_precursor_stat_dict = info["precursor_with_solvent_smiles_stat"]
+            correct_precursor_stat = True
+            for key, gt_value in gt_precursor_stat_dict.items():
+                pred_value = precursor_stat_dict.get(key, None)
+                if pred_value != gt_value:
+                    correct_precursor_stat = False
+                    break
+            if set(gt_precursor_stat_dict.keys()) != set(precursor_stat_dict.keys()):
+                correct_precursor_stat = False
+        except:
+            correct_precursor_stat = False
+
+
+        # Metric 3: Reactant functional groups
+        try:
+            gt_reactant_funcgroup_dict = info["reactant_funcgroup_and_count"]
+            correct_reactant_funcgroup = True
+            for funcgroup, gt_count in gt_reactant_funcgroup_dict.items():
+                pred_count = reactant_funcgroup_dict.get(funcgroup, None)
+                if pred_count != gt_count:
+                    correct_reactant_funcgroup = False
+                    break
+            if set(gt_reactant_funcgroup_dict.keys()) != set(reactant_funcgroup_dict.keys()):
+                correct_reactant_funcgroup = False
+        except:
+            correct_reactant_funcgroup = False
+
+        # Metric 4: Template
+        try:
+            gt_template = info["template"]
+            if template_dict['template'] == gt_template:
+                correct_template = True
+            else:
+                correct_template = False
+        except:
+            correct_template = False
+
+        return {
+            "forward/correct_molecular_role": int(correct_molecular_role),
+            "forward/correct_precursor_stat": int(correct_precursor_stat),
+            "forward/correct_reactant_funcgroup": int(correct_reactant_funcgroup),
+            "forward/correct_template": int(correct_template),            
+        }
+
+
+    def calcualte_retro_rationale_metrics(self, info, GT_rationale, predicted_rationale):
+        product_funcgroup_dict = self.extract_json_in_tags(predicted_rationale, "PRODUCT_FUNCGROUP")
+        product_stat_dict = self.extract_json_in_tags(predicted_rationale, "PRODUCT_STAT")
+        bond_disconnect_list = self.extract_json_in_tags(predicted_rationale, "BOND_DISCONNECT")
+        synthon_list = self.extract_json_in_tags(predicted_rationale, "SYNTHON")
+        synthon_list_new = self.extract_json_in_tags(predicted_rationale, "SYNTHON_GROUP")
+        synthetic_equivalent_list = self.extract_json_in_tags(predicted_rationale, "SYNTHETIC_EQUIVALENT")
+        if len(synthon_list_new) > 0:
+            synthon_list = synthon_list_new
+
+        # Metric 1: Product functional groups
+        try:
+            gt_product_funcgroup_dict = info["bond_funcgroup_and_count"]
+            correct_product_funcgroup = True
+            for funcgroup, gt_count in gt_product_funcgroup_dict.items():
+                pred_count = product_funcgroup_dict.get(funcgroup, None)
+                if pred_count != gt_count:
+                    correct_product_funcgroup = False
+                    break
+            if set(gt_product_funcgroup_dict.keys()) != set(product_funcgroup_dict.keys()):
+                correct_product_funcgroup = False
+        except:
+            correct_product_funcgroup = False
+
+        # Metric 2: Product statistics
+        try:
+            gt_product_stat_dict = info["product_smiles_stat"]
+            correct_product_stat = True
+            for key, gt_value in gt_product_stat_dict.items():
+                pred_value = product_stat_dict.get(key, None)
+                if pred_value != gt_value:
+                    correct_product_stat = False
+                    break
+            if set(gt_product_stat_dict.keys()) != set(product_stat_dict.keys()):
+                correct_product_stat = False
+        except:
+            correct_product_stat = False
+
+        # Metric 3: Bond disconnection
+        try:
+            gt_bond_disconnect_list = info['bond_list'] # [[1, 2, "Double"], [3, 4, "Single"], ...]
+            gt_bond_disconnect_list = [tuple(bond) for bond in gt_bond_disconnect_list]
+            pred_bond_disconnect_list = []
+            for bond in bond_disconnect_list:
+                bond_tuple = tuple(bond)
+                pred_bond_disconnect_list.append(bond_tuple)
+            correct_bond_disconnect = set(gt_bond_disconnect_list) == set(pred_bond_disconnect_list)
+        except:
+            correct_bond_disconnect = False
+
+        # Metric 4: Synthons
+        try:
+            gt_synthons_list = info['synthons_list_new']
+            correct_synthon = set(gt_synthons_list) == set(synthon_list)
+        except:
+            correct_synthon = False
+
+        # Metric 5: Synthetic equivalents
+        try:
+            gt_synthetic_equivalent_list = info['synthetic_equivalents_list']
+            correct_synthetic_equivalent = set(gt_synthetic_equivalent_list) == set(synthetic_equivalent_list)
+        except:
+            correct_synthetic_equivalent = False
+        return {
+            "retro/correct_product_funcgroup": int(correct_product_funcgroup),
+            "retro/correct_product_stat": int(correct_product_stat),
+            "retro/correct_bond_disconnect": int(correct_bond_disconnect),
+            "retro/correct_synthon": int(correct_synthon),
+            "retro/correct_synthetic_equivalent": int(correct_synthetic_equivalent),
+        }
+
+
+    def calcualte_condition_rationale_metrics(self, info, GT_rationale, predicted_rationale):
+        reactant_removed_funcgroup_dict = self.extract_json_in_tags(predicted_rationale, "REACTANT_REMOVED_FUNCGROUP")
+        product_added_funcgroup_dict = self.extract_json_in_tags(predicted_rationale, "PRODUCT_ADDED_FUNCGROUP")
+        reactant_stat_dict = self.extract_json_in_tags(predicted_rationale, "REACTANT_STAT")
+        product_stat_dict = self.extract_json_in_tags(predicted_rationale, "PRODUCT_STAT")
+        condition_dict = self.extract_json_in_tags(predicted_rationale, "CONDITION")
+
+        # Metric 1: Reactant removed functional groups
+        try:
+            gt_reactant_removed_funcgroup_dict = info["disappeared_from_reactant_to_product_funcgroup_and_count"]
+            correct_reactant_removed_funcgroup = True
+            for funcgroup, gt_count in gt_reactant_removed_funcgroup_dict.items():
+                pred_count = reactant_removed_funcgroup_dict.get(funcgroup, None)
+                if pred_count != gt_count:
+                    correct_reactant_removed_funcgroup = False
+                    break
+            if set(gt_reactant_removed_funcgroup_dict.keys()) != set(reactant_removed_funcgroup_dict.keys()):
+                correct_reactant_removed_funcgroup = False
+        except:
+            correct_reactant_removed_funcgroup = False
+
+        # Metric 2: Product added functional groups
+        try:
+            gt_product_added_funcgroup_dict = info["new_from_reactant_to_product_funcgroup_and_count"]
+            correct_product_added_funcgroup = True
+            for funcgroup, gt_count in gt_product_added_funcgroup_dict.items():
+                pred_count = product_added_funcgroup_dict.get(funcgroup, None)
+                if pred_count != gt_count:
+                    correct_product_added_funcgroup = False
+                    break
+            if set(gt_product_added_funcgroup_dict.keys()) != set(product_added_funcgroup_dict.keys()):
+                correct_product_added_funcgroup = False
+        except:
+            correct_product_added_funcgroup = False
+
+        # Metric 3: Reactant statistics
+        try:
+            gt_reactant_stat_dict = info["reactant_smiles_stat"]
+            correct_reactant_stat = True
+            for key, gt_value in gt_reactant_stat_dict.items():
+                pred_value = reactant_stat_dict.get(key, None)
+                if pred_value != gt_value:
+                    correct_reactant_stat = False
+                    break
+            if set(gt_reactant_stat_dict.keys()) != set(reactant_stat_dict.keys()):
+                correct_reactant_stat = False
+        except:
+            correct_reactant_stat = False
+
+        # Metric 4: Product statistics
+        try:
+            gt_product_stat_dict = info["product_smiles_stat"]
+            correct_product_stat = True
+            for key, gt_value in gt_product_stat_dict.items():
+                pred_value = product_stat_dict.get(key, None)
+                if pred_value != gt_value:
+                    correct_product_stat = False
+                    break
+            if set(gt_product_stat_dict.keys()) != set(product_stat_dict.keys()):
+                correct_product_stat = False
+        except:
+            correct_product_stat = False
+
+        # Metric 5: Step 2 rationale BLEU score
+        try:
+            step2_match = re.search(r"##\s*Step\s*2\b(.*?)##\s*Step\s*3\b", predicted_rationale, re.DOTALL)
+            predicted_step2_rationale = step2_match.group(1).strip() if step2_match else ""
+            step2_match = re.search(r"##\s*Step\s*2\b(.*?)##\s*Step\s*3\b", GT_rationale, re.DOTALL)
+            GT_step2_rationale = step2_match.group(1).strip() if step2_match else ""        
+            step2_bleu = corpus_bleu([[GT_step2_rationale.split()]], [predicted_step2_rationale.split()])
+        except:
+            step2_bleu = 0.0
+
+        # Metric 6: Condition
+        try:
+            gt_condition_dict = {
+                "reagents": info["reagent_str"],
+                "solvents": info["solvent_str"],
+            }
+            correct_condition = True
+            for key, gt_value in gt_condition_dict.items():
+                pred_value = condition_dict.get(key, "")
+                if not self._exact_match(pred_value, gt_value):
+                    correct_condition = False
+                    break
+        except:
+            correct_condition = False
+
+        return {
+            "correct_reactant_removed_funcgroup": int(correct_reactant_removed_funcgroup),
+            "correct_product_added_funcgroup": int(correct_product_added_funcgroup),
+            "correct_reactant_stat": int(correct_reactant_stat),
+            "correct_product_stat": int(correct_product_stat),
+            "step2_bleu": step2_bleu,
+            "correct_condition": int(correct_condition),
+        }
+
+    def evaluate(self, info_list, GT_rationale_list, predicted_reasoning_list, task):
+        if "forward" in task:
+            forward_metrics_dict = defaultdict(list)
+            for info, GT_rationale, predicted_reasoning in zip(info_list, GT_rationale_list, predicted_reasoning_list):
+                forward_metrics = self.calcualte_forward_rationale_metrics(info, GT_rationale, predicted_reasoning)
+                for key, value in forward_metrics.items():
+                    forward_metrics_dict[key].append(value)
+            metric_dict = {}
+            for key, values in forward_metrics_dict.items():
+                metric_dict[key] = sum(values) / len(values) if values else 0.0
+            return metric_dict
+
+        elif "retro" in task:
+            retro_metrics_dict = defaultdict(list)
+            for info, GT_rationale, predicted_reasoning in zip(info_list, GT_rationale_list, predicted_reasoning_list):
+                retro_metrics = self.calcualte_retro_rationale_metrics(info, GT_rationale, predicted_reasoning)
+                for key, value in retro_metrics.items():
+                    retro_metrics_dict[key].append(value)
+            metric_dict = {}
+            for key, values in retro_metrics_dict.items():
+                metric_dict[key] = sum(values) / len(values) if values else 0.0
+            return metric_dict
+
+        elif "condition" in task:
+            condition_metrics_dict = defaultdict(list)
+            for info, GT_rationale, predicted_reasoning in zip(info_list, GT_rationale_list, predicted_reasoning_list):
+                condition_metrics = self.calcualte_condition_rationale_metrics(info, GT_rationale, predicted_reasoning)
+                for key, value in condition_metrics.items():
+                    condition_metrics_dict[key].append(value)
+            metric_dict = {}
+            for key, values in condition_metrics_dict.items():
+                metric_dict[key] = sum(values) / len(values) if values else 0.0
+            return metric_dict
+
+
+
+
+
 class ChemistryEvaluator:
     """Main evaluation interface."""
     
@@ -1056,6 +1429,21 @@ class ChemistryEvaluator:
 
         return True
 
+    def parse_raw_response(self, raw_response: str):
+        """
+        Parse the raw response from the model to extract reasoning steps and SMILES.
+        raw_response format:
+        <think>{reasoning steps}</think>\n\n<ANSWER>{SMILES}</ANSWER>
+        """
+        reasoning_pattern = r"<think>(.*?)</think>"
+        smiles_pattern = r"<ANSWER>(.*?)</ANSWER>"
+
+        reasoning_match = re.search(reasoning_pattern, raw_response, re.DOTALL)
+        smiles_match = re.search(smiles_pattern, raw_response, re.DOTALL)
+
+        reasoning_steps = reasoning_match.group(1).strip() if reasoning_match else ""
+        smiles = smiles_match.group(1).strip() if smiles_match else ""
+        return reasoning_steps, smiles
 
     def compute_score(self,
                       solution_str: str,
@@ -1071,13 +1459,44 @@ class ChemistryEvaluator:
         correct_structure = self.validate_structure(solution_str, task)
         correct, pred = self.verify(solution_str, ground_truth, extra_info)
 
+        pred_rationale, pred_smiles = self.parse_raw_response(solution_str)
+        gt_rationale, gt_smiles = self.parse_raw_response(ground_truth)
+
+        info = json.loads(extra_info['info_json_str'])
+        info['products'] = extra_info['products']
+        info['reactants'] = extra_info['reactants']
+
+        if task == "forward":
+            info['precursor_with_solvent_smiles_stat'] = ast.literal_eval(info['precursor_with_solvent_smiles_stat'])
+            info['reactant_funcgroup_and_count'] = ast.literal_eval(info['reactant_funcgroup_and_count'])
+            step_eval_results = self.step_evaluator.calcualte_forward_rationale_metrics(info, gt_rationale, pred_rationale)
+            answer_correct = self.step_evaluator._exact_match(pred_smiles, gt_smiles)
+        elif task == "retro":
+            info['bond_funcgroup_and_count'] = ast.literal_eval(info['bond_funcgroup_and_count'])
+            info['product_smiles_stat'] = ast.literal_eval(info['product_smiles_stat'])
+            info['bond_list'] = ast.literal_eval(info['bond_list'])
+            info['synthons_list_new'] = ast.literal_eval(info['synthons_list_new'])
+            info['synthetic_equivalents_list'] = ast.literal_eval(info['synthetic_equivalents_list'])
+            step_eval_results = self.step_evaluator.calcualte_retro_rationale_metrics(info, gt_rationale, pred_rationale)
+            answer_correct = self.step_evaluator._exact_match(pred_smiles, gt_smiles)
+        elif task == "condition":
+            step_eval_results = self.step_evaluator.calcualte_condition_rationale_metrics(info, gt_rationale, pred_rationale)
+        else:
+            raise ValueError(f"Unknown task type: {task}")
+
+
+        reward = answer_correct
+
+
+
+        """
         info = {
             "products": extra_info['products'],
             "reactants": extra_info['reactants'],
-            "reagents": extra_info['reagents'],
+            # "reagents": extra_info['reagents'],
         }
-        if "reagents" in extra_info["supporting_info"]['reagent']:
-            del extra_info["supporting_info"]['reagent']['reagents']
+        # if "reagents" in extra_info["supporting_info"]['reagent']:
+        #     del extra_info["supporting_info"]['reagent']['reagents']
         # extra_info["supporting_info"]['reagent']['reagent_list'] = extra_info["supporting_info"]['reagent']['reagents']
         # del extra_info["supporting_info"]['reagent']['reagents']
         info.update(extra_info["supporting_info"][task])
@@ -1109,32 +1528,34 @@ class ChemistryEvaluator:
             "step7": 0.0,
             "answer": float(correct),
         }
+        """
 
         reward_metric_dict = {
-            f"{task}/reward/answer_correct": correct,
+            f"{task}/reward/answer_correct": answer_correct,
             f"{task}/reward/valid_structure": int(correct_structure),
         }
         if not correct_structure:
             reward -= 2.0
         if use_content_reward:
-            content_reward = sum(content_reward_dict.values()) / len(content_reward_dict)
+            content_reward = sum(step_eval_results.values()) / len(step_eval_results)
             reward += content_reward
             reward_metric_dict[f"{task}/reward/content_reward"] = content_reward
-            for step_key in content_reward_dict:
-                if "step1" in step_key:
-                    step_rewards["step1"] += content_reward_dict[step_key] / len(content_reward_dict)
-                elif "step2" in step_key:
-                    step_rewards["step2"] += content_reward_dict[step_key] / len(content_reward_dict)
-                elif "step3" in step_key:
-                    step_rewards["step3"] += content_reward_dict[step_key] / len(content_reward_dict)
-                elif "step4" in step_key:
-                    step_rewards["step4"] += content_reward_dict[step_key] / len(content_reward_dict)
-                elif "step5" in step_key:
-                    step_rewards["step5"] += content_reward_dict[step_key] / len(content_reward_dict)
-                elif "step6" in step_key:
-                    step_rewards["step6"] += content_reward_dict[step_key] / len(content_reward_dict)
-                elif "step7" in step_key:
-                    step_rewards["step7"] += content_reward_dict[step_key] / len(content_reward_dict)
+            # for step_key in content_reward_dict:
+            #     if "step1" in step_key:
+            #         step_rewards["step1"] += content_reward_dict[step_key] / len(content_reward_dict)
+            #     elif "step2" in step_key:
+            #         step_rewards["step2"] += content_reward_dict[step_key] / len(content_reward_dict)
+            #     elif "step3" in step_key:
+            #         step_rewards["step3"] += content_reward_dict[step_key] / len(content_reward_dict)
+            #     elif "step4" in step_key:
+            #         step_rewards["step4"] += content_reward_dict[step_key] / len(content_reward_dict)
+            #     elif "step5" in step_key:
+            #         step_rewards["step5"] += content_reward_dict[step_key] / len(content_reward_dict)
+            #     elif "step6" in step_key:
+            #         step_rewards["step6"] += content_reward_dict[step_key] / len(content_reward_dict)
+            #     elif "step7" in step_key:
+            #         step_rewards["step7"] += content_reward_dict[step_key] / len(content_reward_dict)
+        """
         if use_decision_reward:
             decision_reward = sum(reflection_decision_reward_dict.values()) / len(reflection_decision_reward_dict)
             reward += decision_reward
@@ -1176,7 +1597,7 @@ class ChemistryEvaluator:
                 reflection_bonus_reward = 0.0
             reward += reflection_bonus_reward
             reward_metric_dict[f"{task}/reward/reflection_bonus_reward"] = reflection_bonus_reward
-
+        """
         # print("="*100)
         # print("=== predicted_rational ===\n", solution_str)
         # print("-"*100)
@@ -1203,8 +1624,8 @@ class ChemistryEvaluator:
             metrics=step_eval_results
         )
         result = result.to_dict()
-        result["step_rewards"] = step_rewards
-        result["reflection_decision_reward_dict"] = reflection_decision_reward_dict
+        # result["step_rewards"] = step_rewards
+        # result["reflection_decision_reward_dict"] = reflection_decision_reward_dict
 
         # Return dict format for compatibility with existing code
         return result
