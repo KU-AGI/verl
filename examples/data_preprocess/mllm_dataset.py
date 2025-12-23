@@ -6,13 +6,11 @@ import datasets
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--root_dir", default="/data/mllm/janus_r1_sft/data") # flow_grpo/images, reasonr1
-    parser.add_argument("--data_path", default="/data/mllm/our_dataset/train/rl_prompt/genevalpp_target_bench_49504.json")
-    parser.add_argument("--save_dir", default="/data/mllm/data")
+    parser.add_argument("--data_path", default="~/AGILAB/mllm_reasoning/data/ourdataset/train/rl_prompt/genevalpp_target_bench_49504.json")
+    parser.add_argument("--save_dir", default="~/AGILAB/mllm_reasoning/pimang62/data")
 
     args = parser.parse_args()
 
-    root_dir = args.root_dir
     data_path = args.data_path
     save_dir = args.save_dir
 
