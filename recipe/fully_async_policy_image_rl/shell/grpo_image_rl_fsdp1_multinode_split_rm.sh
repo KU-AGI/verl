@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -xeuo pipefail
+set -euo pipefail
 
 # Designate log path
 LOG_DIR=${LOG_DIR:-"logs"}
@@ -11,36 +11,35 @@ exec > >(tee -a "${SCRIPT_LOG}")
 exec 2>&1
 
 project_name='mllm_reasoning'
-exp_name='fully_async_test'
+exp_name='fully_async_kt'
 
-export NCCL_IB_GID_INDEX=0
-export NCCL_CUDA_DEVICE_MAX_CONNECTIONS=8
-export CUDA_DEVICE_MAX_CONNECTIONS=8
-export NCCL_P2P_LEVEL="NVL"
-export NCCL_NET_GDR_LEVEL=2
+# export NCCL_IB_GID_INDEX=0
+# export NCCL_CUDA_DEVICE_MAX_CONNECTIONS=8
+# export CUDA_DEVICE_MAX_CONNECTIONS=8
+# export NCCL_P2P_LEVEL="NVL"
+# export NCCL_NET_GDR_LEVEL=2
 export NCCL_SOCKET_TIMEOUT=300000
-export NCCL_IB_TIMEOUT=300
+export NCCL_IB_TIMEOUT=300000
+export export NCCL_IB_HCA=mlx5_0
 
 # export VLLM_ATTENTION_BACKEND=XFORMERS
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5
 export HYDRA_FULL_ERROR=1
-export NCCL_DEBUG=OFF
-export TORCH_DISTRIBUTED_DEBUG=DETAIL
+# export TORCH_DISTRIBUTED_DEBUG=DETAIL
 
 # Ray
 RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
 WORKING_DIR=${WORKING_DIR:-"${PWD}"}
-RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/recipe/fully_async_policy_image_rl/shell/runtime_env.yaml"}
+RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/recipe/fully_async_policy_image_rl/shell/runtime_env_kt.yaml"}
 
 # Paths
-HOME="/data"
+HOME="/home/work/AGILAB"
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
 # very important! please modify the max_position_embeddings in config.json to 32768 after downloading from huggingface
-MODEL_PATH=/data/mllm/ckpt/step=012000.ckpt/hf_model # /data/mllm/checkpoints/Janus-Pro-7B
-RM_MODEL_PATH=Qwen/Qwen3-VL-30B-A3B-Instruct # OpenGVLab/InternVL3_5-38B
+MODEL_PATH=/home/work/AGILAB/mllm_reasoning/data/experiments/ckpt/janus_sft/1204_v9_sft_constant_sch/version_0/step=012000.ckpt/hf_model # /data/mllm/checkpoints/Janus-Pro-7B
+RM_MODEL_PATH=/home/work/AGILAB/mllm_reasoning/data/checkpoints/Qwen3-VL-30B-A3B-Instruct # OpenGVLab/InternVL3_5-38B
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
-TRAIN_FILES=/data/mllm/data/train.parquet
-VAL_FILES=/data/mllm/data/val.parquet
+TRAIN_FILES=/home/work/AGILAB/mllm_reasoning/pimang62/data/train.parquet
+VAL_FILES=/home/work/AGILAB/mllm_reasoning/pimang62/data/val.parquet
 
 rollout_name=image_unified
 rollout_mode=async
@@ -94,26 +93,27 @@ gen_tp=1
 sp_size=1
 
 # Fully async specific parameters
-NNODES=${NNODES:-1}
-NGPUS_PER_NODE=${NGPUS_PER_NODE:-6}
+# NNODES=${NNODES:-1}
+# NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
 
-n_gpus_rollout=3
-n_gpus_training=$((NGPUS_PER_NODE - n_gpus_rollout))
+# n_gpus_rollout=12
+# n_gpus_training=8 # $((NGPUS_PER_NODE - n_gpus_rollout))
 
-fsdp_size=1 # Must be divisible by (n_gpus_training*n_nodes) and (n_gpus_rollout*n_nodes)
+fsdp_size=8 # Must be divisible by (n_gpus_training*n_nodes) and (n_gpus_rollout*n_nodes)
 
 train_prompt_bsz=0
 gen_prompt_bsz=1
 n_resp_per_prompt=8
-train_prompt_mini_bsz=6
+train_prompt_mini_bsz=128
+train_prompt_micro_bsz=1
 total_rollout_steps=$(((512*100)))
-staleness_threshold=0.0
-trigger_parameter_sync_step=4
-require_batches=8
+staleness_threshold=2.0
+trigger_parameter_sync_step=10
+require_batches=1
 partial_rollout=False
 
-test_freq=20
-save_freq=$((test_freq * trigger_parameter_sync_step * 10))
+test_freq=5
+save_freq=$((test_freq * trigger_parameter_sync_step * 1))
 total_epochs=1
 rollout_freq=1
 log_val_generations=20
@@ -133,14 +133,15 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     data.max_response_length=${max_response_length} \
     data.custom_cls.path=recipe/image_rl/image_rl_dataset.py \
     data.custom_cls.name=ImageRLDataset \
+    actor_rollout_ref.nccl_timeout=120000000 \
     actor_rollout_ref.model.path=\"${MODEL_PATH}\" \
     actor_rollout_ref.actor.optim.lr=1e-6 \
-    actor_rollout_ref.actor.optim.warmup_style=constant \
+    actor_rollout_ref.actor.optim.lr_scheduler_type=constant \
     actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
     actor_rollout_ref.actor.optim.weight_decay=0.1 \
     actor_rollout_ref.actor.strategy=fsdp \
     actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${train_prompt_micro_bsz} \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=${sp_size} \
     actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
     actor_rollout_ref.actor.use_kl_loss=${use_kl_loss} \
@@ -203,16 +204,8 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     algorithm.filter_groups.max_num_gen_batches=8 \
     algorithm.filter_groups.metric=${filter_groups_metric} \
     algorithm.norm_adv_by_std_in_grpo=${norm_adv_by_std_in_grpo} \
-    reward_model.reward_manager=image_generation \
-    custom_reward_function.path=recipe/image_rl/reward_function.py \
-    custom_reward_function.name=compute_score_batch \
-    +reward_model.reward_kwargs.overlong_buffer_cfg.enable=${enable_overlong_buffer} \
-    +reward_model.reward_kwargs.overlong_buffer_cfg.len=${overlong_buffer_len} \
-    +reward_model.reward_kwargs.overlong_buffer_cfg.penalty_factor=${overlong_penalty_factor} \
-    +reward_model.reward_kwargs.overlong_buffer_cfg.log=False \
-    +reward_model.reward_kwargs.max_resp_len=${max_response_length} \
     trainer.critic_warmup=0 \
-    trainer.logger=['console'] \
+    trainer.logger=['console','wandb'] \
     trainer.val_before_train=False \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
@@ -224,10 +217,10 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     trainer.rollout_freq=${rollout_freq} \
     trainer.validation_data_dir="$CKPTS_DIR/validation" \
     trainer.log_val_generations=${log_val_generations} \
-    trainer.nnodes="${NNODES}" \
-    trainer.n_gpus_per_node="${n_gpus_training}" \
-    rollout.nnodes="${NNODES}" \
-    rollout.n_gpus_per_node="${n_gpus_rollout}" \
+    trainer.nnodes=1 \
+    trainer.n_gpus_per_node=8 \
+    rollout.nnodes=2 \
+    rollout.n_gpus_per_node=8 \
     rollout.total_rollout_steps="${total_rollout_steps}" \
     rollout.total_epochs=${total_epochs} \
     rollout.test_freq="${test_freq}" \
@@ -235,4 +228,24 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     async_training.trigger_parameter_sync_step="${trigger_parameter_sync_step}" \
     async_training.require_batches="${require_batches}" \
     async_training.partial_rollout="${partial_rollout}" \
-    async_training.use_rollout_log_probs=False
+    async_training.use_rollout_log_probs=False \
+    reward_model.reward_manager=image_generation \
+    reward_model.enable=True \
+    reward_model.strategy=vllm \
+    reward_model.micro_batch_size=${train_prompt_mini_bsz} \
+    reward_model.ppo_micro_batch_size_per_gpu=1 \
+    reward_model.model.path=\"${RM_MODEL_PATH}\" \
+    reward_model.model.trust_remote_code=True \
+    reward_model.rollout.tensor_model_parallel_size=${rm_gen_tp} \
+    reward_model.rollout.gpu_memory_utilization=0.6 \
+    reward_model.rollout.max_length=2048 \
+    reward_model.reward_manager=image_generation \
+    custom_reward_function.path=recipe/image_rl/reward_function.py \
+    custom_reward_function.name=compute_score_batch \
+    # reward_model.reward_kwargs.img_saving.num=8 \
+    # algorithm.rollout_correction.rollout_is=${rollout_is} \
+    # algorithm.rollout_correction.rollout_is_threshold=${rollout_is_threshold} \
+    # algorithm.rollout_correction.rollout_rs=${rollout_rs} \
+    # algorithm.rollout_correction.rollout_rs_threshold=${rollout_rs_threshold} \
+    # algorithm.rollout_correction.rollout_rs_threshold_lower=${rollout_rs_threshold_lower} \
+    # algorithm.rollout_correction.rollout_token_veto_threshold=${rollout_token_veto_threshold} \

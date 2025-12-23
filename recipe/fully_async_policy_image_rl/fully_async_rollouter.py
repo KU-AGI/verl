@@ -125,6 +125,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         # Config
         self.staleness_threshold: float = config.async_training.get("staleness_threshold", 1)
         # required_samples use ppo_mini_batch_size*require_batches as the minimum number of samples.
+        self.rollouter_world_size = config.async_training.get("rollouter_world_size", 1)
         self.require_batches = config.async_training.require_batches
         self.required_samples = config.actor_rollout_ref.actor.ppo_mini_batch_size * self.require_batches
         self.max_required_samples = None
@@ -156,7 +157,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         self.dataloader_lock = asyncio.Lock()
 
         # Initialize async queues
-        self.pending_queue = asyncio.Queue(maxsize=128)
+        self.pending_queue = asyncio.Queue(maxsize=2048)
         self.active_tasks = set()
         self.cancel_queue = asyncio.Queue()
 
@@ -404,7 +405,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             last_epoch = epoch
 
             # Send accumulated batches when reaching target size
-            if len(full_batch_list) >= self.require_batches:
+            if len(full_batch_list) >= self.rollouter_world_size:
                 await self._merge_and_send(full_batch_list, epoch, self.global_steps)
                 full_batch_list = []
 

@@ -1,0 +1,16 @@
+excludes: [
+  "/.git/",
+  "verl/third_party/dynamo",
+  "bench/",
+  "./ckpts"
+]
+env_vars:
+  VLLM_USE_V1: "1"
+  NCCL_DEBUG: "INFO"
+  NCCL_DEBUG_SUBSYS: "INIT,NET"
+  HYDRA_FULL_ERROR: "1"
+  NCCL_SOCKET_IFNAME: "eth0"
+  NCCL_IB_DISABLE: "1"
+  NCCL_NET: "Socket"
+  GLOO_SOCKET_IFNAME: "eth0"
+  NCCL_TIMEOUT: "300000"
