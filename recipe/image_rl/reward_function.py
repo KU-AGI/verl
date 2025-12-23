@@ -24,9 +24,9 @@ from recipe.image_rl.gdino_regex import _CONNECTORS, SKIP_KEYWORDS, _COMPILED_RE
 
 # Configuration
 BASE_URLS = [
-    # "http://192.169.0.3:8000/v1",
-    # "http://192.169.0.3:8002/v1",
-    "http://192.169.0.3:8004/v1",
+    # "http://10.100.44.4:8006/v1", # main1
+    "http://10.100.44.2:8006/v1", # sub1
+    "http://10.100.44.8:8006/v1", # sub2
 ]
 API_KEY = "EMPTY"
 MAX_RETRIES = 3
@@ -41,8 +41,12 @@ RECOVERY_CHECK_INTERVAL = 60  # seconds to wait before checking if unhealthy ser
 
 # Detector configuration
 DETECTOR_URLS = [
-    "http://192.169.0.3:8084",
-    "http://192.169.0.3:8085"
+    # "http://10.100.44.4:8086", # main1
+    # "http://10.100.44.4:8087",
+    "http://10.100.44.2:8086", # sub1
+    "http://10.100.44.2:8087",
+    "http://10.100.44.8:8086", # sub2
+    "http://10.100.44.8:8087",
 ]
 DETECTOR_TIMEOUT = 300000.0
 
@@ -101,12 +105,12 @@ class ServerInfo:
             return True
         return time.time() - self.last_failure_time > RECOVERY_CHECK_INTERVAL
 
-# client manager with failover support
+# client manager with failover support and round robin load balancing
 class ClientManager:
     def __init__(self, base_urls: List[str]):
         self.servers = []
         self.lock = threading.Lock()
-        self.current_index = 0
+        self.current_index = 0  # Round robin counter
         
         # Initialize servers
         for url in base_urls:
@@ -118,20 +122,47 @@ class ClientManager:
         self.health_monitor_thread = threading.Thread(target=self._health_monitor, daemon=True)
         self.health_monitor_thread.start()
         
-    def get_healthy_servers(self) -> List[ServerInfo]:
-        """Get list of servers that are healthy or degraded (not unhealthy)"""
+    def get_healthy_servers(self) -> List[tuple]:
+        """Get list of (index, server) tuples that are healthy or degraded (not unhealthy)"""
         with self.lock:
             healthy_servers = []
-            for server in self.servers:
+            for i, server in enumerate(self.servers):
                 if server.status in [ServerStatus.HEALTHY, ServerStatus.DEGRADED]:
-                    healthy_servers.append(server)
+                    healthy_servers.append((i, server))
                 elif server.should_retry_unhealthy():
                     # Give unhealthy servers a chance to recover
-                    healthy_servers.append(server)
+                    healthy_servers.append((i, server))
             return healthy_servers
     
+    def get_next_server_round_robin(self) -> tuple:
+        """Get next server using round robin among healthy servers"""
+        healthy_servers = self.get_healthy_servers()
+        
+        if not healthy_servers:
+            print("WARNING: No healthy servers available! Using any available server...")
+            if self.servers:
+                return 0, self.servers[0]
+            return None, None
+        
+        with self.lock:
+            # Build a set of healthy server indices for quick lookup
+            healthy_indices = {idx for idx, _ in healthy_servers}
+            num_servers = len(self.servers)
+            
+            # Find the next healthy server starting from current_index
+            for _ in range(num_servers):
+                idx = self.current_index % num_servers
+                self.current_index = (self.current_index + 1) % num_servers
+                
+                # Check if this server is healthy
+                if idx in healthy_indices:
+                    return idx, self.servers[idx]
+            
+            # Fallback: return first healthy server
+            return healthy_servers[0]
+    
     def get_best_server(self) -> Optional[ServerInfo]:
-        """Get the best available server using weighted selection"""
+        """Get the best available server using weighted selection (legacy method)"""
         healthy_servers = self.get_healthy_servers()
         
         if not healthy_servers:
@@ -139,21 +170,21 @@ class ClientManager:
             return self.servers[0] if self.servers else None
             
         # Sort by status (healthy first) then by success rate
-        healthy_servers.sort(key=lambda s: (
+        servers_only = [s for _, s in healthy_servers]
+        servers_only.sort(key=lambda s: (
             s.status.value,  # healthy < degraded < unhealthy
             -s.success_rate,  # higher success rate first
             s.consecutive_failures  # fewer failures first
         ))
         
-        return healthy_servers[0]
+        return servers_only[0]
     
-    def get_next_client_with_fallback(self) -> Optional[tuple]:
-        """Get next client with automatic fallback to healthy servers"""
-        server = self.get_best_server()
+    def get_next_client_with_fallback(self) -> tuple:
+        """Get next client using round robin with automatic fallback to healthy servers"""
+        server_id, server = self.get_next_server_round_robin()
         if server is None:
             return None, None
             
-        server_id = self.servers.index(server)
         return server.client, server_id
         
     def record_request_result(self, server_id: int, success: bool, error: Exception = None):
