@@ -152,7 +152,8 @@ class ImageUnifiedRollout(BaseRollout):
         self.model_config = model_config
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        print(f"[ImageUnifiedRollout] Using device: {self.device}")
+        if dist.get_rank() == 0:
+            print(f"[ImageUnifiedRollout] Using device: {self.device}")
 
         # Create inference_engine with vLLM-compatible interface for weight syncing
         self.inference_engine = _HFModelWrapper(module)
@@ -442,8 +443,10 @@ class ImageUnifiedRollout(BaseRollout):
             image_embeds = self.module.gen_aligner(self.module.gen_embed(image_ids))
 
         data_proto.batch["task1_response_mask"] = torch.ones((B, image_embeds.size(1)), dtype=torch.long, device=image_embeds.device)
-        print(f"[IMG_GEN] Created DataProto with batch_size: {batch_size}")
+        if dist.get_rank() == 0:
+            print(f"[IMG_GEN] Created DataProto with batch_size: {batch_size}")
 
+        torch.cuda.empty_cache()
         return data_proto
 
     def expand_image_placeholders(self, input_ids_tensor, gen_imgs_pixel_values):
@@ -522,7 +525,8 @@ class ImageUnifiedRollout(BaseRollout):
 
     def _generate_minibatch_text_generation(self, data_proto: DataProto) -> DataProto:
         batch_size = data_proto.batch.batch_size[0]
-        print(f"[TEXT_GEN] Input batch_size: {batch_size}")
+        if dist.get_rank() == 0:
+            print(f"[TEXT_GEN] Input batch_size: {batch_size}")
         
         # Get images from batch
         gen_imgs_pixel_values = data_proto.batch.get('task1_gen_imgs_pixel_values', [])
@@ -530,7 +534,8 @@ class ImageUnifiedRollout(BaseRollout):
             raise ValueError("No images found in batch['task1_gen_imgs_pixel_values']")
         
         # Process all images in batch
-        print(f"[TEXT_GEN] Processing feedback for {len(gen_imgs_pixel_values)} images in batch")
+        if dist.get_rank() == 0:
+            print(f"[TEXT_GEN] Processing feedback for {len(gen_imgs_pixel_values)} images in batch")
 
         # Prepare messages for all images
         input_format = []
@@ -585,14 +590,17 @@ class ImageUnifiedRollout(BaseRollout):
             text_embeds = text_embeds.to(dtype=torch.bfloat16)
 
         data_proto.batch["task2_response_mask"] = outputs["attention_mask"]
-        print(f"[TEXT_GEN] Completed feedback generation")
+        if dist.get_rank() == 0:
+            print(f"[TEXT_GEN] Completed feedback generation")
 
+        torch.cuda.empty_cache()
         return data_proto
 
     def _generate_minibatch_regen_image_generation(self, data_proto: DataProto) -> DataProto:
         batch_size = data_proto.batch.batch_size[0]
 
-        print(f"[REGEN] Input batch_size: {batch_size}")
+        if dist.get_rank() == 0:
+            print(f"[REGEN] Input batch_size: {batch_size}")
 
         # Get data from batch
         gen_imgs_pixel_values = data_proto.batch.get('task1_gen_imgs_pixel_values', [])
@@ -603,10 +611,12 @@ class ImageUnifiedRollout(BaseRollout):
         if len(feedback_texts) == 0:
             raise ValueError("No feedback texts found in non_tensor_batch['task2_feedback_texts']")
 
-        print(f"[REGEN] Loaded {len(gen_imgs_pixel_values)} images and {len(feedback_texts)} feedback_texts from non_tensor_batch")
+        if dist.get_rank() == 0:
+            print(f"[REGEN] Loaded {len(gen_imgs_pixel_values)} images and {len(feedback_texts)} feedback_texts from non_tensor_batch")
 
         # Process all images in batch
-        print(f"[REGEN] Processing regen for {batch_size} images in batch")
+        if dist.get_rank() == 0:
+            print(f"[REGEN] Processing regen for {batch_size} images in batch")
 
         # Parse feedback texts
         prompts = [prompt for prompt in data_proto.non_tensor_batch['prompt']]
@@ -690,8 +700,10 @@ class ImageUnifiedRollout(BaseRollout):
             image_embeds = self.module.gen_aligner(self.module.gen_embed(image_ids))
 
         data_proto.batch["task3_response_mask"] = torch.ones((B, image_embeds.size(1)), dtype=torch.long, device=image_embeds.device)
-        print(f"[IMG_GEN] Created DataProto with batch_size: {batch_size}")
+        if dist.get_rank() == 0:
+            print(f"[IMG_GEN] Created DataProto with batch_size: {batch_size}")
 
+        torch.cuda.empty_cache()
         return data_proto
 
     def _prepare_cfg_embeds(self, data_proto: DataProto) -> Tuple[torch.Tensor, torch.Tensor]:
