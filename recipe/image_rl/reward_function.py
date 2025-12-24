@@ -26,7 +26,9 @@ from recipe.image_rl.gdino_regex import _CONNECTORS, SKIP_KEYWORDS, _COMPILED_RE
 BASE_URLS = [
     # "http://10.100.44.4:8006/v1", # main1
     "http://10.100.44.2:8006/v1", # sub1
+    "http://10.100.44.2:8007/v1",
     "http://10.100.44.8:8006/v1", # sub2
+    "http://10.100.44.8:8007/v1",
 ]
 API_KEY = "EMPTY"
 MAX_RETRIES = 3
@@ -823,7 +825,7 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
         # Detector based reward - always populate for batch consistency
         detection_results = verify_detection_single(feedback_tuple)
         detector_response = {"results": {}, "details": [], "errors": ["No spatial/counting tuples found"]}
-        det_details_list = []
+        # det_details_list = []
 
         detector_reward = 0.0
         if detection_results:
@@ -831,21 +833,21 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
 
             # Calculate detector bonus: +1 if all detections are True
             det_results_dict = detector_response.get("results", {})
-            det_details_list = detector_response.get("details", [])
+            # det_details_list = detector_response.get("details", [])
             if det_results_dict:
                 all_true = all(det_results_dict.values())
                 detector_reward = 1.0 if all_true else 0.0
                 reward_score += detector_reward
                 reward_extra_info[f"task{task_id}_detector_reward"] = detector_reward
-                reward_extra_info[f"task{task_id}_detector_details"] = det_details_list
+                # reward_extra_info[f"task{task_id}_detector_details"] = det_details_list
             else:
                 reward_score += 0.0
                 reward_extra_info[f"task{task_id}_detector_reward"] = 0.0
-                reward_extra_info[f"task{task_id}_detector_details"] = det_details_list
+                # reward_extra_info[f"task{task_id}_detector_details"] = det_details_list
         else:
             reward_score += 0.0
             reward_extra_info[f"task{task_id}_detector_reward"] = 0.0
-            reward_extra_info[f"task{task_id}_detector_details"] = det_details_list
+            # reward_extra_info[f"task{task_id}_detector_details"] = det_details_list
 
         # Always set detector_response for batch consistency
         reward_extra_info[f"task{task_id}_detector_response"] = detector_response
@@ -978,7 +980,7 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
         # Detector based reward - always populate for batch consistency
         detection_results = verify_detection_single(feedback_tuple)
         detector_response = {"results": {}, "details": [], "errors": ["No spatial/counting tuples found"]}
-        det_details_list = []
+        # det_details_list = []
 
         detector_reward = 0.0
         if detection_results:
@@ -986,21 +988,21 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
 
             # Calculate detector bonus: +1 if all detections are True
             det_results_dict = detector_response.get("results", {})
-            det_details_list = detector_response.get("details", [])
+            # det_details_list = detector_response.get("details", [])
             if det_results_dict:
                 all_true = all(det_results_dict.values())
                 detector_reward = 1.0 if all_true else 0.0
                 reward_score += detector_reward
                 reward_extra_info[f"task{task_id}_detector_reward"] = detector_reward
-                reward_extra_info[f"task{task_id}_detector_details"] = det_details_list
+                # reward_extra_info[f"task{task_id}_detector_details"] = det_details_list
             else:
                 reward_score += 0.0
                 reward_extra_info[f"task{task_id}_detector_reward"] = 0.0
-                reward_extra_info[f"task{task_id}_detector_details"] = det_details_list
+                # reward_extra_info[f"task{task_id}_detector_details"] = det_details_list
         else:
             reward_score += 0.0
             reward_extra_info[f"task{task_id}_detector_reward"] = 0.0
-            reward_extra_info[f"task{task_id}_detector_details"] = det_details_list
+            # reward_extra_info[f"task{task_id}_detector_details"] = det_details_list
 
         # Always set detector_response for batch consistency
         reward_extra_info[f"task{task_id}_detector_response"] = detector_response
