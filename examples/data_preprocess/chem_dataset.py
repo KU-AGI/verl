@@ -3,6 +3,10 @@ import argparse
 import os, json, re, random
 from glob import glob
 from tqdm import tqdm
+from rdkit import Chem, RDLogger
+
+
+RDLogger.DisableLog('rdApp.*')
 
 
 def _sort_key(path):
@@ -21,6 +25,16 @@ def _sort_key(path):
         start_num = nums[0]  # 그냥 시작 숫자
 
     return (set_num, start_num)
+
+def convert_to_canonical_smiles(smiles):
+    if not smiles:
+        return None
+    molecule = Chem.MolFromSmiles(smiles)
+    if molecule is not None:
+        canonical_smiles = Chem.MolToSmiles(molecule, isomericSmiles=False, canonical=True)
+        return canonical_smiles
+    else:
+        return None
 
 
 system_prompt_template = "You are a chemist."
@@ -178,12 +192,19 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     concatenated = []
-    args.train = True
+    args.test = True
+
+    with open('/data/llm-reaction-reasoning/data/orderly/retro_related/precursor_with_solvent_to_multiple_products.json', 'r') as f:
+        precursor_with_solvent_to_multiple_products = json.load(f)
+        multiple_precursor_with_solvent_set = set(precursor_with_solvent_to_multiple_products.keys())
+    with open('/data/llm-reaction-reasoning/data/orderly/retro_related/product_to_multiple_reactants.json', 'r') as f:
+        product_to_multiple_reactants = json.load(f)
+        multiple_product_set = set(product_to_multiple_reactants.keys())
 
     tasks = ["forward", "retro"]
     for task in tasks:
         if args.train:
-            dataset_paths = sorted(glob(os.path.join(f"{args.train_dir}/{task}", "*.json")), key=_sort_key)[-10:]
+            dataset_paths = sorted(glob(os.path.join(f"{args.train_dir}/{task}", "*.json")), key=_sort_key)[-30:]
             split = "train"
         elif args.val:
             # dataset_paths = sorted(glob(os.path.join(f"{args.val_dir}", f"{task}*val.json")))
@@ -214,6 +235,17 @@ if __name__ == "__main__":
                 d['dataset_path'] = dataset_path.split("/")[-1].split(".json")[0]
                 if d['filtered'] == False:
                     continue
+                if args.train and task == "forward":
+                    if convert_to_canonical_smiles(".".join(d['reactants'] + d['reagents'] + d['solvents'])) in multiple_precursor_with_solvent_set:
+                        continue
+                elif args.train and task == "retro":
+                    if convert_to_canonical_smiles(".".join(d['products'])) in multiple_product_set:
+                        continue
+                    rxn_str = d['rxn_str']
+                    products_in_rxn = rxn_str.split(">>")[-1].split(".")
+                    products_in_orderly = d['products']
+                    if products_in_rxn != products_in_orderly:
+                        continue
                 for k, v in d["info"].items():
                     if isinstance(d["info"][k], list):
                         for key in d["info"][k]:
