@@ -52,7 +52,6 @@ from verl.utils.debug import marked_timer
 from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.torch_functional import masked_mean
 from recipe.image_rl.ray_image_generation_trainer import RayImageGenerationTrainer
-from recipe.image_rl.reward import compute_reward, compute_reward_async
 from recipe.image_rl import core_algos
 
 
@@ -476,19 +475,17 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
         return batch
 
     def _process_batch_common(self, batch, metrics, timing_raw, local_trigger_step=None, task_id: int = 1):
+        # Compute reward if using reward model worker (use_rm)
+        # Otherwise reward is already computed in rollouter
         with marked_timer("reward", timing_raw, color="yellow"):
-            # compute reward model score
             if self.use_rm:
-                # Already processed in before
-                # reward_tensor = self.rm_wg.compute_rm_score(batch)
-                # batch = batch.union(reward_tensor)
-                reward_tensor = batch[f"task{task_id}_reward_tensor"]
-
-            elif self.config.reward_model.launch_reward_fn_async:
-                # Pass None for reward_fn to avoid pickle issues - it will be loaded inside the remote worker
-                future_reward = compute_reward_async.remote(data=batch, config=self.config, tokenizer=self.tokenizer, processor=self.processor, reward_fn=None, task_id=task_id)
-            else:
-                reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn, eval=False, task_id=task_id)
+                # Compute reward using reward model worker
+                reward_tensor = self.rm_wg.compute_rm_score(batch)
+                # Remove existing response_masks to allow overwriting with modified masks from reward computation
+                for tid in [1, 2, 3]:
+                    if f"task{tid}_response_mask" in batch.batch:
+                        batch.batch.pop(f"task{tid}_response_mask")
+                batch = batch.union(reward_tensor)
 
         with marked_timer("old_log_prob", timing_raw, color="blue"):
 
@@ -547,14 +544,12 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                 batch = batch.union(values)
 
         with marked_timer("adv", timing_raw, color="brown"):
-            # we combine with rule-based rm
-            reward_extra_infos_dict: dict[str, list]
-            if self.config.reward_model.launch_reward_fn_async:
-                reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
-            batch.batch[f"task{task_id}_token_level_scores"] = reward_tensor
+            # Reward is already in batch from rollouter
+            # Get reward_extra_infos_dict from meta_info if available
+            reward_extra_infos_dict = batch.meta_info.get(f"task{task_id}_reward_extra_info", {})
 
-            if reward_extra_infos_dict:
-                batch.non_tensor_batch.update({k: np.array(v, dtype=object) for k, v in reward_extra_infos_dict.items()})
+            # if reward_extra_infos_dict: # remove reward extra info to non_tensor_batch for logging
+            #     batch.non_tensor_batch.update({k: np.array(v, dtype=object) for k, v in reward_extra_infos_dict.items()})
 
             # compute rewards. apply_kl_penalty if available
             if self.config.algorithm.use_kl_in_reward:

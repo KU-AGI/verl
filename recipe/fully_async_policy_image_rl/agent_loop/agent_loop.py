@@ -828,6 +828,82 @@ class AgentLoopManager:
         output.meta_info = {"timing": timing, **outputs[0].meta_info}
         return output
 
+    async def generate_sequences_with_callback(self, prompts: DataProto, on_task_complete=None) -> DataProto:
+        """Generate sequences with task-level callbacks for async reward computation.
+
+        This method executes tasks sequentially (Task 1 -> Task 2 -> Task 3) and calls
+        on_task_complete callback after each task finishes, allowing async reward computation
+        to start immediately without waiting for all tasks.
+
+        Args:
+            prompts (DataProto): Input batch.
+            on_task_complete: Optional async callback(task_id, batch_result) called after each task.
+
+        Returns:
+            DataProto: Output batch with all tasks completed.
+        """
+        logger.info("[AgentLoopManager] generate_sequences_with_callback started")
+
+        if self.config.actor_rollout_ref.rollout.free_cache_engine:
+            logger.debug("[AgentLoopManager] Waking up cache engine")
+            self.wake_up()
+        if self.reward_model_manager and self.config.reward_model.rollout.free_cache_engine:
+            logger.debug("[AgentLoopManager] Waking up reward model cache engine")
+            self.reward_model_manager.wake_up()
+
+        # Determine which tasks to run
+        task_id_tensor = prompts.batch.get("task_id", None)
+        if task_id_tensor is not None:
+            task_id = task_id_tensor.view(-1)[0].item()
+            tasks_to_run = [task_id]
+            logger.info(f"[AgentLoopManager] Running single task: {task_id}")
+        else:
+            tasks_to_run = [1, 2, 3]  # Run all tasks sequentially
+            logger.info("[AgentLoopManager] Running all tasks sequentially: [1, 2, 3]")
+
+        # Execute tasks sequentially with callbacks
+        accumulated_batch = prompts
+        for current_task_id in tasks_to_run:
+            logger.info(f"[AgentLoopManager] Starting task {current_task_id}")
+
+            # Set task_id for this iteration
+            accumulated_batch.batch["task_id"] = torch.tensor([current_task_id] * len(accumulated_batch))
+            logger.debug(f"[AgentLoopManager] Set task_id={current_task_id} for batch size {len(accumulated_batch)}")
+
+            # Execute the task across all workers
+            chunkes = accumulated_batch.chunk(len(self.agent_loop_workers))
+            logger.debug(f"[AgentLoopManager] Split batch into {len(chunkes)} chunks for {len(self.agent_loop_workers)} workers")
+
+            outputs = await asyncio.gather(*[
+                worker.generate_sequences.remote(chunk, on_task_complete=None)
+                for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
+            ])
+            logger.info(f"[AgentLoopManager] Task {current_task_id} generation completed")
+
+            accumulated_batch = DataProto.concat(outputs)
+            logger.debug(f"[AgentLoopManager] Concatenated outputs, batch size: {len(accumulated_batch)}")
+
+            # Call the callback if provided (reward computation will happen here)
+            if on_task_complete is not None:
+                logger.info(f"[AgentLoopManager] Calling on_task_complete callback for task {current_task_id}")
+                await on_task_complete(current_task_id, accumulated_batch)
+                logger.info(f"[AgentLoopManager] Callback completed for task {current_task_id}")
+            else:
+                logger.debug(f"[AgentLoopManager] No callback provided for task {current_task_id}")
+
+        logger.info("[AgentLoopManager] All tasks completed")
+
+        # Clean up
+        if self.config.actor_rollout_ref.rollout.free_cache_engine:
+            logger.debug("[AgentLoopManager] Sleeping cache engine")
+            self.sleep()
+        if self.reward_model_manager and self.config.reward_model.rollout.free_cache_engine:
+            logger.debug("[AgentLoopManager] Sleeping reward model cache engine")
+            self.reward_model_manager.sleep()
+
+        logger.info("[AgentLoopManager] generate_sequences_with_callback finished")
+        return accumulated_batch
+
     def _performance_metrics(self, metrics: list[list[dict[str, str]]], output: DataProto) -> dict[str, float]:
         timing = {}
         t_generate_sequences = np.array([metric["generate_sequences"] for chunk in metrics for metric in chunk])

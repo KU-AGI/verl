@@ -50,6 +50,7 @@ init-container-with-infiniband:
 CACHE_PATH=/data/.cache
 MODEL_PATH=Qwen/Qwen3-VL-30B-A3B-Instruct # OpenGVLab/InternVL3_5-38B
 VLLM_CONTAINER_NAME_PREFIX=vllm-g
+SGLANG_CONTAINER_NAME_PREFIX=sglang-g
 
 # https://github.com/vllm-project/vllm/pull/22386
 start-vllm-servers:
@@ -76,7 +77,32 @@ start-vllm-servers:
 			--async-scheduling ; \
 	done
 
-stop-vllm-servers:
+start-sglang-servers: # fix
+	for GPU in 4 5 ; do \
+		PORT=$$((8000 + $$GPU)) ; \
+		docker run --rm -d --name ${SGLANG_CONTAINER_NAME_PREFIX}$$GPU \
+			--gpus all \
+			-v /data:/data \
+			-v /home:/home \
+			-e HF_HOME=${CACHE_PATH} \
+			-e CUDA_VISIBLE_DEVICES=$$GPU \
+			-e VLLM_WORKER_MULTIPROC_METHOD=spawn \
+			-p $${PORT}:8000 \
+			--ipc=host \
+			lmsysorg/sglang:latest \
+			python -m sglang.launch_server \
+			--model-path Qwen/Qwen3-VL-30B-A3B-Instruct \
+			--trust-remote-code \
+			--host 0.0.0.0 \
+			--port 8000 \
+			--mem-fraction-static 0.9 \
+			--max-running-requests 128 \
+			--max-total-tokens 4096 \
+			--attention-backend flashinfer \
+			--sampling-backend flashinfer ; \
+	done
+
+stop-servers:
 	for GPU in 0 1 2 3 4 5 6 7 ; do \
 		docker stop ${VLLM_CONTAINER_NAME_PREFIX}$$GPU || true ; \
 	done

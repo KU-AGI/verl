@@ -275,26 +275,20 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                     if batch is None:
                         break
                     self._collect_metrics_from_samples(batch, metrics)
-                    
-                    with marked_timer("reward", timing_raw, color="yellow"):
-                        # compute reward model score
-                        if self.use_rm:
-                            reward_tensor = self.rm_wg.compute_rm_score(batch)
-                            # Remove existing response_masks to allow overwriting with modified masks from reward computation
-                            for task_id in [1, 2, 3]:
-                                if f"task{task_id}_response_mask" in batch.batch:
-                                    batch.batch.pop(f"task{task_id}_response_mask")
-                            batch = batch.union(reward_tensor)
 
-                        # Contained in _process_batch_common after
-                        # elif self.config.reward_model.launch_reward_fn_async:
-                        #     future_reward = compute_reward_async.remote(data=batch, config=self.config, tokenizer=self.tokenizer, processor=self.processor)
-                        # else:
-                        #     reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn, eval=False)
+                    # Collect timing info from rollouter (reward computation time)
+                    if hasattr(batch, 'meta_info') and 'reward' in batch.meta_info:
+                        timing_raw['reward'] = batch.meta_info['reward']
 
+                    # Rewards are already computed in rollouter, no need to compute here
+                    # Just process each task
                     for task_id in [1, 2, 3]:
                         batch.batch["task_id"] = torch.tensor([task_id for _ in range(len(batch))], dtype=int)
-                        batch, reward_extra_infos_dict = self._process_batch_common(
+
+                        # Get pre-computed reward_extra_infos_dict from meta_info
+                        reward_extra_infos_dict = batch.meta_info.get(f"task{task_id}_reward_extra_info", {})
+
+                        batch, _ = self._process_batch_common(
                             batch, metrics, timing_raw, self.local_trigger_step if self.compute_prox_log_prob else None, task_id
                         )
                         # Remove universal keys from batch

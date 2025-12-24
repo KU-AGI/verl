@@ -107,19 +107,28 @@ class ImageGenerationRewardManager:
         rewards = []
         already_printed = {}
 
+        # collect all keys that might appear in reward_extra_info
+        all_extra_info_keys = set()
+        for score_dict in scores:
+            if score_dict is not None and "reward_extra_info" in score_dict:
+                all_extra_info_keys.update(score_dict["reward_extra_info"].keys())
+
         for i in range(len(data)):
             valid_response_length = response_mask[i].sum()
             score_dict = scores[i]
+            
+            # Handle None score_dict
             if score_dict is None:
                 print(f"[WARNING] score_dict is None for sample {i}, using default reward 0.0")
-            reward = score_dict.get("score", 0.0)
-            # if reward != -100:
-            #     reward = reward * 10 # scale up
+                score_dict = {"score": 0.0, "reward_extra_info": {}}
             
-            # Update extra info
-            if "reward_extra_info" in score_dict:
-                for key, value in score_dict["reward_extra_info"].items():
-                    reward_extra_info[key].append(value)
+            reward = score_dict.get("score", 0.0)
+            
+            # Update extra info - ensure all keys have values for every sample
+            sample_extra_info = score_dict.get("reward_extra_info", {})
+            for key in all_extra_info_keys:
+                # Use None as placeholder if this sample doesn't have this key
+                reward_extra_info[key].append(sample_extra_info.get(key, None))
 
             rewards.append(reward)
             reward_tensor[i, valid_response_length - 1] = reward
@@ -136,7 +145,7 @@ class ImageGenerationRewardManager:
                 print(f"\n[EXAMINE {i}]")
                 print(f"Data Source: {data_source}")
                 print(f"Prompt: {prompt_text}")
-                print(f"Ground Truth: {ground_truth}") # path
+                print(f"Ground Truth: {ground_truth}")
                 print(f"Score: {score_dict}")
                 print("-" * 80)
                 
@@ -151,6 +160,6 @@ class ImageGenerationRewardManager:
         print(f"[REWARD] Computed {len(rewards)} rewards, valid={len(valid_rewards)}, mean={mean_reward:.4f}")
 
         if return_dict:
-            return {f"task{task_id}_reward_tensor": reward_tensor, f"task{task_id}_reward_extra_info": reward_extra_info}
+            return {f"task{task_id}_reward_tensor": reward_tensor, f"task{task_id}_reward_extra_info": dict(reward_extra_info)}
         else:
             return reward_tensor

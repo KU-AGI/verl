@@ -127,7 +127,7 @@ class DetachActorWorker(DetachNcclSync):
         # Vision model and generation model parameters are not needed in vLLM rollout
         for key, tensor in params.items():
             # Only sync language_model parameters - skip vision and generation components
-            if key.startswith(('vision_model.', 'gen_vision_model.', 'gen_head.', 'gen_embed.')):
+            if key.startswith(('vision_model.', 'gen_vision_model.', 'gen_embed.')):
                 continue
             ret.append((key, tensor.size(), tensor.dtype))
         self._weights_info = ret
@@ -162,9 +162,8 @@ class DetachAsyncRolloutWorker(DetachNcclSync):
         self._weights_info = weights_info
 
     @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
-    def generate_sequences(self, prompts: DataProto) -> DataProto:
+    def generate_sequences(self, prompts: DataProto, on_task_complete=None) -> DataProto:
         """Generate sequences using ImageUnifiedRollout."""
-        print(f"[DetachAsyncRolloutWorker.generate_sequences] Called!")
         assert self._is_rollout and self.rollout is not None
         prompts = prompts.to(get_device_id())
         output = self.rollout.generate_sequences(prompts=prompts)

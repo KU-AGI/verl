@@ -14,7 +14,7 @@
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 import numpy as np
 import torch
@@ -29,134 +29,101 @@ import PIL
 
 import PIL.Image
 
-def postprocess_agent_loop_outputs(rs: "RolloutSample", tokenizer, config, processor) -> DataProto:
-    """Static method to postprocess a list of AgentLoopOutput into DataProto
-
-    Args:
-        rs: RolloutSample
-        tokenizer: Tokenizer instance
-        config: Configuration object
-        processor: Processor instance
-
-    Returns:
-        DataProto: Processed batch data
-    """
-    inputs: list[AgentLoopOutput] = rs.agent_loop_output_list
+def postprocess_agent_loop_outputs(rs_or_list: Union["RolloutSample", list], tokenizer, config, processor) -> DataProto:
+    """Optimized postprocessing of AgentLoopOutput list into DataProto with dynamic task_id handling"""
+    if isinstance(rs_or_list, list):
+        inputs = rs_or_list
+    else:
+        inputs = rs_or_list.agent_loop_output_list
+    if not inputs:
+        return DataProto.concat([])
+    
     batch_list = []
+    IMAGE_KEY_PATTERNS = frozenset(('image', 'pixel', 'img', 'pil', 'gen_img_tokens', 'regen_img_tokens'))
+    
+    def is_image_key(key: str, _patterns=IMAGE_KEY_PATTERNS) -> bool:
+        key_lower = key.lower()
+        return any(p in key_lower for p in _patterns)
 
-    # Image-related key patterns (including token sequences)
-    IMAGE_KEY_PATTERNS = ('image', 'pixel', 'img', 'pil', 'gen_img_tokens', 'regen_img_tokens')
-
-    def is_image_key(key: str) -> bool:
-        return any(pattern in key.lower() for pattern in IMAGE_KEY_PATTERNS)
-
-    for i, out in enumerate(inputs):
+    for out in inputs:
         generation_data: DataProto = out.generation_data
+        batch = generation_data.batch
+        
+        # --- 1) task_id 기반 누적 Attention Mask 계산 ---
+        t_id_val = batch.get("task_id")
+        # task_id가 텐서든 스칼라든 안전하게 정수로 변환
+        current_task_id = int(t_id_val.reshape(-1)[0].item()) if t_id_val is not None else 1
+        
+        cumulative_sum = torch.tensor(0, dtype=torch.long, device=batch.device if hasattr(batch, 'device') else 'cpu')
+        
+        for i in range(1, current_task_id + 1):
+            for mask_type in ["attention_mask", "response_mask"]:
+                k = f"task{i}_{mask_type}"
+                if k in batch:
+                    # 각 마스크의 유효 토큰(1의 개수)을 더함
+                    cumulative_sum += batch[k].sum().long()
 
-        # 1) Compute attention_mask from all task masks
-        attention_mask = (
-            generation_data.batch["task1_attention_mask"].sum(dim=-1)
-            + generation_data.batch["task1_response_mask"].sum(dim=-1)
-            + generation_data.batch["task2_attention_mask"].sum(dim=-1)
-            + generation_data.batch["task2_response_mask"].sum(dim=-1)
-            + generation_data.batch["task3_attention_mask"].sum(dim=-1)
-            + generation_data.batch["task3_response_mask"].sum(dim=-1)
-        )
-        if attention_mask.dim() == 0:
-            attention_mask = attention_mask.unsqueeze(0)
+        # 결과는 항상 [1] 차원의 텐서로 유지
+        attention_mask = cumulative_sum.view(1)
 
-        # 2) Normalize all tensors to batch_size=1
+        # --- 2) 텐서 처리 ---
         fixed_tensors: dict[str, torch.Tensor] = {"attention_mask": attention_mask}
         
-        for name, t in generation_data.batch.items():
-            # Skip placeholder tensor
-            if name == "dummy_tensor":
+        for name, t in batch.items():
+            if name == "dummy_tensor" or not isinstance(t, torch.Tensor):
                 continue
-                
-            if not isinstance(t, torch.Tensor):
-                raise TypeError(f"Tensor field '{name}' is not a torch.Tensor: {type(t)}")
-
-            # Special handling for image-related tensors (pixel values, image tokens)
-            if is_image_key(name):
-                if t.dim() == 1:
-                    # [seq_len] -> [1, seq_len] (e.g., gen_img_tokens)
-                    t = t.unsqueeze(0)
-                elif t.dim() == 2:
-                    # [B, seq_len] -> [1, seq_len]
-                    t = t[:1]
-                elif t.dim() == 3:
-                    # [C, H, W] -> [1, C, H, W]
-                    t = t.unsqueeze(0)
-                elif t.dim() == 4:
-                    # [B, C, H, W] -> [1, C, H, W]
-                    t = t[:1]
-                fixed_tensors[name] = t
-                continue
-
-            # General tensor handling
-            if t.dim() == 0:
-                t = t.unsqueeze(0)
-            elif t.dim() == 1:
-                t = t.unsqueeze(0)
+            
+            dim = t.dim()
+            is_img = is_image_key(name)
+            
+            if dim == 0:
+                fixed_tensors[name] = t.unsqueeze(0)
+            elif dim == 1:
+                fixed_tensors[name] = t.unsqueeze(0)
+            elif dim == 2:
+                # [Seq, Hidden] -> [1, Seq, Hidden]
+                fixed_tensors[name] = t.unsqueeze(0) 
+            elif dim == 3:
+                # [C, H, W] -> [1, C, H, W]
+                fixed_tensors[name] = t.unsqueeze(0)
             else:
-                t = t[:1]
-            fixed_tensors[name] = t
+                fixed_tensors[name] = t[:1]
 
-        # 3) Process non_tensor_batch
-        num_turns = np.array([out.num_turns], dtype=np.int32)
-
-        if hasattr(out.metrics, "model_dump"):
-            metrics = out.metrics.model_dump()
-        elif isinstance(out.metrics, dict):
-            metrics = out.metrics
-        else:
-            metrics = {}
-
-        non_tensor_batch_dict: dict[str, np.ndarray] = {"__num_turns__": num_turns}
+        # --- 3) Non-tensor 처리 ---
+        non_tensor_batch_dict: dict[str, np.ndarray] = {
+            "__num_turns__": np.array([out.num_turns], dtype=np.int32)
+        }
 
         if generation_data.non_tensor_batch:
             for k, v in generation_data.non_tensor_batch.items():
-                # Handle PIL Image arrays directly
                 if isinstance(v, np.ndarray) and v.dtype == object and len(v) > 0:
                     if isinstance(v.flat[0], PIL.Image.Image):
                         non_tensor_batch_dict[k] = v[:1] if v.shape[0] > 1 else v
                         continue
 
                 v = np.asarray(v)
+                ndim = v.ndim
+                is_img = is_image_key(k)
+                
+                if ndim == 0:
+                    non_tensor_batch_dict[k] = v[None]
+                elif ndim == 1:
+                    non_tensor_batch_dict[k] = v[np.newaxis, ...] if is_img else (v[:1] if v.shape[0] != 1 else v)
+                else:
+                    non_tensor_batch_dict[k] = v[:1]
 
-                # Image array handling (pixel values, etc.)
-                if is_image_key(k):
-                    if v.ndim == 1:
-                        # [seq_len] -> [1, seq_len]
-                        v = v[np.newaxis, ...]
-                    elif v.ndim == 2:
-                        # [B, seq_len] -> [1, seq_len]
-                        v = v[:1]
-                    elif v.ndim == 3:
-                        # [C, H, W] -> [1, C, H, W]
-                        v = v[np.newaxis, ...]
-                    elif v.ndim == 4:
-                        # [B, C, H, W] -> [1, C, H, W]
-                        v = v[:1]
-                    non_tensor_batch_dict[k] = v
-                    continue
+        # --- 4) Metrics 추출 및 Append ---
+        metrics = out.metrics.model_dump() if hasattr(out.metrics, "model_dump") else (
+            out.metrics if isinstance(out.metrics, dict) else {}
+        )
 
-                # General array handling
-                if v.ndim == 0:
-                    v = v[None]
-                elif v.shape[0] != 1:
-                    v = v[:1]
-                non_tensor_batch_dict[k] = v
-
-        _batch = DataProto.from_dict(
+        batch_list.append(DataProto.from_dict(
             tensors=fixed_tensors,
             non_tensors=non_tensor_batch_dict,
             meta_info={"metrics": metrics},
-        )
-        batch_list.append(_batch)
+        ))
 
     return DataProto.concat(batch_list)
-
 
 @dataclass
 class RolloutSample:
@@ -255,31 +222,15 @@ def merge_rollout_sample(config, tokenizer, rs: RolloutSample, processor):
     """
     Supplement and refine the RolloutSample object,
     """
-    # Step 1: Create a DataProto from the AgentLoopOutput to generate the result
-    gen_batch_output = postprocess_agent_loop_outputs(rs, tokenizer, config, processor)
-    ##### X rollout log probs #####
-    # rollout_log_probs = [x.log_probs for x in rs.agent_loop_output_list]
-    # rollout_log_probs = process_rollout_log_probs(gen_batch_output, rollout_log_probs)
-    # gen_batch_output.batch["rollout_log_probs"] = rollout_log_probs.to(torch.float32)
-    ##### X rollout log probs #####
-
-    # Step 2: Add uid
+    # Step 1: Add uid
     rs.full_batch.non_tensor_batch["uid"] = np.array([f"uid_{rs.sample_id}"] * len(rs.full_batch), dtype=object)
 
-    # Step 2: Merge batches
-    # Merge the non_tensor_batch and meta_info of original_batch into final_batch
-    for key, value in rs.full_batch.non_tensor_batch.items():
-        gen_batch_output.non_tensor_batch[key] = value
-    gen_batch_output.meta_info.update(rs.full_batch.meta_info)
-
-    # Step 3, set full_batch
-    rs.full_batch = gen_batch_output
+    # Step 2, set processing_times in full_batch meta_info
     rs.processing_times = []
-    for agent_loop in rs.agent_loop_output_list:
-        rs.processing_times.append(agent_loop.metrics.generate_sequences)
-    rs.param_version_start = [agent_loop.param_version_start for agent_loop in rs.agent_loop_output_list]
-    rs.param_version_end = [agent_loop.param_version_end for agent_loop in rs.agent_loop_output_list]
-    # Step 4, clear agent_loop_output_list
+    for metrics in rs.full_batch.meta_info.get("metrics", []):
+        rs.processing_times.append(metrics.get("generate_sequences", 0.0))
+
+    # Step 3, clear agent_loop_output_list
     rs.agent_loop_output_list = []
     return rs
 
@@ -287,108 +238,66 @@ def merge_rollout_sample(config, tokenizer, rs: RolloutSample, processor):
 def assemble_batch_from_rollout_samples(
     rollout_samples: list[RolloutSample], tokenizer, config, balance_batch=None
 ) -> DataProto:
-    """
-    Assemble gen_batch_output from RolloutSample objects
-    Assembles batches from RolloutSample objects, similar to the _post_generate_batch logic in ray_trainer.
-
-    Args:
-        rollout_samples: List of RolloutSample objects
-        tokenizer: Tokenizer instance
-        config: Configuration object containing trainer settings
-        balance_batch: Whether to balance the batch (simplified version)
-
-    Returns:
-        DataProto: Assembled gen_batch_output
-
-    Raises:
-        ValueError: If rollout_samples is empty
-    """
+    """Optimized batch assembly"""
     start_time = time.time()
 
     if not rollout_samples:
-        raise ValueError("Empty rollout_samples provided for batch assembly")
+        raise ValueError("Empty rollout_samples provided")
 
-    print(f"[BatchUtils] Assembling batch from {len(rollout_samples)} RolloutSample objects")
+    n_samples = len(rollout_samples)
+    print(f"[BatchUtils] Assembling batch from {n_samples} RolloutSample objects")
 
-    rollout_samples_batch = []
-    processing_times = []
-    rollout_status = rollout_samples[0].rollout_status
-    # Add a prefix to all rollout_status keys
-    rollout_status = {f"fully_async/{key}": value for key, value in rollout_status.items()}
+    # Pre-allocate lists
+    rollout_samples_batch = [rs.full_batch for rs in rollout_samples]
+    processing_times = [t for rs in rollout_samples for t in rs.processing_times]
+    
+    # Prefix rollout_status once
+    rollout_status = {f"fully_async/{k}": v for k, v in rollout_samples[0].rollout_status.items()}
 
-    for rs in rollout_samples:
-        rollout_samples_batch.append(rs.full_batch)
-        processing_times.extend(rs.processing_times)
     final_batch = DataProto.concat(rollout_samples_batch)
-
-    # # Calculate response_mask (if not present)
-    # if "response_mask" not in final_batch.batch.keys():
-    #     final_batch.batch["response_mask"] = compute_response_mask(final_batch)
 
     if balance_batch:
         balance_batch(final_batch, metrics={})
 
-    # # Calculate the global valid token number
-    # if "attention_mask" in final_batch.batch:
-    #     final_batch.meta_info["global_token_num"] = torch.sum(final_batch.batch["attention_mask"], dim=-1).tolist()
-
+    # Attention mask processing
     if "attention_mask" in final_batch.batch:
-        attention_mask = final_batch.batch["attention_mask"]
-
-        # dim 에 따라 안전하게 token_lens 만들기 (항상 1D [B]로)
-        if attention_mask.dim() == 0:
-            # 완전 scalar면 그냥 길이 1짜리로 감싸기
-            token_lens = attention_mask.view(1)
-        elif attention_mask.dim() == 1:
-            # [T] 한 개 시퀀스 -> 전체를 하나의 샘플로 보고 sum
-            token_lens = attention_mask.sum().view(1)  # shape [1]
+        mask = final_batch.batch["attention_mask"]
+        if mask.dim() <= 1:
+            token_lens = mask.sum().view(1) if mask.dim() == 1 else mask.view(1)
         else:
-            # [B, T] 또는 [B, ... , T] 인 경우, 첫 dim = batch 로 보고 나머지 다 펼쳐서 합
-            token_lens = attention_mask.view(attention_mask.shape[0], -1).sum(dim=-1)  # shape [B]
+            token_lens = mask.view(mask.shape[0], -1).sum(dim=-1)
+        final_batch.meta_info["global_token_num"] = token_lens.cpu().tolist()
 
-        # meta_info 에는 항상 List[int] 로 저장
-        final_batch.meta_info["global_token_num"] = [int(x) for x in token_lens.cpu().tolist()]
-
-    # Collect statistics
+    # Collect param versions efficiently
     param_versions = [rs.param_version for rs in rollout_samples]
-    trajectorys_param_versions = [version for rs in rollout_samples for version in rs.param_version_end]
-
-    processing_time_stats = {
-        "processing_time/avg": np.mean(processing_times),
-        "processing_time/max": np.max(processing_times),
-        "processing_time/min": np.min(processing_times),
-        "processing_time/tp50": np.percentile(processing_times, 50),
-        "processing_time/tp99": np.percentile(processing_times, 99),
-        "processing_time/tp95": np.percentile(processing_times, 95),
-    }
-    processing_time_stats = {f"fully_async/{key}": value for key, value in processing_time_stats.items()}
-
-    # param_version_diff = [abs(a - b) for a, b in zip(rs.param_version_end, rs.param_version_start, strict=False)]
     param_version_diff = [
-        abs(a - b)
+        abs(end - start)
         for rs in rollout_samples
-        for a, b in zip(rs.param_version_end, rs.param_version_start, strict=False)
+        for start, end in zip(rs.param_version_start, rs.param_version_end)
     ]
+    
+    # Compute stats using numpy for efficiency
+    pt_arr = np.array(processing_times)
     num_diff0 = param_version_diff.count(0)
-    partial_stats = {
-        "fully_async/partial/total_partial_num": len(param_version_diff) - num_diff0,
-        "fully_async/partial/partial_ratio": (len(param_version_diff) - num_diff0) / len(param_version_diff),
+    n_diff = len(param_version_diff)
+
+    final_batch.meta_info.update({
+        "rollout_param_versions": param_versions,
+        "param_version_diversity": len(set(param_versions)),
+        "trajectory_param_versions": [v for rs in rollout_samples for v in rs.param_version_end],
+        "fully_async/processing_time/avg": pt_arr.mean(),
+        "fully_async/processing_time/max": pt_arr.max(),
+        "fully_async/processing_time/min": pt_arr.min(),
+        "fully_async/processing_time/tp50": np.percentile(pt_arr, 50),
+        "fully_async/processing_time/tp95": np.percentile(pt_arr, 95),
+        "fully_async/processing_time/tp99": np.percentile(pt_arr, 99),
+        "fully_async/partial/total_partial_num": n_diff - num_diff0,
+        "fully_async/partial/partial_ratio": (n_diff - num_diff0) / n_diff,
         "fully_async/partial/max_partial_span": max(param_version_diff),
-    }
-    # add meta_info
-    final_batch.meta_info.update(
-        {
-            "rollout_param_versions": param_versions,
-            "param_version_diversity": len(set(param_versions)) if param_versions else 0,
-            "trajectory_param_versions": trajectorys_param_versions,
-            **processing_time_stats,
-            **rollout_status,
-            **partial_stats,
-        }
-    )
+        **rollout_status,
+    })
 
     print(f"[BatchUtils] Batch assembly completed in {time.time() - start_time:.2f}s")
-
     return final_batch
 
 

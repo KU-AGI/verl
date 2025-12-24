@@ -160,6 +160,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         self.pending_queue = asyncio.Queue(maxsize=2048)
         self.active_tasks = set()
         self.cancel_queue = asyncio.Queue()
+        self.reward_tasks = set()
 
     def _init_async_objects(self):
         # Initialize asyncio synchronization primitives.
@@ -486,6 +487,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                     "[FullyAsyncRollouter][Processor] Received end signal, "
                     "waiting for remaining tasks to complete..."
                 )
+                # Wait for rollout tasks
                 while self.active_tasks:
                     async with self.lock:
                         if self.active_tasks:
@@ -494,18 +496,27 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                             )
                         for task in done_tasks:
                             await task
+                
+                # Wait for reward tasks
+                while self.reward_tasks:
+                    async with self.lock:
+                        if self.reward_tasks:
+                            done_tasks, self.reward_tasks = await asyncio.wait(
+                                self.reward_tasks, return_when=asyncio.FIRST_COMPLETED
+                            )
+                        for task in done_tasks:
+                            await task
                 break
 
-            # 여기까지 왔으면 rollout_sample은 실제 데이터
+            # Process actual rollout sample
             batch_size = len(rollout_sample.full_batch)
 
-            # 새로 in-flight로 들어가는 샘플 수 반영
+            # Update in-flight sample count
             async with self.lock:
                 if not sample_from_cancel_queue:
-                    # pending_queue에서 처음 나올 때만 staleness 추가
+                    # Add to staleness only when first dequeued from pending_queue
                     self.staleness_samples += batch_size
-                # cancel_queue에서 온 샘플은 staleness에 이미 포함되어 있다고 보고,
-                # 공통으로 in-flight 샘플 수만 증가
+                # Increment active sample count for both queues
                 self.active_sample_count += batch_size
 
             # Check concurrency limit
@@ -534,8 +545,51 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             else:
                 self.pending_queue.task_done()
 
+    async def _compute_single_task_reward(
+        self,
+        task_id: int,
+        batch_result: DataProto,
+        rollout_sample: RolloutSample
+    ):
+        """Compute reward for a single task asynchronously"""
+        try:
+            from recipe.image_rl.reward import compute_reward_async
+
+            # Launch async reward computation
+            future = compute_reward_async.remote(
+                data=batch_result,
+                config=self.config,
+                tokenizer=self.tokenizer,
+                processor=self.processor,
+                reward_fn=None,
+                eval=False,
+                task_id=task_id
+            )
+
+            # Wait for reward computation to complete
+            reward_result = await asyncio.to_thread(ray.get, future)
+            reward_tensor, reward_extra_infos_dict = reward_result
+
+            # Store reward in rollout_sample batch
+            rollout_sample.full_batch.batch[f"task{task_id}_token_level_scores"] = reward_tensor
+
+            if not hasattr(rollout_sample.full_batch, 'meta_info'):
+                rollout_sample.full_batch.meta_info = {}
+            rollout_sample.full_batch.meta_info[f"task{task_id}_reward_extra_info"] = reward_extra_infos_dict
+
+        except Exception as e:
+            print(f"[Rollouter][RewardTask{task_id}] ERROR: {e}")
+            import traceback
+            traceback.print_exc()
+
+        finally:
+            current_task = asyncio.current_task()
+            async with self.lock:
+                self.reward_tasks.discard(current_task)
+
+
     async def _process_single_sample_streaming(self, rollout_sample: RolloutSample):
-        """Process a single sample streamingly"""
+        """Process a single sample with task-level streaming reward computation"""
         try:
             batch_size = len(rollout_sample.full_batch)
             current_version = self.current_param_version
@@ -545,41 +599,72 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 (batch_size,), current_version, dtype=np.int64
             )
 
-            # Execute rollout
-            agent_loop_output_list = await self.async_rollout_manager.generate_single_sample_async(
+            # Track reward tasks for this sample
+            sample_reward_tasks = []
+
+            # Define callback for task completion
+            async def on_task_complete(task_id: int, batch_result: DataProto):
+                """Called when each task completes - launch reward computation"""
+                # Launch async reward computation for this task
+                reward_task = asyncio.create_task(
+                    self._compute_single_task_reward(
+                        task_id=task_id,
+                        batch_result=batch_result,
+                        rollout_sample=rollout_sample,
+                    ),
+                    name=f"reward_task{task_id}_{rollout_sample.sample_id}",
+                )
+                sample_reward_tasks.append(reward_task)
+
+                async with self.lock:
+                    self.reward_tasks.add(reward_task)
+
+            # Execute rollout with task-level callbacks
+            # generate_sequences_with_callback will sequentially execute Task 1, 2, 3
+            # and call on_task_complete after each task finishes
+            result_batch = await self.async_rollout_manager.generate_sequences_with_callback(
                 rollout_sample.full_batch,
-                rollout_sample.agent_loop_output_list,
+                on_task_complete=on_task_complete,
             )
 
-            rollout_sample.agent_loop_output_list = agent_loop_output_list
+            # Update the rollout_sample with the result batch
+            rollout_sample.full_batch = result_batch
+            rollout_sample.agent_loop_output_list = []
 
             # Check if cancelled
-            is_cancel = any(
-                getattr(agent_loop, "is_cancel", False) for agent_loop in agent_loop_output_list
-            )
+            is_cancel = False
 
             if is_cancel:
-                # Put back to cancel queue
-                # await self.cancel_queue.put(rollout_sample)
+                # Cancel all pending reward tasks
+                for task in sample_reward_tasks:
+                    task.cancel()
+
                 async with self.lock:
                     self.active_sample_count -= batch_size
                     self.cancel_sample_count += batch_size
                 await self.cancel_queue.put(rollout_sample)
             else:
-                # Merge rollout sample directly here (instead of consumer worker)
+                # Wait for all task rewards to complete
+                results = await asyncio.gather(*sample_reward_tasks, return_exceptions=True)
+
+                # Check for exceptions
+                for i, result in enumerate(results):
+                    if isinstance(result, Exception):
+                        print(f"[Rollouter] ERROR: Reward task {i} failed: {result}")
+
+                # Merge rollout sample
                 rollout_sample.param_version = current_version
                 rollout_sample.rollout_status = {
                     "param_version": current_version,
                     "staleness_samples": self.staleness_samples,
                     "total_generated_samples": self.total_generated_samples,
                 }
-                
-                # Merge rollout sample
+
                 rollout_sample = merge_rollout_sample(
                     self.config, self.tokenizer, rollout_sample, self.processor
                 )
 
-                # Put directly to message queue
+                # Send to message queue
                 success = await self.message_queue_client.put_sample(
                     sample=ray.cloudpickle.dumps(rollout_sample),
                     param_version=rollout_sample.param_version,
@@ -593,7 +678,6 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                     else:
                         self.staleness_samples -= batch_size
                         self.dropped_stale_samples += batch_size
-
                     self.active_sample_count -= batch_size
 
             self.processed_sample_count += 1
@@ -758,9 +842,10 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         while True:
             async with self.lock:
                 remaining_samples = self.active_sample_count
+                remaining_rewards = len(self.reward_tasks)
                 remaining_tasks = len(self.active_tasks)
 
-            if remaining_samples == 0:
+            if remaining_samples == 0 and remaining_rewards == 0:
                 break
 
             now = time.time()

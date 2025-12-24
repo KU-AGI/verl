@@ -163,7 +163,6 @@ class FullyAsyncAgentLoopWorker(AgentLoopWorkerBase):
 
         batch_size = len(batch)
         num_servers = self.server_manager.get_num_servers()
-        print(f"[FullyAsyncAgentLoopWorker] Processing batch with size: {batch_size}, num_servers: {num_servers}")
 
         # Check conditions for batch processing
         agent_names = batch.non_tensor_batch.get("agent_name", [])
@@ -172,16 +171,13 @@ class FullyAsyncAgentLoopWorker(AgentLoopWorkerBase):
 
         if all_same_agent and no_partial_outputs:
             # Multi-GPU batch processing path
-            print(f"[FullyAsyncAgentLoopWorker] Using multi-GPU batch processing for {batch_size} samples across {num_servers} servers")
             agent_name = agent_names[0]
-
             result = await self._partial_run_agent_loop_batch_distributed(
                 sampling_params, trajectory_info, agent_name, batch, partial_output_list
             )
             return result
         else:
-            # Original per-sample processing path
-            print(f"[FullyAsyncAgentLoopWorker] Using per-sample processing (batch_size={batch_size}, all_same_agent={all_same_agent}, no_partial={no_partial_outputs})")
+            # Per-sample processing path
             tasks = []
             for i in range(batch_size):
                 kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items()}
@@ -212,23 +208,19 @@ class FullyAsyncAgentLoopWorker(AgentLoopWorkerBase):
         samples_per_server = batch_size // num_servers
         remainder = batch_size % num_servers
         
-        print(f"[Batch Distributed] Distributing {batch_size} samples across {num_servers} servers")
-        
         # Split batch into chunks
         chunks = []
         start_idx = 0
         
         for server_idx in range(num_servers):
             chunk_size = samples_per_server + (1 if server_idx < remainder else 0)
-            
+
             if chunk_size == 0:
                 continue
-                
+
             end_idx = start_idx + chunk_size
             chunk_batch = batch[start_idx:end_idx]
             chunks.append((server_idx, chunk_batch, start_idx, end_idx))
-            
-            print(f"[Batch Distributed] Server {server_idx}: samples {start_idx}-{end_idx} (size={chunk_size})")
             start_idx = end_idx
         
         # Process chunks in parallel
@@ -353,8 +345,37 @@ class FullyAsyncAgentLoopWorker(AgentLoopWorkerBase):
                     param_version_start=0, param_version_end=0,
                 )
 
-        print(f"[Batch Distributed] Completed {batch_size} samples")
         return outputs
+
+    async def generate_sequences(self, prompts: DataProto, on_task_complete=None) -> DataProto:
+        """Generate sequences and convert agent loop outputs to DataProto."""
+        import torch
+        from recipe.fully_async_policy_image_rl.detach_utils import postprocess_agent_loop_outputs
+
+        # Preserve task_id through processing
+        task_id = prompts.batch.get("task_id", None)
+
+        # Generate sequences using multi-GPU batch processing
+        outputs_list = await self.generate_sequences_no_post(prompts, partial_output_list=None)
+
+        # Convert agent loop outputs to DataProto
+        result_proto = postprocess_agent_loop_outputs(
+            rs_or_list=outputs_list,
+            tokenizer=self.tokenizer,
+            config=self.config,
+            processor=self.processor
+        )
+
+        # Re-attach task_id to result so manager knows which task was completed
+        if task_id is not None:
+            batch_size = len(result_proto)
+            current_task_id = task_id.view(-1)[0].item()
+            result_proto.batch["task_id"] = torch.full(
+                (batch_size,), current_task_id,
+                dtype=torch.int32, device=result_proto.batch.device
+            )
+
+        return result_proto
 
 class FullyAsyncAgentLoopManager(AgentLoopManager):
     def __init__(self, config: DictConfig, worker_group: RayWorkerGroup = None, rm_wg: RayWorkerGroup = None):
@@ -433,6 +454,64 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         print(f"[AgentLoop] received result batch_size={len(result)}")
 
         return result
+
+    async def generate_sequences_with_callback(self, prompts: DataProto, on_task_complete=None) -> DataProto:
+        """Generate sequences with task-level callbacks for async reward computation.
+
+        This method overrides the parent class to use the async HF replica approach.
+        It executes tasks sequentially (Task 1 -> Task 2 -> Task 3) and calls
+        on_task_complete callback after each task finishes.
+
+        Args:
+            prompts (DataProto): Input batch.
+            on_task_complete: Optional async callback(task_id, batch_result) called after each task.
+
+        Returns:
+            DataProto: Output batch with all tasks completed.
+        """
+        logger.info("[FullyAsyncAgentLoopManager] generate_sequences_with_callback started")
+
+        # Determine which tasks to run
+        import torch
+        task_id_tensor = prompts.batch.get("task_id", None)
+        if task_id_tensor is not None:
+            task_id = task_id_tensor.view(-1)[0].item()
+            tasks_to_run = [task_id]
+            logger.info(f"[FullyAsyncAgentLoopManager] Running single task: {task_id}")
+        else:
+            tasks_to_run = [1, 2, 3]  # Run all tasks sequentially
+            logger.info("[FullyAsyncAgentLoopManager] Running all tasks sequentially: [1, 2, 3]")
+
+        # Execute tasks sequentially with callbacks
+        accumulated_batch = prompts
+        for current_task_id in tasks_to_run:
+            logger.info(f"[FullyAsyncAgentLoopManager] Starting task {current_task_id}")
+
+            # Set task_id in batch by creating new TensorDict (ensures proper tracking through chunk operations)
+            from tensordict import TensorDict
+            task_id_tensor = torch.tensor([current_task_id] * len(accumulated_batch), dtype=torch.int32)
+
+            if accumulated_batch.batch is not None:
+                new_batch_dict = {k: v for k, v in accumulated_batch.batch.items()}
+                new_batch_dict["task_id"] = task_id_tensor
+                new_batch = TensorDict(new_batch_dict, batch_size=accumulated_batch.batch.batch_size)
+            else:
+                new_batch = TensorDict({"task_id": task_id_tensor}, batch_size=[len(accumulated_batch)])
+
+            accumulated_batch.batch = new_batch
+
+            # Execute the task using async worker
+            worker = self._select_best_worker()
+            output_ref = worker.generate_sequences.remote(accumulated_batch, on_task_complete=None)
+            accumulated_batch = await output_ref
+            logger.info(f"Task {current_task_id} generation completed")
+
+            # Call callback for async reward computation
+            if on_task_complete is not None:
+                await on_task_complete(current_task_id, accumulated_batch)
+
+        logger.info("[FullyAsyncAgentLoopManager] All tasks completed")
+        return accumulated_batch
 
     def _select_best_worker(self):
         """Select the best worker, simple round-robin load balancing"""
