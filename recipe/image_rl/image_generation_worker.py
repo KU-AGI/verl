@@ -501,6 +501,8 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
 
     def _build_rollout(self, trust_remote_code=False):
         from torch.distributed.device_mesh import init_device_mesh
+        from transformers import AutoModelForCausalLM, AutoConfig
+        from verl.utils.fs import copy_to_local
 
         # 1. parse rollout and huggingface model config
         if self.config.rollout.name == "image_unified":
@@ -535,48 +537,58 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
         # 3. init trainer and rollout random states
         self.torch_random_states = get_torch_device().get_rng_state()
         gen_dp_rank = rollout_device_mesh["dp"].get_local_rank()
-        get_torch_device().manual_seed(gen_dp_rank + 1000)  # make sure all tp ranks have the same random states
+        get_torch_device().manual_seed(gen_dp_rank + 1000)
         self.gen_random_states = get_torch_device().get_rng_state()
         get_torch_device().set_rng_state(self.torch_random_states)
+
+        # ============== initialize for rollout ==============
+        if rollout_name == 'image_unified':
+            from janus.models import MultiModalityCausalLM, VLChatProcessor
+            
+            use_shm = self.config.model.get("use_shm", False)
+            local_path = copy_to_local(self.config.model.path, use_shm=use_shm)
+            
+            rollout_model_config = AutoConfig.from_pretrained(local_path)
+            rollout_model_config.language_config.use_flash_attention_2 = True
+            rollout_model_config.language_config._attn_implementation = "flash_attention_2"
+            
+            if self.ulysses_sequence_parallel_size > 1 and hasattr(rollout_model_config, "vision_config"):
+                rollout_model_config.vision_config._attn_implementation = "eager"
+            
+            rollout_module = AutoModelForCausalLM.from_pretrained(
+                pretrained_model_name_or_path=local_path,
+                torch_dtype=torch.bfloat16,
+                config=rollout_model_config,
+                trust_remote_code=trust_remote_code,
+            )
+            
+            # GPU로 이동
+            rollout_module = rollout_module.to(get_device_id())
+            rollout_module.eval()
+            
+            if self.rank == 0:
+                print(f"[Rollout] Initialized separate rollout module (non-FSDP)")
+            
+            log_gpu_memory_usage(f"After building rollout module", logger=logger)
+        else:
+            rollout_module = self.actor_module_fsdp
+        # ================================================================
 
         # 4. build rollout model
         log_gpu_memory_usage(f"Before building {self.config.rollout.name} rollout", logger=logger)
         if rollout_name == 'image_unified':
             from verl.workers.rollout import ImageUnifiedRollout
             self.rollout = ImageUnifiedRollout(
-                module=self.actor_module_fsdp, config=self.config.rollout, model_config=model_config, device_mesh=rollout_device_mesh
+                module=rollout_module,
+                config=self.config.rollout, 
+                model_config=model_config, 
+                device_mesh=rollout_device_mesh
             )
         else:
             self.rollout = get_rollout_class(rollout_config.name, rollout_config.mode)(
                 config=rollout_config, model_config=model_config, device_mesh=rollout_device_mesh
             )
         log_gpu_memory_usage(f"After building {self.config.rollout.name} rollout", logger=logger)
-
-        # Full params
-        if torch.distributed.get_world_size() == 1 and fsdp_version(self.actor_module_fsdp) == 1:
-            FSDP.set_state_dict_type(
-                self.actor_module_fsdp,
-                state_dict_type=StateDictType.FULL_STATE_DICT,
-                state_dict_config=FullStateDictConfig(),
-            )
-        elif fsdp_version(self.actor_module_fsdp) == 1:
-            FSDP.set_state_dict_type(
-                self.actor_module_fsdp,
-                state_dict_type=StateDictType.SHARDED_STATE_DICT,
-                state_dict_config=ShardedStateDictConfig(),
-            )
-
-        # used for LoRA
-        self.base_sync_done: bool = "dummy" not in self.config.rollout.load_format
-        self.layered_summon = self.config.rollout.get("layered_summon", False)
-
-        # 5. switch to trainer mode
-        # NOTE: It's critical that hybrid engine in trainer mode initially to load checkpoint.
-        # For sync mode, we directly switch to trainer mode here.
-        # For async mode, we can't call run_until_complete here, so we will switch to trainer mode in AgentLoopManager.
-        if rollout_config.mode == "sync" and self._is_actor:
-            loop = asyncio.get_event_loop()
-            loop.run_until_complete(self.trainer_mode())
 
     async def rollout_mode(self):
         """Context switch hybridengine to rollout mode."""

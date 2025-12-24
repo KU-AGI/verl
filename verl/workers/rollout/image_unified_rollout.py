@@ -12,12 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import contextlib
 import torch
 import torch.distributed as dist
 from tensordict import TensorDict
 from torch import nn
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 from verl import DataProto
 from .base import BaseRollout
@@ -296,8 +294,7 @@ class ImageUnifiedRollout(BaseRollout):
         return None
 
     async def release(self):
-        with contextlib.suppress(Exception):
-            torch.cuda.empty_cache()
+        torch.cuda.empty_cache()
         return None
 
     async def update_weights(self, weights, **kwargs):
@@ -383,6 +380,7 @@ class ImageUnifiedRollout(BaseRollout):
             3: self._generate_minibatch_regen_image_generation,
         }
 
+        # Check for task_id in batch
         task_id_tensor = prompts.batch.get("task_id", None)
         if task_id_tensor is None:
             selected_funcs = task_funcs.values()
@@ -390,7 +388,7 @@ class ImageUnifiedRollout(BaseRollout):
             task_id = task_id_tensor.view(-1)[0].item()
             selected_funcs = [task_funcs.get(task_id)]
 
-        for func in selected_funcs:
+        for i, func in enumerate(selected_funcs):
             if func is not None:
                 prompts = func(prompts)
 
@@ -412,14 +410,9 @@ class ImageUnifiedRollout(BaseRollout):
         attention_mask = data_proto.batch["task1_attention_mask"]
 
         # embedding
-        param_ctx = contextlib.nullcontext()
-        if isinstance(self.module, FSDP):
-            param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=False)
-
-        with param_ctx:
-            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                input_embeds = self.module.language_model.get_input_embeddings()(input_ids)
-                input_embeds = input_embeds.to(dtype=torch.bfloat16)
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            input_embeds = self.module.language_model.get_input_embeddings()(input_ids)
+            input_embeds = input_embeds.to(dtype=torch.bfloat16)
 
         # For computing logits: input (especially input text embedding)
         data_proto.batch["task1_input_embeds"] = input_embeds
@@ -438,20 +431,15 @@ class ImageUnifiedRollout(BaseRollout):
         gen_imgs_pixel_values = gen_imgs_tensor.to(self.device, dtype=torch.bfloat16)
 
         # Postprocessing output embeds
-        param_ctx = contextlib.nullcontext()
-        if isinstance(self.module, FSDP):
-            param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=False)
-
         B, C, H, W = gen_imgs_pixel_values.shape
 
-        with param_ctx:
-            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                _, _, all_image_ids = self.module.gen_vision_model.encode(gen_imgs_pixel_values)
-        
-                image_ids = all_image_ids[2]
-                image_ids = image_ids.view(B, -1)
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            _, _, all_image_ids = self.module.gen_vision_model.encode(gen_imgs_pixel_values)
+    
+            image_ids = all_image_ids[2]
+            image_ids = image_ids.view(B, -1)
 
-                image_embeds = self.module.gen_aligner(self.module.gen_embed(image_ids))
+            image_embeds = self.module.gen_aligner(self.module.gen_embed(image_ids))
 
         data_proto.batch["task1_response_mask"] = torch.ones((B, image_embeds.size(1)), dtype=torch.long, device=image_embeds.device)
         print(f"[IMG_GEN] Created DataProto with batch_size: {batch_size}")
@@ -564,18 +552,13 @@ class ImageUnifiedRollout(BaseRollout):
         batched_total_ids, batched_attention_mask, output_start_indices, all_image_start_indices, images_to_batch = self.expand_image_placeholders(input_ids, gen_imgs_pixel_values)
 
         # embedding
-        param_ctx = contextlib.nullcontext()
-        if isinstance(self.module, FSDP):
-            param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=False)
-
         gen_imgs_pixel_values = gen_imgs_pixel_values.to(self.device, dtype=torch.bfloat16)
 
-        with param_ctx:
-            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                text_embeds = self.module.language_model.get_input_embeddings()(batched_total_ids)
-                image_embeds = self.module.aligner(self.module.vision_model(gen_imgs_pixel_values))
-                text_embeds = text_embeds.to(dtype=torch.bfloat16)
-                image_embeds = image_embeds.to(dtype=torch.bfloat16)
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            text_embeds = self.module.language_model.get_input_embeddings()(batched_total_ids)
+            image_embeds = self.module.aligner(self.module.vision_model(gen_imgs_pixel_values))
+            text_embeds = text_embeds.to(dtype=torch.bfloat16)
+            image_embeds = image_embeds.to(dtype=torch.bfloat16)
 
         # merge text and image embeds
         merged_embeds = self.merge_text_and_image_embeds(text_embeds, image_embeds, all_image_start_indices)
@@ -597,14 +580,9 @@ class ImageUnifiedRollout(BaseRollout):
         feedback_ids = feedback_ids.to(self.device)
 
         # Postprocessing output embeds
-        param_ctx = contextlib.nullcontext()
-        if isinstance(self.module, FSDP):
-            param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=False)
-
-        with param_ctx:
-            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                text_embeds = self.module.language_model.get_input_embeddings()(feedback_ids)
-                text_embeds = text_embeds.to(dtype=torch.bfloat16)
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            text_embeds = self.module.language_model.get_input_embeddings()(feedback_ids)
+            text_embeds = text_embeds.to(dtype=torch.bfloat16)
 
         data_proto.batch["task2_response_mask"] = outputs["attention_mask"]
         print(f"[TEXT_GEN] Completed feedback generation")
@@ -668,21 +646,16 @@ class ImageUnifiedRollout(BaseRollout):
         gen_imgs_pixel_values = gen_imgs_pixel_values.to(self.device, dtype=torch.bfloat16)
 
         # embedding
-        param_ctx = contextlib.nullcontext()
-        if isinstance(self.module, FSDP):
-            param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=False)
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            _, _, all_image_ids = self.module.gen_vision_model.encode(gen_imgs_pixel_values)
+    
+            image_ids = all_image_ids[2]
+            image_ids = image_ids.view(B, -1)
 
-        with param_ctx:
-            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                _, _, all_image_ids = self.module.gen_vision_model.encode(gen_imgs_pixel_values)
-        
-                image_ids = all_image_ids[2]
-                image_ids = image_ids.view(B, -1)
-
-                image_embeds = self.module.gen_aligner(self.module.gen_embed(image_ids))
-                text_embeds = self.module.language_model.get_input_embeddings()(batched_total_ids)
-                image_embeds = image_embeds.to(dtype=torch.bfloat16)
-                text_embeds = text_embeds.to(dtype=torch.bfloat16)
+            image_embeds = self.module.gen_aligner(self.module.gen_embed(image_ids))
+            text_embeds = self.module.language_model.get_input_embeddings()(batched_total_ids)
+            image_embeds = image_embeds.to(dtype=torch.bfloat16)
+            text_embeds = text_embeds.to(dtype=torch.bfloat16)
 
         # merge text and image embeds
         merged_embeds = self.merge_text_and_image_embeds(text_embeds, image_embeds, all_image_start_indices)
@@ -706,20 +679,15 @@ class ImageUnifiedRollout(BaseRollout):
         regen_imgs_pixel_values = regen_imgs_tensor.to(self.device, dtype=torch.bfloat16)
 
         # Postprocessing output embeds
-        param_ctx = contextlib.nullcontext()
-        if isinstance(self.module, FSDP):
-            param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=False)
-
         B, C, H, W = regen_imgs_pixel_values.shape
 
-        with param_ctx:
-            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                _, _, all_image_ids = self.module.gen_vision_model.encode(regen_imgs_pixel_values)
-        
-                image_ids = all_image_ids[2]
-                image_ids = image_ids.view(B, -1)
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            _, _, all_image_ids = self.module.gen_vision_model.encode(regen_imgs_pixel_values)
+    
+            image_ids = all_image_ids[2]
+            image_ids = image_ids.view(B, -1)
 
-                image_embeds = self.module.gen_aligner(self.module.gen_embed(image_ids))
+            image_embeds = self.module.gen_aligner(self.module.gen_embed(image_ids))
 
         data_proto.batch["task3_response_mask"] = torch.ones((B, image_embeds.size(1)), dtype=torch.long, device=image_embeds.device)
         print(f"[IMG_GEN] Created DataProto with batch_size: {batch_size}")
@@ -736,14 +704,9 @@ class ImageUnifiedRollout(BaseRollout):
 
         pad_id = torch.tensor(self.processor.pad_id, device=input_ids.device)
 
-        param_ctx = contextlib.nullcontext()
-        if isinstance(self.module, FSDP):
-            param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=False)
-        
-        with param_ctx:
-            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                pad_embed = self.module.language_model.get_input_embeddings()(pad_id).unsqueeze(0)
-                pad_embed = pad_embed.to(dtype=torch.bfloat16)
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            pad_embed = self.module.language_model.get_input_embeddings()(pad_id).unsqueeze(0)
+            pad_embed = pad_embed.to(dtype=torch.bfloat16)
 
         start_marker = torch.tensor([100601], device=input_ids.device) # <|User|>
         end_marker = torch.tensor([100602], device=input_ids.device) # <|Assistant|>
@@ -784,13 +747,8 @@ class ImageUnifiedRollout(BaseRollout):
         
         shape = [batch_size, 8, self.img_size // self.patch_size, self.img_size // self.patch_size]
 
-        param_ctx = contextlib.nullcontext()
-        if isinstance(self.module, FSDP):
-            param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=False)
-        
-        with param_ctx:
-            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                dec = self.module.gen_vision_model.decode_code(generated_tokens.to(dtype=torch.long), shape=shape)
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            dec = self.module.gen_vision_model.decode_code(generated_tokens.to(dtype=torch.long), shape=shape)
         
         dec = dec.detach().to(torch.float32).cpu().numpy().transpose(0, 2, 3, 1)
         dec = np.clip((dec + 1) / 2 * 255, 0, 255).astype(np.uint8)
@@ -837,64 +795,54 @@ class ImageUnifiedRollout(BaseRollout):
         position_ids = position_ids.masked_fill(attention_mask == 0, 0)
         past_len = attention_mask.sum(dim=1, keepdim=True).long()
 
-        param_ctx = contextlib.nullcontext()
-        if isinstance(self.module, FSDP):
-            param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=False)
-        
-        with param_ctx:
-            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                past_key_values = None
-                for i in range(self.image_token_num_per_image):
-                    outputs = self.module.language_model.model(
-                        inputs_embeds=inputs_embeds,
-                        attention_mask=attention_mask,
-                        position_ids=position_ids,
-                        past_key_values=past_key_values,
-                        use_cache=True,
-                    )
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            past_key_values = None
+            for i in range(self.image_token_num_per_image):
+                outputs = self.module.language_model.model(
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                )
 
-                    hidden_states = outputs.last_hidden_state
-                    past_key_values = outputs.past_key_values
+                hidden_states = outputs.last_hidden_state
+                past_key_values = outputs.past_key_values
 
-                    logits = self.module.gen_head(hidden_states[:, -1, :])
-                    
-                    # CFG
-                    logit_cond = logits[0::2, :]
-                    logit_uncond = logits[1::2, :]
-                    
-                    logits = logit_uncond + self.cfg_weight * (logit_cond-logit_uncond)
-                    next_token = self._sample_from_logits(logits, is_text=False, generator=generator)
-                    generated_tokens[:, i] = next_token.squeeze(-1)
+                logits = self.module.gen_head(hidden_states[:, -1, :])
+                
+                # CFG
+                logit_cond = logits[0::2, :]
+                logit_uncond = logits[1::2, :]
+                
+                logits = logit_uncond + self.cfg_weight * (logit_cond-logit_uncond)
+                next_token = self._sample_from_logits(logits, is_text=False, generator=generator)
+                generated_tokens[:, i] = next_token.squeeze(-1)
 
-                    next_token_pair = next_token.repeat(1, 2).view(-1)
-                    inputs_embeds = self.module.prepare_gen_img_embeds(next_token_pair).unsqueeze(1)
-                    inputs_embeds = inputs_embeds.to(dtype=torch.bfloat16)
+                next_token_pair = next_token.repeat(1, 2).view(-1)
+                inputs_embeds = self.module.prepare_gen_img_embeds(next_token_pair).unsqueeze(1)
+                inputs_embeds = inputs_embeds.to(dtype=torch.bfloat16)
 
-                    attention_mask = torch.cat([attention_mask, torch.ones((attention_mask.shape[0], 1), dtype=torch.long, device=self.device)], dim=1)
+                attention_mask = torch.cat([attention_mask, torch.ones((attention_mask.shape[0], 1), dtype=torch.long, device=self.device)], dim=1)
 
-                    position_ids = past_len.clone()
-                    past_len += 1
+                position_ids = past_len.clone()
+                past_len += 1
 
         return generated_tokens
 
     @torch.no_grad()
     def generate_text(self, inputs_embeds: torch.Tensor, attention_masks: torch.Tensor) -> torch.Tensor:
-        param_ctx = contextlib.nullcontext()
-        if isinstance(self.module, FSDP):
-            param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=False)
-        
-        with param_ctx:
-            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                outputs = self.module.language_model.generate(
-                    inputs_embeds=inputs_embeds,
-                    attention_mask=attention_masks,
-                    max_new_tokens=self.response_length,
-                    use_cache=True,
-                    do_sample=True,
-                    pad_token_id=self.processor.tokenizer.eos_token_id,
-                    eos_token_id=self.processor.tokenizer.eos_token_id,
-                    bos_token_id=self.processor.tokenizer.bos_token_id,
-                )
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            outputs = self.module.language_model.generate(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_masks,
+                max_new_tokens=self.response_length,
+                use_cache=True,
+                do_sample=True,
+                pad_token_id=self.processor.tokenizer.eos_token_id,
+                eos_token_id=self.processor.tokenizer.eos_token_id,
+                bos_token_id=self.processor.tokenizer.bos_token_id,
+            )
 
         answer = self.processor.tokenizer.batch_decode(outputs, skip_special_tokens=True)
 
@@ -910,14 +858,9 @@ class ImageUnifiedRollout(BaseRollout):
 
         pad_id = torch.tensor(self.processor.pad_id, device=input_ids.device)
 
-        param_ctx = contextlib.nullcontext()
-        if isinstance(self.module, FSDP):
-            param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=False)
-        
-        with param_ctx:
-            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                pad_embed = self.module.language_model.get_input_embeddings()(pad_id).unsqueeze(0)
-                pad_embed = pad_embed.to(dtype=torch.bfloat16)
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            pad_embed = self.module.language_model.get_input_embeddings()(pad_id).unsqueeze(0)
+            pad_embed = pad_embed.to(dtype=torch.bfloat16)
 
         start_marker = torch.tensor([100593, 185], device=input_ids.device) # <end_of_image>\n
         end_marker = torch.tensor([100602], device=input_ids.device) # <|Assistant|>
