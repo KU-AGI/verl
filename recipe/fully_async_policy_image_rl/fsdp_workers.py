@@ -157,6 +157,18 @@ class DetachAsyncRolloutWorker(DetachNcclSync):
         ImageGenerationActorRolloutRefWorker.__init__(self, config, role)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def init_model(self):
+        """Rollout-only worker: init rollout model only."""
+        from verl.utils.import_utils import import_external_libs
+        
+        import_external_libs(self.config.model.get("external_lib", None))
+        
+        # Rollout-only: actor/ref 모델 빌드 스킵, rollout만 빌드
+        assert self._is_rollout and not self._is_actor
+        
+        self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def set_actor_weights_info(self, weights_info):
         assert self._is_rollout
         self._weights_info = weights_info
