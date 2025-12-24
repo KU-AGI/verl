@@ -24,3 +24,8 @@ fastapi
 latex2sympy2_extended
 math_verify
 tensorboard
+attrdict
+timm
+numpy==1.26.4
+deepspeed==0.18.2
+tensordict==0.6.2
