@@ -549,7 +549,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         self,
         task_id: int,
         batch_result: DataProto,
-        rollout_sample: RolloutSample
+        reward_results: dict,
     ):
         """Compute reward for a single task asynchronously"""
         try:
@@ -570,12 +570,12 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             reward_result = await asyncio.to_thread(ray.get, future)
             reward_tensor, reward_extra_infos_dict = reward_result
 
-            # Store reward in rollout_sample batch
-            rollout_sample.full_batch.batch[f"task{task_id}_token_level_scores"] = reward_tensor
+            # Store reward in reward_results
+            reward_results[f"task{task_id}_token_level_scores"] = reward_tensor
 
-            if not hasattr(rollout_sample.full_batch, 'meta_info'):
-                rollout_sample.full_batch.meta_info = {}
-            rollout_sample.full_batch.meta_info[f"task{task_id}_reward_extra_info"] = reward_extra_infos_dict
+            if "meta_info" not in reward_results:
+                reward_results["meta_info"] = {}
+            reward_results["meta_info"][f"task{task_id}_reward_extra_info"] = reward_extra_infos_dict
 
         except Exception as e:
             print(f"[Rollouter][RewardTask{task_id}] ERROR: {e}")
@@ -602,6 +602,9 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             # Track reward tasks for this sample
             sample_reward_tasks = []
 
+            # Store reward results
+            reward_results = {}
+
             # Define callback for task completion
             async def on_task_complete(task_id: int, batch_result: DataProto):
                 """Called when each task completes - launch reward computation"""
@@ -610,7 +613,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                     self._compute_single_task_reward(
                         task_id=task_id,
                         batch_result=batch_result,
-                        rollout_sample=rollout_sample,
+                        reward_results=reward_results,
                     ),
                     name=f"reward_task{task_id}_{rollout_sample.sample_id}",
                 )
@@ -647,10 +650,17 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 # Wait for all task rewards to complete
                 results = await asyncio.gather(*sample_reward_tasks, return_exceptions=True)
 
-                # Check for exceptions
-                for i, result in enumerate(results):
-                    if isinstance(result, Exception):
-                        print(f"[Rollouter] ERROR: Reward task {i} failed: {result}")
+                # Integrate reward results into rollout_sample
+                for key, value in reward_results.items():
+                    rollout_sample.full_batch.batch[key] = value
+
+                print(f"[Rollouter] token_level_scores keys after reward computation: {[k for k in rollout_sample.full_batch.batch.keys() if 'token_level_scores' in k]}")
+
+                # Merge meta_info
+                if "meta_info" in reward_results:
+                    if not hasattr(rollout_sample.full_batch, 'meta_info'):
+                        rollout_sample.full_batch.meta_info = {}
+                    rollout_sample.full_batch.meta_info.update(reward_results["meta_info"])
 
                 # Merge rollout sample
                 rollout_sample.param_version = current_version
