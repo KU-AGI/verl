@@ -112,15 +112,24 @@ def postprocess_agent_loop_outputs(rs_or_list: Union["RolloutSample", list], tok
                 else:
                     non_tensor_batch_dict[k] = v[:1]
 
-        # --- 4) Metrics 추출 및 Append ---
+        # --- 4) Metrics 추출 및 모든 필드를 meta_info에 추가 ---
         metrics = out.metrics.model_dump() if hasattr(out.metrics, "model_dump") else (
             out.metrics if isinstance(out.metrics, dict) else {}
         )
 
+        # Extract all relevant fields from AgentLoopOutput to meta_info
+        meta_info = {
+            "metrics": metrics,
+            "param_version_start": getattr(out, 'param_version_start', 0),
+            "param_version_end": getattr(out, 'param_version_end', 0),
+            "is_cancel": getattr(out, 'is_cancel', False),
+            "num_turns": getattr(out, 'num_turns', 1),
+        }
+
         batch_list.append(DataProto.from_dict(
             tensors=fixed_tensors,
             non_tensors=non_tensor_batch_dict,
-            meta_info={"metrics": metrics},
+            meta_info=meta_info,
         ))
 
     return DataProto.concat(batch_list)
@@ -222,15 +231,19 @@ def merge_rollout_sample(config, tokenizer, rs: RolloutSample, processor):
     """
     Supplement and refine the RolloutSample object,
     """
+    batch_size = len(rs.full_batch)
+
     # Step 1: Add uid
-    rs.full_batch.non_tensor_batch["uid"] = np.array([f"uid_{rs.sample_id}"] * len(rs.full_batch), dtype=object)
+    rs.full_batch.non_tensor_batch["uid"] = np.array([f"uid_{rs.sample_id}"] * batch_size, dtype=object)
 
-    # Step 2, set processing_times in full_batch meta_info
-    rs.processing_times = []
-    for metrics in rs.full_batch.meta_info.get("metrics", []):
-        rs.processing_times.append(metrics.get("generate_sequences", 0.0))
+    # Step 2: Set processing_times from meta_info
+    rs.processing_times = rs.full_batch.meta_info.get("metrics", {}).get("generate_sequences", [0.0] * batch_size)
 
-    # Step 3, clear agent_loop_output_list
+    # Step 3: Extract param_version_start and param_version_end from meta_info
+    rs.param_version_start = [rs.full_batch.meta_info.get("param_version_start", 0)] * batch_size
+    rs.param_version_end = [rs.full_batch.meta_info.get("param_version_end", 0)] * batch_size
+
+    # Step 4: Clear agent_loop_output_list
     rs.agent_loop_output_list = []
     return rs
 
