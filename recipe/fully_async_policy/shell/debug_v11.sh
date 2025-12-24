@@ -57,7 +57,7 @@ use_reflection_bonus=False
 reflection_bonus_weight=0.0
 
 # Response length parameters
-max_prompt_length=500 # $((1024 * 2))
+max_prompt_length=550 # $((1024 * 2))
 max_response_length=2100 # $((1024 * 8))
 enable_overlong_buffer=False
 overlong_buffer_len=0 # $((1024 * 4))
