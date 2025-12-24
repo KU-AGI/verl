@@ -541,33 +541,31 @@ class DataParallelImageGenerationActor(BasePPOActor):
                 for micro_batch in micro_batches:
                     micro_batch = micro_batch.to(get_device_id())
                     model_inputs = {**micro_batch.batch}
-                    
-                    # Accumulate loss across all tasks
-                    total_loss = 0.0
-                    total_weight = 0.0
+
                     micro_batch_metrics = {}
-                    
+
+                    # Process each task separately with backward
                     for task_id in task_ids:
                         # Get task-specific data
                         old_log_prob = model_inputs[f"task{task_id}_old_log_probs"]
                         advantages = model_inputs[f"task{task_id}_advantages"]
                         response_mask = model_inputs[f"task{task_id}_response_mask"]
-                        
+
                         entropy_coeff = self.config.entropy_coeff
                         loss_agg_mode = self.config.loss_agg_mode
-                        
+
                         if self.config.use_dynamic_bsz:
                             loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
                         else:
                             loss_scale_factor = 1 / self.gradient_accumulation
-                        
+
                         # Forward pass for this task
                         calculate_entropy = entropy_coeff != 0
                         entropy, log_prob = self._forward_micro_batch(
-                            model_inputs, temperature=temperature, 
+                            model_inputs, temperature=temperature,
                             calculate_entropy=calculate_entropy, task_id=task_id
                         )
-                        
+
                         # Handle old_log_prob
                         if hasattr(self.config, "use_rollout_log_probs") and self.config.use_rollout_log_probs:
                             old_log_prob = model_inputs["old_log_probs"]
@@ -576,11 +574,11 @@ class DataParallelImageGenerationActor(BasePPOActor):
                                 old_log_prob = log_prob.detach()
                             else:
                                 old_log_prob = model_inputs[f"task{task_id}_old_log_probs"]
-                        
+
                         loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
                         rollout_is_weights = model_inputs.get("rollout_is_weights", None)
                         policy_loss_fn = get_policy_loss_fn(loss_mode)
-                        
+
                         # Compute policy loss
                         pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
                             old_log_prob=old_log_prob,
@@ -591,34 +589,33 @@ class DataParallelImageGenerationActor(BasePPOActor):
                             config=self.config,
                             rollout_is_weights=rollout_is_weights,
                         )
-                        
+
                         if entropy_coeff != 0:
-                            entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, 
+                            entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask,
                                                 loss_agg_mode=loss_agg_mode)
                             policy_loss = pg_loss - entropy_loss * entropy_coeff
                         else:
                             policy_loss = pg_loss
-                        
+
                         if self.config.use_kl_loss:
                             ref_log_prob = model_inputs[f"task{task_id}_ref_log_prob"]
                             kld = kl_penalty(
-                                logprob=log_prob, ref_logprob=ref_log_prob, 
+                                logprob=log_prob, ref_logprob=ref_log_prob,
                                 kl_penalty=self.config.kl_loss_type
                             )
-                            kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, 
+                            kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask,
                                             loss_agg_mode=loss_agg_mode)
                             policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
                             micro_batch_metrics[f"actor/task{task_id}_kl_loss"] = kl_loss.detach().item() * loss_scale_factor
                             micro_batch_metrics[f"actor/task{task_id}_kl_coef"] = self.config.kl_loss_coef
-                        
-                        # Apply task weight
+
+                        # Apply task weight and scale factor
                         task_weight = task_weights[task_id - 1] if enable_multi_task else 1.0
                         weighted_loss = policy_loss * task_weight * loss_scale_factor
-                        
-                        # Accumulate
-                        total_loss = total_loss + weighted_loss
-                        total_weight += task_weight
-                        
+
+                        # Backward for each task separately
+                        weighted_loss.backward()
+
                         # Store metrics per task
                         micro_batch_metrics.update({
                             f"actor/task{task_id}_pg_loss": pg_loss.detach().item() * loss_scale_factor,
@@ -626,32 +623,27 @@ class DataParallelImageGenerationActor(BasePPOActor):
                             f"actor/task{task_id}_ppo_kl": ppo_kl.detach().item(),
                             f"actor/task{task_id}_pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
                             f"actor/task{task_id}_weight": task_weight,
+                            f"actor/task{task_id}_loss": weighted_loss.detach().item(),
                         })
-                    
-                    # Use sum of task losses (not normalized by weight)
-                    if total_weight > 0:
-                        total_loss.backward()
 
                     # Add aggregated metrics across tasks
                     if enable_multi_task and len(task_ids) > 1:
-                        # Compute average/sum metrics across all tasks
                         aggregated_metrics = {}
 
-                        # Average metrics (pg_loss, pg_clipfrac, ppo_kl, etc.)
                         avg_pg_loss = sum([micro_batch_metrics.get(f"actor/task{tid}_pg_loss", 0.0) for tid in task_ids]) / len(task_ids)
                         avg_pg_clipfrac = sum([micro_batch_metrics.get(f"actor/task{tid}_pg_clipfrac", 0.0) for tid in task_ids]) / len(task_ids)
                         avg_ppo_kl = sum([micro_batch_metrics.get(f"actor/task{tid}_ppo_kl", 0.0) for tid in task_ids]) / len(task_ids)
                         avg_pg_clipfrac_lower = sum([micro_batch_metrics.get(f"actor/task{tid}_pg_clipfrac_lower", 0.0) for tid in task_ids]) / len(task_ids)
+                        total_loss = sum([micro_batch_metrics.get(f"actor/task{tid}_loss", 0.0) for tid in task_ids])
 
                         aggregated_metrics.update({
                             "actor/avg_pg_loss": avg_pg_loss,
                             "actor/avg_pg_clipfrac": avg_pg_clipfrac,
                             "actor/avg_ppo_kl": avg_ppo_kl,
                             "actor/avg_pg_clipfrac_lower": avg_pg_clipfrac_lower,
-                            "actor/loss": total_loss.detach().item() if isinstance(total_loss, torch.Tensor) else total_loss,
+                            "actor/loss": total_loss,
                         })
 
-                        # Average KL loss if present
                         if any(f"actor/task{tid}_kl_loss" in micro_batch_metrics for tid in task_ids):
                             avg_kl_loss = sum([micro_batch_metrics.get(f"actor/task{tid}_kl_loss", 0.0) for tid in task_ids]) / len(task_ids)
                             aggregated_metrics["actor/avg_kl_loss"] = avg_kl_loss
