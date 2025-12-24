@@ -11,7 +11,7 @@ exec > >(tee -a "${SCRIPT_LOG}")
 exec 2>&1
 
 project_name='mllm_reasoning'
-exp_name='fully_async_kt'
+exp_name='kt_debug'
 
 # export NCCL_IB_GID_INDEX=0
 # export NCCL_CUDA_DEVICE_MAX_CONNECTIONS=8
@@ -102,17 +102,17 @@ sp_size=1
 # n_gpus_rollout=12
 # n_gpus_training=8 # $((NGPUS_PER_NODE - n_gpus_rollout))
 
-fsdp_size=4 # Must be divisible by (n_gpus_training*n_nodes) and (n_gpus_rollout*n_nodes)
+fsdp_size=8 # Must be divisible by (n_gpus_training*n_nodes) and (n_gpus_rollout*n_nodes)
 
 train_prompt_bsz=0
 gen_prompt_bsz=1
-n_resp_per_prompt=8
+n_resp_per_prompt=16
 rollouter_world_size=12
 train_prompt_mini_bsz=128
-train_prompt_micro_bsz=16
+train_prompt_micro_bsz=128
 total_rollout_steps=$(((512*100)))
 staleness_threshold=1.25
-trigger_parameter_sync_step=2
+trigger_parameter_sync_step=10
 require_batches=1
 partial_rollout=False
 
