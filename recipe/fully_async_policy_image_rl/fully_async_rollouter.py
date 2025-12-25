@@ -652,7 +652,8 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
 
                 # Integrate reward results into rollout_sample
                 for key, value in reward_results.items():
-                    rollout_sample.full_batch.batch[key] = value
+                    if key != "meta_info":
+                        rollout_sample.full_batch.batch[key] = value
 
                 print(f"[Rollouter] token_level_scores keys after reward computation: {[k for k in rollout_sample.full_batch.batch.keys() if 'token_level_scores' in k]}")
 

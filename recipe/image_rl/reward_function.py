@@ -824,8 +824,8 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
 
         # Detector based reward - always populate for batch consistency
         detection_results = verify_detection_single(feedback_tuple)
-        detector_response = {"results": {}, "details": [], "errors": ["No spatial/counting tuples found"]}
-        # det_details_list = []
+        detector_response = {"results": {}}
+        # det_details_list = [] # can not concat with DataProto meta_info
 
         detector_reward = 0.0
         if detection_results:
@@ -979,7 +979,7 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
 
         # Detector based reward - always populate for batch consistency
         detection_results = verify_detection_single(feedback_tuple)
-        detector_response = {"results": {}, "details": [], "errors": ["No spatial/counting tuples found"]}
+        detector_response = {"results": {}}
         # det_details_list = []
 
         detector_reward = 0.0
