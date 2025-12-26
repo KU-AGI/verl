@@ -59,16 +59,14 @@ class MessageQueue:
         self.total_consumed = 0
         self.dropped_samples = 0
 
-        self.total_sample_count = 0
-
         print(
             f"[MessageQueue] initialized with max_queue_size={max_queue_size},"
             f"staleness_threshold={self.staleness_threshold}"
         )
 
-    async def put_sample(self, sample: Any, param_version: int, sample_count: int = 1) -> bool:
+    async def put_sample(self, sample: Any, param_version: int) -> bool:
         """
-        Put a batch sample into the queue
+        Put a single sample into the queue
 
         Args:
             sample: Sample data
@@ -80,17 +78,14 @@ class MessageQueue:
         async with self._lock:
             is_drop = False
             if len(self.queue) >= self.max_queue_size:
-                dropped_item = self.queue.popleft()
-                dropped_count = dropped_item[1] if isinstance(dropped_item, tuple) else 1
-                self.total_sample_count -= dropped_count
-                self.dropped_samples += dropped_count
+                self.queue.popleft()
+                self.dropped_samples += 1
                 is_drop = True
-                logger.warning(f"Queue full, dropped {dropped_count} samples")
-            
-            # (sample_data, sample_count) 튜플로 저장
-            self.queue.append((sample, sample_count))
-            self.total_sample_count += sample_count
-            self.total_produced += sample_count
+                logger.warning(f"Queue full, dropped 1 sample")
+
+            # Store single sample directly
+            self.queue.append(sample)
+            self.total_produced += 1
 
             # Notify waiting consumers
             self._consumer_condition.notify_all()
@@ -117,30 +112,16 @@ class MessageQueue:
                 return None
 
             # Get one sample
-            # queue에는 (sample, sample_count) 형태로 들어 있음
-            data = self.queue.popleft()
+            sample = self.queue.popleft()
+            self.total_consumed += 1
 
-            # 여기서 sample_count만 꺼내서 통계 업데이트
-            if isinstance(data, tuple) and len(data) == 2:
-                _, sample_count = data
-            else:
-                sample_count = 1  # 혹시 모를 예외 대비
-
-            # sample_count 감소
-            self.total_sample_count -= sample_count
-            if self.total_sample_count < 0:
-                self.total_sample_count = 0
-
-            # consumed 개수도 sample 기준으로
-            self.total_consumed += sample_count
-
-            # 리턴 형태는 원래대로 유지해야 함
-            return data, len(self.queue)
+            # Return sample and current queue length
+            return sample, len(self.queue)
 
     async def get_sample_count(self) -> int:
-        """Get total sample count in queue"""
+        """Get total sample count in queue (same as queue size for single samples)"""
         async with self._lock:
-            return self.total_sample_count
+            return len(self.queue)
 
     async def update_param_version(self, version: int):
         """Update current parameter version"""
@@ -159,7 +140,6 @@ class MessageQueue:
         async with self._lock:
             return {
                 "queue_size": len(self.queue),
-                "sample_count": self.total_sample_count,
                 "total_produced": self.total_produced,
                 "total_consumed": self.total_consumed,
                 "dropped_samples": self.dropped_samples,
@@ -173,7 +153,6 @@ class MessageQueue:
         async with self._lock:
             cleared_count = len(self.queue)
             self.queue.clear()
-            self.total_sample_count = 0
             logger.info(f"Cleared {cleared_count} samples from queue")
 
     async def shutdown(self):
@@ -234,9 +213,9 @@ class MessageQueueClient:
     def __init__(self, queue_actor: Any):
         self.queue_actor = queue_actor
 
-    async def put_sample(self, sample: Any, param_version: int, sample_count: int = 1) -> bool:
-        """Put batch into queue (async)"""
-        future = self.queue_actor.put_sample.remote(sample, param_version, sample_count)
+    async def put_sample(self, sample: Any, param_version: int) -> bool:
+        """Put single sample into queue (async)"""
+        future = self.queue_actor.put_sample.remote(sample, param_version)
         return await asyncio.wrap_future(future.future())
 
     async def put_validate(self, data: Any) -> bool:
@@ -285,9 +264,9 @@ class MessageQueueClient:
         future = self.queue_actor.get_memory_usage.remote()
         return await asyncio.wrap_future(future.future())
 
-    def put_sample_sync(self, sample: Any, param_version: int, sample_count: int = 1) -> bool:
-        """Put batch into queue (sync - deprecated, use put_sample instead)"""
-        return ray.get(self.queue_actor.put_sample.remote(sample, param_version, sample_count))
+    def put_sample_sync(self, sample: Any, param_version: int) -> bool:
+        """Put single sample into queue (sync - deprecated, use put_sample instead)"""
+        return ray.get(self.queue_actor.put_sample.remote(sample, param_version))
 
     def get_sample_sync(self) -> Any | None:
         """Get single sample from queue (sync - deprecated, use get_sample instead)"""

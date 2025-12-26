@@ -26,6 +26,7 @@ from recipe.fully_async_policy_image_rl.detach_utils import (
     ValidateMetrics,
     prepare_single_generation_data,
     merge_rollout_sample,
+    expand_rollout_sample,
 )
 from recipe.fully_async_policy_image_rl.message_queue import MessageQueueClient
 from recipe.fully_async_policy_image_rl.ray_trainer import FullyAsyncRayPPOTrainer
@@ -125,7 +126,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         # Config
         self.staleness_threshold: float = config.async_training.get("staleness_threshold", 1)
         # required_samples use ppo_mini_batch_size*require_batches as the minimum number of samples.
-        self.rollouter_world_size = config.async_training.get("rollouter_world_size", 1)
+        self.rollout_prompt_size = config.async_training.get("rollout_prompt_size", 1)
         self.require_batches = config.async_training.require_batches
         self.required_samples = config.actor_rollout_ref.actor.ppo_mini_batch_size * self.require_batches
         self.max_required_samples = None
@@ -406,7 +407,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             last_epoch = epoch
 
             # Send accumulated batches when reaching target size
-            if len(full_batch_list) >= self.rollouter_world_size:
+            if len(full_batch_list) >= self.rollout_prompt_size:
                 await self._merge_and_send(full_batch_list, epoch, self.global_steps)
                 full_batch_list = []
 
@@ -655,8 +656,6 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                     if key != "meta_info":
                         rollout_sample.full_batch.batch[key] = value
 
-                print(f"[Rollouter] token_level_scores keys after reward computation: {[k for k in rollout_sample.full_batch.batch.keys() if 'token_level_scores' in k]}")
-
                 # Merge meta_info
                 if "meta_info" in reward_results:
                     if not hasattr(rollout_sample.full_batch, 'meta_info'):
@@ -675,20 +674,23 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                     self.config, self.tokenizer, rollout_sample, self.processor
                 )
 
-                # Send to message queue
-                success = await self.message_queue_client.put_sample(
-                    sample=ray.cloudpickle.dumps(rollout_sample),
-                    param_version=rollout_sample.param_version,
-                    sample_count=batch_size,
-                )
+                # Expand the merged rollout sample back to individual samples
+                individual_samples = expand_rollout_sample(rollout_sample)
+
+                # Send individual samples to message queue
+                success_count = 0
+                for individual_sample in individual_samples:
+                    success = await self.message_queue_client.put_sample(
+                        sample=ray.cloudpickle.dumps(individual_sample),
+                        param_version=individual_sample.param_version,
+                    )
+                    if success:
+                        success_count += 1
 
                 async with self.lock:
-                    if success:
-                        self.total_generated_samples += batch_size
-                        self.staleness_samples -= batch_size
-                    else:
-                        self.staleness_samples -= batch_size
-                        self.dropped_stale_samples += batch_size
+                    self.total_generated_samples += success_count
+                    self.staleness_samples -= batch_size
+                    self.dropped_stale_samples += (batch_size - success_count)
                     self.active_sample_count -= batch_size
 
             self.processed_sample_count += 1
@@ -736,7 +738,6 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         await self.message_queue_client.put_sample(
             sample=None,
             param_version=self.current_param_version,
-            sample_count=0,
         )
 
         async with self.lock:

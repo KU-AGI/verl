@@ -149,48 +149,47 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         consumer_start = time.time()
         queue_samples = []
         queue_len = 0
-        total_sample_count = 0
 
-        while total_sample_count < self.required_samples:
+        # Collect individual samples until we have enough
+        while len(queue_samples) < self.required_samples:
             result = self.message_queue_client.get_sample_sync()
-            
+
             if result is None:
                 print(
                     f"[FullyAsyncTrainer] Detected termination signal (None), stopping sample collection. "
-                    f"Collected {total_sample_count}/{self.required_samples} samples"
+                    f"Collected {len(queue_samples)}/{self.required_samples} samples"
                 )
                 break
-            
-            # result = ((sample_data, sample_count), queue_len) 형태
-            (sample_data, batch_sample_count), queue_len = result
-            
+
+            # result = (sample_data, queue_len)
+            sample_data, queue_len = result
+
             if sample_data is None:
                 print(
                     f"[FullyAsyncTrainer] Detected termination signal (None), stopping sample collection. "
-                    f"Collected {total_sample_count}/{self.required_samples} samples"
+                    f"Collected {len(queue_samples)}/{self.required_samples} samples"
                 )
                 break
 
-            queue_samples.append(sample_data)  # serialized sample만 저장
-            total_sample_count += batch_sample_count
+            queue_samples.append(sample_data)  # serialized sample
 
             if len(queue_samples) % 10 == 0:
                 print(
-                    f"[FullyAsyncTrainer] Collected {total_sample_count}/{self.required_samples} samples "
-                    f"({len(queue_samples)} batches). mq_len: {queue_len}"
+                    f"[FullyAsyncTrainer] Collected {len(queue_samples)}/{self.required_samples} samples. "
+                    f"mq_len: {queue_len}"
                 )
 
         consumer_end = time.time()
 
-        if not queue_samples or total_sample_count < self.required_samples:
-            print(f"[FullyAsyncTrainer] not enough samples collected: {total_sample_count}/{self.required_samples}")
+        if not queue_samples or len(queue_samples) < self.required_samples:
+            print(f"[FullyAsyncTrainer] not enough samples collected: {len(queue_samples)}/{self.required_samples}")
             return None, None
 
         total_wait_time = consumer_end - consumer_start
 
         print(
-            f"[FullyAsyncTrainer] Loop collection completed: {total_sample_count}/{self.required_samples} samples "
-            f"({len(queue_samples)} batches), total wait time: {total_wait_time:.2f} seconds. mq_len: {queue_len}"
+            f"[FullyAsyncTrainer] Loop collection completed: {len(queue_samples)}/{self.required_samples} samples, "
+            f"total wait time: {total_wait_time:.2f} seconds. mq_len: {queue_len}"
         )
 
         queue_samples = [ray.cloudpickle.loads(x) for x in queue_samples]
@@ -201,7 +200,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             batch = assemble_batch_from_rollout_samples(queue_samples, self.tokenizer, self.config, None)
 
         batch.meta_info["fully_async/total_wait_time"] = total_wait_time
-        batch.meta_info["fully_async/total_sample_count"] = total_sample_count
+        batch.meta_info["fully_async/total_sample_count"] = len(queue_samples)
         batch.meta_info["fully_async/batch_count"] = len(queue_samples)
         return 0, batch
 

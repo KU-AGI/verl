@@ -8,8 +8,8 @@ defaults:
 
 async_training:
 
-  # Number of rollouter workers
-  rollouter_world_size: 1
+  # Number of prompts sampled by the rollouter at a time
+  rollout_prompt_size: 1
 
   # Maximum samples staleness threshold
   staleness_threshold: 0.1

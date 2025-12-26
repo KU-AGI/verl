@@ -68,7 +68,7 @@ class ImageGenerationRewardManager:
         ground_truth_imgs = [ground_truth[i]["ground_truth"] if i < len(ground_truth) else None for i in range(len(data))]
         feedback_tuples = [ground_truth[i]["tuple"] if i < len(ground_truth) else None for i in range(len(data))]
         vqa_questions = [ground_truth[i]["vqa_question"] if i < len(ground_truth) else None for i in range(len(data))]
-        extra_infos = [data.non_tensor_batch.get("extra_info", {})] * len(data)
+        extra_infos = [data.meta_info.get("extra_info", {})] * len(data)
         task_ids = [task_id] * len(data)
 
         # Call batch processing function
@@ -91,7 +91,7 @@ class ImageGenerationRewardManager:
     def __call__(self, data: DataProto, task_id: int = 1, eval: bool = False, return_dict: bool = True):
         """Main reward computation with batch processing."""
         print(f"[REWARD] Computing rewards for batch_size={len(data)}")
-        response_mask = data.batch[f"task{task_id}_response_mask"]
+        response_mask = data.batch[f"task{task_id}_response_mask"].clone()
 
         # Initialize reward tensor
         reward_tensor = torch.zeros_like(response_mask, dtype=torch.float32)

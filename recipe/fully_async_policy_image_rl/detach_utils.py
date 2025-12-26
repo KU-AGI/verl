@@ -110,7 +110,7 @@ def postprocess_agent_loop_outputs(rs_or_list: Union["RolloutSample", list], tok
                 elif ndim == 1:
                     non_tensor_batch_dict[k] = v[np.newaxis, ...] if is_img else (v[:1] if v.shape[0] != 1 else v)
                 else:
-                    non_tensor_batch_dict[k] = v[:1]
+                    non_tensor_batch_dict[k] = v[np.newaxis, ...] if is_img else v[:1]
 
         # --- 4) Metrics 추출 및 모든 필드를 meta_info에 추가 ---
         metrics = out.metrics.model_dump() if hasattr(out.metrics, "model_dump") else (
@@ -229,23 +229,79 @@ def process_rollout_log_probs(data_proto: DataProto, rollout_log_probs: list[lis
 
 def merge_rollout_sample(config, tokenizer, rs: RolloutSample, processor):
     """
-    Supplement and refine the RolloutSample object,
+    Supplement and refine the RolloutSample object.
     """
     batch_size = len(rs.full_batch)
-
+    
     # Step 1: Add uid
-    rs.full_batch.non_tensor_batch["uid"] = np.array([f"uid_{rs.sample_id}"] * batch_size, dtype=object)
-
+    rs.full_batch.non_tensor_batch["uid"] = np.array(
+        [f"uid_{rs.sample_id}"] * batch_size, dtype=object
+    )
+    
     # Step 2: Set processing_times from meta_info
-    rs.processing_times = rs.full_batch.meta_info.get("metrics", {}).get("generate_sequences", [0.0] * batch_size)
-
+    rs.processing_times = rs.full_batch.meta_info.get("metrics", {}).get(
+        "generate_sequences", [0.0] * batch_size
+    )
+    
     # Step 3: Extract param_version_start and param_version_end from meta_info
     rs.param_version_start = [rs.full_batch.meta_info.get("param_version_start", 0)] * batch_size
     rs.param_version_end = [rs.full_batch.meta_info.get("param_version_end", 0)] * batch_size
-
+    
     # Step 4: Clear agent_loop_output_list
     rs.agent_loop_output_list = []
+    
+    # Step 5: Mask invalid rewards (-100) for each task
+    for task_id in [1, 2, 3]:  # task1, task2, task3
+        scores_key = f"task{task_id}_token_level_scores"
+        response_mask_key = f"task{task_id}_response_mask"
+
+        if scores_key in rs.full_batch.batch and response_mask_key in rs.full_batch.batch:
+            token_level_scores = rs.full_batch.batch[scores_key]  # shape: [batch_size, seq_len]
+            response_mask = rs.full_batch.batch[response_mask_key]  # shape: [batch_size, seq_len]
+
+            # Check if any token in each instance has a score of -100
+            has_invalid = (token_level_scores == -100).any(dim=1)  # shape: [batch_size]
+
+            # For instances with invalid scores, set response_mask to all zeros
+            for i in range(batch_size):
+                if has_invalid[i]:
+                    rs.full_batch.batch[response_mask_key][i] = torch.zeros_like(response_mask[i])
+
     return rs
+
+
+def expand_rollout_sample(rs: RolloutSample) -> list[RolloutSample]:
+    """
+    Expand a merged RolloutSample (containing multiple samples in batch)
+    back into individual RolloutSamples.
+
+    This reverses the merge operation and creates individual samples
+    that can be sent through the original put_sample/get_sample pattern.
+    """
+    batch_size = len(rs.full_batch)
+    individual_samples = []
+
+    for i in range(batch_size):
+        # Extract single item from batch using DataProto slicing
+        single_batch = rs.full_batch[i:i+1]
+
+        # Create individual RolloutSample
+        individual_sample = RolloutSample(
+            full_batch=single_batch,
+            agent_loop_output_list=[],  # Already cleared in merge_rollout_sample
+            sample_id=f"{rs.sample_id}_idx{i}",
+            epoch=rs.epoch,
+            tool_calls=rs.tool_calls,
+            param_version=rs.param_version,
+            param_version_start=[rs.param_version_start[i]] if rs.param_version_start else [0],
+            param_version_end=[rs.param_version_end[i]] if rs.param_version_end else [0],
+            processing_times=[rs.processing_times[i]] if rs.processing_times else [0.0],
+            rollout_status=rs.rollout_status,
+        )
+
+        individual_samples.append(individual_sample)
+
+    return individual_samples
 
 
 def assemble_batch_from_rollout_samples(

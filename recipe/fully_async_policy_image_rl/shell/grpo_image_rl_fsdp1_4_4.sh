@@ -11,7 +11,7 @@ exec > >(tee -a "${SCRIPT_LOG}")
 exec 2>&1
 
 project_name='mllm_reasoning'
-exp_name='fully_async_nipa_test'
+exp_name='naive_grpo'
 
 export NCCL_IB_GID_INDEX=0
 export NCCL_CUDA_DEVICE_MAX_CONNECTIONS=8
@@ -48,8 +48,8 @@ adv_estimator=grpo_task_skip
 
 use_kl_in_reward=False
 kl_coef=0.0
-use_kl_loss=True
-kl_loss_coef=0.001
+use_kl_loss=False
+kl_loss_coef=0.04
 
 clip_ratio_low=0.2
 clip_ratio_high=0.2
@@ -100,20 +100,23 @@ n_gpus_training=4 # $((NGPUS_PER_NODE - n_gpus_rollout))
 
 fsdp_size=4 # Must be divisible by (n_gpus_training*n_nodes) and (n_gpus_rollout*n_nodes)
 
-train_prompt_bsz=0
-gen_prompt_bsz=1
-n_resp_per_prompt=8
+# https://verl.readthedocs.io/en/latest/advance/fully_async.html#parameter-description
+train_prompt_bsz=0 # not used in async mode
+gen_prompt_bsz=1 # streaming generation, set to 1
+n_resp_per_prompt=16
+rollout_prompt_size=4 # set to number of prompts per actor per batch, used in async mode
 train_prompt_mini_bsz=128
-train_prompt_micro_bsz=8
+train_prompt_micro_bsz=16
 total_rollout_steps=$(((512*100)))
-staleness_threshold=3.0
+staleness_threshold=2.0
 trigger_parameter_sync_step=10
-require_batches=4
+require_batches=1
 partial_rollout=False
 
 test_freq=5
 save_freq=$((test_freq * trigger_parameter_sync_step * 1))
-total_epochs=1
+# total_epochs=1
+total_training_steps=3000
 rollout_freq=1
 log_val_generations=20
 
@@ -209,7 +212,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
     trainer.save_freq="${save_freq}" \
-    trainer.total_epochs=${total_epochs} \
+    trainer.total_training_steps="${total_training_steps}" \
     trainer.resume_mode=auto \
     trainer.default_local_dir=$CKPTS_DIR \
     trainer.rollout_data_dir="$CKPTS_DIR/rollout" \
@@ -221,8 +224,8 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     rollout.nnodes="${NNODES}" \
     rollout.n_gpus_per_node="${n_gpus_rollout}" \
     rollout.total_rollout_steps="${total_rollout_steps}" \
-    rollout.total_epochs=${total_epochs} \
     rollout.test_freq="${test_freq}" \
+    async_training.rollout_prompt_size="${rollout_prompt_size}" \
     async_training.staleness_threshold="${staleness_threshold}" \
     async_training.trigger_parameter_sync_step="${trigger_parameter_sync_step}" \
     async_training.require_batches="${require_batches}" \
