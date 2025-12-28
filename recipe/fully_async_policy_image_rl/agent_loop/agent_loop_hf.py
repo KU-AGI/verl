@@ -484,7 +484,6 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
 
         # Execute tasks with overlapping generation and reward computation
         accumulated_batch = prompts
-        callback_tasks = []  # Track callback tasks to ensure they all complete
 
         for current_task_id in tasks_to_run:
             logger.info(f"[FullyAsyncAgentLoopManager] Starting task {current_task_id}")
@@ -511,10 +510,6 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             # Launch callback for reward computation in background (DON'T WAIT)
             if on_task_complete is not None:
                 on_task_complete(current_task_id, accumulated_batch)
-
-        # Wait for all reward callbacks to complete before returning
-        if callback_tasks:
-            results = await asyncio.gather(*callback_tasks, return_exceptions=True)
 
         logger.info("[FullyAsyncAgentLoopManager] All tasks completed")
         return accumulated_batch

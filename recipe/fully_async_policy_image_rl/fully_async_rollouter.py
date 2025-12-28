@@ -511,14 +511,17 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
 
             # Process actual rollout sample
             batch_size = len(rollout_sample.full_batch)
+            print(f"[FullyAsyncRollouter] _processor_worker batch size: {batch_size}")
 
             # Update in-flight sample count
             async with self.lock:
                 if not sample_from_cancel_queue:
                     # Add to staleness only when first dequeued from pending_queue
                     self.staleness_samples += batch_size
+                    print(f"[FullyAsyncRollouter] staleness samples: {self.staleness_samples}")
                 # Increment active sample count for both queues
                 self.active_sample_count += batch_size
+                print(f"[FullyAsyncRollouter] active samples: {self.active_sample_count}")
 
             # Check concurrency limit
             while self.active_sample_count >= self.max_concurrent_samples:
@@ -539,6 +542,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                     name=rollout_sample.sample_id,
                 )
                 self.active_tasks.add(task)
+                print(f"[FullyAsyncRollouter] active task size: {len(self.active_tasks)}")
 
             # Mark queue task as done
             if sample_from_cancel_queue:
@@ -577,6 +581,8 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             if "meta_info" not in reward_results:
                 reward_results["meta_info"] = {}
             reward_results["meta_info"][f"task{task_id}_reward_extra_info"] = reward_extra_infos_dict
+
+            print(f"[FullyAsyncRollout] reward_result: {reward_results.keys()}")
 
         except Exception as e:
             print(f"[Rollouter][RewardTask{task_id}] ERROR: {e}")
@@ -701,6 +707,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                     )
                     if success:
                         success_count += 1
+                        print(f"[FullyAsyncRollouter] Message queue statistic: {self.message_queue_client.get_statistics_sync()}")
 
                 # async with self.lock:
                 self.total_generated_samples += success_count
