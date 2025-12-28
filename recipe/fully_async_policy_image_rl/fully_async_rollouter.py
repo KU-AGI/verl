@@ -696,8 +696,6 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 reward_results["meta_info"] = {}
             reward_results["meta_info"][f"task{task_id}_reward_extra_info"] = reward_extra_infos_dict
 
-            print(f"[FullyAsyncRollout] reward_result: {reward_results.keys()}")
-
         except Exception as e:
             print(f"[Rollouter][RewardTask{task_id}] ERROR: {e}")
             import traceback
@@ -752,7 +750,6 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             )
 
             await asyncio.sleep(0)
-            print(f"[Rollouter][ProcessSample] generate_sequences_with_callback completed...")
 
             # IMPORTANT: Decrement active_sample_count immediately after generation completes
             # This allows next generation to start while rewards are being computed
@@ -777,12 +774,10 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             else:
                 # Wait for all task rewards to complete
                 results = await asyncio.gather(*sample_reward_tasks, return_exceptions=True)
-                print(f"[Rollouter][ProcessSample] All {len(results)} reward tasks completed")
 
                 # Check for exceptions
                 for i, result in enumerate(results):
                     if isinstance(result, Exception):
-                        print(f"[Rollouter][ProcessSample] ERROR in reward task {i}: {result}")
                         import traceback
                         traceback.print_exception(type(result), result, result.__traceback__)
 
@@ -821,7 +816,6 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                     )
                     if success:
                         success_count += 1
-                        print(f"[FullyAsyncRollouter] Message queue statistic: {self.message_queue_client.get_statistics_sync()}")
 
                 # async with self.lock:
                 self.total_generated_samples += success_count
@@ -982,47 +976,28 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
     async def pause(self):
         """pause rollout"""
         print("[FullyAsyncRollouter][Public][Pause]")
-
-        # Set paused flag
+        
         async with self.lock:
             self.paused = True
             self.monitor_loop_trigger = False
-
-        # Cancel all rollout tasks if partial_rollout is enabled
-        if self.config.async_training.partial_rollout:
-            await self.async_rollout_manager.cancel()
-
-        # Wait for active tasks to complete with throttled logging
-        last_logged_count = None
-        last_logged_time = 0.0
-        log_interval = 10.0
-        sleep_interval = 0.5
-
-        while True:
-            async with self.lock:
-                remaining_samples = self.active_sample_count
-                remaining_rewards = len(self.reward_tasks)
-                remaining_tasks = len(self.active_tasks)
-
-            if remaining_samples == 0 and remaining_rewards == 0:
-                break
-
-            now = time.time()
-            if (
-                remaining_samples != last_logged_count
-                or (now - last_logged_time) >= log_interval
-            ):
-                print(
-                    "[FullyAsyncRollouter][Pause] Waiting for "
-                    f"{remaining_samples} active samples "
-                    f"(task set size={remaining_tasks})..."
-                )
-                last_logged_count = remaining_samples
-                last_logged_time = now
-
-            await asyncio.sleep(sleep_interval)
-
-        print("[FullyAsyncRollouter][Public][Pause] All active samples completed")
+            
+            # Cancel ongoing rollouts if partial_rollout is enabled  
+            if self.config.async_training.partial_rollout:
+                await self.async_rollout_manager.cancel()
+            
+            # Gather all current tasks
+            all_tasks = list(self.active_tasks) | list(self.reward_tasks)
+        
+        if all_tasks:
+            print(f"[FullyAsyncRollouter][Pause] Waiting for {len(all_tasks)} tasks...")
+            await asyncio.gather(*all_tasks, return_exceptions=True)
+        
+        async with self.lock:
+            self.active_tasks.clear()
+            self.reward_tasks.clear()
+            self.active_sample_count = 0
+        
+        print("[FullyAsyncRollouter][Public][Pause] All active tasks completed")
 
     async def resume(self, dependency_ref: ObjectRef = None):
         if dependency_ref is not None:

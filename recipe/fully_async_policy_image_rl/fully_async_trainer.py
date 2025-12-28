@@ -173,7 +173,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
 
             queue_samples.append(sample_data)  # serialized sample
 
-            if len(queue_samples) % 100 == 0:
+            if len(queue_samples) % 10 == 0:
                 print(
                     f"[FullyAsyncTrainer] Collected {len(queue_samples)}/{self.required_samples} samples. "
                     f"mq_len: {queue_len}"
