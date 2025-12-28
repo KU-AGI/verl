@@ -259,8 +259,8 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
 
         self.max_steps_duration = 0
 
-        # get validate data before training
-        self._log_validation_data()
+        # # get validate data before training
+        # self._log_validation_data()
 
         # Use queue mode, no need for traditional dataloader iterator
         # Initialize to get the first batch of data

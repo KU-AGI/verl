@@ -253,7 +253,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             # )
             # await self.message_queue_client.put_validate(ray.cloudpickle.dumps(data))
 
-            # self.version_start_time = time.time()
+            self.version_start_time = time.time()
 
     async def save_checkpoint(self, local_global_step_folder: str):
         # WARNING!: Due to the asynchronous nature, there are some in-flight samples
@@ -521,7 +521,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 self.active_sample_count += batch_size
 
             # Check concurrency limit
-            while len(self.active_tasks) >= self.max_concurrent_samples:
+            while self.active_sample_count >= self.max_concurrent_samples:
                 async with self.lock:
                     if self.active_tasks:
                         done_tasks, self.active_tasks = await asyncio.wait(
@@ -585,8 +585,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
 
         finally:
             current_task = asyncio.current_task()
-            async with self.lock:
-                self.reward_tasks.discard(current_task)
+            self.reward_tasks.discard(current_task)
 
 
     async def _process_single_sample_streaming(self, rollout_sample: RolloutSample):
@@ -607,7 +606,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             reward_results = {}
 
             # Define callback for task completion
-            async def on_task_complete(task_id: int, batch_result: DataProto):
+            def on_task_complete(task_id: int, batch_result: DataProto):
                 """Called when each task completes - launch reward computation"""
                 # Launch async reward computation for this task
                 reward_task = asyncio.create_task(
@@ -620,8 +619,9 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 )
                 sample_reward_tasks.append(reward_task)
 
-                async with self.lock:
-                    self.reward_tasks.add(reward_task)
+                # Add to global reward_tasks tracking without lock to avoid deadlock
+                # The lock here was causing callbacks to wait for each other
+                self.reward_tasks.add(reward_task)
 
             # Execute rollout with task-level callbacks
             # generate_sequences_with_callback will sequentially execute Task 1, 2, 3
@@ -630,6 +630,14 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 rollout_sample.full_batch,
                 on_task_complete=on_task_complete,
             )
+
+            await asyncio.sleep(0)
+            print(f"[Rollouter][ProcessSample] generate_sequences_with_callback completed...")
+
+            # IMPORTANT: Decrement active_sample_count immediately after generation completes
+            # This allows next generation to start while rewards are being computed
+            # async with self.lock:
+            self.active_sample_count -= batch_size
 
             # Update the rollout_sample with the result batch
             rollout_sample.full_batch = result_batch
@@ -643,13 +651,20 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 for task in sample_reward_tasks:
                     task.cancel()
 
-                async with self.lock:
-                    self.active_sample_count -= batch_size
-                    self.cancel_sample_count += batch_size
+                # async with self.lock:
+                self.cancel_sample_count += batch_size
                 await self.cancel_queue.put(rollout_sample)
             else:
                 # Wait for all task rewards to complete
                 results = await asyncio.gather(*sample_reward_tasks, return_exceptions=True)
+                print(f"[Rollouter][ProcessSample] All {len(results)} reward tasks completed")
+
+                # Check for exceptions
+                for i, result in enumerate(results):
+                    if isinstance(result, Exception):
+                        print(f"[Rollouter][ProcessSample] ERROR in reward task {i}: {result}")
+                        import traceback
+                        traceback.print_exception(type(result), result, result.__traceback__)
 
                 # Integrate reward results into rollout_sample
                 for key, value in reward_results.items():
@@ -687,18 +702,20 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                     if success:
                         success_count += 1
 
-                async with self.lock:
-                    self.total_generated_samples += success_count
-                    self.staleness_samples -= batch_size
-                    self.dropped_stale_samples += (batch_size - success_count)
-                    self.active_sample_count -= batch_size
+                # async with self.lock:
+                self.total_generated_samples += success_count
+                self.staleness_samples -= batch_size
+                self.dropped_stale_samples += (batch_size - success_count)
 
             self.processed_sample_count += 1
-
+        except Exception as e:
+            print(f"[Rollouter][ProcessSample] EXCEPTION during processing: {e}")
+            import traceback
+            traceback.print_exc()
         finally:
             current_task = asyncio.current_task()
-            async with self.lock:
-                self.active_tasks.discard(current_task)
+            # async with self.lock:
+            self.active_tasks.discard(current_task)
 
     async def _streaming_generation_main(self):
         """The main entry method for stream processing"""
@@ -802,10 +819,19 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 last_stats_time = current_time
 
             # Trigger rollout recovery
-            if self.monitor_loop_trigger and not self.paused:
-                if not await self._should_pause_generation():
-                    async with self.lock:
-                        self.paused = False
+            # if self.monitor_loop_trigger and not self.paused:
+            #     if not await self._should_pause_generation():
+            #         async with self.lock:
+            #             self.paused = False
+            #             self.condition.notify_all()
+
+            if self.paused:
+                should_pause = await self._should_pause_generation()
+                print(f"[MonitorLoop] paused=True, should_pause={should_pause}", flush=True)
+                if not should_pause:
+                    print(f"[MonitorLoop] Triggering resume!", flush=True)
+                    self.paused = False
+                    async with self.condition:
                         self.condition.notify_all()
 
     async def _should_pause_generation(self) -> bool:

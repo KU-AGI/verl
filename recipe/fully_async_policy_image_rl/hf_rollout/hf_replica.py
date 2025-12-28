@@ -117,11 +117,6 @@ class HuggingFaceReplica(RolloutReplica):
         self._server_handle = self.servers[0]
         self._server_address = f"{server_address}:{server_port}"
 
-        logger.info(
-            f"HuggingFace replica {self.replica_rank} launched with {len(self.servers)} servers "
-            f"wrapping {len(self.workers)} ImageUnifiedRollout workers"
-        )
-
     async def cancel(self):
         """Cancel all ongoing generations in each rollout server."""
         if self.servers:
