@@ -105,7 +105,7 @@ def create_role_worker_mapping(config):
     """
     # Select worker class based on strategy
     if config.actor_rollout_ref.actor.strategy in ["fsdp", "fsdp2"]:
-        assert config.actor_rollout_ref.actor.strategy == config.critic.strategy
+        # assert config.actor_rollout_ref.actor.strategy == config.critic.strategy # we don't need critic in async image rl
         from recipe.fully_async_policy_image_rl.fsdp_workers import (
             DetachActorWorker,
             DetachAsyncRolloutWorker,
