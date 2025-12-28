@@ -522,7 +522,7 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                     self.actor_rollout_wg.restore_model_from_cpu(local_trigger_step)
                     self.actor_rollout_wg.clear_cpu_model(local_trigger_step)
                 else:
-                    batch.batch["old_log_probs"] = batch.batch["rollout_log_probs"]
+                    batch.batch[f"task{task_id}_old_log_probs"] = batch.batch[f"task{task_id}_rollout_log_probs"]
                     batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
 
             else:

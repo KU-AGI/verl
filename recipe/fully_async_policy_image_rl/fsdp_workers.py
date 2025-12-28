@@ -21,7 +21,10 @@ import torch.distributed
 from omegaconf import DictConfig
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
-from recipe.fully_async_policy_image_rl.fsdp2_utils import fsdp2_sharded_load_from_cpu, fsdp2_sharded_save_to_cpu
+from recipe.fully_async_policy_image_rl.fsdp1_utils import (
+    fsdp_sharded_save_to_cpu,
+    fsdp_sharded_load_from_cpu,
+)
 from verl.single_controller.base.decorator import Dispatch, register
 from verl.utils.device import (
     get_device_id,
@@ -32,7 +35,6 @@ from verl.utils.fsdp_utils import (
     fsdp_version,
 )
 from verl import DataProto
-# from verl.workers.fsdp_workers import ActorRolloutRefWorker, AsyncActorRolloutRefWorker, CriticWorker
 from recipe.image_rl.image_generation_worker import ImageGenerationActorRolloutRefWorker, ImageGenerationAsyncActorRolloutRefWorker
 
 logger = logging.getLogger(__file__)
@@ -137,13 +139,23 @@ class DetachActorWorker(DetachNcclSync):
     def save_model_to_cpu(self, n):
         if not hasattr(self, "cpu_saved_models"):
             self.cpu_saved_models = {}
-        self.cpu_saved_models[n] = fsdp2_sharded_save_to_cpu(self.actor_module_fsdp)
+        
+        version = fsdp_version(self.actor_module_fsdp)
+        saved_state = fsdp_sharded_save_to_cpu(self.actor_module_fsdp)
+        
+        # FSDP2 returns (state_dict, global_spec), FSDP1 returns just state_dict
+        if version == 2:
+            self.cpu_saved_models[n] = saved_state  # (cpu_sharded_state, global_spec)
+        else:
+            self.cpu_saved_models[n] = (saved_state, None)  # (state_dict, None)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def restore_model_from_cpu(self, n):
-        if n in self.cpu_saved_models:
-            cpu_sharded_state, global_spec = self.cpu_saved_models[n]
-            fsdp2_sharded_load_from_cpu(self.actor_module_fsdp, cpu_sharded_state, global_spec)
+        if n not in self.cpu_saved_models:
+            return
+        
+        cpu_sharded_state, global_spec = self.cpu_saved_models[n]
+        fsdp_sharded_load_from_cpu(self.actor_module_fsdp, cpu_sharded_state, global_spec)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def clear_cpu_model(self, n):
@@ -163,7 +175,7 @@ class DetachAsyncRolloutWorker(DetachNcclSync):
         
         import_external_libs(self.config.model.get("external_lib", None))
         
-        # Rollout-only: actor/ref 모델 빌드 스킵, rollout만 빌드
+        # actor worker does not need to init model
         assert self._is_rollout and not self._is_actor
         
         self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))

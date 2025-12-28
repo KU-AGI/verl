@@ -568,7 +568,7 @@ class DataParallelImageGenerationActor(BasePPOActor):
 
                         # Handle old_log_prob
                         if hasattr(self.config, "use_rollout_log_probs") and self.config.use_rollout_log_probs:
-                            old_log_prob = model_inputs["old_log_probs"]
+                            old_log_prob = model_inputs[f"task{task_id}_old_log_probs"]
                         else:
                             if on_policy:
                                 old_log_prob = log_prob.detach()
