@@ -385,6 +385,124 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             worker_group=self.rollout_wg,
         )
 
+    async def queue_async_weight_update(self, version: int, param_synchronizer=None):
+        """
+        Queue async weight update on all server replicas and apply when idle.
+        Called from ParameterSynchronizer.
+        """
+        if self.async_rollout_manager is None:
+            await self._init_async_rollout_manager()
+
+        # Queue weight update on all server replicas
+        server_handles = self.async_rollout_manager.server_handles
+        print(f"[FullyAsyncRollouter] Queueing weight update version {version} to {len(server_handles)} servers")
+
+        # Queue on all servers in parallel (non-blocking)
+        await asyncio.gather(
+            *[server.queue_weight_update.remote(version) for server in server_handles]
+        )
+
+        # Start background task to apply weights when servers are idle
+        asyncio.create_task(self._apply_weights_when_idle(version, param_synchronizer))
+
+    async def _apply_weights_when_idle(self, version: int, param_synchronizer):
+        """
+        Wait for all servers to become idle, then trigger NCCL sync via ParameterSynchronizer.
+
+        Optimization: Uses adaptive polling - checks more frequently when servers are becoming idle.
+
+        This monitors generation servers and when all are idle, calls the ParameterSynchronizer
+        to perform the actual NCCL broadcast with both actor_wg and rollout_wg.
+        """
+        print(f"[FullyAsyncRollouter] Starting background task to monitor idle state for version {version}")
+
+        check_interval = 0.01  # Start with 10ms for fast detection
+        idle_count = 0
+
+        while True:
+            await asyncio.sleep(check_interval)
+
+            # Check if all servers are idle (no ongoing generations)
+            server_handles = self.async_rollout_manager.server_handles
+
+            try:
+                statuses = await asyncio.gather(
+                    *[server.get_weight_update_status.remote() for server in server_handles]
+                )
+            except Exception as e:
+                print(f"[FullyAsyncRollouter] Error getting server status: {e}")
+                break
+
+            all_idle = all(status['ongoing_generations'] == 0 for status in statuses)
+            any_pending = any(status['pending_weight_version'] == version for status in statuses)
+
+            # Count how many servers are idle for logging
+            num_idle = sum(1 for s in statuses if s['ongoing_generations'] == 0)
+
+            if all_idle and any_pending:
+                print(f"[FullyAsyncRollouter] All {len(server_handles)} servers idle, triggering NCCL sync for version {version}")
+
+                # Trigger NCCL weight sync via ParameterSynchronizer
+                # The synchronizer has access to both actor_wg and rollout_wg
+                if param_synchronizer is not None:
+                    try:
+                        print(f"[FullyAsyncRollouter] Calling apply_nccl_weight_sync for version {version}")
+                        # Fire the remote call but don't wait synchronously - use ray.get in thread pool
+                        apply_ref = param_synchronizer.apply_nccl_weight_sync.remote(version)
+
+                        # Run ray.get in thread pool to avoid blocking the event loop
+                        await asyncio.to_thread(ray.get, apply_ref)
+                        print(f"[FullyAsyncRollouter] Successfully completed NCCL weight sync for version {version}")
+                    except Exception as e:
+                        print(f"[FullyAsyncRollouter] Failed to apply weight sync: {e}")
+                        import traceback
+                        traceback.print_exc()
+
+                # Clear pending versions on all servers (fire-and-forget to avoid deadlock)
+                print(f"[FullyAsyncRollouter] Clearing pending weight updates for version {version}")
+                # Don't await - just fire the remote calls
+                for server in server_handles:
+                    server.queue_weight_update.remote(-1)  # Fire-and-forget
+                print(f"[FullyAsyncRollouter] Background task complete for version {version}")
+                break
+            else:
+                # Adaptive polling: if getting close to all idle, check more frequently
+                if num_idle >= len(server_handles) - 1:
+                    check_interval = 0.01  # 10ms - very frequent
+                    idle_count += 1
+                    if idle_count % 100 == 0:  # Log every 100ms when almost ready
+                        print(f"[FullyAsyncRollouter] Waiting for weight sync v{version}: {num_idle}/{len(server_handles)} servers idle")
+                elif num_idle >= len(server_handles) // 2:
+                    check_interval = 0.05  # 50ms - moderate
+                else:
+                    check_interval = 0.1  # 100ms - normal
+
+            # If no server has pending update for this version anymore, stop waiting
+            if not any_pending:
+                print(f"[FullyAsyncRollouter] No pending updates for version {version}, stopping background task")
+                break
+
+    async def check_all_servers_idle(self) -> bool:
+        """Check if all generation servers are currently idle."""
+        if self.async_rollout_manager is None:
+            return False
+
+        server_handles = self.async_rollout_manager.server_handles
+        statuses = await asyncio.gather(
+            *[server.get_weight_update_status.remote() for server in server_handles]
+        )
+        return all(status['ongoing_generations'] == 0 for status in statuses)
+
+    async def clear_pending_weight_updates(self):
+        """Clear all pending weight update versions on generation servers."""
+        if self.async_rollout_manager is None:
+            return
+
+        server_handles = self.async_rollout_manager.server_handles
+        await asyncio.gather(
+            *[server.queue_weight_update.remote(-1) for server in server_handles]  # -1 means clear
+        )
+
     # Add samples to the pending_queue
     async def _feed_samples(self):
         continuous_iterator = self._create_continuous_iterator()
@@ -511,17 +629,14 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
 
             # Process actual rollout sample
             batch_size = len(rollout_sample.full_batch)
-            print(f"[FullyAsyncRollouter] _processor_worker batch size: {batch_size}")
 
             # Update in-flight sample count
             async with self.lock:
                 if not sample_from_cancel_queue:
                     # Add to staleness only when first dequeued from pending_queue
                     self.staleness_samples += batch_size
-                    print(f"[FullyAsyncRollouter] staleness samples: {self.staleness_samples}")
                 # Increment active sample count for both queues
                 self.active_sample_count += batch_size
-                print(f"[FullyAsyncRollouter] active samples: {self.active_sample_count}")
 
             # Check concurrency limit
             while self.active_sample_count >= self.max_concurrent_samples:
@@ -542,7 +657,6 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                     name=rollout_sample.sample_id,
                 )
                 self.active_tasks.add(task)
-                print(f"[FullyAsyncRollouter] active task size: {len(self.active_tasks)}")
 
             # Mark queue task as done
             if sample_from_cancel_queue:

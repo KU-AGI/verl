@@ -261,6 +261,8 @@ class FullyAsyncTaskRunner:
             rollouter=self.components["rollouter"],
             mq=self.components["message_queue_client"],
         )
+        # Set the handle so it can pass itself to rollouter
+        ray.get(param_synchronizer.set_self_handle.remote(param_synchronizer))
         ray.get(self.components["trainer"].set_parameter_synchronizer.remote(param_synchronizer))
 
         # load checkpoint and sync parameter before doing anything
@@ -272,7 +274,8 @@ class FullyAsyncTaskRunner:
         val_before_train = has_val_reward and config.trainer.get("val_before_train", True)
         ray.get(self.components["trainer"].load_checkpoint.remote())
         ray.get(param_synchronizer.sync_weights.remote(version=0, validate=val_before_train))
-        ray.get(param_synchronizer.wait_last_valid.remote())
+        # Note: wait_last_valid() is blocking and should only be called after rollouter starts
+        # ray.get(param_synchronizer.wait_last_valid.remote())
 
         self.components["param_synchronizer"] = param_synchronizer
         print("[ASYNC MAIN] All components initialized successfully")

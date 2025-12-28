@@ -67,6 +67,12 @@ class HuggingFaceAsyncServerForImageRollout:
         # Thread pool for running synchronous generate_sequences in background
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
+        # Weight update queue (maxsize=1 to keep only latest version)
+        self.pending_weight_version: Optional[int] = None
+        self.weight_update_lock = asyncio.Lock()
+        self.weight_update_worker_task: Optional[asyncio.Task] = None
+        self.ongoing_generations = 0  # Track number of ongoing generations
+
         logger.info(f"Initializing HF async server on replica {self.replica_rank}, node {self.node_rank}")
 
     async def init_model(self):
@@ -85,7 +91,10 @@ class HuggingFaceAsyncServerForImageRollout:
                 logger.info(f"Worker {i} info: {info}")
             except Exception as e:
                 logger.error(f"Failed to get worker {i} info: {e}")
-        
+
+        # Start background weight update worker
+        self.weight_update_worker_task = asyncio.create_task(self._weight_update_worker())
+
         logger.info(f"HF async server initialized on replica {self.replica_rank}")
 
     async def _generate_step(
@@ -99,6 +108,10 @@ class HuggingFaceAsyncServerForImageRollout:
         Since generate_sequences is a synchronous method, we run it in an executor.
         """
         try:
+            # Track ongoing generation
+            async with self.weight_update_lock:
+                self.ongoing_generations += 1
+
             # Update DataProto meta_info with sampling params
             if hasattr(prompt_data, 'meta_info'):
                 for key, value in sampling_params.items():
@@ -108,13 +121,13 @@ class HuggingFaceAsyncServerForImageRollout:
             # This is critical for NCCL collective operations (all-reduce, etc.)
             # All workers must participate in the same collective op at the same time
             result_refs = [worker.generate_sequences.remote(prompt_data) for worker in self.workers]
-            
+
             # Wait for all workers to complete
             # Convert Ray ObjectRefs to asyncio-compatible futures and gather
             results = await asyncio.gather(
                 *[asyncio.wrap_future(ref.future()) for ref in result_refs]
             )
-            
+
             # Return result from worker[0] (rank 0 in this replica)
             # Other workers' results are identical due to synchronized execution
             return results[0]
@@ -122,6 +135,10 @@ class HuggingFaceAsyncServerForImageRollout:
         except Exception as e:
             logger.error(f"Generation failed for request {request_id}: {e}", exc_info=True)
             raise
+        finally:
+            # Decrement ongoing generation count
+            async with self.weight_update_lock:
+                self.ongoing_generations -= 1
 
     async def generate_for_partial(
         self,
@@ -247,3 +264,56 @@ class HuggingFaceAsyncServerForImageRollout:
     def get_master_address(self):
         """Get master address (for compatibility)"""
         return ray.util.get_node_ip_address().strip("[]"), 8001
+
+    async def get_weight_update_status(self) -> dict:
+        """Get current weight update status for monitoring"""
+        async with self.weight_update_lock:
+            return {
+                "replica_rank": self.replica_rank,
+                "node_rank": self.node_rank,
+                "pending_weight_version": self.pending_weight_version,
+                "ongoing_generations": self.ongoing_generations,
+                "has_pending_update": self.pending_weight_version is not None,
+            }
+
+    async def queue_weight_update(self, version: int):
+        """
+        Queue a weight update to be applied after ongoing generations complete.
+        Only keeps the latest version - older pending updates are discarded.
+        Special value: version=-1 clears the pending update.
+        """
+        async with self.weight_update_lock:
+            if version == -1:
+                # Clear pending update
+                self.pending_weight_version = None
+                logger.info(f"[Replica {self.replica_rank}] Cleared pending weight update")
+            elif self.pending_weight_version is None or version > self.pending_weight_version:
+                self.pending_weight_version = version
+                logger.info(
+                    f"[Replica {self.replica_rank}] Queued weight update to version {version}, "
+                    f"ongoing_generations={self.ongoing_generations}"
+                )
+            else:
+                logger.debug(
+                    f"[Replica {self.replica_rank}] Skipped weight update to version {version}, "
+                    f"already have pending version {self.pending_weight_version}"
+                )
+
+    async def _weight_update_worker(self):
+        """
+        Background worker that monitors for weight updates when no generation is ongoing.
+        Instead of applying weights directly, this just monitors the idle state.
+        The actual weight sync is triggered by FullyAsyncRollouter when it detects idle replicas.
+        """
+        logger.info(f"[Replica {self.replica_rank}] Weight update worker started (monitor mode)")
+
+        while True:
+            await asyncio.sleep(0.1)  # Monitor every 100ms
+
+            # Just log status for monitoring - actual sync happens at rollouter level
+            async with self.weight_update_lock:
+                if self.pending_weight_version is not None and self.ongoing_generations == 0:
+                    logger.debug(
+                        f"[Replica {self.replica_rank}] Ready for weight update: "
+                        f"pending_version={self.pending_weight_version}, ongoing={self.ongoing_generations}"
+                    )
