@@ -473,7 +473,6 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
 
         await self._initialize_llm_servers_async()
         self._init_agent_loop_workers()
-        print("[DEBUG] agent_loop_workers =", len(self.agent_loop_workers), flush=True)
 
     async def _initialize_llm_servers_async(self):
         rollout_world_size = self.config.actor_rollout_ref.rollout.tensor_model_parallel_size

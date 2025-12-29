@@ -37,7 +37,7 @@ from verl.trainer.ppo.utils import Role, WorkerType
 from verl import DataProto
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.profiler import marked_timer
-from verl.utils.tracking import ValidationGenerationsLogger
+from recipe.image_rl.tracking import ValidationGenerationsLogger
 
 
 @ray.remote(num_cpus=10, max_concurrency=100)
@@ -628,6 +628,9 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         while True:
             # 0) Pause gate ONLY here (loop head)
             if self.paused or await self._should_pause_generation():
+                print(
+                    "[FullyAsyncRollouter][Processor] Received pause signal, waiting for remaining tasks to return..."
+                )
                 async with self.lock:
                     self.paused = True
                     self.idle_start_time = time.time()
@@ -810,9 +813,9 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 asyncio.create_task(self._track_reward_task(reward_task))
 
             result_batch = await self.async_rollout_manager.generate_sequences_with_callback_on_server(
-            rollout_sample.full_batch,
-            server_index=server_index,
-            on_task_complete=on_task_complete,
+                rollout_sample.full_batch,
+                server_index=server_index,
+                on_task_complete=on_task_complete,
             )
             await self._wait_server_idle(server_index)
 
@@ -832,7 +835,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 (rollout_sample, sample_reward_tasks, reward_results, current_version, finalize_budget)
             )
             enqueued_to_finalize = True
-            return  # ★ 여기서 끝
+            return  # 여기서 끝
 
         except Exception as e:
             print(f"[Rollouter][ProcessSample] EXCEPTION during processing: {e}")
@@ -888,8 +891,6 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             await self.reward_finalize_queue.put("DONE")
             if self.reward_finalize_worker_task:
                 await asyncio.gather(self.reward_finalize_worker_task, return_exceptions=True)
-
-            
 
         # Send a finish signal
         await self.message_queue_client.put_sample(
@@ -1023,13 +1024,8 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                     statuses = await asyncio.gather(
                         *[s.get_weight_update_status.remote() for s in self.async_rollout_manager.server_handles]
                     )
-                    print(
-                        "[DEBUG] ongoing_generations =",
-                        [st.get("ongoing_generations") for st in statuses],
-                        flush=True,
-                    )
                 except Exception as e:
-                    print("[DEBUG] status check failed:", e, flush=True)
+                    print("[FullAsyncRollouter] status check failed:", e, flush=True)
 
             # Trigger rollout recovery
             # if self.monitor_loop_trigger and not self.paused:

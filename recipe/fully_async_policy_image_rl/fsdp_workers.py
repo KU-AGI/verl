@@ -151,11 +151,9 @@ class DetachActorWorker(DetachNcclSync):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def restore_model_from_cpu(self, n):
-        if n not in self.cpu_saved_models:
-            return
-        
-        cpu_sharded_state, global_spec = self.cpu_saved_models[n]
-        fsdp_sharded_load_from_cpu(self.actor_module_fsdp, cpu_sharded_state, global_spec)
+        if n in self.cpu_saved_models:
+            cpu_sharded_state, global_spec = self.cpu_saved_models[n]
+            fsdp_sharded_load_from_cpu(self.actor_module_fsdp, cpu_sharded_state, global_spec)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def clear_cpu_model(self, n):
