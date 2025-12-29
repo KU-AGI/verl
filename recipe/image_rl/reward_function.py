@@ -33,7 +33,6 @@ BASE_URLS = [
 API_KEY = "EMPTY"
 MAX_RETRIES = 3
 BASE_DELAY = 2
-MAX_CONCURRENT_REQUESTS = 4
 MODEL_NAME = os.environ.get("RM_MODEL_PATH", "Qwen/Qwen3-VL-30B-A3B-Instruct")
 
 # Health checking configuration
@@ -55,6 +54,51 @@ DETECTOR_TIMEOUT = 300000.0
 DETECTOR_MAX_RETRIES = 2
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+
+RM_PER_SERVER_INFLIGHT = 16
+_rm_slot_state = {}
+
+DET_PER_SERVER_INFLIGHT = 4  
+_det_slot_state = {}       
+
+async def _ensure_rm_slots() -> asyncio.Queue:
+    loop = asyncio.get_running_loop()
+    state = _rm_slot_state.get(loop)
+    if state is None:
+        state = {"lock": asyncio.Lock(), "q": None}
+        _rm_slot_state[loop] = state
+
+    if state["q"] is not None:
+        return state["q"]
+
+    async with state["lock"]:
+        if state["q"] is None:
+            q = asyncio.Queue()
+
+            start = random.randrange(len(BASE_URLS))
+            for i in range(RM_PER_SERVER_INFLIGHT * len(BASE_URLS)):
+                sid = (start + i) % len(BASE_URLS)
+                q.put_nowait(sid)
+
+            state["q"] = q
+
+    return state["q"]
+
+
+async def borrow_rm_client():
+    q = await _ensure_rm_slots()
+    while True:
+        sid = await q.get()
+        s = client_manager.servers[sid]
+        if s.status != ServerStatus.UNHEALTHY or s.should_retry_unhealthy():
+            return s.client, sid
+        q.put_nowait(sid)
+        await asyncio.sleep(0.05)
+
+async def release_rm_client(server_id: int):
+    q = await _ensure_rm_slots()
+    q.put_nowait(server_id)
+
 
 class ServerStatus(Enum):
     HEALTHY = "healthy"
@@ -468,57 +512,44 @@ def get_messages_task2_align(prompt, gen_img, feedback_text, regen_img, ground_t
 
     return messages
 
+async def get_response_once(client, server_id, messages):
+    """딱 1번만 RM 호출. retry는 바깥에서."""
+    try:
+        response = await client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=messages,
+            max_tokens=2048,
+            extra_body={"repetition_penalty": 1.2},
+            timeout=300000.0,
+        )
+        client_manager.record_request_result(server_id, success=True)
+        return response.choices[0].message.content
+    except Exception as e:
+        client_manager.record_request_result(server_id, success=False, error=e)
+        raise
 
-async def get_response_with_client(client, client_id, messages):
-    """Get response from a specific client with improved error handling"""
-    for attempt in range(MAX_RETRIES):
+async def get_response_with_fallback(prompt, gen_img, feedback_text, regen_img, ground_truth_img,
+                                     feedback_tuple, vqa_question, extra_info, task_id):
+    messages = get_messages(
+        prompt, gen_img, feedback_text, regen_img, ground_truth_img,
+        feedback_tuple, vqa_question, extra_info, task_id
+    )
+
+    max_attempts = len(BASE_URLS) * MAX_RETRIES
+    for attempt in range(max_attempts):
+        client, sid = await borrow_rm_client()
+        err = None
         try:
-            response = await client.chat.completions.create(
-                model=MODEL_NAME,
-                messages=messages,
-                max_tokens=2048,
-                extra_body={"repetition_penalty": 1.2},
-                timeout=300000.0  # Add timeout
-            )
-            # Record successful request
-            client_manager.record_request_result(client_id, success=True)
-            return response.choices[0].message.content
-            
+            return await get_response_once(client, sid, messages)
         except Exception as e:
-            # Record failed request
-            client_manager.record_request_result(client_id, success=False, error=e)
-            
-            if attempt < MAX_RETRIES - 1:
-                print(f"Client {client_id} attempt {attempt+1} failed: {repr(e)}")
-                delay = BASE_DELAY * (2**attempt) + random.uniform(0, 1)
-                await asyncio.sleep(delay)
-            else:
-                print(f"Client {client_id} failed after {MAX_RETRIES} attempts. Error: {e}")
-                return None
+            err = e
+        finally:
+            await release_rm_client(sid)
 
+        # ★ 슬롯 반납 후 backoff
+        delay = BASE_DELAY * (2 ** min(attempt, 3)) + random.uniform(0, 1)
+        await asyncio.sleep(delay)
 
-async def get_response_with_fallback(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id):
-    """Get response with automatic server fallback"""
-    messages = get_messages(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id)
-    
-    # Try different servers until one succeeds
-    max_server_attempts = len(client_manager.servers)
-    
-    for server_attempt in range(max_server_attempts):
-        client_info = client_manager.get_next_client_with_fallback()
-        if client_info[0] is None:
-            print("No available servers!")
-            break
-            
-        client, client_id = client_info
-        
-        response = await get_response_with_client(client, client_id, messages)
-        if response is not None:
-            return response
-            
-        print(f"Server attempt {server_attempt + 1}/{max_server_attempts} failed, trying next server...")
-    
-    print("All servers failed!")
     return None
 
 
@@ -528,28 +559,27 @@ async def get_response(prompt, gen_img, feedback_text, regen_img, ground_truth_i
     return await get_response_with_fallback(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id)
 
 
-async def get_response_with_fallback_task2_align(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id):
-    """Get response with automatic server fallback"""
-    messages = get_messages_task2_align(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id)
-    
-    # Try different servers until one succeeds
-    max_server_attempts = len(client_manager.servers)
-    
-    for server_attempt in range(max_server_attempts):
-        client_info = client_manager.get_next_client_with_fallback()
-        if client_info[0] is None:
-            print("No available servers!")
-            break
-            
-        client, client_id = client_info
-        
-        response = await get_response_with_client(client, client_id, messages)
-        if response is not None:
-            return response
-            
-        print(f"Server attempt {server_attempt + 1}/{max_server_attempts} failed, trying next server...")
-    
-    print("All servers failed!")
+async def get_response_with_fallback_task2_align(prompt, gen_img, feedback_text, regen_img, ground_truth_img,
+                                                 feedback_tuple, vqa_question, extra_info, task_id):
+    messages = get_messages_task2_align(
+        prompt, gen_img, feedback_text, regen_img, ground_truth_img,
+        feedback_tuple, vqa_question, extra_info, task_id
+    )
+
+    max_attempts = len(BASE_URLS) * MAX_RETRIES
+    for attempt in range(max_attempts):
+        client, sid = await borrow_rm_client()
+        err = None
+        try:
+            return await get_response_once(client, sid, messages)
+        except Exception as e:
+            err = e
+        finally:
+            await release_rm_client(sid)
+
+        delay = BASE_DELAY * (2 ** min(attempt, 3)) + random.uniform(0, 1)
+        await asyncio.sleep(delay)
+
     return None
 
 
@@ -633,131 +663,145 @@ def verify_detection_single(feedback_tuple: list) -> List[Dict[str, Any]]: #
     
 async def request_detector_single(detection_list: List[Dict[str, Any]], img) -> Dict[str, Any]:
     """
-    Send detection requests to GDino detector API.
-    
-    Args:
-        detection_list: List of detection info dicts with keys like:
-            - type: "spatial" or "counting" (will be converted to "numeracy")
-            - subject, object, relation (for spatial)
-            - object, num (for counting/numeracy)
-            - tuple_idx: original tuple index
-        img: PIL Image or path to image
-    
-    Returns:
-        Dict with:
-            - results: Dict[tuple_idx, bool] mapping tuple indices to detection results
-            - details: List of full detection responses
-            - errors: List of any errors encountered
+    - detector 서버 4개를 고루 사용 (slot token 기반)
+    - 서버당 inflight cap (DET_PER_SERVER_INFLIGHT)
+    - failover/retry (DETECTOR_MAX_RETRIES) 동안 슬롯 점유하지 않음
     """
+
     if not detection_list:
         return {"results": {}, "details": [], "errors": []}
-    
-    # Convert image to base64
-    img_base64 = convert_gen_img_to_base64(img)
-    # Remove data URL prefix if present (API expects raw base64)
-    if img_base64.startswith("data:"):
-        img_base64 = img_base64.split(",", 1)[1]
-    
-    # Prepare info_list for API request
+
+    # -------- loop-local slot queue init --------
+    async def _ensure_det_slots() -> asyncio.Queue:
+        loop = asyncio.get_running_loop()
+        state = _det_slot_state.get(loop)
+        if state is None:
+            state = {"lock": asyncio.Lock(), "q": None}
+            _det_slot_state[loop] = state
+
+        if state["q"] is not None:
+            return state["q"]
+
+        async with state["lock"]:
+            if state["q"] is None:
+                q = asyncio.Queue()
+
+                start = random.randrange(len(DETECTOR_URLS))
+                for i in range(DET_PER_SERVER_INFLIGHT * len(DETECTOR_URLS)):
+                    sid = (start + i) % len(DETECTOR_URLS)
+                    q.put_nowait(sid)
+
+                state["q"] = q
+        return state["q"]
+
+    slot_q = await _ensure_det_slots()
+
+    # -------- image -> raw base64 --------
+    img_b64 = convert_gen_img_to_base64(img)
+    if img_b64.startswith("data:"):
+        img_b64 = img_b64.split(",", 1)[1]
+
+    # -------- build payload --------
     info_list = []
-    idx_mapping = {}  # Map API index to tuple_idx
-    
-    for i, det_info in enumerate(detection_list):
-        api_info = {}
+    idx_mapping = {}
+
+    for det_info in detection_list:
         det_type = det_info.get("type", "")
-        
+        api_info = None
+
         if det_type == "spatial":
             api_info = {
                 "type": "spatial",
                 "subject": det_info.get("subject"),
                 "object": det_info.get("object"),
-                "relation": det_info.get("relation")
+                "relation": det_info.get("relation"),
             }
         elif det_type in ["counting", "numeracy"]:
             api_info = {
                 "type": "numeracy",
                 "object": det_info.get("object"),
-                "num": str(det_info.get("num", ""))
+                "num": str(det_info.get("num", "")),
             }
-        else:
+
+        if api_info is None:
             continue
-            
+
+        idx_mapping[len(info_list)] = det_info.get("tuple_idx", len(info_list))
         info_list.append(api_info)
-        idx_mapping[len(info_list) - 1] = det_info.get("tuple_idx", i)
-    
+
     if not info_list:
         return {"results": {}, "details": [], "errors": ["No valid detection items"]}
-    
-    # Prepare request payload
-    payload = {
-        "info_list": info_list,
-        "img_url": img_base64
-    }
-    
-    results = {}
-    details = []
-    errors = []
-    
-    # Try each detector URL with failover
-    async with aiohttp.ClientSession() as session:
-        for url_idx, base_url in enumerate(DETECTOR_URLS):
-            try:
-                detect_url = f"{base_url}/detect"
-                
-                for attempt in range(DETECTOR_MAX_RETRIES):
-                    try:
-                        async with session.post(
-                            detect_url,
-                            json=payload,
-                            timeout=aiohttp.ClientTimeout(total=DETECTOR_TIMEOUT)
-                        ) as response:
-                            if response.status == 200:
-                                data = await response.json()
-                                api_results = data.get("results", [])
-                                
-                                # Parse results
-                                for api_idx, result_list in enumerate(api_results):
-                                    if api_idx in idx_mapping and result_list:
-                                        tuple_idx = idx_mapping[api_idx]
-                                        result = result_list[0]  # First result per info item
-                                        
-                                        results[tuple_idx] = result.get("det_judge", False)
-                                        details.append({
-                                            "tuple_idx": tuple_idx,
-                                            "det_judge": result.get("det_judge", False),
-                                            "det_reason": result.get("det_reason", ""),
-                                            "det_info": result.get("det_info", {}),
-                                            "vis_data": result.get("vis_data")
-                                        })
-                                
-                                # Success - return results
-                                return {
-                                    "results": results,
-                                    "details": details,
-                                    "errors": errors
-                                }
-                            else:
-                                error_text = await response.text()
-                                errors.append(f"Server {url_idx} returned {response.status}: {error_text[:200]}")
-                                
-                    except asyncio.TimeoutError:
-                        errors.append(f"Server {url_idx} attempt {attempt+1} timed out")
-                    except aiohttp.ClientError as e:
-                        errors.append(f"Server {url_idx} attempt {attempt+1} client error: {str(e)}")
-                    
-                    if attempt < DETECTOR_MAX_RETRIES - 1:
-                        await asyncio.sleep(0.5 * (attempt + 1))
-                        
-            except Exception as e:
-                errors.append(f"Server {url_idx} failed: {str(e)}")
+
+    payload = {"info_list": info_list, "img_url": img_b64}
+
+    # -------- retry bookkeeping --------
+    per_server_attempts = {sid: 0 for sid in range(len(DETECTOR_URLS))}
+    max_total_attempts = len(DETECTOR_URLS) * DETECTOR_MAX_RETRIES
+
+    results: Dict[int, bool] = {}
+    details: List[Dict[str, Any]] = []
+    errors: List[str] = []
+
+    timeout = aiohttp.ClientTimeout(total=DETECTOR_TIMEOUT)
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for attempt in range(max_total_attempts):
+            sid = await slot_q.get()
+
+            # 서버당 시도 횟수 제한
+            if per_server_attempts[sid] >= DETECTOR_MAX_RETRIES:
+                slot_q.put_nowait(sid)
                 continue
-    
-    # All servers failed
-    return {
-        "results": results,
-        "details": details,
-        "errors": errors if errors else ["All detector servers failed"]
-    }
+            per_server_attempts[sid] += 1
+
+            detect_url = f"{DETECTOR_URLS[sid]}/detect"
+
+            err = None
+            try:
+                async with session.post(detect_url, json=payload) as resp:
+                    if resp.status != 200:
+                        txt = await resp.text()
+                        errors.append(f"{detect_url} -> {resp.status}: {txt[:200]}")
+                        continue
+
+                    data = await resp.json()
+                    api_results = data.get("results", [])
+
+                    for api_idx, result_list in enumerate(api_results):
+                        if api_idx not in idx_mapping or not result_list:
+                            continue
+                        tuple_idx = idx_mapping[api_idx]
+                        r0 = result_list[0]
+
+                        det_judge = bool(r0.get("det_judge", False))
+                        results[tuple_idx] = det_judge
+                        details.append(
+                            {
+                                "tuple_idx": tuple_idx,
+                                "det_judge": det_judge,
+                                "det_reason": r0.get("det_reason", ""),
+                                "det_info": r0.get("det_info", {}),
+                                "vis_data": r0.get("vis_data"),
+                                "server": DETECTOR_URLS[sid],
+                            }
+                        )
+
+                    return {"results": results, "details": details, "errors": errors}
+
+            except Exception as e:
+                err = e
+                errors.append(f"{detect_url} exception: {repr(e)}")
+
+            finally:
+                # ★ backoff 전에 반드시 슬롯 반환
+                slot_q.put_nowait(sid)
+
+            # ★ 슬롯 반환 후 backoff(가볍게)
+            await asyncio.sleep(0.1 * (attempt + 1))
+
+    return {"results": results, "details": details, "errors": errors or ["All detector servers failed"]}
+
+
 
 
 async def request_detector_batch(detection_requests: List[tuple]) -> List[Dict[str, Any]]:
@@ -1027,21 +1071,19 @@ async def compute_score_batch_async(prompts, gen_imgs, feedback_texts, regen_img
         return []
 
     # Create semaphore for concurrency control
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
     
     async def process_single_request(idx, args):
-        async with semaphore:
-            (prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id) = args
-            
-            # Load ground truth image
-            ground_truth_img = await asyncio.to_thread(lambda p=ground_truth_img: PIL.Image.open(p).convert("RGB")) if ground_truth_img is not None else ground_truth_img
-            
-            # Process the request with improved error handling
-            result = await compute_score_single_async(
-                prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id
-            )
-            
-            return idx, result
+        (prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id) = args
+        
+        # Load ground truth image
+        #ground_truth_img = await asyncio.to_thread(lambda p=ground_truth_img: PIL.Image.open(p).convert("RGB")) if ground_truth_img is not None else ground_truth_img
+        
+        # Process the request with improved error handling
+        result = await compute_score_single_async(
+            prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id
+        )
+        
+        return idx, result
 
     # Create tasks for all requests
     tasks = []

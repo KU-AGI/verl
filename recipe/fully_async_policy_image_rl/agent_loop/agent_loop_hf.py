@@ -15,7 +15,9 @@ import asyncio
 import logging
 import os
 from typing import Any, Optional
+from tensordict import TensorDict
 
+import torch
 import hydra
 import numpy as np
 import ray
@@ -31,6 +33,7 @@ from recipe.fully_async_policy_image_rl.agent_loop.agent_loop import (
     _DummyConfig,
     get_trajectory_info,
 )
+
 from verl.protocol import DataProto
 from verl.single_controller.ray import RayWorkerGroup
 from verl.utils.rollout_trace import rollout_trace_attr
@@ -44,8 +47,9 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
     """Extended server manager with multi-GPU distribution support."""
     
     def __init__(self, config: DictConfig, server_handles: list):
-        super().__init__(config, server_handles)
+        super().__init__(config, list(server_handles))
         self._server_index = 0
+        self.server_handles_by_index = list(server_handles)
         self._lock = asyncio.Lock()
     
     def get_num_servers(self) -> int:
@@ -84,7 +88,7 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
         Generate on a specific server by index.
         Used for explicit multi-GPU distribution.
         """
-        server = self.server_handles[server_index]
+        server = self.server_handles_by_index[server_index]
         result, is_cancel = await server.generate_for_partial.remote(
             request_id=request_id,
             prompt_data=prompt_data,
@@ -349,9 +353,7 @@ class FullyAsyncAgentLoopWorker(AgentLoopWorkerBase):
 
     async def generate_sequences(self, prompts: DataProto, on_task_complete=None) -> DataProto:
         """Generate sequences and convert agent loop outputs to DataProto."""
-        import torch
         from recipe.fully_async_policy_image_rl.detach_utils import postprocess_agent_loop_outputs
-
         # Preserve task_id through processing
         task_id = prompts.batch.get("task_id", None)
 
@@ -376,6 +378,70 @@ class FullyAsyncAgentLoopWorker(AgentLoopWorkerBase):
             )
 
         return result_proto
+
+    async def generate_sequences_on_server(self, prompts: DataProto, server_index: int) -> DataProto:
+        from recipe.fully_async_policy_image_rl.detach_utils import postprocess_agent_loop_outputs
+        # sampling_params 구성은 기존 generate_sequences_no_post와 동일하게
+        config = self.config.actor_rollout_ref.rollout
+        sampling_params = dict(
+            temperature=config.temperature,
+            top_p=config.top_p,
+            repetition_penalty=1.0,
+            logprobs=config.calculate_log_probs,
+        )
+        if prompts.meta_info.get("validate", False):
+            sampling_params["top_p"] = config.val_kwargs.top_p
+            sampling_params["temperature"] = config.val_kwargs.temperature
+
+        # server_index로 “한 번만” 호출 (batch 전체)
+        from uuid import uuid4
+        request_id = f"{uuid4().hex}_server{server_index}"
+        result_data, is_cancel = await self.server_manager.generate_for_partial_on_server(
+            server_index=server_index,
+            request_id=request_id,
+            prompt_data=prompts,
+            sampling_params=sampling_params,
+        )
+
+        # 결과를 FullyAsyncAgentLoopOutput 리스트로 포장 (기존 batch_distributed 성공 경로와 동일)
+        batch_size = len(prompts)
+        param_version = prompts.non_tensor_batch.get("param_version", [0] * batch_size)
+
+        outputs_list = []
+        if is_cancel or result_data is None:
+            for _ in range(batch_size):
+                outputs_list.append(FullyAsyncAgentLoopOutput(
+                    prompt_ids=[], response_ids=[], response_mask=[], num_turns=1,
+                    metrics={}, is_cancel=True, log_probs=[],
+                    param_version_start=0, param_version_end=0,
+                ))
+        else:
+            for i in range(batch_size):
+                outputs_list.append(FullyAsyncAgentLoopOutput(
+                    prompt_ids=[], response_ids=[], response_mask=[], num_turns=1,
+                    metrics={}, is_cancel=False, log_probs=[],
+                    param_version_start=param_version[i], param_version_end=param_version[i],
+                    generation_data=result_data[i],
+                ))
+
+        # DataProto로 후처리 + task_id 복구 (기존 generate_sequences와 동일)
+        result_proto = postprocess_agent_loop_outputs(
+            rs_or_list=outputs_list,
+            tokenizer=self.tokenizer,
+            config=self.config,
+            processor=self.processor,
+        )
+
+        task_id = prompts.batch.get("task_id", None)
+        if task_id is not None:
+            current_task_id = task_id.view(-1)[0].item()
+            result_proto.batch["task_id"] = torch.full(
+                (len(result_proto),), current_task_id,
+                dtype=torch.int32, device=result_proto.batch.device,
+            )
+
+        return result_proto
+
 
 class FullyAsyncAgentLoopManager(AgentLoopManager):
     def __init__(self, config: DictConfig, worker_group: RayWorkerGroup = None, rm_wg: RayWorkerGroup = None):
@@ -407,6 +473,7 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
 
         await self._initialize_llm_servers_async()
         self._init_agent_loop_workers()
+        print("[DEBUG] agent_loop_workers =", len(self.agent_loop_workers), flush=True)
 
     async def _initialize_llm_servers_async(self):
         rollout_world_size = self.config.actor_rollout_ref.rollout.tensor_model_parallel_size
@@ -472,7 +539,6 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         logger.info("[FullyAsyncAgentLoopManager] generate_sequences_with_callback started")
 
         # Determine which tasks to run
-        import torch
         task_id_tensor = prompts.batch.get("task_id", None)
         if task_id_tensor is not None:
             task_id = task_id_tensor.view(-1)[0].item()
@@ -489,7 +555,6 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             logger.info(f"[FullyAsyncAgentLoopManager] Starting task {current_task_id}")
 
             # Set task_id in batch by creating new TensorDict (ensures proper tracking through chunk operations)
-            from tensordict import TensorDict
             task_id_tensor = torch.tensor([current_task_id] * len(accumulated_batch), dtype=torch.int32)
 
             if accumulated_batch.batch is not None:
@@ -512,6 +577,35 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
                 on_task_complete(current_task_id, accumulated_batch)
 
         logger.info("[FullyAsyncAgentLoopManager] All tasks completed")
+        return accumulated_batch
+        
+    async def generate_sequences_with_callback_on_server(self, prompts: DataProto, server_index: int, on_task_complete=None) -> DataProto:
+
+        task_id_tensor = prompts.batch.get("task_id", None)
+        if task_id_tensor is not None:
+            tasks_to_run = [task_id_tensor.view(-1)[0].item()]
+        else:
+            tasks_to_run = [1, 2, 3]
+
+        accumulated_batch = prompts
+        for current_task_id in tasks_to_run:
+            task_id_tensor = torch.tensor([current_task_id] * len(accumulated_batch), dtype=torch.int32)
+
+            if accumulated_batch.batch is not None:
+                new_batch_dict = {k: v for k, v in accumulated_batch.batch.items()}
+                new_batch_dict["task_id"] = task_id_tensor
+                accumulated_batch.batch = TensorDict(new_batch_dict, batch_size=accumulated_batch.batch.batch_size)
+            else:
+                accumulated_batch.batch = TensorDict({"task_id": task_id_tensor}, batch_size=[len(accumulated_batch)])
+
+            # ★ 여기만 다름: 지정된 server_index로
+            worker = self._select_best_worker()
+            output_ref = worker.generate_sequences_on_server.remote(accumulated_batch, server_index)
+            accumulated_batch = await output_ref
+
+            if on_task_complete is not None:
+                on_task_complete(current_task_id, accumulated_batch)
+
         return accumulated_batch
 
     def _select_best_worker(self):

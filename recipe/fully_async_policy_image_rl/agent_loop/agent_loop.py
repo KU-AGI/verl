@@ -790,6 +790,7 @@ class AgentLoopManager:
                     scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
                         node_id=node_id, soft=True
                     ),
+                    max_concurrency=64
                 ).remote(self.config, self.server_handles, self.reward_router_address)
             )
 

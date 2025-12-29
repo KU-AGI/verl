@@ -163,6 +163,15 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         self.cancel_queue = asyncio.Queue()
         self.reward_tasks = set()
 
+        self.reward_finalize_queue = asyncio.Queue(maxsize=0)
+        self.reward_finalize_worker_task = None
+
+        self.max_finalize_backlog_samples = None
+        self._finalize_cond = asyncio.Condition()
+        self._finalize_inflight_samples = 0
+
+        self.server_token_q = None
+
     def _init_async_objects(self):
         # Initialize asyncio synchronization primitives.
         # We let asyncio.Condition create the Lock internally to ensure they share the same Event Loop.
@@ -189,10 +198,17 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 self.total_rollout_steps
                 / (self.required_samples * self.config.async_training.trigger_parameter_sync_step)
             )
-
-            self.max_concurrent_samples = len(self.async_rollout_manager.server_handles) * 16
+            
+            batch_size_per_prompt = self.config.actor_rollout_ref.rollout.n * self.rollout_prompt_size
+            self.max_concurrent_samples = len(self.async_rollout_manager.server_handles) * batch_size_per_prompt
             self.max_concurrent_samples = min(self.max_concurrent_samples, self.max_required_samples)
             self.max_queue_size = self.max_required_samples
+
+            cfg_limit = self.config.async_training.get("max_finalize_backlog_samples", None)
+            if cfg_limit is not None:
+                self.max_finalize_backlog_samples = int(cfg_limit)
+            else:
+                self.max_finalize_backlog_samples = int(min(self.max_required_samples, max(self.max_concurrent_samples * 4, self.max_concurrent_samples)))
 
             print(
                 f"[FullyAsyncRollouter] required_samples : {self.required_samples} "
@@ -201,6 +217,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 f"total_train_steps: {self.total_train_steps} "
                 f"total_rollout_steps: {self.total_rollout_steps} "
                 f"max_concurrent_samples: {self.max_concurrent_samples} "
+                f"max_finalize_backlog_samples: {self.max_finalize_backlog_samples} "
             )
 
     def get_rollout_wg(self):
@@ -222,7 +239,8 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             mq_size = await self.message_queue_client.get_queue_size()
             # active_sample_count: in-flight rollout sample 수
             # cancel_sample_count: cancel_queue 안의 sample 수
-            self.staleness_samples = self.active_sample_count + self.cancel_sample_count + mq_size
+            # self.staleness_samples = self.active_sample_count + self.cancel_sample_count + mq_size
+            stale_backlog = int(self.staleness_samples + self.cancel_sample_count + mq_size)
             timing_raw = {}
             idle_ratio = None
             if self.idle_start_time is not None and self.version_start_time is not None:
@@ -236,6 +254,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             print(
                 f"[FullyAsyncRollouter][Public][update_param_version] "
                 f"Parameter version updated from {old_version} to {version} "
+                f"| stale_backlog={stale_backlog} "
                 f",reset staleness_samples to: {self.staleness_samples}"
                 f",idle_ratio: {idle_ratio}"
             )
@@ -384,7 +403,11 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             config=self.config,
             worker_group=self.rollout_wg,
         )
-
+        num_servers = len(self.async_rollout_manager.server_handles)
+        self.server_token_q = asyncio.Queue()
+        for sid in range(num_servers):
+            self.server_token_q.put_nowait(sid)
+        
     async def queue_async_weight_update(self, version: int, param_synchronizer=None):
         """
         Queue async weight update on all server replicas and apply when idle.
@@ -503,6 +526,19 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             *[server.queue_weight_update.remote(-1) for server in server_handles]  # -1 means clear
         )
 
+    async def _acquire_finalize_budget(self, n: int):
+        async with self._finalize_cond:
+            while (self._finalize_inflight_samples + n) > self.max_finalize_backlog_samples:
+                await self._finalize_cond.wait()
+            self._finalize_inflight_samples += n
+
+    async def _release_finalize_budget(self, n: int):
+        async with self._finalize_cond:
+            self._finalize_inflight_samples -= n
+            if self._finalize_inflight_samples < 0:
+                self._finalize_inflight_samples = 0
+            self._finalize_cond.notify_all()
+
     # Add samples to the pending_queue
     async def _feed_samples(self):
         continuous_iterator = self._create_continuous_iterator()
@@ -570,26 +606,37 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         await self.pending_queue.put(rollout_sample)
         # print(f"[FullyAsyncRollouter][Feed] Sent chunk batch size: {batch_size}")
 
+    async def _wait_server_idle(self, sid: int):
+        while True:
+            ref = self.async_rollout_manager.server_handles[sid].get_weight_update_status.remote()
+            st = await ref
+            if st.get("ongoing_generations", 0) == 0:
+                return
+            await asyncio.sleep(0.01)
+
+
     async def _processor_worker(self):
         """
-        Streaming worker coroutines, a sample is submitted for processing without waiting for batches
+        Streaming worker coroutine.
+        - Pause is handled ONLY at the loop head (do not pause-gate inside task creation).
+        - active_sample_count is incremented ONLY after a generation task is created,
+        and decremented in _process_single_sample_streaming (generation-finish or finally 보험).
+        - DONE drain waits without overwriting self.active_tasks/self.reward_tasks.
         """
         print("[FullyAsyncRollouter][Processor] processor worker started")
 
         while True:
-            # Check for pause condition
+            # 0) Pause gate ONLY here (loop head)
             if self.paused or await self._should_pause_generation():
                 async with self.lock:
                     self.paused = True
                     self.idle_start_time = time.time()
                     while self.paused:
                         await self.condition.wait()
-                # After resume, continue to next iteration
                 continue
 
+            # 1) Get next sample (prefer cancel_queue)
             sample_from_cancel_queue = False
-            rollout_sample = None
-
             if not self.cancel_queue.empty():
                 rollout_sample = await self.cancel_queue.get()
                 sample_from_cancel_queue = True
@@ -600,65 +647,95 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             else:
                 rollout_sample = await self.pending_queue.get()
 
-            # Handle DONE signal
+            # 2) DONE drain: wait for all active gen tasks and reward tasks to finish
             if rollout_sample == "DONE":
                 print(
                     "[FullyAsyncRollouter][Processor] Received end signal, "
                     "waiting for remaining tasks to complete..."
                 )
-                # Wait for rollout tasks
-                while self.active_tasks:
+
+                # Drain generation tasks
+                while True:
                     async with self.lock:
-                        if self.active_tasks:
-                            done_tasks, self.active_tasks = await asyncio.wait(
-                                self.active_tasks, return_when=asyncio.FIRST_COMPLETED
-                            )
-                        for task in done_tasks:
-                            await task
-                
-                # Wait for reward tasks
-                while self.reward_tasks:
+                        tasks = list(self.active_tasks)
+                    if not tasks:
+                        break
+
+                    done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                    for t in done:
+                        try:
+                            await t
+                        except Exception:
+                            pass
                     async with self.lock:
-                        if self.reward_tasks:
-                            done_tasks, self.reward_tasks = await asyncio.wait(
-                                self.reward_tasks, return_when=asyncio.FIRST_COMPLETED
-                            )
-                        for task in done_tasks:
-                            await task
+                        self.active_tasks.difference_update(done)
+
+                # Drain reward tasks
+                while True:
+                    async with self.lock:
+                        tasks = list(self.reward_tasks)
+                    if not tasks:
+                        break
+
+                    done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                    for t in done:
+                        try:
+                            await t
+                        except Exception:
+                            pass
+                    async with self.lock:
+                        self.reward_tasks.difference_update(done)
+
+                # Mark queue task done and exit
+                if sample_from_cancel_queue:
+                    self.cancel_queue.task_done()
+                else:
+                    self.pending_queue.task_done()
                 break
 
-            # Process actual rollout sample
+            # 3) Normal sample processing
             batch_size = len(rollout_sample.full_batch)
 
-            # Update in-flight sample count
+            # Update staleness ONLY when dequeued from pending_queue (not cancel_queue)
             async with self.lock:
                 if not sample_from_cancel_queue:
-                    # Add to staleness only when first dequeued from pending_queue
                     self.staleness_samples += batch_size
-                # Increment active sample count for both queues
+
+            # 4) Concurrency throttle: wait until there is room for this batch_size
+            while True:
+                async with self.lock:
+                    if (self.active_sample_count + batch_size) <= self.max_concurrent_samples:
+                        break
+                    tasks = list(self.active_tasks)
+
+                if not tasks:
+                    await asyncio.sleep(0.01)
+                    continue
+
+                done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                for t in done:
+                    try:
+                        await t
+                    except Exception:
+                        pass
+                # Optional: proactively clean up finished tasks here (not required if task finally does discard)
+                async with self.lock:
+                    self.active_tasks.difference_update(done)
+
+            await self._acquire_finalize_budget(batch_size)
+
+            sid = await self.server_token_q.get()
+
+            # 5) Create generation task (NO pause gate here)
+            task = asyncio.create_task(
+                self._process_single_sample_streaming(rollout_sample, finalize_budget=batch_size, server_index=sid),
+                name=getattr(rollout_sample, "sample_id", None) or "rollout_sample",
+            )
+            async with self.lock:
+                self.active_tasks.add(task)
                 self.active_sample_count += batch_size
 
-            # Check concurrency limit
-            while self.active_sample_count >= self.max_concurrent_samples:
-                async with self.lock:
-                    if self.active_tasks:
-                        done_tasks, self.active_tasks = await asyncio.wait(
-                            self.active_tasks, return_when=asyncio.FIRST_COMPLETED
-                        )
-                    for task in done_tasks:
-                        await task
-
-            # Create and submit task
-            async with self.lock:
-                while self.paused:
-                    await self.condition.wait()
-                task = asyncio.create_task(
-                    self._process_single_sample_streaming(rollout_sample),
-                    name=rollout_sample.sample_id,
-                )
-                self.active_tasks.add(task)
-
-            # Mark queue task as done
+            # 6) Mark queue task done
             if sample_from_cancel_queue:
                 self.cancel_queue.task_done()
             else:
@@ -703,134 +780,75 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
 
         finally:
             current_task = asyncio.current_task()
-            self.reward_tasks.discard(current_task)
+            async with self.lock:
+                self.reward_tasks.discard(current_task)
 
+    async def _track_reward_task(self, t: asyncio.Task):
+        async with self.lock:
+            self.reward_tasks.add(t)
 
-    async def _process_single_sample_streaming(self, rollout_sample: RolloutSample):
-        """Process a single sample with task-level streaming reward computation"""
+    async def _process_single_sample_streaming(self, rollout_sample: RolloutSample, finalize_budget: int, server_index: int):
+        batch_size = len(rollout_sample.full_batch)
+        active_released = False
+        enqueued_to_finalize = False
+        token_released = False
         try:
-            batch_size = len(rollout_sample.full_batch)
             current_version = self.current_param_version
-
-            # Set param_version in non_tensor_batch
             rollout_sample.full_batch.non_tensor_batch["param_version"] = np.full(
                 (batch_size,), current_version, dtype=np.int64
             )
 
-            # Track reward tasks for this sample
             sample_reward_tasks = []
-
-            # Store reward results
             reward_results = {}
 
-            # Define callback for task completion
             def on_task_complete(task_id: int, batch_result: DataProto):
-                """Called when each task completes - launch reward computation"""
-                # Launch async reward computation for this task
                 reward_task = asyncio.create_task(
-                    self._compute_single_task_reward(
-                        task_id=task_id,
-                        batch_result=batch_result,
-                        reward_results=reward_results,
-                    ),
+                    self._compute_single_task_reward(task_id, batch_result, reward_results),
                     name=f"reward_task{task_id}_{rollout_sample.sample_id}",
                 )
                 sample_reward_tasks.append(reward_task)
+                asyncio.create_task(self._track_reward_task(reward_task))
 
-                # Add to global reward_tasks tracking without lock to avoid deadlock
-                # The lock here was causing callbacks to wait for each other
-                self.reward_tasks.add(reward_task)
-
-            # Execute rollout with task-level callbacks
-            # generate_sequences_with_callback will sequentially execute Task 1, 2, 3
-            # and call on_task_complete after each task finishes
-            result_batch = await self.async_rollout_manager.generate_sequences_with_callback(
-                rollout_sample.full_batch,
-                on_task_complete=on_task_complete,
+            result_batch = await self.async_rollout_manager.generate_sequences_with_callback_on_server(
+            rollout_sample.full_batch,
+            server_index=server_index,
+            on_task_complete=on_task_complete,
             )
+            await self._wait_server_idle(server_index)
 
-            await asyncio.sleep(0)
+            self.server_token_q.put_nowait(server_index)
+            token_released = True
 
-            # IMPORTANT: Decrement active_sample_count immediately after generation completes
-            # This allows next generation to start while rewards are being computed
-            # async with self.lock:
-            self.active_sample_count -= batch_size
+            # 2) generation 끝났으면 즉시 active_sample_count 반환
+            async with self.lock:
+                self.active_sample_count -= batch_size
+            active_released = True
 
-            # Update the rollout_sample with the result batch
             rollout_sample.full_batch = result_batch
             rollout_sample.agent_loop_output_list = []
 
-            # Check if cancelled
-            is_cancel = False
+            # 3) finalize 워커로 넘기고 즉시 종료
+            await self.reward_finalize_queue.put(
+                (rollout_sample, sample_reward_tasks, reward_results, current_version, finalize_budget)
+            )
+            enqueued_to_finalize = True
+            return  # ★ 여기서 끝
 
-            if is_cancel:
-                # Cancel all pending reward tasks
-                for task in sample_reward_tasks:
-                    task.cancel()
-
-                # async with self.lock:
-                self.cancel_sample_count += batch_size
-                await self.cancel_queue.put(rollout_sample)
-            else:
-                # Wait for all task rewards to complete
-                results = await asyncio.gather(*sample_reward_tasks, return_exceptions=True)
-
-                # Check for exceptions
-                for i, result in enumerate(results):
-                    if isinstance(result, Exception):
-                        import traceback
-                        traceback.print_exception(type(result), result, result.__traceback__)
-
-                # Integrate reward results into rollout_sample
-                for key, value in reward_results.items():
-                    if key != "meta_info":
-                        rollout_sample.full_batch.batch[key] = value
-
-                # Merge meta_info
-                if "meta_info" in reward_results:
-                    if not hasattr(rollout_sample.full_batch, 'meta_info'):
-                        rollout_sample.full_batch.meta_info = {}
-                    rollout_sample.full_batch.meta_info.update(reward_results["meta_info"])
-
-                # Merge rollout sample
-                rollout_sample.param_version = current_version
-                rollout_sample.rollout_status = {
-                    "param_version": current_version,
-                    "staleness_samples": self.staleness_samples,
-                    "total_generated_samples": self.total_generated_samples,
-                }
-
-                rollout_sample = merge_rollout_sample(
-                    self.config, self.tokenizer, rollout_sample, self.processor
-                )
-
-                # Expand the merged rollout sample back to individual samples
-                individual_samples = expand_rollout_sample(rollout_sample)
-
-                # Send individual samples to message queue
-                success_count = 0
-                for individual_sample in individual_samples:
-                    success = await self.message_queue_client.put_sample(
-                        sample=ray.cloudpickle.dumps(individual_sample),
-                        param_version=individual_sample.param_version,
-                    )
-                    if success:
-                        success_count += 1
-
-                # async with self.lock:
-                self.total_generated_samples += success_count
-                self.staleness_samples -= batch_size
-                self.dropped_stale_samples += (batch_size - success_count)
-
-            self.processed_sample_count += 1
         except Exception as e:
             print(f"[Rollouter][ProcessSample] EXCEPTION during processing: {e}")
             import traceback
             traceback.print_exc()
         finally:
-            current_task = asyncio.current_task()
-            # async with self.lock:
-            self.active_tasks.discard(current_task)
+            if server_index is not None and not token_released:
+                self.server_token_q.put_nowait(server_index)
+
+            if not enqueued_to_finalize:
+                await self._release_finalize_budget(finalize_budget)
+
+            async with self.lock:
+                if not active_released:
+                    self.active_sample_count -= batch_size
+                self.active_tasks.discard(asyncio.current_task())
 
     async def _streaming_generation_main(self):
         """The main entry method for stream processing"""
@@ -847,6 +865,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         # Start sample feed and processor coroutines (no consumer worker needed)
         self.feed_task = asyncio.create_task(self._feed_samples())
         self.processor_task = asyncio.create_task(self._processor_worker())
+        self.reward_finalize_worker_task = asyncio.create_task(self._reward_finalize_worker())
 
         try:
             # Wait for sample feed to complete
@@ -862,9 +881,15 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
 
         finally:
             if self.processor_task:
-                self.processor_task.cancel()
+                await asyncio.gather(self.processor_task, return_exceptions=True)
 
-            await asyncio.gather(self.processor_task, return_exceptions=True)
+            await self.reward_finalize_queue.join()
+
+            await self.reward_finalize_queue.put("DONE")
+            if self.reward_finalize_worker_task:
+                await asyncio.gather(self.reward_finalize_worker_task, return_exceptions=True)
+
+            
 
         # Send a finish signal
         await self.message_queue_client.put_sample(
@@ -874,6 +899,67 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
 
         async with self.lock:
             self.running = False
+
+    async def _reward_finalize_worker(self):
+        print("[FullyAsyncRollouter][RewardFinalize] worker started")
+        while True:
+            item = await self.reward_finalize_queue.get()
+            try:
+                if item == "DONE":
+                    break
+
+                rollout_sample, sample_reward_tasks, reward_results, current_version, finalize_budget = item
+                batch_size = len(rollout_sample.full_batch)
+
+                # reward 완료 대기
+                results = await asyncio.gather(*sample_reward_tasks, return_exceptions=True)
+                for r in results:
+                    if isinstance(r, Exception):
+                        import traceback
+                        traceback.print_exception(type(r), r, r.__traceback__)
+
+                # reward 결과 반영
+                for key, value in reward_results.items():
+                    if key != "meta_info":
+                        rollout_sample.full_batch.batch[key] = value
+
+                if "meta_info" in reward_results:
+                    if not hasattr(rollout_sample.full_batch, "meta_info"):
+                        rollout_sample.full_batch.meta_info = {}
+                    rollout_sample.full_batch.meta_info.update(reward_results["meta_info"])
+
+                rollout_sample.param_version = current_version
+                rollout_sample.rollout_status = {
+                    "param_version": current_version,
+                    "staleness_samples": self.staleness_samples,
+                    "total_generated_samples": self.total_generated_samples,
+                }
+
+                rollout_sample = merge_rollout_sample(self.config, self.tokenizer, rollout_sample, self.processor)
+                individual_samples = expand_rollout_sample(rollout_sample)
+
+                success_count = 0
+                for individual_sample in individual_samples:
+                    success = await self.message_queue_client.put_sample(
+                        sample=ray.cloudpickle.dumps(individual_sample),
+                        param_version=individual_sample.param_version,
+                    )
+                    if success:
+                        success_count += 1
+
+                # 카운터 업데이트 (여기로 이동)
+                async with self.lock:
+                    self.total_generated_samples += success_count
+                    self.staleness_samples -= batch_size
+                    self.dropped_stale_samples += (batch_size - success_count)
+                    self.processed_sample_count += 1
+
+            finally:
+                if item != "DONE":
+                    await self._release_finalize_budget(finalize_budget)
+                self.reward_finalize_queue.task_done()
+
+        print("[FullyAsyncRollouter][RewardFinalize] worker stopped")
 
     async def fit(self):
         """
@@ -933,6 +1019,18 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 print(f"[FullyAsyncRollouter][MonitorLoop][Statistics] {pformat(stats)}")
                 last_stats_time = current_time
 
+                try:
+                    statuses = await asyncio.gather(
+                        *[s.get_weight_update_status.remote() for s in self.async_rollout_manager.server_handles]
+                    )
+                    print(
+                        "[DEBUG] ongoing_generations =",
+                        [st.get("ongoing_generations") for st in statuses],
+                        flush=True,
+                    )
+                except Exception as e:
+                    print("[DEBUG] status check failed:", e, flush=True)
+
             # Trigger rollout recovery
             # if self.monitor_loop_trigger and not self.paused:
             #     if not await self._should_pause_generation():
@@ -974,30 +1072,28 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         return False
 
     async def pause(self):
-        """pause rollout"""
         print("[FullyAsyncRollouter][Public][Pause]")
-        
+
         async with self.lock:
             self.paused = True
             self.monitor_loop_trigger = False
-            
-            # Cancel ongoing rollouts if partial_rollout is enabled  
-            if self.config.async_training.partial_rollout:
-                await self.async_rollout_manager.cancel()
-            
-            # Gather all current tasks
-            all_tasks = list(self.active_tasks) | list(self.reward_tasks)
-        
-        if all_tasks:
-            print(f"[FullyAsyncRollouter][Pause] Waiting for {len(all_tasks)} tasks...")
-            await asyncio.gather(*all_tasks, return_exceptions=True)
-        
-        async with self.lock:
-            self.active_tasks.clear()
-            self.reward_tasks.clear()
-            self.active_sample_count = 0
-        
+
+        if self.config.async_training.partial_rollout:
+            await self.async_rollout_manager.cancel()
+
+        # generation/reward task drain
+        while True:
+            async with self.lock:
+                tasks = list(self.active_tasks | self.reward_tasks)
+            if not tasks:
+                break
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        # finalize drain
+        await self.reward_finalize_queue.join()
+
         print("[FullyAsyncRollouter][Public][Pause] All active tasks completed")
+
 
     async def resume(self, dependency_ref: ObjectRef = None):
         if dependency_ref is not None:
@@ -1018,6 +1114,17 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         queue_stats = self.message_queue_client.get_statistics_sync()
 
         stats = {
+
+            "monitor/paused": self.paused,
+            "monitor/processor_task_done": (self.processor_task.done() if self.processor_task else None),
+            "monitor/feed_task_done": (self.feed_task.done() if self.feed_task else None),
+
+            "monitor/server_tokens_free": (self.server_token_q.qsize() if self.server_token_q else None),
+            "monitor/server_tokens_inuse": (
+                len(self.async_rollout_manager.server_handles) - self.server_token_q.qsize()
+                if (self.async_rollout_manager and self.server_token_q) else None
+            ),
+
             # monitor stats
             "monitor/active_tasks_size": len(self.active_tasks),
             "monitor/active_sample_count": self.active_sample_count,
