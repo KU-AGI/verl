@@ -19,7 +19,7 @@ from torch import nn
 
 from verl import DataProto
 from .base import BaseRollout
-from verl.single_controller.base.decorator import register
+from verl.single_controller.base.decorator import register, Dispatch
 
 from transformers import GenerationConfig
 import numpy as np
@@ -40,6 +40,7 @@ from recipe.image_rl.config import ImageGenerationHFModelConfig
 from recipe.image_rl.utils import FormattingEvaluator
 import asyncio
 import logging
+import time
 
 __all__ = ['ImageUnifiedRollout']
 
@@ -81,60 +82,96 @@ class _HFModelWrapper:
                 self.model = self._ModelWithLoadWeights(module)
 
             class _ModelWithLoadWeights:
-                """
-                Wrapper that adds vLLM-compatible load_weights method to HuggingFace models.
-                """
                 def __init__(self, module: nn.Module):
                     self._module = module
-
-                def load_weights(self, weights):
-                    """
-                    Load weights into the model. Compatible with vLLM's load_weights interface.
-
-                    Args:
-                        weights: Iterator/list of (name, tensor) tuples
-                    """
-                    import logging
-                    logger = logging.getLogger(__name__)
-
-                    # Get the actual module (unwrap FSDP if needed)
+                    self._weight_map = None
+                    self._init_weight_map()
+                
+                def _init_weight_map(self):
+                    # FSDP나 다른 래퍼가 있을 경우 실제 모듈 추출
                     actual_module = self._module
-                    if hasattr(actual_module, '_fsdp_wrapped_module'):
+                    if hasattr(actual_module, "_fsdp_wrapped_module"):
                         actual_module = actual_module._fsdp_wrapped_module
+                    
+                    # 가중치 순서 보장을 위해 state_dict 키 정렬
+                    current_sd = actual_module.state_dict()
+                    sorted_keys = sorted(current_sd.keys())
+                    
+                    param_dict = dict(actual_module.named_parameters())
+                    buffer_dict = dict(actual_module.named_buffers()) # 기존 코드: buffer_map
+                    
+                    self._weight_map = []
+                    pointer = 0
+                    
+                    for name in sorted_keys:
+                        # 파라미터 또는 버퍼에서 타겟 찾기
+                        target = param_dict.get(name)
+                        if target is None:
+                            target = buffer_dict.get(name) # 수정됨: buffer_dict
+                        
+                        if target is None:
+                            # 가중치가 아닌 메타데이터 등은 건너뜀 (numel만큼 포인터는 이동)
+                            if name in current_sd and isinstance(current_sd[name], torch.Tensor):
+                                pointer += current_sd[name].numel()
+                            continue
+                        
+                        numel = target.numel()
+                        self._weight_map.append({
+                            'target': target,
+                            'start': pointer,
+                            'end': pointer + numel
+                        })
+                        pointer += numel
+                        
+                    self._total_numel = pointer
+                    print(f"✅ Weight map initialized: {len(self._weight_map)} tensors, Total numel: {self._total_numel}")
 
-                    state_dict = actual_module.state_dict()
+                @torch.no_grad()
+                def load_weights(self, flat_tensor: torch.Tensor, **kwargs):
+                    # 1. 크기 검증 (매우 중요)
+                    if flat_tensor.numel() != self._total_numel:
+                        raise ValueError(f"Size mismatch! Expected {self._total_numel}, got {flat_tensor.numel()}")
 
-                    for name, tensor in weights:
-                        if name in state_dict:
-                            # Get the parameter from the actual module
-                            param = dict(actual_module.named_parameters()).get(name)
-                            if param is not None:
-                                # Update the parameter in-place
-                                param.data.copy_(tensor)
-                            else:
-                                # It might be a buffer
-                                buffer = dict(actual_module.named_buffers()).get(name)
-                                if buffer is not None:
-                                    buffer.copy_(tensor)
-                                else:
-                                    logger.debug(f"Parameter or buffer {name} not found in model")
-                        else:
-                            # Use debug level for expected missing parameters (vision/generation components)
-                            # These are expected to be missing in vLLM rollout models
-                            logger.debug(f"Parameter {name} not found in model state_dict")
+                    actual_module = self._module
+                    if hasattr(actual_module, "_fsdp_wrapped_module"):
+                        actual_module = actual_module._fsdp_wrapped_module
+                    
+                    # 2. 전송 최적화 (Non-blocking HtoD copy)
+                    # 이미 같은 디바이스라면 복사 비용 없음
+                    device = next(actual_module.parameters()).device
+                    gpu_flat_tensor = flat_tensor.to(device, non_blocking=True)
+                    
+                    # 3. 가중치 복사
+                    for weight_info in self._weight_map:
+                        target = weight_info['target']
+                        source_slice = gpu_flat_tensor[weight_info['start']:weight_info['end']]
+                        
+                        # view_as를 통해 형태를 맞춘 뒤 복사
+                        target.copy_(source_slice.view_as(target))
+                    
+                    return {"loaded_elements": self._total_numel, "status": "success"}
+                
+                @torch.no_grad()
+                def load_weights_from_path(self, file_path: str):
 
-                def __getattr__(self, name):
-                    """Forward all other attribute access to the wrapped module."""
-                    if name in ['_module', 'load_weights']:
-                        return object.__getattribute__(self, name)
-                    return getattr(self._module, name)
+                    t0 = time.time()
+                    try:
+                        flat_tensor = torch.load(
+                        file_path, 
+                        map_location='cpu', 
+                        mmap=True, 
+                        weights_only=True
+                        )
+                        
+                    except Exception as e:
+                        print(f"[Worker] Error loading binary weights from {file_path}: {e}")
+                        raise e
 
-                def __setattr__(self, name, value):
-                    """Forward all attribute setting to the wrapped module, except _module."""
-                    if name == '_module':
-                        object.__setattr__(self, name, value)
-                    else:
-                        setattr(self._module, name, value)
+                    result = self.load_weights(flat_tensor)
+                    
+                    dt = time.time() - t0
+                    print(f"[Worker] Weights loaded from binary file {file_path} in {dt:.3f}s")
+                    return result
 
 class ImageUnifiedRollout(BaseRollout):
     def __init__(
@@ -179,6 +216,16 @@ class ImageUnifiedRollout(BaseRollout):
         self.formatter = FormattingEvaluator()
 
         self.image_token_num_per_image = getattr(config, "image_token_num_per_image", 576)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def get_node_id(self):
+        import ray
+        return ray.get_runtime_context().get_node_id()
+
+    # [추가] 서버로부터 파일 경로를 받아 로드를 수행하는 진입점
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def apply_rollout_weights_from_path(self, version: int, file_path: str):
+        return self.inference_engine.worker.model_runner.model.load_weights_from_path(file_path)
 
     def _pad_tensor_left(self, tensor: torch.Tensor, target_length: int, pad_value: int) -> torch.Tensor:
         """Left padding for input tensors"""
@@ -299,9 +346,8 @@ class ImageUnifiedRollout(BaseRollout):
         return None
 
     async def update_weights(self, weights, **kwargs):
-        for _ in weights:
-            pass
-        return None
+        stats = self.inference_engine.worker.model_runner.model.load_weights(weights, **kwargs)
+        return stats
 
     def set_generation_config(self, prompt: DataProto):
         do_sample = prompt.meta_info.get("do_sample", self.config.do_sample)

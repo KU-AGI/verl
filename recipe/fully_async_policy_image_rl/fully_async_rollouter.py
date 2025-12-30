@@ -71,6 +71,9 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         )
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
 
+        self.param_synchronizer = None
+        self.server_applied_versions = None
+
         assert not self.hybrid_engine
         assert self.config.data.train_batch_size == 0, "train_batch_size must be zero"
         assert self.config.data.gen_batch_size == 1, "gen_batch_size must be one"
@@ -172,6 +175,22 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
 
         self.server_token_q = None
 
+    async def set_param_synchronizer(self, h):
+        async with self.lock:
+            self.param_synchronizer = h
+
+    async def _maybe_update_server_weights(self, sid: int):
+
+        server = self.async_rollout_manager.server_handles[sid]
+        
+        used_version = await server.ensure_weights_updated.remote()
+        
+        async with self.lock:
+            self.server_applied_versions[sid] = used_version
+            
+        return used_version
+
+
     def _init_async_objects(self):
         # Initialize asyncio synchronization primitives.
         # We let asyncio.Condition create the Lock internally to ensure they share the same Event Loop.
@@ -258,6 +277,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 f",reset staleness_samples to: {self.staleness_samples}"
                 f",idle_ratio: {idle_ratio}"
             )
+
             val_metrics = None
             if (
                 self.val_reward_fn is not None
@@ -273,6 +293,9 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             await self.message_queue_client.put_validate(ray.cloudpickle.dumps(data))
 
             self.version_start_time = time.time()
+            
+        if self.async_rollout_manager is not None:
+            await self.set_latest_available_version(version)
 
     async def save_checkpoint(self, local_global_step_folder: str):
         # WARNING!: Due to the asynchronous nature, there are some in-flight samples
@@ -407,88 +430,8 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         self.server_token_q = asyncio.Queue()
         for sid in range(num_servers):
             self.server_token_q.put_nowait(sid)
-        
-    async def queue_async_weight_update(self, version: int, param_synchronizer=None):
-        """
-        Queue async weight update on all server replicas and apply when idle.
-        Called from ParameterSynchronizer.
-        """
-        if self.async_rollout_manager is None:
-            await self._init_async_rollout_manager()
 
-        # Queue weight update on all server replicas
-        server_handles = self.async_rollout_manager.server_handles
-        print(f"[FullyAsyncRollouter] Queueing weight update version {version} to {len(server_handles)} servers")
-
-        # Queue on all servers in parallel (non-blocking)
-        await asyncio.gather(
-            *[server.queue_weight_update.remote(version) for server in server_handles]
-        )
-
-        # Start background task to apply weights when servers are idle
-        asyncio.create_task(self._apply_weights(version, param_synchronizer))
-
-    async def _apply_weights(self, version: int, param_synchronizer):
-        """
-        Wait for all servers to become idle, then trigger NCCL sync via ParameterSynchronizer.
-
-        Optimization: Uses adaptive polling - checks more frequently when servers are becoming idle.
-
-        This monitors generation servers and when all are idle, calls the ParameterSynchronizer
-        to perform the actual NCCL broadcast with both actor_wg and rollout_wg.
-        """
-        print(f"[FullyAsyncRollouter] Starting background task to monitor idle state for version {version}")
-
-        check_interval = 0.01  # Start with 10ms for fast detection
-
-        while True:
-            await asyncio.sleep(check_interval)
-
-            # Check if all servers are idle (no ongoing generations)
-            server_handles = self.async_rollout_manager.server_handles
-
-            try:
-                statuses = await asyncio.gather(
-                    *[server.get_weight_update_status.remote() for server in server_handles]
-                )
-            except Exception as e:
-                print(f"[FullyAsyncRollouter] Error getting server status: {e}")
-                break
-
-            any_pending = any(status['pending_weight_version'] == version for status in statuses)
-
-            if any_pending:
-                print(f"[FullyAsyncRollouter] Triggering NCCL sync for version {version}")
-
-                # Trigger NCCL weight sync via ParameterSynchronizer
-                # The synchronizer has access to both actor_wg and rollout_wg
-                if param_synchronizer is not None:
-                    try:
-                        print(f"[FullyAsyncRollouter] Calling apply_nccl_weight_sync for version {version}")
-                        # Fire the remote call but don't wait synchronously - use ray.get in thread pool
-                        sync_start_time = time.time()
-                        apply_ref = param_synchronizer.apply_nccl_weight_sync.remote(version)
-
-                        # Run ray.get in thread pool to avoid blocking the event loop
-                        await asyncio.to_thread(ray.get, apply_ref)
-                        print(f"[FullyAsyncRollouter] Successfully completed NCCL weight sync for version {version}, cost time: {time.time() - sync_start_time:.4f}")
-                    except Exception as e:
-                        print(f"[FullyAsyncRollouter] Failed to apply weight sync: {e}")
-                        import traceback
-                        traceback.print_exc()
-
-                # Clear pending versions on all servers (fire-and-forget to avoid deadlock)
-                print(f"[FullyAsyncRollouter] Clearing pending weight updates for version {version}")
-                # Don't await - just fire the remote calls
-                for server in server_handles:
-                    server.queue_weight_update.remote(-1)  # Fire-and-forget
-                print(f"[FullyAsyncRollouter] Background task complete for version {version}")
-                break
-
-            # If no server has pending update for this version anymore, stop waiting
-            if not any_pending:
-                print(f"[FullyAsyncRollouter] No pending updates for version {version}, stopping background task")
-                break
+        self.server_applied_versions = [-1] * num_servers
 
     async def check_all_servers_idle(self) -> bool:
         """Check if all generation servers are currently idle."""
@@ -510,6 +453,17 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         await asyncio.gather(
             *[server.queue_weight_update.remote(-1) for server in server_handles]  # -1 means clear
         )
+
+    async def set_latest_available_version(self, version: int):
+
+        async with self.lock:
+            self.current_param_version = version
+            
+        server_handles = self.async_rollout_manager.server_handles
+        await asyncio.gather(
+            *[server.set_latest_available_version.remote(version) for server in server_handles]
+        )
+        print(f"[Rollouter] Notified {len(server_handles)} servers about v{version} ready in SHM.")
 
     async def _acquire_finalize_budget(self, n: int):
         async with self._finalize_cond:
@@ -781,9 +735,9 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         enqueued_to_finalize = False
         token_released = False
         try:
-            current_version = self.current_param_version
+            used_version = await self._maybe_update_server_weights(server_index)
             rollout_sample.full_batch.non_tensor_batch["param_version"] = np.full(
-                (batch_size,), current_version, dtype=np.int64
+                (batch_size,), used_version, dtype=np.int64
             )
 
             sample_reward_tasks = []
@@ -817,7 +771,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
 
             # 3) finalize 워커로 넘기고 즉시 종료
             await self.reward_finalize_queue.put(
-                (rollout_sample, sample_reward_tasks, reward_results, current_version, finalize_budget)
+                (rollout_sample, sample_reward_tasks, reward_results, used_version, finalize_budget)
             )
             enqueued_to_finalize = True
             return  # 여기서 끝
@@ -894,7 +848,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 if item == "DONE":
                     break
 
-                rollout_sample, sample_reward_tasks, reward_results, current_version, finalize_budget = item
+                rollout_sample, sample_reward_tasks, reward_results, used_version, finalize_budget = item
                 batch_size = len(rollout_sample.full_batch)
 
                 # reward 완료 대기
@@ -914,9 +868,9 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                         rollout_sample.full_batch.meta_info = {}
                     rollout_sample.full_batch.meta_info.update(reward_results["meta_info"])
 
-                rollout_sample.param_version = current_version
+                rollout_sample.param_version = used_version
                 rollout_sample.rollout_status = {
-                    "param_version": current_version,
+                    "param_version": used_version,
                     "staleness_samples": self.staleness_samples,
                     "total_generated_samples": self.total_generated_samples,
                 }
@@ -933,7 +887,6 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                     if success:
                         success_count += 1
 
-                # 카운터 업데이트 (여기로 이동)
                 async with self.lock:
                     self.total_generated_samples += success_count
                     self.staleness_samples -= batch_size

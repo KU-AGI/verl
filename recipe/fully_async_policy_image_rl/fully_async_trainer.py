@@ -17,6 +17,8 @@ import time
 from datetime import datetime
 from pprint import pprint
 from typing import Any
+import threading
+import queue
 
 import ray
 from omegaconf import OmegaConf
@@ -115,6 +117,26 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             + config.rollout.nnodes * config.rollout.n_gpus_per_node
         )
         self.metrics_aggregator = MetricsAggregator(total_gpus=total_gpus)
+
+        self.batch_buffer = queue.Queue(maxsize=1)
+        self.stop_prefetch = False
+        self.prefetch_thread = None
+
+    def _run_prefetch(self):
+        print("[FullyAsyncTrainer] Prefetch thread started.")
+        while not self.stop_prefetch:
+            try:
+                epoch, batch = self._get_samples_from_queue()
+                
+                if batch is None:
+                    self.batch_buffer.put((None, None))
+                    break
+                
+                # 수집된 128개 묶음을 버퍼에 투척 (버퍼가 차있으면 여기서 대기)
+                self.batch_buffer.put((epoch, batch))
+            except Exception as e:
+                print(f"[Prefetch Error] {e}")
+                time.sleep(1)
 
     def set_message_queue_client(self, message_queue_client: MessageQueueClient):
         """Set message queue client"""
@@ -257,6 +279,8 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             config=OmegaConf.to_container(self.config, resolve=True),
         )
 
+        self.prefetch_thread = threading.Thread(target=self._run_prefetch, daemon=True)
+        self.prefetch_thread.start()
         self.max_steps_duration = 0
 
         # get validate data before training
@@ -270,9 +294,8 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
 
             with marked_timer("step", timing_raw):
                 with marked_timer("gen", timing_raw, color="red"):
-                    epoch, batch = self._get_samples_from_queue()
-                    if batch is None:
-                        break
+                    epoch, batch = self.batch_buffer.get()
+                    if batch is None: break
                     self._collect_metrics_from_samples(batch, metrics)
 
                     # Collect timing info from rollouter (reward computation time)
@@ -281,18 +304,27 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
 
                     async_training = self.config.get("async_training", None)
                     if async_training and async_training.use_rollout_log_probs:
-                        # If local_triger_step == 1, load the training engine's parameters to the CPU
-                        #  and save a copy for subsequent MIS use.
-                        # If local_trigger_step == 2, 3, ..., restore the parameters of version 1 to calculate the old_log_prob,
-                        # then restore the parameters of the current version.
                         if self.local_trigger_step == 1:
-                            self.actor_rollout_wg.save_model_to_cpu(1) # not depened on task 1, 2, 3 iteration
+                            self.actor_rollout_wg.save_model_to_cpu(1)
                         elif self.local_trigger_step is not None:
                             self.actor_rollout_wg.save_model_to_cpu(self.local_trigger_step)
                         print("[FullyAsyncTrainer] saving model to cpu for rollout log probs computation, local_trigger_step:", self.local_trigger_step)
 
-                    # Rewards are already computed in rollouter, no need to compute here
-                    # Just process each task
+
+                    async_training = self.config.get("async_training", None)
+                    use_mis = async_training and async_training.use_rollout_log_probs
+                    local_trigger = self.local_trigger_step if self.compute_prox_log_prob else None
+                    
+                    should_swap = use_mis and local_trigger is not None and local_trigger > 1
+                    
+                    if use_mis and local_trigger == 1:
+
+                        self.actor_rollout_wg.save_model_to_cpu(1)
+                    elif should_swap:
+                        # 현재 학습 중인 모델을 저장하고 롤아웃 당시 모델(V1)을 GPU로 로드
+                        self.actor_rollout_wg.save_model_to_cpu(local_trigger)
+                        self.actor_rollout_wg.restore_model_from_cpu(1)
+
                     for task_id in [1, 2, 3]:
                         batch.batch["task_id"] = torch.tensor([task_id for _ in range(len(batch))], dtype=int)
 
@@ -304,6 +336,10 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                         )
                         # Remove universal keys from batch
                         batch.pop(batch_keys=["task_id"])
+
+                    if should_swap:
+                        self.actor_rollout_wg.restore_model_from_cpu(local_trigger)
+                        self.actor_rollout_wg.clear_cpu_model(local_trigger)
                 
                     # update critic
                     if self.use_critic:
@@ -354,7 +390,9 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             self._trigger_parameter_sync_after_step(validate=True, global_steps=self.global_steps)
             ray.get(self.param_synchronizer.wait_last_valid.remote())
             self._log_validation_data()
+            
         self.progress_bar.close()
+        self.stop_prefetch = True
 
         self._check_save_checkpoint(timing_raw)
 
@@ -543,10 +581,9 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         with marked_timer("timing_s/wait_last_valid", timing_param_sync):
             ray.get(self.param_synchronizer.wait_last_valid.remote())
         with marked_timer("timing_s/param_sync", timing_param_sync):
-            ray.get(
-                self.param_synchronizer.sync_weights.remote(
-                    self.current_param_version, validate=validate, global_steps=global_steps
-                )
+            t0 = time.time()
+            self.param_synchronizer.sync_weights.remote(
+            self.current_param_version, validate=validate, global_steps=global_steps
             )
         self.logger.log(data=timing_param_sync, step=self.current_param_version)
 

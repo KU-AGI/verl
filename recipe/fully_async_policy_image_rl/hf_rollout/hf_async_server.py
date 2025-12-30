@@ -15,6 +15,8 @@ import asyncio
 import logging
 from typing import Any, Optional
 import concurrent.futures
+import time
+import os
 
 import ray
 import torch
@@ -27,6 +29,20 @@ from verl import DataProto
 
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
+
+def _apply_one_worker(w, version, weights):
+    # 환경에 따라 prefix/unprefixed가 다를 수 있으니 후보를 모두 시도
+    for name in (
+        "apply_rollout_weights",
+        "rollout_apply_rollout_weights",
+        "actor_apply_rollout_weights",
+        "ref_apply_rollout_weights",
+    ):
+        try:
+            return getattr(w, name).remote(version, weights)
+        except AttributeError:
+            continue
+    raise RuntimeError("No apply_rollout_weights method found on worker handle")
 
 
 @ray.remote(num_cpus=1)
@@ -73,6 +89,9 @@ class HuggingFaceAsyncServerForImageRollout:
         self.weight_update_worker_task: Optional[asyncio.Task] = None
         self.ongoing_generations = 0  # Track number of ongoing generations
 
+        self.latest_available_version = -1
+        self.applied_version = -1
+
         logger.info(f"Initializing HF async server on replica {self.replica_rank}, node {self.node_rank}")
 
     async def init_model(self):
@@ -96,6 +115,44 @@ class HuggingFaceAsyncServerForImageRollout:
         self.weight_update_worker_task = asyncio.create_task(self._weight_update_worker())
 
         logger.info(f"HF async server initialized on replica {self.replica_rank}")
+
+    async def set_latest_available_version(self, version: int):
+
+        async with self.weight_update_lock:
+            if version > self.latest_available_version:
+                self.latest_available_version = version
+                print(f"[DEBUG 4-1] Server {self.replica_rank} notified: v{version} is ready for next inference", flush=True)
+                logger.info(f"[Server {self.replica_rank}] New version v{version} is ready in SHM.")
+
+    async def ensure_weights_updated(self) -> int:
+
+        print(f"[DEBUG 5-1] Server {self.replica_rank} updating: v{self.applied_version} -> v{self.latest_available_version}", flush=True)
+        t0 = time.time()
+
+        async with self.weight_update_lock:
+           
+            if self.applied_version >= self.latest_available_version:
+                return self.applied_version
+
+            target_v = self.latest_available_version
+            file_path = f"/dev/shm/weights_v{target_v}.pt"
+
+            wait_count = 0
+            while not os.path.exists(file_path):
+                await asyncio.sleep(0.05)
+                wait_count += 1
+                if wait_count > 100:
+                    logger.error(f"Weights file {file_path} not found after 5s!")
+                    return self.applied_version
+
+            logger.info(f"[Server {self.replica_rank}] Lazy updating weights to v{target_v} via mmap...")
+            
+            refs = [w.apply_rollout_weights_from_path.remote(target_v, file_path) for w in self.workers]
+            await asyncio.gather(*[asyncio.wrap_future(r.future()) for r in refs])
+
+            self.applied_version = target_v
+            print(f"[DEBUG 5-2] Server {self.replica_rank} GPU update finished in {time.time()-t0:.2f}s", flush=True)
+            return self.applied_version
 
     async def _generate_step(
         self,
@@ -317,3 +374,37 @@ class HuggingFaceAsyncServerForImageRollout:
                         f"[Replica {self.replica_rank}] Ready for weight update: "
                         f"pending_version={self.pending_weight_version}, ongoing={self.ongoing_generations}"
                     )
+                    
+
+    async def apply_weights_from_ref(self, version: int, weights_or_ref):
+
+        print(f"[HFServer] apply enter replica={self.replica_rank} v={version} type={type(weights_or_ref)} ongoing={self.ongoing_generations}", flush=True)
+
+        while True:
+            async with self.weight_update_lock:
+                if self.ongoing_generations == 0:
+                    break
+            await asyncio.sleep(0.001)
+
+        # 2) weights_or_ref가 ObjectRef면 값을 꺼내고, 값이면 그대로 사용
+        if isinstance(weights_or_ref, ray.ObjectRef):
+            weights = await asyncio.to_thread(ray.get, weights_or_ref)
+        else:
+            weights = weights_or_ref  # 보통 Ray가 이미 resolve해서 값으로 들어올 수도 있음
+
+        assert weights is not None and (isinstance(weights, list) or isinstance(weights, torch.Tensor)), \
+        f"[HFServer] invalid weights payload: {type(weights)}"
+
+        # 3) 핵심: 서버가 모델을 안 들고 있으니, workers 전원에게 apply RPC 브로드캐스트
+        refs = [
+            (w, version, weights) for w in self.workers]
+        results = await asyncio.gather(*[asyncio.wrap_future(r.future()) for r in refs])
+
+        # 4) 상태 업데이트(선택)
+        async with self.weight_update_lock:
+            self.pending_weight_version = None
+            self.applied_version = version
+
+        print(f"[HFServer] apply done replica={self.replica_rank} v={version} worker_results={results[:1]}", flush=True)
+
+        return version

@@ -17,11 +17,32 @@ import time
 
 import ray
 from ray.util.collective import collective
+import asyncio
+import numpy as np
 
 from verl.utils.device import get_nccl_backend
 
 logger = logging.getLogger(__name__)
 
+def _resolve_method_by_suffix(worker, suffix: str, prefer_prefixes=()):
+    """
+    worker actor 내부 dir(self)에서 suffix로 끝나는 메서드명을 찾아 반환.
+    prefer_prefixes 순서대로 우선 선택.
+    """
+    names = ray.get(worker.__ray_call__.remote(
+        lambda self: [m for m in dir(self) if callable(getattr(self, m, None)) and m.endswith(suffix)]
+    ))
+    if not names:
+        all_export = ray.get(worker.__ray_call__.remote(
+            lambda self: [m for m in dir(self) if "export" in m]
+        ))
+        raise RuntimeError(f"No method endswith '{suffix}'. export-like={all_export[:50]}")
+
+    for p in prefer_prefixes:
+        cand = f"{p}_{suffix}"
+        if cand in names:
+            return cand
+    return names[0]
 
 @ray.remote
 class ParameterSynchronizer:
@@ -46,14 +67,65 @@ class ParameterSynchronizer:
         self.wait_last_update = None
         self.wait_last_resume = None
 
+        # Weight Version
+        self.latest_version = 0
+        self.latest_weights_ref = None
+        self.keep_last_n = getattr(config.async_training, "keep_last_n_weights", 1)
+        self._weights_refs = {}
+
+        self.relays = self._setup_node_relays()
+
         # Statistics
         self.current_version = 0
 
         # Store self handle for passing to rollouter
         self.self_handle = None
 
+        self._export_method_name = None
+        self._rank_method_name = None
+        self._actor_rank0_idx = self._setup_rank_info()
+
         self._init_weights_info()
         self._init_sync_group()
+
+    def _setup_rank_info(self):
+    
+        rank_method = _resolve_method_by_suffix(
+            self.actor_wg.workers[0], "get_dist_rank",
+            prefer_prefixes=("actor", "rollout")
+        )
+        ranks = ray.get([getattr(w, rank_method).remote() for w in self.actor_wg.workers])
+        return ranks.index(0)
+
+    def _setup_node_relays(self):
+        from recipe.fully_async_policy_image_rl.weight_relay import WeightRelayActor
+        
+        method_name = _resolve_method_by_suffix(
+            self.rollout_wg.workers[0], 
+            "get_node_id", 
+            prefer_prefixes=("rollout", "actor", "actor_rollout")
+        )
+        print(f"[ParamSync] Resolved node_id method name: {method_name}")
+
+        node_ids = ray.get([
+            getattr(w, method_name).remote() for w in self.rollout_wg.workers
+        ])
+        
+        unique_nodes = list(set(node_ids))
+        
+        relays = {}
+        for node_id in unique_nodes:
+            relays[node_id] = WeightRelayActor.options(
+                scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
+                    node_id=node_id, soft=False
+                )
+            ).remote(node_id)
+        
+        print(f"[ParamSync] Initialized {len(relays)} RelayActors on nodes: {unique_nodes}")
+        return relays
+
+    def get_latest_published(self):
+        return self.latest_version, self.latest_weights_ref
 
     def get_current_param_version(self) -> int:
         """Get current parameter version number"""
@@ -82,27 +154,44 @@ class ParameterSynchronizer:
         """Store the actor handle for this ParameterSynchronizer"""
         self.self_handle = handle
 
-    def sync_weights(self, version, validate=False, global_steps=0):
-        """
-        Async weight sync: queues weight update on rollouter without blocking.
-        The actual NCCL broadcast happens later when rollouter detects idle state.
-        """
+        print(f"[ParameterSynchronizer] Linking self handle to Rollouter...")
+        self.rollouter.set_param_synchronizer.remote(handle)
+
+    async def _publish_weights(self, version: int):
+    
+        if self._export_method_name is None:
+            self._export_method_name = _resolve_method_by_suffix(
+                self.actor_wg.workers[0], "export_rollout_weights",
+                prefer_prefixes=("actor", "rollout")
+            )
+
+        export_refs = [getattr(w, self._export_method_name).remote() for w in self.actor_wg.workers]
+        
+        weights_ref = export_refs[self._actor_rank0_idx]
+        self.latest_weights_ref = weights_ref
+        self.latest_version = version
+        return weights_ref
+
+    async def sync_weights(self, version, validate=False, global_steps=0):
+
         start_time = time.time()
-
         self.current_version = version
-        print(f"[ParameterSynchronizer] Starting ASYNC weight synchronization (version {self.current_version})...")
-
-        # Update MQ version immediately (samples generated with old weights will be tagged with old version)
+        
+        # 1. 메시지 큐 버전 즉시 업데이트
         self.mq_client.update_param_version_sync(version)
 
-        # Queue async weight update on rollouter (non-blocking)
-        # Pass self handle as param_synchronizer so rollouter can call us back when ready
-        # This only queues the version - actual NCCL broadcast happens in background task
-        # when servers become idle
-        ray.get(self.rollouter.queue_async_weight_update.remote(version, self.self_handle))
+        # 2. 트레이너 가중치(통짜 1D 텐서) 가져오기
+        weights_ref = await self._publish_weights(version)
 
-        end_time = time.time()
-        print(f"[ParameterSynchronizer] Queued async weight update to version {version}. cost {end_time - start_time:.2f} seconds")
+        # 노드 수만큼만 네트워크 전송이 발생합니다.
+        prefetch_tasks = [r.prefetch_to_shm.remote(version, weights_ref) for r in self.relays.values()]
+        
+        print(f"[DEBUG 2-1] Synchronizer triggering prefetch for v{version} to {len(self.relays)} nodes", flush=True)
+        t0 = time.time()
+        await asyncio.gather(*prefetch_tasks)
+        print(f"[DEBUG 2-2] All nodes finished SHM prefetch for v{version} in {time.time()-t0:.2f}s", flush=True)
+        
+        print(f"[ParamSync] v{version} Prefetch to all nodes SHM done. Time: {time.time()-start_time:.2f}s")
 
         # Update rollout version metadata & trigger validation asynchronously
         self.wait_last_update = self.rollouter.update_param_version.remote(version, validate, global_steps)

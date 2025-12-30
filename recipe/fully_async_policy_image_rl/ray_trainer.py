@@ -797,15 +797,8 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                 #  and save a copy for subsequent MIS use.
                 # If local_trigger_step == 2, 3, ..., restore the parameters of version 1 to calculate the old_log_prob,
                 # then restore the parameters of the current version.
-                if local_trigger_step == 1:
-                    # self.actor_rollout_wg.save_model_to_cpu(1) # save already done before
+                if local_trigger_step is not None:
                     batch = compute_old_log_prob(batch)
-                elif local_trigger_step is not None:
-                    # self.actor_rollout_wg.save_model_to_cpu(local_trigger_step)
-                    self.actor_rollout_wg.restore_model_from_cpu(1)
-                    batch = compute_old_log_prob(batch)
-                    self.actor_rollout_wg.restore_model_from_cpu(local_trigger_step)
-                    self.actor_rollout_wg.clear_cpu_model(local_trigger_step)
                 else:
                     batch.batch[f"task{task_id}_old_log_probs"] = batch.batch[f"task{task_id}_rollout_log_probs"]
                     batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature

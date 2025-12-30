@@ -22,6 +22,7 @@ import os
 import warnings
 from dataclasses import asdict
 from typing import Any, Optional
+import time
 
 # Third-party imports
 import numpy as np
@@ -232,6 +233,10 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
         if self._is_ref and self.config.ref.log_prob_micro_batch_size is not None:
             self.config.ref.log_prob_micro_batch_size //= self.device_mesh.size() // self.ulysses_sequence_parallel_size
             self.config.ref.log_prob_micro_batch_size_per_gpu = self.config.ref.log_prob_micro_batch_size
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def get_dist_rank(self):
+        return dist.get_rank()
 
     def _build_model_optimizer(
         self,
@@ -1065,7 +1070,61 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
                 # silently ignore if profiler doesn't support memory snapshots
                 pass
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def export_rollout_weights(self, cast_bf16: bool = True):
+        assert self._is_actor, "export_rollout_weights was only called actor."
 
+        rank = dist.get_rank()
+        t0 = time.time()
+
+        if torch.distributed.is_initialized():
+            print(f"[DEBUG 1-1] Rank {rank} entering barrier for sync...", flush=True)
+            torch.distributed.barrier()
+
+        if getattr(self, "_is_offload_param", False):
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        try:
+            # 1. State Dict 가져오기 (FSDP 처리)
+            if fsdp_version(self.actor_module_fsdp) == 1 and isinstance(self.actor_module_fsdp, FSDP):
+                with FSDP.state_dict_type(
+                    self.actor_module_fsdp,
+                    StateDictType.FULL_STATE_DICT,
+                    FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
+                ):
+                    sd = self.actor_module_fsdp.state_dict()
+            else:
+                sd = self.actor_module_fsdp.state_dict()
+
+            # 키 변환
+            sd = convert_weight_keys(sd, getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp))
+            
+            if rank == 0:
+                sorted_keys = sorted(sd.keys())
+                total_numel = sum(sd[k].numel() for k in sorted_keys)
+                
+                # [수정] Pinned Memory 할당 및 순차 복사
+                flat_tensor = torch.empty(total_numel, dtype=torch.bfloat16, pin_memory=True)
+                
+                offset = 0
+                for k in sorted_keys:
+                    param = sd[k]
+                    numel = param.numel()
+                    flat_tensor[offset : offset + numel].copy_(param.view(-1))
+                    offset += numel
+                    del sd[k] # 메모리 즉시 해제
+                
+                dt = time.time() - t0
+                print(f"[DEBUG 1-2] Rank 0 gathered 14GB weights in {time.time()-t0:.2f}s", flush=True)
+                
+                # Numpy로 변환하여 Ray Zero-copy 전송 활성화
+                return flat_tensor.view(torch.int16).numpy()
+            else:
+                return None
+
+        finally:
+            if getattr(self, "_is_offload_param", False):
+                offload_fsdp_model_to_cpu(self.actor_module_fsdp)
 
 # TODO(sgm): we may need to extract it to dp_reward_model.py
 class ImageGenerationRewardModelWorker(RewardModelWorker):
@@ -1430,7 +1489,6 @@ class ImageGenerationRewardModelWorker(RewardModelWorker):
         output = output.to("cpu")
         return output
 
-
 # ================================= Async related workers =================================
 class ImageGenerationAsyncActorRolloutRefWorker(ImageGenerationActorRolloutRefWorker):
     @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
@@ -1442,6 +1500,31 @@ class ImageGenerationAsyncActorRolloutRefWorker(ImageGenerationActorRolloutRefWo
     async def sleep(self):
         await self.trainer_mode()
         return True
+
+    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
+    async def apply_rollout_weights(self, version: int, weights):
+        stats = await self.rollout.update_weights(weights, tag=f"v{version}")
+        if dist.get_rank() == 0:
+            print(f"[Worker] apply_rollout_weights rank0 v={version} stats={stats}", flush=True)
+        self.applied_version = version
+        return stats
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def get_node_id(self):
+        import ray
+        return ray.get_runtime_context().get_node_id()
+
+    # [추가] 파일 경로를 통한 가중치 로드 (mmap 활용)
+    @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
+    async def apply_rollout_weights_from_path(self, version: int, file_path: str):
+        
+        stats = self.rollout.inference_engine.worker.model_runner.model.load_weights_from_path(file_path)
+        
+        if dist.get_rank() == 0:
+            print(f"[Worker] apply_weights from SHM v={version} stats={stats}", flush=True)
+            
+        self.applied_version = version
+        return stats
 
     # ============================ HuggingFace Rollout related ============================
 
