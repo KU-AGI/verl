@@ -52,6 +52,7 @@ from recipe.image_rl.custom_metric_utils import ( # custom metric
     compute_data_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
+    compute_group_reward_metrics,
     process_validation_metrics,
     reduce_metrics,
 )
@@ -67,11 +68,11 @@ from verl.utils.metric import reduce_metrics
 from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
-from verl.utils.tracking import ValidationGenerationsLogger
 from verl.utils.transferqueue_utils import tqbridge
 from verl.workers.reward_manager.abstract import AbstractRewardManager
 
 from recipe.image_rl.reward import compute_reward, compute_reward_async
+from recipe.image_rl.tracking import ValidationGenerationsLogger
 from recipe.image_rl.utils import FormattingEvaluator
 
 @dataclass
@@ -526,7 +527,9 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                 dump_path=dump_path,
             )
 
-    def _maybe_log_val_generations(self, inputs, outputs, scores):
+    def _maybe_log_val_generations(self, 
+            prompts, task1_gen_imgs, task2_feedback_text, task3_regen_imgs, task1_scores, task2_scores, task3_scores
+        ):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
 
         generations_to_log = self.config.trainer.log_val_generations
@@ -537,7 +540,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
         import numpy as np
 
         # Create tuples of (input, output, score) and sort by input text
-        samples = list(zip(inputs, outputs, scores, strict=True))
+        samples = list(zip(prompts, task1_gen_imgs, task2_feedback_text, task3_regen_imgs, task1_scores, task2_scores, task3_scores, strict=True))
         samples.sort(key=lambda x: x[0])  # Sort by input text
 
         # Use fixed random seed for deterministic shuffling
@@ -551,13 +554,18 @@ class RayImageGenerationTrainer(RayPPOTrainer):
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
 
     def _validate(self):
-        reward_tensor_lst = []
+        # task reward tensors collection
+        task_reward_tensors = {1: [], 2: [], 3: []}
         data_source_lst = []
 
         # Lists to collect samples for the table
-        sample_inputs = []
-        sample_outputs = []
-        sample_scores = []
+        sample_prompts = []
+        sample_task1_gen_imgs = []
+        sample_task2_feedback_texts = []
+        sample_task3_regen_imgs = []
+        sample_task1_scores = []
+        sample_task2_scores = []
+        sample_task3_scores = []
         self.val_reward_fn.steps = self.global_steps
 
         for test_data in self.val_dataloader:
@@ -565,7 +573,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
 
             # repeat test batch
             test_batch = test_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n,
-                                           interleave=True)
+                                        interleave=True)
 
             # add uid to batch <- dummy tensor in batch
             test_batch.non_tensor_batch["uid"] = np.array(
@@ -573,53 +581,92 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             )
 
             test_gen_batch = self._get_gen_batch(test_batch)
-
-            # # pad to be divisible by dp_size
-            # test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_wg.world_size)
-            # test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
-
-            # # unpad
-            # test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
             test_output_gen_batch = self.actor_rollout_wg.generate_sequences(test_gen_batch)
             print('validation generation end')
 
             prompts = test_output_gen_batch.non_tensor_batch['prompt'].tolist()
+            sample_prompts.extend(prompts)
+
             task1_gen_imgs_pil_list = test_output_gen_batch.non_tensor_batch['task1_gen_imgs_pil_list']
             task1_gen_imgs_pil_list = [wandb.Image(gen_img, caption=prompts[i]) for i, gen_img in enumerate(task1_gen_imgs_pil_list)]
-            sample_outputs.extend(task1_gen_imgs_pil_list)
+            sample_task1_gen_imgs.extend(task1_gen_imgs_pil_list)
 
-            test_batch = test_batch.union(test_output_gen_batch)
-            
+            task2_feedback_texts = test_output_gen_batch.non_tensor_batch['task2_feedback_texts'].tolist()
+            sample_task2_feedback_texts.extend(task2_feedback_texts)
+
+            task3_regen_imgs_pil_list = test_output_gen_batch.non_tensor_batch['task3_regen_imgs_pil_list']
+            task3_regen_imgs_pil_list = [wandb.Image(regen_img, caption=prompts[i]) for i, regen_img in enumerate(task3_regen_imgs_pil_list)]
+            sample_task3_regen_imgs.extend(task3_regen_imgs_pil_list)
+
             if self.config.reward_model.enable and not self.config.reward_model.paired:
                 reward_tensor = self.rm_wg.compute_rm_score(test_batch)
                 test_batch = test_batch.union(reward_tensor)
 
-            # evaluate using reward_function
-            reward_tensor = self.val_reward_fn(test_batch, eval=True, task_id=1, return_dict=False)
+            # evaluate using reward_function for each task
+            for task_id in [1, 2, 3]:
+                task_reward_dict = self.val_reward_fn(test_batch, eval=True, task_id=task_id, return_dict=True)
+                task_reward_tensor = task_reward_dict[f"task{task_id}_reward_tensor"]
+                task_reward_tensors[task_id].append(task_reward_tensor)
 
-            # Store scores
-            scores = reward_tensor.sum(-1).cpu().tolist()
-            sample_scores.extend(scores)
+                # Compute per-sample scores
+                per_sample_scores = task_reward_tensor.sum(-1).cpu().tolist()
 
-            reward_tensor_lst.append(reward_tensor)
-            data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
+                if task_id == 1:
+                    sample_task1_scores.extend(per_sample_scores)
+                elif task_id == 2:
+                    sample_task2_scores.extend(per_sample_scores)
+                else:
+                    sample_task3_scores.extend(per_sample_scores)
 
-        self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
+            batch_size = len(prompts)
+            data_source = test_batch.non_tensor_batch.get('data_source', ['unknown'] * batch_size)
+            data_source_lst.extend(data_source)
 
-        reward_tensor = torch.cat(reward_tensor_lst, dim=0).sum(-1).cpu()  # (batch_size,)
-        data_sources = np.concatenate(data_source_lst, axis=0)
+        # Log validation generations
+        self._maybe_log_val_generations(
+            prompts=sample_prompts,
+            task1_gen_imgs=sample_task1_gen_imgs,
+            task2_feedback_text=sample_task2_feedback_texts,
+            task3_regen_imgs=sample_task3_regen_imgs,
+            task1_scores=sample_task1_scores,
+            task2_scores=sample_task2_scores,
+            task3_scores=sample_task3_scores
+        )
 
-        # evaluate test_score based on data source
-        data_source_reward = {}
-        for i in range(reward_tensor.shape[0]):
-            data_source = data_sources[i]
-            if data_source not in data_source_reward:
-                data_source_reward[data_source] = []
-            data_source_reward[data_source].append(reward_tensor[i].item())
+        # Store validation samples for logging by Trainer
+        validation_samples = list(zip(
+            sample_prompts,
+            sample_task1_gen_imgs,
+            sample_task2_feedback_texts,
+            sample_task3_regen_imgs,
+            sample_task1_scores,
+            sample_task2_scores,
+            sample_task3_scores
+        ))
 
+        data_sources = np.array(data_source_lst)
+
+        # task metrics computation
         metric_dict = {}
-        for data_source, rewards in data_source_reward.items():
-            metric_dict[f'val/test_score/{data_source}'] = np.mean(rewards)
+        for task_id in [1, 2, 3]:
+            reward_tensor = torch.cat(task_reward_tensors[task_id], dim=0).sum(-1).cpu()
+
+            # evaluate test_score based on data source
+            data_source_reward = {}
+            for i in range(reward_tensor.shape[0]):
+                data_source = data_sources[i]
+                if data_source not in data_source_reward:
+                    data_source_reward[data_source] = []
+                data_source_reward[data_source].append(reward_tensor[i].item())
+
+            for data_source, rewards in data_source_reward.items():
+                valid_rewards = [r for r in rewards if r > 0] # positive
+                if valid_rewards:
+                    metric_dict[f'val/task{task_id}_score/{data_source}'] = np.mean(valid_rewards)
+                metric_dict[f'val/task{task_id}_positive_ratio/{data_source}'] = np.mean(np.array(rewards) > 0)
+
+        # Include validation generation samples in the result for Trainer to log
+        metric_dict['validation_samples'] = validation_samples
 
         return metric_dict
 
@@ -649,7 +696,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
         """
         from omegaconf import OmegaConf
 
-        from verl.utils.tracking import Tracking
+        from recipe.image_rl.tracking import Tracking
 
         logger = Tracking(
             project_name=self.config.trainer.project_name,
@@ -912,6 +959,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                     # collect metrics
                     metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                     metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+                    metrics.update(compute_group_reward_metrics(batch=batch))
                     # Remove universal keys from batch
                     batch.pop(batch_keys=["task_id"])
                 

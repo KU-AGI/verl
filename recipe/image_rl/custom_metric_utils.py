@@ -350,6 +350,37 @@ def compute_throughout_metrics(batch: DataProto, timing_raw: dict[str, float], n
     }
 
 
+def compute_group_reward_metrics(batch: DataProto) -> dict[str, Any]:
+    """
+    Computes reward-related metrics from a batch of data.
+
+    This function calculates statistics about the rewards assigned to responses
+    in the batch, including mean, max, min, and the ratio of positive rewards.
+
+    Args:
+        batch: A DataProto object containing batch data with token-level rewards.
+
+    Returns:
+        A dictionary containing:
+            - group_rewards/task{task_id}/mean: Mean of sequence rewards
+            - group_rewards/task{task_id}/max: Max of sequence rewards
+            - group_rewards/task{task_id}/min: Min of sequence rewards
+            - group_rewards/task{task_id}/positive_ratio: Ratio of sequences with positive rewards
+    """
+    task_id = batch.batch["task_id"].view(-1)[0].item()
+    task_reward_extra_info = batch.meta_info.get(f"task{task_id}_reward_extra_info", {})
+
+    task_reward_section = {}
+    for name, value in task_reward_extra_info.items():
+        if name.endswith("_reward"):
+            task_reward_section[f"group_rewards/task{task_id}/{name}/mean"] = np.mean(value)
+            task_reward_section[f"group_rewards/task{task_id}/{name}/max"] = np.max(value)
+            task_reward_section[f"group_rewards/task{task_id}/{name}/min"] = np.min(value)
+            task_reward_section[f"group_rewards/task{task_id}/{name}/positive_ratio"] = np.mean(np.array(value) > 0)
+
+    return task_reward_section
+
+
 def bootstrap_metric(
     data: list[Any],
     subset_size: int,

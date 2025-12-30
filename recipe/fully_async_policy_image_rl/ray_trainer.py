@@ -26,6 +26,7 @@ from typing import Any, Dict, Optional, Type
 import numpy as np
 import ray
 import torch
+import wandb
 from omegaconf import OmegaConf
 from tqdm import tqdm
 
@@ -42,6 +43,7 @@ from recipe.image_rl.custom_metric_utils import ( # custom metric
     compute_data_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
+    compute_group_reward_metrics,
     process_validation_metrics,
     reduce_metrics,
 )
@@ -664,6 +666,7 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
             # collect metrics
             metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
             metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+            metrics.update(compute_group_reward_metrics(batch=batch))
             # Remove universal keys from batch
             batch.pop(batch_keys=["task_id"])
         # TODO: implement actual tflpo and theoretical tflpo

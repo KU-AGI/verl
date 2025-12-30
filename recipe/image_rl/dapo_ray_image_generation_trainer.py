@@ -52,6 +52,7 @@ from recipe.image_rl.custom_metric_utils import ( # custom metric
     compute_data_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
+    compute_group_reward_metrics,
     process_validation_metrics,
     reduce_metrics,
 )
@@ -67,11 +68,11 @@ from verl.utils.metric import reduce_metrics
 from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
-from verl.utils.tracking import ValidationGenerationsLogger
 from verl.utils.transferqueue_utils import tqbridge
 from verl.workers.reward_manager.abstract import AbstractRewardManager
 
 from recipe.image_rl.reward import compute_reward, compute_reward_async
+from recipe.image_rl.tracking import ValidationGenerationsLogger
 from recipe.image_rl.utils import FormattingEvaluator
 
 @dataclass
@@ -678,7 +679,7 @@ class RayImageGenerationDAPOTrainer(RayPPOTrainer):
         """
         from omegaconf import OmegaConf
 
-        from verl.utils.tracking import Tracking
+        from recipe.image_rl.tracking import Tracking
 
         logger = Tracking(
             project_name=self.config.trainer.project_name,
@@ -1002,6 +1003,7 @@ class RayImageGenerationDAPOTrainer(RayPPOTrainer):
                         # collect metrics
                         metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                         metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+                        metrics.update(compute_group_reward_metrics(batch=batch))
                         # Remove universal keys from batch
                         batch.pop(batch_keys=["task_id"])
 
