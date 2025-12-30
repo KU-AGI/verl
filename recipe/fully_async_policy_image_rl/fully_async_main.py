@@ -266,16 +266,12 @@ class FullyAsyncTaskRunner:
         ray.get(self.components["trainer"].set_parameter_synchronizer.remote(param_synchronizer))
 
         # load checkpoint and sync parameter before doing anything
-        # Check if validation reward is configured
-        has_val_reward = (
-            hasattr(config, "reward_model")
-            and config.reward_model.get("val_reward", None) is not None
-        )
-        val_before_train = has_val_reward and config.trainer.get("val_before_train", True)
-        ray.get(self.components["trainer"].load_checkpoint.remote())
-        ray.get(param_synchronizer.sync_weights.remote(version=0, validate=val_before_train))
-        # Note: wait_last_valid() is blocking and should only be called after rollouter starts
-        # ray.get(param_synchronizer.wait_last_valid.remote())
+        val_before_train = config.trainer.get("val_before_train", True)
+        # param_version resume from ckpt or default 0
+        param_version = ray.get(self.components["trainer"].load_checkpoint.remote())
+        ray.get(self.components["rollouter"].load_checkpoint.remote())
+        ray.get(param_synchronizer.sync_weights.remote(version=param_version, validate=val_before_train))
+        ray.get(param_synchronizer.wait_last_valid.remote())
 
         self.components["param_synchronizer"] = param_synchronizer
         print("[ASYNC MAIN] All components initialized successfully")

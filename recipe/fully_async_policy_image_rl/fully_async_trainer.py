@@ -248,7 +248,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         if self.param_synchronizer is None:
             raise ValueError("param_synchronizer client not set. Call set_parameter_synchronizer() first.")
 
-        from verl.utils.tracking import Tracking
+        from recipe.image_rl.tracking import Tracking
 
         self.logger = Tracking(
             project_name=self.config.trainer.project_name,
@@ -259,8 +259,8 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
 
         self.max_steps_duration = 0
 
-        # # get validate data before training
-        # self._log_validation_data()
+        # get validate data before training
+        self._log_validation_data()
 
         # Use queue mode, no need for traditional dataloader iterator
         # Initialize to get the first batch of data
@@ -278,6 +278,18 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                     # Collect timing info from rollouter (reward computation time)
                     if hasattr(batch, 'meta_info') and 'reward' in batch.meta_info:
                         timing_raw['reward'] = batch.meta_info['reward']
+
+                    async_training = self.config.get("async_training", None)
+                    if async_training and async_training.use_rollout_log_probs:
+                        # If local_triger_step == 1, load the training engine's parameters to the CPU
+                        #  and save a copy for subsequent MIS use.
+                        # If local_trigger_step == 2, 3, ..., restore the parameters of version 1 to calculate the old_log_prob,
+                        # then restore the parameters of the current version.
+                        if self.local_trigger_step == 1:
+                            self.actor_rollout_wg.save_model_to_cpu(1) # not depened on task 1, 2, 3 iteration
+                        elif self.local_trigger_step is not None:
+                            self.actor_rollout_wg.save_model_to_cpu(self.local_trigger_step)
+                        print("[FullyAsyncTrainer] saving model to cpu for rollout log probs computation, local_trigger_step:", self.local_trigger_step)
 
                     # Rewards are already computed in rollouter, no need to compute here
                     # Just process each task
@@ -329,19 +341,19 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                 f"{time_str}"
             )
             self._trigger_parameter_sync_after_step(global_steps=self.global_steps)
-            # self._log_validation_data()
+            self._log_validation_data()
             self._check_save_checkpoint(timing_raw)
             self.global_steps += 1
 
-        # # final parameter sync and validate
-        # # 1. waiting remaining validate task
-        # ray.get(self.param_synchronizer.wait_last_valid.remote())
-        # self._log_validation_data()
-        # # 2. perform addtional parameter_sync and validate if trainer already updated
-        # if self.current_param_version % self.config.rollout.test_freq != 0 or self.local_trigger_step > 1:
-        #     self._trigger_parameter_sync_after_step(validate=True, global_steps=self.global_steps)
-        #     ray.get(self.param_synchronizer.wait_last_valid.remote())
-        #     self._log_validation_data()
+        # final parameter sync and validate
+        # 1. waiting remaining validate task
+        ray.get(self.param_synchronizer.wait_last_valid.remote())
+        self._log_validation_data()
+        # 2. perform addtional parameter_sync and validate if trainer already updated
+        if self.current_param_version % self.config.rollout.test_freq != 0 or self.local_trigger_step > 1:
+            self._trigger_parameter_sync_after_step(validate=True, global_steps=self.global_steps)
+            ray.get(self.param_synchronizer.wait_last_valid.remote())
+            self._log_validation_data()
         self.progress_bar.close()
 
         self._check_save_checkpoint(timing_raw)
@@ -548,9 +560,24 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
 
         val_metrics: ValidateMetrics = ray.cloudpickle.loads(val_data)
         if val_metrics.metrics:
+            # Extract validation generation samples if present (image RL specific)
+            validation_samples = val_metrics.metrics.pop('validation_samples', None)
+
             self.logger.log(data=val_metrics.metrics, step=val_metrics.param_version)
             pprint(
                 f"[FullyAsyncTrainer] parameter version: {val_metrics.param_version} "
                 f"Validation metrics: {val_metrics.metrics}"
             )
+
+            # Log validation generation samples to wandb (image RL specific)
+            if validation_samples and "wandb" in self.logger.logger:
+                from recipe.image_rl.tracking import ValidationGenerationsLogger
+                import wandb
+
+                val_gen_logger = ValidationGenerationsLogger(
+                    project_name=self.config.trainer.project_name,
+                    experiment_name=self.config.trainer.experiment_name,
+                )
+                val_gen_logger._log_generations_to_wandb(validation_samples, val_metrics.param_version, wandb)
+
         self.logger.log(data=val_metrics.timing_raw, step=val_metrics.param_version)

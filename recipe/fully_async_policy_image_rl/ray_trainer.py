@@ -268,6 +268,285 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
     def _init_async_rollout_manager(self):
         pass
 
+    async def _validate_async(self):
+        import asyncio
+
+        # task reward tensors collection
+        task_reward_tensors = {1: [], 2: [], 3: []}
+        task_reward_extra_infos = {1: [], 2: [], 3: []}
+        data_source_lst = []
+
+        # Lists to collect samples for the table
+        sample_prompts = []
+        sample_task1_gen_imgs = []
+        sample_task2_feedback_texts = []
+        sample_task3_regen_imgs = []
+        sample_task1_scores = []
+        sample_task2_scores = []
+        sample_task3_scores = []
+
+        # For async mode, create a server token queue similar to rollouter
+        if self.async_rollout_mode:
+            async def async_validate_all():
+                num_servers = len(self.async_rollout_manager.server_handles)
+                val_server_token_q = asyncio.Queue()
+                for sid in range(num_servers):
+                    val_server_token_q.put_nowait(sid)
+
+                # Producer-consumer queues
+                prepared_batch_queue = asyncio.Queue(maxsize=num_servers * 2)  # Limited buffer
+                reward_finalize_queue = asyncio.Queue()  # For reward computation
+                result_queue = asyncio.Queue()
+
+                async def _val_producer_worker():
+                    """Producer: Prepare validation batches and put them in queue"""
+                    # Get rollout_prompt_size (number of batches to merge)
+                    val_rollout_prompt_size = self.config.async_training.get("val_rollout_prompt_size", 1)
+
+                    batch_list = []
+                    batch_idx_list = []
+
+                    for val_batch_idx, test_data in enumerate(self.val_dataloader):
+                        # Prepare batch (heavy computation done in producer)
+                        test_batch = DataProto.from_single_dict(test_data)
+
+                        # # repeat test batch
+                        # test_batch = test_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n,
+                        #                             interleave=True)
+
+                        # add uid to batch
+                        test_batch.non_tensor_batch["uid"] = np.array(
+                            [str(uuid.uuid4()) for _ in range(len(test_batch.batch))], dtype=object
+                        )
+
+                        # Accumulate batches
+                        batch_list.append(test_batch)
+                        batch_idx_list.append(val_batch_idx)
+
+                        # Send accumulated batches when reaching target size
+                        if len(batch_list) >= val_rollout_prompt_size:
+                            merged_batch = DataProto.concat(batch_list)
+                            merged_gen_batch = self._get_gen_batch(merged_batch)
+                            await prepared_batch_queue.put((merged_batch, merged_gen_batch, batch_idx_list))
+                            batch_list = []
+                            batch_idx_list = []
+
+                    # Send remaining batches
+                    if batch_list:
+                        merged_batch = DataProto.concat(batch_list)
+                        merged_gen_batch = self._get_gen_batch(merged_batch)
+                        await prepared_batch_queue.put((merged_batch, merged_gen_batch, batch_idx_list))
+
+                    # Send done signals (one per consumer)
+                    for _ in range(num_servers):
+                        await prepared_batch_queue.put(None)
+
+                async def _val_reward_worker():
+                    """Reward worker: Process reward computations and post-processing separately"""
+                    while True:
+                        item = await reward_finalize_queue.get()
+
+                        if item is None:
+                            reward_finalize_queue.task_done()
+                            break
+
+                        test_batch, test_output_gen_batch, reward_tensor_dict, reward_reward_extra_infos, reward_tasks, val_batch_idx = item
+
+                        # Wait for all reward computations to finish
+                        await asyncio.gather(*reward_tasks)
+
+                        # Do post-processing here (instead of at the end)
+                        prompts = test_output_gen_batch.non_tensor_batch['prompt'].tolist()
+
+                        task1_gen_imgs_pil_list = test_output_gen_batch.non_tensor_batch['task1_gen_imgs_pil_list']
+                        task1_gen_imgs_pil_list = [wandb.Image(gen_img, caption=prompts[i]) for i, gen_img in enumerate(task1_gen_imgs_pil_list)]
+
+                        task2_feedback_texts = test_output_gen_batch.non_tensor_batch['task2_feedback_texts'].tolist()
+
+                        task3_regen_imgs_pil_list = test_output_gen_batch.non_tensor_batch['task3_regen_imgs_pil_list']
+                        task3_regen_imgs_pil_list = [wandb.Image(regen_img, caption=prompts[i]) for i, regen_img in enumerate(task3_regen_imgs_pil_list)]
+
+                        # Collect batch results (keep as batch for efficient queue operation)
+                        batch_size = len(prompts)
+                        data_source = test_batch.non_tensor_batch.get('data_source', ['unknown'] * batch_size)
+
+                        # Compute per-sample scores
+                        batch_scores = {1: [], 2: [], 3: []}
+                        for task_id in [1, 2, 3]:
+                            task_reward_tensor = reward_tensor_dict[task_id]
+                            # Sum over sequence dimension (-1) to get per-sample scores
+                            per_sample_scores = task_reward_tensor.sum(-1).detach().cpu().tolist()
+                            # Handle both single sample and batch cases
+                            if not isinstance(per_sample_scores, list):
+                                per_sample_scores = [per_sample_scores]
+                            batch_scores[task_id] = per_sample_scores
+
+                        # Put batch result into result queue (one queue operation per batch)
+                        result_item = {
+                            'prompts': prompts,
+                            'task1_gen_imgs': task1_gen_imgs_pil_list,
+                            'task2_feedback_texts': task2_feedback_texts,
+                            'task3_regen_imgs': task3_regen_imgs_pil_list,
+                            'reward_tensors': reward_tensor_dict,
+                            'reward_extra_infos': reward_reward_extra_infos,
+                            'scores': batch_scores,
+                            'data_source': data_source,
+                        }
+                        await result_queue.put(result_item)
+
+                        reward_finalize_queue.task_done()
+
+                async def _val_consumer_worker():
+                    """Consumer: Get prepared batch and run generation on server"""
+                    # Get available server token ONCE at the start
+                    server_index = await val_server_token_q.get()
+
+                    try:
+                        while True:
+                            # Get prepared batch from queue (server already acquired)
+                            item = await prepared_batch_queue.get()
+
+                            if item is None:
+                                # Done signal - mark as done and exit
+                                prepared_batch_queue.task_done()
+                                break
+
+                            test_batch, test_gen_batch, val_batch_idx_list = item
+
+                            # Generation with callback for reward computation
+                            reward_tensor_dict = {}
+                            reward_reward_extra_infos = {}
+                            reward_tasks = []
+
+                            def on_task_complete(task_id: int, batch_result: DataProto):
+                                # Launch async reward computation task
+                                async def compute_reward_async():
+                                    task_reward_dict = self.val_reward_fn(batch_result, task_id=task_id, eval=True, return_dict=True)
+                                    reward_tensor_dict[task_id] = task_reward_dict[f"task{task_id}_reward_tensor"]
+                                    reward_reward_extra_infos[task_id] = task_reward_dict[f"task{task_id}_reward_extra_info"]
+
+                                reward_task = asyncio.create_task(compute_reward_async())
+                                reward_tasks.append(reward_task)
+
+                            # Use generate_sequences_with_callback_on_server
+                            test_output_gen_batch = await self.async_rollout_manager.generate_sequences_with_callback_on_server(
+                                test_gen_batch,
+                                server_index=server_index,
+                                on_task_complete=on_task_complete
+                            )
+
+                            # Send to reward worker for finalization (don't wait here!)
+                            await reward_finalize_queue.put((test_batch, test_output_gen_batch, reward_tensor_dict, reward_reward_extra_infos, reward_tasks, val_batch_idx_list))
+
+                            # Yield control to allow reward worker to process
+                            await asyncio.sleep(0)
+
+                            # Mark task as done in prepared_batch_queue
+                            prepared_batch_queue.task_done()
+
+                            # Immediately continue to next batch (server stays busy!)
+
+                    finally:
+                        # Return server token when worker exits
+                        val_server_token_q.put_nowait(server_index)
+
+                # Start producer
+                producer_task = asyncio.create_task(_val_producer_worker())
+
+                # Start reward worker
+                async def _val_reward_worker_wrapper():
+                    try:
+                        await _val_reward_worker()
+                    except Exception as e:
+                        print(f'[VALIDATION ERROR] Reward worker failed with exception: {e}')
+                        import traceback
+                        traceback.print_exc()
+                        raise
+
+                reward_worker_task = asyncio.create_task(_val_reward_worker_wrapper())
+
+                # Start consumers (one per server)
+                consumer_tasks = [
+                    asyncio.create_task(_val_consumer_worker())
+                    for _ in range(num_servers)
+                ]
+
+                # Wait for producer to finish
+                await producer_task
+
+                # Wait for all consumers to finish
+                await asyncio.gather(*consumer_tasks)
+
+                # Wait for reward queue to be processed
+                await reward_finalize_queue.join()
+
+                # Send done signal to reward worker
+                await reward_finalize_queue.put(None)
+                await reward_worker_task
+
+                # Collect all results from result queue (batch results)
+                while not result_queue.empty():
+                    result_item = await result_queue.get()
+
+                    # Extend with batch data
+                    sample_prompts.extend(result_item['prompts'])
+                    sample_task1_gen_imgs.extend(result_item['task1_gen_imgs'])
+                    sample_task2_feedback_texts.extend(result_item['task2_feedback_texts'])
+                    sample_task3_regen_imgs.extend(result_item['task3_regen_imgs'])
+
+                    # Collect reward tensors (keep as batch tensors)
+                    for task_id in [1, 2, 3]:
+                        task_reward_tensors[task_id].append(result_item['reward_tensors'][task_id])
+                        task_reward_extra_infos[task_id].append(result_item['reward_extra_infos'][task_id])
+
+                    # Extend with per-sample scores
+                    sample_task1_scores.extend(result_item['scores'][1])
+                    sample_task2_scores.extend(result_item['scores'][2])
+                    sample_task3_scores.extend(result_item['scores'][3])
+
+                    data_source_lst.extend(result_item['data_source'])
+
+            # Run async validation
+            await async_validate_all()
+            print('Validation completed')
+
+        # Store validation samples for logging by Trainer
+        validation_samples = list(zip(
+            sample_prompts,
+            sample_task1_gen_imgs,
+            sample_task2_feedback_texts,
+            sample_task3_regen_imgs,
+            sample_task1_scores,
+            sample_task2_scores,
+            sample_task3_scores
+        ))
+
+        data_sources = np.array(data_source_lst)
+
+        # task metrics computation
+        metric_dict = {}
+        for task_id in [1, 2, 3]:
+            reward_tensor = torch.cat(task_reward_tensors[task_id], dim=0).sum(-1).cpu()
+
+            # evaluate test_score based on data source
+            data_source_reward = {}
+            for i in range(reward_tensor.shape[0]):
+                data_source = data_sources[i]
+                if data_source not in data_source_reward:
+                    data_source_reward[data_source] = []
+                data_source_reward[data_source].append(reward_tensor[i].item())
+
+            for data_source, rewards in data_source_reward.items():
+                valid_rewards = [r for r in rewards if r > 0] # positive
+                if valid_rewards:
+                    metric_dict[f'val/task{task_id}_score/{data_source}'] = np.mean(valid_rewards)
+                metric_dict[f'val/task{task_id}_positive_ratio/{data_source}'] = np.mean(np.array(rewards) > 0)
+
+        # Include validation generation samples in the result for Trainer to log
+        metric_dict['validation_samples'] = validation_samples
+
+        return metric_dict
+
     def fit(self):
         """
         The training loop of PPO.
@@ -277,7 +556,7 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
         """
         from omegaconf import OmegaConf
 
-        from verl.utils.tracking import Tracking
+        from recipe.image_rl.tracking import Tracking
 
         logger = Tracking(
             project_name=self.config.trainer.project_name,
@@ -294,7 +573,11 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
         # perform validation before training
         # currently, we only support validation using the reward_function.
         if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
-            val_metrics = self._validate()
+            if self.async_rollout_mode:
+                import asyncio
+                val_metrics = asyncio.run(self._validate_async())
+            else:
+                val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
@@ -515,10 +798,10 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                 # If local_trigger_step == 2, 3, ..., restore the parameters of version 1 to calculate the old_log_prob,
                 # then restore the parameters of the current version.
                 if local_trigger_step == 1:
-                    self.actor_rollout_wg.save_model_to_cpu(1)
+                    # self.actor_rollout_wg.save_model_to_cpu(1) # save already done before
                     batch = compute_old_log_prob(batch)
                 elif local_trigger_step is not None:
-                    self.actor_rollout_wg.save_model_to_cpu(local_trigger_step)
+                    # self.actor_rollout_wg.save_model_to_cpu(local_trigger_step)
                     self.actor_rollout_wg.restore_model_from_cpu(1)
                     batch = compute_old_log_prob(batch)
                     self.actor_rollout_wg.restore_model_from_cpu(local_trigger_step)
@@ -526,7 +809,7 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                 else:
                     batch.batch[f"task{task_id}_old_log_probs"] = batch.batch[f"task{task_id}_rollout_log_probs"]
                     batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
-
+                print("[FullyAsyncRayPPOTrainer] restore model from cpu done.")
             else:
                 batch = compute_old_log_prob(batch)
 
@@ -623,7 +906,11 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
             and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
         ):
             with marked_timer("testing", timing_raw, color="green"):
-                val_metrics: dict = self._validate()
+                if self.async_rollout_mode:
+                    import asyncio
+                    val_metrics: dict = asyncio.run(self._validate_async())
+                else:
+                    val_metrics: dict = self._validate()
                 if is_last_step:
                     last_val_metrics = val_metrics
             metrics.update(val_metrics)

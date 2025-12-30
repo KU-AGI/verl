@@ -258,19 +258,19 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 f",reset staleness_samples to: {self.staleness_samples}"
                 f",idle_ratio: {idle_ratio}"
             )
-            # val_metrics = None
-            # if (
-            #     self.val_reward_fn is not None
-            #     and self.config.rollout.test_freq > 0
-            #     and self.current_param_version % self.config.rollout.test_freq == 0
-            #     and self.current_param_version > 0  # don't test here in the initial parameter sync
-            # ) or (validate and self.val_reward_fn is not None):
-            #     with marked_timer("rollouter/validate_time", timing_raw, color="green"):
-            #         val_metrics: dict = self._validate()
-            # data = ValidateMetrics(
-            #     timing_raw=timing_raw, metrics=val_metrics, global_steps=global_steps, param_version=version
-            # )
-            # await self.message_queue_client.put_validate(ray.cloudpickle.dumps(data))
+            val_metrics = None
+            if (
+                self.val_reward_fn is not None
+                and self.config.rollout.test_freq > 0
+                and self.current_param_version % self.config.rollout.test_freq == 0
+                and self.current_param_version > 0  # don't test here in the initial parameter sync
+            ) or (validate and self.val_reward_fn is not None):
+                with marked_timer("rollouter/validate_time", timing_raw, color="green"):
+                    val_metrics = await self._validate_async()
+            data = ValidateMetrics(
+                timing_raw=timing_raw, metrics=val_metrics, global_steps=global_steps, param_version=version
+            )
+            await self.message_queue_client.put_validate(ray.cloudpickle.dumps(data))
 
             self.version_start_time = time.time()
 
@@ -426,9 +426,9 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         )
 
         # Start background task to apply weights when servers are idle
-        asyncio.create_task(self._apply_weights_when_idle(version, param_synchronizer))
+        asyncio.create_task(self._apply_weights(version, param_synchronizer))
 
-    async def _apply_weights_when_idle(self, version: int, param_synchronizer):
+    async def _apply_weights(self, version: int, param_synchronizer):
         """
         Wait for all servers to become idle, then trigger NCCL sync via ParameterSynchronizer.
 
@@ -440,7 +440,6 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         print(f"[FullyAsyncRollouter] Starting background task to monitor idle state for version {version}")
 
         check_interval = 0.01  # Start with 10ms for fast detection
-        idle_count = 0
 
         while True:
             await asyncio.sleep(check_interval)
@@ -456,14 +455,10 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 print(f"[FullyAsyncRollouter] Error getting server status: {e}")
                 break
 
-            all_idle = all(status['ongoing_generations'] == 0 for status in statuses)
             any_pending = any(status['pending_weight_version'] == version for status in statuses)
 
-            # Count how many servers are idle for logging
-            num_idle = sum(1 for s in statuses if s['ongoing_generations'] == 0)
-
-            if all_idle and any_pending:
-                print(f"[FullyAsyncRollouter] All {len(server_handles)} servers idle, triggering NCCL sync for version {version}")
+            if any_pending:
+                print(f"[FullyAsyncRollouter] Triggering NCCL sync for version {version}")
 
                 # Trigger NCCL weight sync via ParameterSynchronizer
                 # The synchronizer has access to both actor_wg and rollout_wg
@@ -471,11 +466,12 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                     try:
                         print(f"[FullyAsyncRollouter] Calling apply_nccl_weight_sync for version {version}")
                         # Fire the remote call but don't wait synchronously - use ray.get in thread pool
+                        sync_start_time = time.time()
                         apply_ref = param_synchronizer.apply_nccl_weight_sync.remote(version)
 
                         # Run ray.get in thread pool to avoid blocking the event loop
                         await asyncio.to_thread(ray.get, apply_ref)
-                        print(f"[FullyAsyncRollouter] Successfully completed NCCL weight sync for version {version}")
+                        print(f"[FullyAsyncRollouter] Successfully completed NCCL weight sync for version {version}, cost time: {time.time() - sync_start_time:.4f}")
                     except Exception as e:
                         print(f"[FullyAsyncRollouter] Failed to apply weight sync: {e}")
                         import traceback
@@ -488,17 +484,6 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                     server.queue_weight_update.remote(-1)  # Fire-and-forget
                 print(f"[FullyAsyncRollouter] Background task complete for version {version}")
                 break
-            else:
-                # Adaptive polling: if getting close to all idle, check more frequently
-                if num_idle >= len(server_handles) - 1:
-                    check_interval = 0.01  # 10ms - very frequent
-                    idle_count += 1
-                    if idle_count % 100 == 0:  # Log every 100ms when almost ready
-                        print(f"[FullyAsyncRollouter] Waiting for weight sync v{version}: {num_idle}/{len(server_handles)} servers idle")
-                elif num_idle >= len(server_handles) // 2:
-                    check_interval = 0.05  # 50ms - moderate
-                else:
-                    check_interval = 0.1  # 100ms - normal
 
             # If no server has pending update for this version anymore, stop waiting
             if not any_pending:
