@@ -11,6 +11,9 @@ async_training:
   # Number of prompts sampled by the rollouter at a time
   rollout_prompt_size: 1
 
+  # Number of validation prompts sampled by the rollouter at a time
+  val_rollout_prompt_size: 1
+
   # Maximum samples staleness threshold
   staleness_threshold: 0.1
 
