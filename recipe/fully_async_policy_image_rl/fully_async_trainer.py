@@ -569,6 +569,8 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             self.local_trigger_step += 1
             return
 
+        print(f"[FullyAsyncTrainer] Hard syncing workers before sync v{self.current_param_version + 1}...")
+
         self.current_param_version += 1
         self.local_trigger_step = 1
         self.logger.log(
@@ -582,9 +584,18 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             ray.get(self.param_synchronizer.wait_last_valid.remote())
         with marked_timer("timing_s/param_sync", timing_param_sync):
             t0 = time.time()
-            self.param_synchronizer.sync_weights.remote(
-            self.current_param_version, validate=validate, global_steps=global_steps
+            weights_ref = ray.get(
+            self.param_synchronizer.export_weights_only.remote(self.current_param_version)
             )
+            self.param_synchronizer.distribute_weights.remote(
+                self.current_param_version,
+                weights_ref,
+                validate=validate,
+                global_steps=global_steps
+            )
+            # self.param_synchronizer.sync_weights.remote(
+            # self.current_param_version, validate=validate, global_steps=global_steps
+            # )
         self.logger.log(data=timing_param_sync, step=self.current_param_version)
 
     def _log_validation_data(self):

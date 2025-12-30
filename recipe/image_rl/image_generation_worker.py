@@ -1074,6 +1074,8 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
     def export_rollout_weights(self, cast_bf16: bool = True):
         assert self._is_actor, "export_rollout_weights was only called actor."
 
+        torch.cuda.synchronize()
+
         rank = dist.get_rank()
         t0 = time.time()
 

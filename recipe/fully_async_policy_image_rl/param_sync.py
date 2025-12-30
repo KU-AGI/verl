@@ -198,6 +198,29 @@ class ParameterSynchronizer:
         # No need to pause/resume - generation continues with old weights until async update completes
         self.wait_last_resume = None
 
+    async def export_weights_only(self, version):
+        self.current_version = version
+        self.mq_client.update_param_version_sync(version)
+        weights_ref = await self._publish_weights(version)
+        return weights_ref
+
+    async def distribute_weights(self, version, weights_ref, validate=False, global_steps=0):
+        start_time = time.time()
+        
+        prefetch_tasks = [r.prefetch_to_shm.remote(version, weights_ref) for r in self.relays.values()]
+        
+        print(f"[DEBUG 2-1] Synchronizer triggering prefetch for v{version} to {len(self.relays)} nodes", flush=True)
+        t0 = time.time()
+        await asyncio.gather(*prefetch_tasks)
+        print(f"[DEBUG 2-2] All nodes finished SHM prefetch for v{version} in {time.time() - t0:.2f}s", flush=True)
+        
+        print(f"[ParamSync] v{version} Prefetch to all nodes SHM done. Time: {time.time()-start_time:.2f}s")
+
+        # Update rollout version metadata & trigger validation asynchronously
+        self.wait_last_update = self.rollouter.update_param_version.remote(version, validate, global_steps)
+        # No need to pause/resume - generation continues with old weights until async update completes
+        self.wait_last_resume = None
+
     def apply_nccl_weight_sync(self, version: int):
         """
         Perform NCCL weight synchronization between actor and rollout workers.
