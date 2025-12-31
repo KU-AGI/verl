@@ -131,7 +131,8 @@ class DataParallelImageGenerationActor(BasePPOActor):
         self.use_ulysses_sp = self.ulysses_sequence_parallel_size > 1
 
         if self.config.entropy_from_logits_with_chunking:
-            entropy_from_logits = verl_F.entropy_from_logits_with_chunking
+            # entropy_from_logits = verl_F.entropy_from_logits_with_chunking
+            entropy_from_logits = verl_F.entropy_from_logits_with_chunking_for_2D # OURS
         else:
             entropy_from_logits = verl_F.entropy_from_logits
 
@@ -291,10 +292,9 @@ class DataParallelImageGenerationActor(BasePPOActor):
         entropy = None
         if calculate_entropy:
             if not self.config.entropy_checkpointing:
-                entropy = verl_F.entropy_from_logits(task_logits)
+                entropy = self.compute_entropy_from_logits(task_logits)
             else:
-                entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, task_logits)
-
+                entropy = torch.utils.checkpoint.checkpoint(self.compute_entropy_from_logits, task_logits)
         return entropy, log_probs
 
     def _optimizer_step(self):

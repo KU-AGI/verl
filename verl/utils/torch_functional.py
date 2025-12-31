@@ -160,6 +160,17 @@ def entropy_from_logits_with_chunking(logits: torch.Tensor, chunk_size: int = 20
     return entropy
 
 
+def entropy_from_logits_with_chunking_for_2D(logits: torch.Tensor, chunk_size: int = 2048): # OURS
+    entropy_chunks = []
+    for i in range(0, logits.size(0), chunk_size):
+        chunk_logits = logits[i : i + chunk_size]
+        probs = F.softmax(chunk_logits, dim=-1)
+        log_probs = F.log_softmax(chunk_logits, dim=-1)
+        entropy_chunk = -(probs * log_probs).sum(dim=-1)  # shape: (batch, seq_len)
+        entropy_chunks.append(entropy_chunk)
+    return torch.cat(entropy_chunks, dim=0)
+
+
 def masked_sum(values, mask, axis=None):
     """Compute mean of tensor with a masked values."""
     # If NaNs exist out of mask, replace NaNs in values with a value that
