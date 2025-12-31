@@ -121,12 +121,11 @@ class HuggingFaceAsyncServerForImageRollout:
         async with self.weight_update_lock:
             if version > self.latest_available_version:
                 self.latest_available_version = version
-                print(f"[DEBUG 4-1] Server {self.replica_rank} notified: v{version} is ready for next inference", flush=True)
                 logger.info(f"[Server {self.replica_rank}] New version v{version} is ready in SHM.")
 
     async def ensure_weights_updated(self) -> int:
 
-        print(f"[DEBUG 5-1] Server {self.replica_rank} updating: v{self.applied_version} -> v{self.latest_available_version}", flush=True)
+        print(f"[Replica {self.replica_rank}] updating: v{self.applied_version} -> v{self.latest_available_version}", flush=True)
         t0 = time.time()
 
         async with self.weight_update_lock:
@@ -151,7 +150,7 @@ class HuggingFaceAsyncServerForImageRollout:
             await asyncio.gather(*[asyncio.wrap_future(r.future()) for r in refs])
 
             self.applied_version = target_v
-            print(f"[DEBUG 5-2] Server {self.replica_rank} GPU update finished in {time.time()-t0:.2f}s", flush=True)
+            print(f"[Replica {self.replica_rank}] GPU update finished in {time.time()-t0:.2f}s", flush=True)
             return self.applied_version
 
     async def _generate_step(
@@ -378,7 +377,7 @@ class HuggingFaceAsyncServerForImageRollout:
 
     async def apply_weights_from_ref(self, version: int, weights_or_ref):
 
-        print(f"[HFServer] apply enter replica={self.replica_rank} v={version} type={type(weights_or_ref)} ongoing={self.ongoing_generations}", flush=True)
+        print(f"[Replica {self.replica_rank}] v={version} type={type(weights_or_ref)} ongoing={self.ongoing_generations}", flush=True)
 
         while True:
             async with self.weight_update_lock:
@@ -393,7 +392,7 @@ class HuggingFaceAsyncServerForImageRollout:
             weights = weights_or_ref  # 보통 Ray가 이미 resolve해서 값으로 들어올 수도 있음
 
         assert weights is not None and (isinstance(weights, list) or isinstance(weights, torch.Tensor)), \
-        f"[HFServer] invalid weights payload: {type(weights)}"
+        f"[Replica {self.replica_rank}] invalid weights payload: {type(weights)}"
 
         # 3) 핵심: 서버가 모델을 안 들고 있으니, workers 전원에게 apply RPC 브로드캐스트
         refs = [
@@ -405,6 +404,6 @@ class HuggingFaceAsyncServerForImageRollout:
             self.pending_weight_version = None
             self.applied_version = version
 
-        print(f"[HFServer] apply done replica={self.replica_rank} v={version} worker_results={results[:1]}", flush=True)
+        print(f"[Replica {self.replica_rank}] v={version} worker_results={results[:1]}", flush=True)
 
         return version

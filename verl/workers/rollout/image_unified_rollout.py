@@ -88,7 +88,6 @@ class _HFModelWrapper:
                     self._init_weight_map()
                 
                 def _init_weight_map(self):
-                    # FSDP나 다른 래퍼가 있을 경우 실제 모듈 추출
                     actual_module = self._module
                     if hasattr(actual_module, "_fsdp_wrapped_module"):
                         actual_module = actual_module._fsdp_wrapped_module
@@ -98,19 +97,17 @@ class _HFModelWrapper:
                     sorted_keys = sorted(current_sd.keys())
                     
                     param_dict = dict(actual_module.named_parameters())
-                    buffer_dict = dict(actual_module.named_buffers()) # 기존 코드: buffer_map
+                    buffer_dict = dict(actual_module.named_buffers())
                     
                     self._weight_map = []
                     pointer = 0
                     
                     for name in sorted_keys:
-                        # 파라미터 또는 버퍼에서 타겟 찾기
                         target = param_dict.get(name)
                         if target is None:
-                            target = buffer_dict.get(name) # 수정됨: buffer_dict
+                            target = buffer_dict.get(name)
                         
                         if target is None:
-                            # 가중치가 아닌 메타데이터 등은 건너뜀 (numel만큼 포인터는 이동)
                             if name in current_sd and isinstance(current_sd[name], torch.Tensor):
                                 pointer += current_sd[name].numel()
                             continue
@@ -124,11 +121,10 @@ class _HFModelWrapper:
                         pointer += numel
                         
                     self._total_numel = pointer
-                    print(f"✅ Weight map initialized: {len(self._weight_map)} tensors, Total numel: {self._total_numel}")
+                    print(f"[ImageUnifiedRollout] Weight map initialized: {len(self._weight_map)} tensors, Total numel: {self._total_numel}")
 
                 @torch.no_grad()
                 def load_weights(self, flat_tensor: torch.Tensor, **kwargs):
-                    # 1. 크기 검증 (매우 중요)
                     if flat_tensor.numel() != self._total_numel:
                         raise ValueError(f"Size mismatch! Expected {self._total_numel}, got {flat_tensor.numel()}")
 
@@ -136,17 +132,13 @@ class _HFModelWrapper:
                     if hasattr(actual_module, "_fsdp_wrapped_module"):
                         actual_module = actual_module._fsdp_wrapped_module
                     
-                    # 2. 전송 최적화 (Non-blocking HtoD copy)
-                    # 이미 같은 디바이스라면 복사 비용 없음
                     device = next(actual_module.parameters()).device
                     gpu_flat_tensor = flat_tensor.to(device, non_blocking=True)
                     
-                    # 3. 가중치 복사
                     for weight_info in self._weight_map:
                         target = weight_info['target']
                         source_slice = gpu_flat_tensor[weight_info['start']:weight_info['end']]
                         
-                        # view_as를 통해 형태를 맞춘 뒤 복사
                         target.copy_(source_slice.view_as(target))
                     
                     return {"loaded_elements": self._total_numel, "status": "success"}
@@ -161,16 +153,16 @@ class _HFModelWrapper:
                         map_location='cpu', 
                         mmap=True, 
                         weights_only=True
-                        )
-                        
+                    )
+
                     except Exception as e:
-                        print(f"[Worker] Error loading binary weights from {file_path}: {e}")
+                        print(f"[ImageUnifiedRollout] Error loading binary weights from {file_path}: {e}")
                         raise e
 
                     result = self.load_weights(flat_tensor)
                     
                     dt = time.time() - t0
-                    print(f"[Worker] Weights loaded from binary file {file_path} in {dt:.3f}s")
+                    print(f"[ImageUnifiedRollout] Weights loaded from binary file {file_path} in {dt:.3f}s")
                     return result
 
 class ImageUnifiedRollout(BaseRollout):

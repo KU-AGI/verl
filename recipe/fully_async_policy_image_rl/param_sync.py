@@ -177,21 +177,15 @@ class ParameterSynchronizer:
         start_time = time.time()
         self.current_version = version
         
-        # 1. 메시지 큐 버전 즉시 업데이트
         self.mq_client.update_param_version_sync(version)
 
-        # 2. 트레이너 가중치(통짜 1D 텐서) 가져오기
         weights_ref = await self._publish_weights(version)
 
-        # 노드 수만큼만 네트워크 전송이 발생합니다.
         prefetch_tasks = [r.prefetch_to_shm.remote(version, weights_ref) for r in self.relays.values()]
         
-        print(f"[DEBUG 2-1] Synchronizer triggering prefetch for v{version} to {len(self.relays)} nodes", flush=True)
         t0 = time.time()
         await asyncio.gather(*prefetch_tasks)
-        print(f"[DEBUG 2-2] All nodes finished SHM prefetch for v{version} in {time.time()-t0:.2f}s", flush=True)
-        
-        print(f"[ParamSync] v{version} Prefetch to all nodes SHM done. Time: {time.time()-start_time:.2f}s")
+        print(f"[ParameterSynchronizer] v{version} Prefetch to all nodes SHM done. Time: {time.time()-start_time:.2f}s")
 
         # Update rollout version metadata & trigger validation asynchronously
         self.wait_last_update = self.rollouter.update_param_version.remote(version, validate, global_steps)
@@ -209,12 +203,9 @@ class ParameterSynchronizer:
         
         prefetch_tasks = [r.prefetch_to_shm.remote(version, weights_ref) for r in self.relays.values()]
         
-        print(f"[DEBUG 2-1] Synchronizer triggering prefetch for v{version} to {len(self.relays)} nodes", flush=True)
         t0 = time.time()
         await asyncio.gather(*prefetch_tasks)
-        print(f"[DEBUG 2-2] All nodes finished SHM prefetch for v{version} in {time.time() - t0:.2f}s", flush=True)
-        
-        print(f"[ParamSync] v{version} Prefetch to all nodes SHM done. Time: {time.time()-start_time:.2f}s")
+        print(f"[ParameterSynchronizer] v{version} Prefetch to all nodes SHM done. Time: {time.time()-start_time:.2f}s")
 
         # Update rollout version metadata & trigger validation asynchronously
         self.wait_last_update = self.rollouter.update_param_version.remote(version, validate, global_steps)

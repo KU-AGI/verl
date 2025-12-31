@@ -14,7 +14,7 @@ class WeightRelayActor:
 
     async def prefetch_to_shm(self, version: int, weights_ref: ray.ObjectRef):
 
-        print(f"[DEBUG 3-1] Node {self.node_id} starting network download of v{version}...", flush=True)
+        print(f"[WeightRelayActor] Node {self.node_id} starting network download of v{version}...", flush=True)
         t0 = time.time()
 
         file_path = f"/dev/shm/weights_v{version}.pt"
@@ -44,6 +44,5 @@ class WeightRelayActor:
             try: os.remove(old_path)
             except: pass
             
-        print(f"[DEBUG 3-2] Node {self.node_id} saved v{version} to SHM file in {time.time()-t0:.2f}s", flush=True)
-        print(f"[Relay][Node {self.node_id}] v{version} prefetch done.")
+        print(f"[WeightRelayActor][Node {self.node_id}] v{version} prefetch done.")
         return file_path
