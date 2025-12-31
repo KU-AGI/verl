@@ -318,10 +318,8 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                     should_swap = use_mis and local_trigger is not None and local_trigger > 1
                     
                     if use_mis and local_trigger == 1:
-
                         self.actor_rollout_wg.save_model_to_cpu(1)
                     elif should_swap:
-                        # 현재 학습 중인 모델을 저장하고 롤아웃 당시 모델(V1)을 GPU로 로드
                         self.actor_rollout_wg.save_model_to_cpu(local_trigger)
                         self.actor_rollout_wg.restore_model_from_cpu(1)
 

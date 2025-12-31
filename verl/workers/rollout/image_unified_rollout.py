@@ -37,7 +37,7 @@ from pathlib import Path
 from torch.distributed.device_mesh import DeviceMesh
 from verl.workers.config import HFModelConfig, RolloutConfig
 from recipe.image_rl.config import ImageGenerationHFModelConfig
-from recipe.image_rl.utils import FormattingEvaluator
+from recipe.image_rl.utils import FormattingEvaluatorV2
 import asyncio
 import logging
 import time
@@ -205,7 +205,7 @@ class ImageUnifiedRollout(BaseRollout):
         self.feedback_system_prompt = getattr(config, "feedback_system_prompt", "")
         # self.regen_system_prompt = getattr(config, "regen_system_prompt", "")
         self.regen_system_prompt = EDIT_TEMPLATE
-        self.formatter = FormattingEvaluator()
+        self.formatter = FormattingEvaluatorV2()
 
         self.image_token_num_per_image = getattr(config, "image_token_num_per_image", 576)
 
@@ -579,7 +579,7 @@ class ImageUnifiedRollout(BaseRollout):
         input_format = []
         for prompt in data_proto.non_tensor_batch['prompt']:
             _prompt = self.get_sft_format(prompt)
-            input_format.append(_prompt + self.image_tag + self.image_end_tag + "\nFirst, Decompose input prompt\n")
+            input_format.append(_prompt + self.image_tag + self.image_end_tag + "\nFirst, summarize the input prompt by keeping only explicitly stated visual facts\n")
 
         self.processor.tokenizer.pad_token_id = self.processor.pad_id
         
