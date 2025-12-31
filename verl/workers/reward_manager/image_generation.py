@@ -65,9 +65,10 @@ class ImageGenerationRewardManager:
         gen_imgs = [gen_imgs_pil_list[i] if i < len(gen_imgs_pil_list) else None for i in range(len(data))]
         feedback_texts_padded = [feedback_texts[i] if i < len(feedback_texts) else "" for i in range(len(data))]
         regen_imgs = [regen_imgs_pil_list[i] if i < len(regen_imgs_pil_list) else None for i in range(len(data))]
-        ground_truth_imgs = [ground_truth[i]["ground_truth"] if i < len(ground_truth) else None for i in range(len(data))]
-        feedback_tuples = [ground_truth[i]["tuple"] if i < len(ground_truth) else None for i in range(len(data))]
-        vqa_questions = [ground_truth[i]["vqa_question"] if i < len(ground_truth) else None for i in range(len(data))]
+        summarizes = [summary.get("summary", None) if i < len(ground_truth) else "" for i, summary in enumerate(ground_truth)]
+        ground_truth_imgs = [ground_truth[i].get("ground_truth", None) if i < len(ground_truth) else None for i in range(len(data))]
+        feedback_tuples = [ground_truth[i].get("tuple", None) if i < len(ground_truth) else None for i in range(len(data))]
+        vqa_questions = [ground_truth[i].get("vqa_question", None) if i < len(ground_truth) else None for i in range(len(data))]
         extra_infos = [data.meta_info.get("extra_info", {})] * len(data)
         task_ids = [task_id] * len(data)
 
@@ -78,12 +79,12 @@ class ImageGenerationRewardManager:
             # If async, we need to run it in a sync context
             import asyncio
             scores = asyncio.run(self.compute_score(
-                prompts, gen_imgs, feedback_texts_padded, regen_imgs, ground_truth_imgs, feedback_tuples, vqa_questions, extra_infos, task_ids
+                prompts, gen_imgs, feedback_texts_padded, regen_imgs, ground_truth_imgs, summarizes, feedback_tuples, vqa_questions, extra_infos, task_ids
             ))
         else:
             # If sync, call directly
             scores = self.compute_score(
-                prompts, gen_imgs, feedback_texts_padded, regen_imgs, ground_truth_imgs, feedback_tuples, vqa_questions, extra_infos, task_ids
+                prompts, gen_imgs, feedback_texts_padded, regen_imgs, ground_truth_imgs, summarizes, feedback_tuples, vqa_questions, extra_infos, task_ids
             )
 
         return scores
@@ -157,7 +158,7 @@ class ImageGenerationRewardManager:
         # Compute mean excluding -100 rewards
         valid_rewards = [reward for reward in rewards if reward != -100]
         mean_reward = sum(valid_rewards) / len(valid_rewards) if len(valid_rewards) > 0 else 0.0
-        print(f"[REWARD] Computed {len(rewards)} rewards, valid={len(valid_rewards)}, mean={mean_reward:.4f}")
+        print(f"[REWARD] Computed task{task_id} {len(rewards)} rewards, valid={len(valid_rewards)}, mean={mean_reward:.4f}")
 
         if return_dict:
             return {f"task{task_id}_reward_tensor": reward_tensor, f"task{task_id}_reward_extra_info": dict(reward_extra_info)}
