@@ -8,10 +8,10 @@ for i in 6 7; do
         --trust-remote-code \
         --host 0.0.0.0 \
         --port $port \
-        --mem-fraction-static 0.95 \
-        --max-running-requests 1024 \
-        --max-total-tokens 131072 \
-        --chunked-prefill-size 8192 \
+        --mem-fraction-static 0.90 \
+        --max-running-requests 512 \
+        --max-total-tokens 65536 \
+        --chunked-prefill-size 4096 \
         --attention-backend flashinfer \
         --sampling-backend flashinfer &
 done
