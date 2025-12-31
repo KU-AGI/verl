@@ -78,13 +78,29 @@ class ImageGenerationRewardManager:
         if inspect.iscoroutinefunction(self.compute_score):
             # If async, we need to run it in a sync context
             import asyncio
-            scores = asyncio.run(self.compute_score(
-                prompts, gen_imgs, feedback_texts_padded, regen_imgs, ground_truth_imgs, summarizes, feedback_tuples, vqa_questions, extra_infos, task_ids
-            ))
+            try:
+                # Check if there's already a running event loop
+                loop = asyncio.get_running_loop()
+                # If we're in an event loop, create a new thread to run the async function
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    future = executor.submit(
+                        asyncio.run,
+                        self.compute_score(
+                            prompts, gen_imgs, feedback_texts_padded, regen_imgs,
+                            ground_truth_imgs, feedback_tuples, vqa_questions, extra_infos, task_ids
+                        )
+                    )
+                    scores = future.result()
+            except RuntimeError:
+                # No event loop running, safe to use asyncio.run()
+                scores = asyncio.run(self.compute_score(
+                    prompts, gen_imgs, feedback_texts_padded, regen_imgs, ground_truth_imgs, feedback_tuples, vqa_questions, extra_infos, task_ids
+                ))
         else:
             # If sync, call directly
             scores = self.compute_score(
-                prompts, gen_imgs, feedback_texts_padded, regen_imgs, ground_truth_imgs, summarizes, feedback_tuples, vqa_questions, extra_infos, task_ids
+                prompts, gen_imgs, feedback_texts_padded, regen_imgs, ground_truth_imgs, feedback_tuples, vqa_questions, extra_infos, task_ids
             )
 
         return scores
