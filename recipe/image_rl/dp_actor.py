@@ -285,6 +285,9 @@ class DataParallelImageGenerationActor(BasePPOActor):
         logits = output.logits
         task_logits = extract_output_logits(logits, output_starts, output_lengths)
 
+        del logits
+        del output
+
         # Compute log probabilities
         compact_log_probs = logprobs_from_logits(task_logits, valid_output_tokens)
         log_probs = self._restore_log_probs_to_original_length(compact_log_probs, original_response_mask)

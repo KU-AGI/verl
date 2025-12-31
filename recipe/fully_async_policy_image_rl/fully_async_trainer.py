@@ -303,25 +303,16 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                         timing_raw['reward'] = batch.meta_info['reward']
 
                     async_training = self.config.get("async_training", None)
-                    if async_training and async_training.use_rollout_log_probs:
-                        if self.local_trigger_step == 1:
-                            self.actor_rollout_wg.save_model_to_cpu(1)
-                        elif self.local_trigger_step is not None:
-                            self.actor_rollout_wg.save_model_to_cpu(self.local_trigger_step)
-                        print("[FullyAsyncTrainer] saving model to cpu for rollout log probs computation, local_trigger_step:", self.local_trigger_step)
-
-
-                    async_training = self.config.get("async_training", None)
                     use_mis = async_training and async_training.use_rollout_log_probs
                     local_trigger = self.local_trigger_step if self.compute_prox_log_prob else None
-                    
                     should_swap = use_mis and local_trigger is not None and local_trigger > 1
                     
-                    if use_mis and local_trigger == 1:
-                        self.actor_rollout_wg.save_model_to_cpu(1)
-                    elif should_swap:
-                        self.actor_rollout_wg.save_model_to_cpu(local_trigger)
-                        self.actor_rollout_wg.restore_model_from_cpu(1)
+                    if use_mis:
+                        if local_trigger == 1:
+                            ray.get(self.actor_rollout_wg.save_model_to_cpu(1))
+                        elif should_swap:
+                            ray.get(self.actor_rollout_wg.save_model_to_cpu(local_trigger))
+                            ray.get(self.actor_rollout_wg.restore_model_from_cpu(1))
 
                     for task_id in [1, 2, 3]:
                         batch.batch["task_id"] = torch.tensor([task_id for _ in range(len(batch))], dtype=int)
@@ -332,12 +323,10 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                         batch, _ = self._process_batch_common(
                             batch, metrics, timing_raw, self.local_trigger_step if self.compute_prox_log_prob else None, task_id
                         )
-                        # Remove universal keys from batch
-                        batch.pop(batch_keys=["task_id"])
 
                     if should_swap:
-                        self.actor_rollout_wg.restore_model_from_cpu(local_trigger)
-                        self.actor_rollout_wg.clear_cpu_model(local_trigger)
+                        ray.get(self.actor_rollout_wg.restore_model_from_cpu(local_trigger))
+                        ray.get(self.actor_rollout_wg.clear_cpu_model(local_trigger))
                 
                     # update critic
                     if self.use_critic:

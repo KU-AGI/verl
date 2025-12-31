@@ -66,7 +66,7 @@ class ImageGenerationRewardManager:
         feedback_texts_padded = [feedback_texts[i] if i < len(feedback_texts) else "" for i in range(len(data))]
         regen_imgs = [regen_imgs_pil_list[i] if i < len(regen_imgs_pil_list) else None for i in range(len(data))]
         ground_truth_imgs = [reward_model[i].get("ground_truth", None) if i < len(reward_model) else None for i in range(len(data))]
-        summarizes = [reward_model[i].get("summary", None) if i < len(reward_model) else "" for i in enumerate(data)]
+        summarizes = [reward_model[i].get("summary", None) if i < len(reward_model) else "" for i in range(len(data))]
         feedback_tuples = [reward_model[i].get("tuple", None) if i < len(reward_model) else None for i in range(len(data))]
         vqa_questions = [reward_model[i].get("vqa_question", None) if i < len(reward_model) else None for i in range(len(data))]
         extra_infos = [data.meta_info.get("extra_info", {})] * len(data)
