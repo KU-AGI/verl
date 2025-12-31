@@ -13,7 +13,8 @@ from concurrent.futures import ThreadPoolExecutor
 import time
 from collections import defaultdict
 from verl.utils.reward_score.math_reward import last_boxed_only_string, remove_boxed
-from recipe.image_rl.utils import FormattingEvaluator
+from recipe.image_rl.utils import FormattingEvaluator, FormattingEvaluatorV2
+from recipe.image_rl.prompts import *
 import asyncio
 import threading
 import random
@@ -278,111 +279,6 @@ class ClientManager:
 # Initialize the client manager
 client_manager = ClientManager(BASE_URLS)
 
-# 기존 프롬프트 템플릿들은 동일하게 유지
-TASK1_TASK3_IMAGE_GENERATOR_SYSTEM_PROMPT_TEMPLATE = """
-You are an AI assistant that answers a batch of yes/no questions.
-
-Protocol:
-1) For each question, output EXACTLY two lines, in order, both starting with "<index> |".
-2) Line 1 (justification): one or two concise sentences; no lists, no newlines, do NOT include "Answer:".
-3) Line 2 (final): exactly "<index> | Answer: Yes" or "<index> | Answer: No".
-4) Preserve the original question order and indices. Do not skip or renumber.
-5) If evidence is insufficient or the question is malformed/ambiguous, include the phrase "Insufficient evidence." in the justification and set the final line to "Answer: No".
-6) Do NOT reveal chain-of-thought; provide only brief conclusions based on observable evidence.
-7) Do not add any extra text before, between, or after answers.
-
-Output template per question (two lines per question):
-<index> | <one or two concise sentences for justification>
-<index> | Answer: Yes or Answer: No""".strip()
-
-TASK1_TASK3_IMAGE_GENERATOR_USER_PROMPT_TEMPLATE = """
-You will receive multiple questions, one per line, in the format "<index> | <question>".
-For each question, follow the protocol and produce EXACTLY two lines using the template:
-
-<index> | <one or two concise sentences for justification>
-<index> | Answer: Yes or Answer: No
-
-Questions:
-{questions}""".strip()
-
-TASK2_FEEDBACK_GENERATOR_SYSTEM_PROMPT_TEMPLATE = """
-You are a data consistency auditor.
-
-### Goal
-Given a PROMPT describing an image, a list of QUESTIONS (semantic tuples) with corresponding ANSWERS (Yes/No),
-and a FEEDBACK text describing how the image was edited,
-your job is to determine whether the feedback only changes objects or attributes that were answered "No"
-and leaves all "Yes" ones unchanged.
-
-If **all ANSWERS are "Yes"**, there is **no need to generate feedback** — the correct output in that case should explicitly state:
-{
-  "reason": "All tuples were labeled 'Yes', meaning no edits are required."
-  "label": "no_feedback_needed",
-}
-
-### Labels
-- "targeted_only" : feedback changes only the No-labeled tuples.
-- "non_target_touched" : feedback also modifies Yes-labeled tuples.
-- "global_or_irrelevant" : feedback changes unrelated global properties (background, lighting, tone).
-
-### Guidelines
-1. Identify which objects, attributes, or relations are mentioned or affected in the FEEDBACK (e.g., banana color, cup, background).
-2. Match these with the QUESTIONS and their ANSWERS:
-   - If all modified targets correspond to No-labeled tuples → label as "targeted_only".
-   - If any modified target corresponds to a Yes-labeled tuple → label as "non_target_touched".
-   - If feedback refers only to global or environmental aspects not tied to any tuple → label as "global_or_irrelevant".
-3. Output a single JSON object in this format:
-{
-  "targeted_entities": ["..."],
-  "violations": ["..."], // if any
-  "reason": "<short explanation>",
-  "label": "targeted_only | non_target_touched | global_or_irrelevant"
-}
-
-### Example
-
-PROMPT:
-"A green banana and a blue cup"
-
-QUESTIONS:
-1 | entity - whole (banana)
-2 | attribute - color (banana, green)
-3 | entity - whole (cup)
-4 | attribute - color (cup, blue)
-
-ANSWERS:
-1 | The image clearly shows a banana next to a blue cup. Answer: Yes
-2 | The banana appears yellow, not green. Answer: No
-3 | The image shows a ceramic mug, which is a type of cup. Answer: Yes
-4 | The cup looks turquoise, which is a blue-green color. Answer: Yes
-
-FEEDBACK:
-"Change the banana's color from yellow to green, and remove one banana, positioning the remaining one leaning against the cup. Adjust the background from green to a light blue shade."
-
-EXPECTED OUTPUT:
-{
-  "targeted_entities": ["banana","background"],
-  "violations": [
-    "background color modified even though background was not part of any No-labeled tuple"
-  ],
-  "reason": "Feedback correctly changes the banana (a No-labeled tuple) but also modifies the background, which was not among the No targets.",
-  "label": "non_target_touched"
-}
-"""
-
-TASK2_FEEDBACK_GENERATOR_USER_PROMPT_TEMPLATE = """PROMPT:
-{prompt}
-
-QUESTIONS:
-{part1_tuples}
-
-ANSWERS:
-{part2_answers}
-
-FEEDBACK:
-{part3_feedback}
-""".strip()
-
 
 def convert_gen_img_to_base64(gen_img) -> Optional[str]:
     """Convert image to base64 data URL.
@@ -437,7 +333,7 @@ def image_evaluator_parser(text):
 
 # Main message construction function
 def get_messages(*args):
-    prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id = args
+    prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback, vqa_question, extra_info, task_id = args
 
     if task_id == 1:
         system_prompt = TASK1_TASK3_IMAGE_GENERATOR_SYSTEM_PROMPT_TEMPLATE
@@ -450,11 +346,8 @@ def get_messages(*args):
             ]}
         ]
     elif task_id == 2:
-        formatting_evaluator = FormattingEvaluator() # task 2 only
-        part1, part2, part3 = formatting_evaluator._split_text_into_parts(feedback_text.strip())
-
         system_prompt = TASK2_FEEDBACK_GENERATOR_SYSTEM_PROMPT_TEMPLATE
-        user_prompt = TASK2_FEEDBACK_GENERATOR_USER_PROMPT_TEMPLATE.format(prompt=prompt, part1_tuples=part1, part2_answers=part2, part3_feedback=part3)
+        user_prompt = TASK2_FEEDBACK_GENERATOR_USER_PROMPT_TEMPLATE.format(prompt=prompt, part2_tuples=predicted_tuple, part3_answers=predicted_answer, part4_feedback=predicted_feedback)
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": [
@@ -473,6 +366,86 @@ def get_messages(*args):
         ]
     else:
         raise ValueError(f"Invalid task: {task_id} is must be one of task1, task2, or task3.")
+
+    return messages
+
+
+# Additional message constructors for task 2 subtasks
+def get_messsages_task2_comparison_summarize(*args): # 5: part 1
+    prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback, vqa_question, extra_info, task_id = args
+
+    system_prompt = TASK2_COMPARISON_SUMMARIZE_SYSTEM_PROMPT
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": [
+            {"type": "text", "text": f"prompt: {prompt}"},
+            {"type": "text", "text": f"summarize: {predicted_summarize}"}
+        ]}
+    ]
+
+    return messages
+
+def get_messages_task2_comparison_tuple(*args): # 1: part 2
+    prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback, vqa_question, extra_info, task_id = args
+
+    system_prompt = TASK2_COMPARISON_TUPLE_SYSTEM_PROMPT
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": [
+            {"type": "text", "text": f"GT: {feedback_tuple}"},
+            {"type": "text", "text": f"Pred: {predicted_tuple}"}
+        ]}
+    ]
+
+    return messages
+
+
+def get_messages_task2_hallucination_check(*args): # 2: part 3
+    prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback, vqa_question, extra_info, task_id = args
+
+    system_prompt = TASK2_HALLUCINATION_CHECK_SYSTEM_PROMPT
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": convert_gen_img_to_base64(ground_truth_img)}},
+            {"type": "text", "text": f"question: {vqa_question}"},
+            {"type": "text", "text": f"answer: {predicted_answer}"}
+        ]}
+    ]
+
+    return messages
+
+
+def get_messages_task2_edit_instruction(*args): # 3: part 4
+    prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback, vqa_question, extra_info, task_id = args
+
+    system_prompt = TASK2_EDIT_INSTRUCTION_SYSTEM_PROMPT
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": [
+            {"type": "text", "text": f"prompt: {prompt}"},
+            {"type": "text", "text": f"answer: {predicted_answer}"},
+            {"type": "text", "text": f"edit_instruction: {predicted_feedback}"},
+        ]}
+    ]
+
+    return messages
+
+
+# Additional message constructors for task 1 alignment
+def get_messages_task3_regeneration_followed_by_editing(*args):
+    prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback, vqa_question, extra_info, task_id = args
+
+    system_prompt = TASK3_REGENERATION_FOLLOWED_BY_EDITING_SYSTEM_PROMPT
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": convert_gen_img_to_base64(gen_img)}},
+            {"type": "image_url", "image_url": {"url": convert_gen_img_to_base64(regen_img)}},
+            {"type": "text", "text": f"prompt: {prompt}"},
+            {"type": "text", "text": f"edit_instruction: {predicted_feedback}"},
+        ]}
+    ]
 
     return messages
 
@@ -768,7 +741,7 @@ async def request_detector_batch(detection_requests: List[tuple]) -> List[Dict[s
     return results
 
 
-async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id):
+async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback, vqa_question, extra_info, task_id):
     """Async version of compute_score"""
     reward_score = 0.0
     reward_extra_info = {}
@@ -779,7 +752,7 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
 
         # Create tasks
         vlm_task = asyncio.create_task(
-            get_response(get_messages, prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id)
+            get_response(get_messages, prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback, vqa_question, extra_info, task_id)
         )
 
         detector_task = None
@@ -794,7 +767,7 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
 
         # Process VLM response
         task1_vlm_reward_score = 0.0
-        if response is not None:
+        if not isinstance(response, Exception) and response is not None:
             try:
                 task1_idx_to_ans: dict = image_evaluator_parser(response)
                 task1_vlm_reward_score_sum = sum(task1_idx_to_ans.values())
@@ -840,36 +813,59 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
 
     elif task_id == 2: # Total score: 1.0 (normalized)
         task2_reward_score = 0.0
-        task2_ans_count = 0
-        
-        # Rule-based reward
-        formatting_evaluator = FormattingEvaluator()
-        part1, part2, part3 = formatting_evaluator._split_text_into_parts(feedback_text.strip())
+        # task2_ans_count = 0
 
-        # formatting
-        task2_is_exactly_three_parts = all(part is not None for part in [part1, part2, part3])
+        task2_reward_score += 1.0 if all(part is not None for part in [predicted_tuple, predicted_answer, predicted_feedback]) else 0.0
+        # task2_ans_count += 1
+
+        # Call FormattingEvaluator
+        formatting_evaluator = FormattingEvaluatorV2()
+
+        # Rule-based: formatting reward
+        task2_is_exactly_three_parts = all(part is not None for part in [predicted_tuple, predicted_answer, predicted_feedback])
         task2_reward_score += 1.0 if task2_is_exactly_three_parts else 0.0
         reward_extra_info[f"task{task_id}_formatting_reward"] = 1.0 if task2_is_exactly_three_parts else 0.0
-        task2_ans_count += 1
+        # task2_ans_count += 1
 
-        # part 1 scoring
+        # Rule-based: part 1 scoring
         feedback_parsed_tuple = formatting_evaluator._parse_part1(feedback_tuple)
-        predict_parsed_tuple = formatting_evaluator._parse_part1(part1)
-        predict_decomposed_ans = formatting_evaluator._extract_answer_paragraphs(part2)
+        predict_parsed_tuple = formatting_evaluator._parse_part1(predicted_tuple)
+        predict_decomposed_ans = formatting_evaluator._extract_answer_paragraphs(predicted_answer)
 
         part1_reward_dict = formatting_evaluator._calculate_metrics_for_reward(feedback_parsed_tuple, predict_parsed_tuple, predict_decomposed_ans)
         task2_part1_reward = sum(part1_reward_dict.values())
         task2_reward_score += task2_part1_reward
         reward_extra_info[f"task{task_id}_part1_reward"] = task2_part1_reward
-        task2_ans_count += len(part1_reward_dict)
+        # task2_ans_count += len(part1_reward_dict)
 
-        # Launch API request
-        args = (prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id)
-        response = await get_response(get_messages, *args)
+        # Launch all API requests in parallel
+        args = (prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback, vqa_question, extra_info, task_id)
+
+        feedback_task = asyncio.create_task(get_response(get_messages, *args))
+        comparison_summarize_task = asyncio.create_task(get_response(get_messsages_task2_comparison_summarize, *args))
+        comparison_tuple_task = asyncio.create_task(get_response(get_messages_task2_comparison_tuple, *args))
+        hallucination_check_task = asyncio.create_task(get_response(get_messages_task2_hallucination_check, *args))
+        edit_instruction_task = asyncio.create_task(get_response(get_messages_task2_edit_instruction, *args))
+
+        # Gather all results at once
+        (
+            response,
+            comparison_summarize_response,
+            comparison_tuple_response,
+            hallucination_check_response,
+            edit_instruction_response
+        ) = await asyncio.gather(
+            feedback_task,
+            comparison_summarize_task,
+            comparison_tuple_task,
+            hallucination_check_task,
+            edit_instruction_task,
+            return_exceptions=True
+        )
 
         # Process feedback response
         task2_vlm_reward_score = 0.0
-        if response is not None:
+        if not isinstance(response, Exception) and response is not None:
             try:
                 raw_json = json.loads(response)
                 label_response = raw_json.get("label", "").lower()
@@ -881,7 +877,7 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
                     task2_vlm_reward_score = 0.0
 
                 task2_reward_score += task2_vlm_reward_score
-                task2_ans_count += 1
+                # task2_ans_count += 1
             except:
                 task2_vlm_reward_score = 0.0
                 task2_reward_score += 0.0
@@ -889,14 +885,88 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
             task2_vlm_reward_score = 0.0
             task2_reward_score += 0.0
 
-        reward_score += (task2_reward_score / task2_ans_count) if task2_ans_count > 0 else 0.0
-        # reward_score += task2_reward_score
+        # reward_score += (task2_reward_score / task2_ans_count) if task2_ans_count > 0 else 0.0
+        reward_score += task2_reward_score  # not normalizing
         reward_extra_info[f"task{task_id}_vlm_reward"] = task2_vlm_reward_score
         reward_extra_info[f"task{task_id}_reward_response"] = response
 
+        # Process comparison_summarize response
+        task2_comparison_summarize_score = 0.0
+        if not isinstance(comparison_summarize_response, Exception) and comparison_summarize_response is not None:
+            try:
+                reward_data = json.loads(comparison_summarize_response)
+                task2_comparison_summarize_score = float(reward_data.get("score", 0.0))
+                task2_reward_score += task2_comparison_summarize_score
+                # task2_ans_count += 1
+            except:
+                task2_comparison_summarize_score = 0.0
+                task2_reward_score += 0.0
+        else:
+            task2_comparison_summarize_score = 0.0
+            task2_reward_score += 0.0
+
+        reward_extra_info[f"task{task_id}_comparison_summarize_score"] = task2_comparison_summarize_score
+        reward_extra_info[f"task{task_id}_comparison_summarize_response"] = comparison_summarize_response if not isinstance(comparison_summarize_response, Exception) else str(comparison_summarize_response)
+
+        # Process comparison_tuple response
+        task2_comparison_tuple_score = 0.0
+        if not isinstance(comparison_tuple_response, Exception) and comparison_tuple_response is not None:
+            try:
+                reward_data = json.loads(comparison_tuple_response)
+                task2_comparison_tuple_score = float(reward_data.get("accuracy", 0.0))
+                task2_reward_score += task2_comparison_tuple_score
+                # task2_ans_count += 1
+            except:
+                task2_comparison_tuple_score = 0.0
+                task2_reward_score += 0.0
+        else:
+            task2_comparison_tuple_score = 0.0
+            task2_reward_score += 0.0
+
+        reward_extra_info[f"task{task_id}_comparison_tuple_score"] = task2_comparison_tuple_score
+        reward_extra_info[f"task{task_id}_comparison_tuple_response"] = comparison_tuple_response if not isinstance(comparison_tuple_response, Exception) else str(comparison_tuple_response)
+
+        # Process hallucination_check response
+        task2_hallucination_check_score = 0.0
+        if not isinstance(hallucination_check_response, Exception) and hallucination_check_response is not None:
+            try:
+                reward_data = json.loads(hallucination_check_response)
+                task2_hallucination_check_score = float(reward_data.get("accuracy", 0.0))
+                task2_reward_score += task2_hallucination_check_score
+                # task2_ans_count += 1
+            except:
+                task2_hallucination_check_score = 0.0
+                task2_reward_score += 0.0
+        else:
+            task2_hallucination_check_score = 0.0
+            task2_reward_score += 0.0
+        
+        reward_extra_info[f"task{task_id}_hallucination_check_score"] = task2_hallucination_check_score
+        reward_extra_info[f"task{task_id}_hallucination_check_response"] = hallucination_check_response if not isinstance(hallucination_check_response, Exception) else str(hallucination_check_response)
+
+        # Process edit_instruction response
+        task2_edit_instruction_score = 0.0
+        if not isinstance(edit_instruction_response, Exception) and edit_instruction_response is not None:
+            try:
+                reward_data = json.loads(edit_instruction_response)
+                task2_edit_instruction_score = float(reward_data.get("score", 0.0))
+                task2_reward_score += task2_edit_instruction_score
+                # task2_ans_count += 1
+            except:
+                task2_edit_instruction_score = 0.0
+                task2_reward_score += 0.0
+        else:
+            task2_edit_instruction_score = 0.0
+            task2_reward_score += 0.0
+        
+        reward_extra_info[f"task{task_id}_edit_instruction_score"] = task2_edit_instruction_score
+        reward_extra_info[f"task{task_id}_edit_instruction_response"] = edit_instruction_response if not isinstance(edit_instruction_response, Exception) else str(edit_instruction_response)
+
+        # reward_score += (task2_reward_score / task2_ans_count) if task2_ans_count > 0 else 0.0
+        reward_score += task2_reward_score # not normalizing
+
     elif task_id == 3: # Total score: 3.0
-        formatting_evaluator = FormattingEvaluator()
-        last = formatting_evaluator._split_text_into_parts(feedback_text)[-1]
+        last = predicted_feedback
         if last is not None and "No need to generate feedback.".lower() in last.lower():
             reward_score = -100
             reward_extra_info[f"task{task_id}_vlm_reward"] = 0.0
@@ -912,9 +982,10 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
 
         # Launch all API requests in parallel
         detection_results = verify_detection_single(feedback_tuple)
-        args = (prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id)
+        args = (prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback, vqa_question, extra_info, task_id)
 
         vlm_task = asyncio.create_task(get_response(get_messages, *args))
+        regeneration_task = asyncio.create_task(get_response(get_messages_task3_regeneration_followed_by_editing, *args))
 
         detector_task = None
         if detection_results:
@@ -922,11 +993,13 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
 
         # Gather results
         if detector_task:
-            response, detector_response = await asyncio.gather(
-                vlm_task, detector_task, return_exceptions=True
+            response, regeneration_followed_by_editing_response, detector_response = await asyncio.gather(
+                vlm_task, regeneration_task, detector_task, return_exceptions=True
             )
         else:
-            response = await vlm_task
+            response, regeneration_followed_by_editing_response = await asyncio.gather(
+                vlm_task, regeneration_task, return_exceptions=True
+            )
             detector_response = {"results": {}}
 
         # Process VLM response
@@ -943,6 +1016,23 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
             reward_score += 0.0
             reward_extra_info[f"task{task_id}_vlm_reward"] = 0.0
             reward_extra_info[f"task{task_id}_reward_response"] = str(response) if isinstance(response, Exception) else "No response received"
+
+        # Process regeneration response
+        task3_regeneration_followed_by_editing_reward_score = 0.0
+        if not isinstance(regeneration_followed_by_editing_response, Exception) and regeneration_followed_by_editing_response is not None:
+            try:
+                reward_data = json.loads(regeneration_followed_by_editing_response)
+                task3_regeneration_followed_by_editing_reward_score = float(reward_data.get("score", 0.0))
+                reward_score += task3_regeneration_followed_by_editing_reward_score
+            except:
+                task3_regeneration_followed_by_editing_reward_score = 0.0
+                reward_score += 0.0
+        else:
+            task3_regeneration_followed_by_editing_reward_score = 0.0
+            reward_score += 0.0
+
+        reward_extra_info[f"task{task_id}_regeneration_followed_by_editing_reward"] = task3_regeneration_followed_by_editing_reward_score
+        reward_extra_info[f"task{task_id}_regeneration_followed_by_editing_response"] = regeneration_followed_by_editing_response if not isinstance(regeneration_followed_by_editing_response, Exception) else str(regeneration_followed_by_editing_response)
 
         # Process detector response
         detector_reward = 0.0
@@ -976,21 +1066,26 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
     }
 
 
-async def compute_score_batch_async(prompts, gen_imgs, feedback_texts, regen_imgs, ground_truth_imgs, feedback_tuples, vqa_questions, extra_infos, task_ids):
+async def compute_score_batch_async(prompts, gen_imgs, feedback_texts, regen_imgs, ground_truth_imgs, summarizes, feedback_tuples, vqa_questions, extra_infos, task_ids):
     """Async batch processing with better load balancing"""
     n = len(prompts)
     if n == 0:
         return []
 
     async def process_single_request(idx, args):
-        (prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id) = args
+        (prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, vqa_question, extra_info, task_id) = args
         
         # Load ground truth image
         ground_truth_img = await asyncio.to_thread(lambda p=ground_truth_img: PIL.Image.open(p).convert("RGB")) if ground_truth_img is not None else ground_truth_img
+
+        # Extract predicted feedback tuple for task 2
+        formatting_evaluator = FormattingEvaluatorV2() # task 2 only
+        par1, part2, part3, part4 = formatting_evaluator._split_text_into_parts(feedback_text.strip())
+        predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback = par1, part2, part3, part4
         
         # Process the request with improved error handling
         result = await compute_score_single_async(
-            prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id
+            prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback, vqa_question, extra_info, task_id
         )
         
         return idx, result
@@ -998,7 +1093,7 @@ async def compute_score_batch_async(prompts, gen_imgs, feedback_texts, regen_img
     # Create tasks for all requests
     tasks = []
     for idx, args in enumerate(zip(
-        prompts, gen_imgs, feedback_texts, regen_imgs, ground_truth_imgs, feedback_tuples, vqa_questions, extra_infos, task_ids
+        prompts, gen_imgs, feedback_texts, regen_imgs, ground_truth_imgs, summarizes, feedback_tuples, vqa_questions, extra_infos, task_ids
     )):
         task = asyncio.create_task(process_single_request(idx, args))
         tasks.append(task)
@@ -1018,15 +1113,15 @@ async def compute_score_batch_async(prompts, gen_imgs, feedback_texts, regen_img
 
 
 # Make this async to work with the async reward loop
-async def compute_score_batch(prompts, gen_imgs, feedback_texts, regen_imgs, ground_truth_imgs, feedback_tuples, vqa_questions, extra_infos, task_ids):
+async def compute_score_batch(prompts, gen_imgs, feedback_texts, regen_imgs, ground_truth_imgs, summarizes, feedback_tuples, vqa_questions, extra_infos, task_ids):
     """Async batch processing - directly calls the async implementation"""
-    return await compute_score_batch_async(prompts, gen_imgs, feedback_texts, regen_imgs, ground_truth_imgs, feedback_tuples, vqa_questions, extra_infos, task_ids)
+    return await compute_score_batch_async(prompts, gen_imgs, feedback_texts, regen_imgs, ground_truth_imgs, summarizes, feedback_tuples, vqa_questions, extra_infos, task_ids)
 
 
-def compute_score_batch_sync(prompts, gen_imgs, feedback_texts, regen_imgs, ground_truth_imgs, feedback_tuples, vqa_questions, extra_infos, task_ids):
+def compute_score_batch_sync(prompts, gen_imgs, feedback_texts, regen_imgs, ground_truth_imgs, summarizes, feedback_tuples, vqa_questions, extra_infos, task_ids):
     """Synchronous wrapper for non-async contexts"""
     return asyncio.run(
-        compute_score_batch_async(prompts, gen_imgs, feedback_texts, regen_imgs, ground_truth_imgs, feedback_tuples, vqa_questions, extra_infos, task_ids)
+        compute_score_batch_async(prompts, gen_imgs, feedback_texts, regen_imgs, ground_truth_imgs, summarizes, feedback_tuples, vqa_questions, extra_infos, task_ids)
     )
 
 
