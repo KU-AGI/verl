@@ -87,20 +87,19 @@ class ImageGenerationRewardManager:
                     future = executor.submit(
                         asyncio.run,
                         self.compute_score(
-                            prompts, gen_imgs, feedback_texts_padded, regen_imgs,
-                            ground_truth_imgs, feedback_tuples, vqa_questions, extra_infos, task_ids
+                            prompts, gen_imgs, feedback_texts_padded, regen_imgs, ground_truth_imgs, summarizes, feedback_tuples, vqa_questions, extra_infos, task_ids
                         )
                     )
                     scores = future.result()
             except RuntimeError:
                 # No event loop running, safe to use asyncio.run()
                 scores = asyncio.run(self.compute_score(
-                    prompts, gen_imgs, feedback_texts_padded, regen_imgs, ground_truth_imgs, feedback_tuples, vqa_questions, extra_infos, task_ids
+                    prompts, gen_imgs, feedback_texts_padded, regen_imgs, ground_truth_imgs, summarizes, feedback_tuples, vqa_questions, extra_infos, task_ids
                 ))
         else:
             # If sync, call directly
             scores = self.compute_score(
-                prompts, gen_imgs, feedback_texts_padded, regen_imgs, ground_truth_imgs, feedback_tuples, vqa_questions, extra_infos, task_ids
+                prompts, gen_imgs, feedback_texts_padded, regen_imgs, ground_truth_imgs, summarizes, feedback_tuples, vqa_questions, extra_infos, task_ids
             )
 
         return scores
