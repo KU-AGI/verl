@@ -372,7 +372,7 @@ def compute_group_reward_metrics(batch: DataProto) -> dict[str, Any]:
 
     task_reward_section = {}
     for name, value in task_reward_extra_info.items():
-        if name.endswith("_reward"):
+        if name.endswith("_reward") or name.endswith("_score"):
             task_reward_section[f"group_rewards/task{task_id}/{name}/mean"] = np.mean(value)
             task_reward_section[f"group_rewards/task{task_id}/{name}/max"] = np.max(value)
             task_reward_section[f"group_rewards/task{task_id}/{name}/min"] = np.min(value)

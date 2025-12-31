@@ -205,8 +205,8 @@ class FormattingEvaluatorV2:
 
         precision = correct_matches / len(pred_part2) if len(pred_part2) > 0 else 0.0
         recall = correct_matches / total_gt if total_gt > 0 else 0.0
-        f1_score = (2 * precision * recall) / (precision + recall)
-        metrics['part1_accuracy'] = f1_score if (precision + recall) > 0 else 0.0
+        f1_score = (2 * precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+        metrics['part1_accuracy'] = f1_score
         
         # Part 2: Pred Part 2와 Pred Part 2의 항목 개수 일치 여부 (내부 일관성)
         metrics['internal_consistency_ok'] = 1 if len(pred_part2) == len(pred_paragraphs) else 0

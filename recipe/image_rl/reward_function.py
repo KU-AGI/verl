@@ -45,8 +45,8 @@ RECOVERY_CHECK_INTERVAL = 60  # seconds to wait before checking if unhealthy ser
 DETECTOR_URLS = [
     # "http://10.100.44.4:8086", # main1
     # "http://10.100.44.4:8087",
-    "http://10.100.44.2:8086", # sub1
-    "http://10.100.44.2:8087",
+    # "http://10.100.44.2:8086", # sub1
+    # "http://10.100.44.2:8087",
     "http://10.100.44.8:8086", # sub2
     "http://10.100.44.8:8087",
 ]
@@ -483,7 +483,11 @@ async def get_response(message_builder_fn, *args):
         client, client_id = await borrow_rm_client()
         err = None
         try:
-            return await get_response_with_client(client, client_id, messages)
+            response = await get_response_with_client(client, client_id, messages)
+            if is_meaningful_response(response):
+                return response
+            else:
+                continue # retry
         except Exception as e:
             err = e
         finally:
@@ -763,7 +767,7 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
 
         # Gather results
         response = await vlm_task
-        detector_response = await detector_task if detector_task else {"results": {}}
+        detector_response = await detector_task if detector_task else {"results": {}, "details": [], "errors": ["No valid detection items"]}
 
         # Process VLM response
         task1_vlm_reward_score = 0.0
@@ -775,15 +779,15 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
                 task1_vlm_reward_score = 1.0 if task1_vlm_reward_score_sum == task1_ans_count else 0.0
                 reward_score += task1_vlm_reward_score
                 reward_extra_info[f"task{task_id}_vlm_reward"] = task1_vlm_reward_score
-                reward_extra_info[f"task{task_id}_reward_response"] = response
             except Exception as e:
                 task1_vlm_reward_score = 0.0
                 reward_score += 0.0
                 reward_extra_info[f"task{task_id}_vlm_reward"] = 0.0
-                reward_extra_info[f"task{task_id}_reward_response"] = f"Error parsing response: {str(e)}"
         else:
             reward_score += 0.0
-            reward_extra_info[f"task{task_id}_reward_response"] = "No response received"
+            reward_extra_info[f"task{task_id}_vlm_reward"] = 0.0
+
+        reward_extra_info[f"task{task_id}_reward_response"] = response if not isinstance(response, Exception) else str(response)
 
         # Process detector response
         detector_reward = 0.0
@@ -971,10 +975,12 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
             reward_score = -100
             reward_extra_info[f"task{task_id}_vlm_reward"] = 0.0
             reward_extra_info[f"task{task_id}_reward_response"] = "None"
-            reward_extra_info[f"task{task_id}_detector_response"] = {"results": {}, "details": [], "errors": ["Skipped: No feedback needed"]}
             reward_extra_info[f"task{task_id}_detector_reward"] = 0.0
+            reward_extra_info[f"task{task_id}_detector_response"] = {"results": {}, "details": [], "errors": []}
             reward_extra_info[f"task{task_id}_detector_details"] = []
             reward_extra_info[f"task{task_id}_vlm_detector_bonus"] = 0.0
+            reward_extra_info[f"task{task_id}_regeneration_followed_by_editing_reward"] = 0.0
+            reward_extra_info[f"task{task_id}_regeneration_followed_by_editing_response"] = "No need to respond reward."
             return {
                 "score": reward_score,
                 "reward_extra_info": reward_extra_info,
@@ -1000,7 +1006,7 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
             response, regeneration_followed_by_editing_response = await asyncio.gather(
                 vlm_task, regeneration_task, return_exceptions=True
             )
-            detector_response = {"results": {}}
+            detector_response = {"results": {}, "details": [], "errors": ["No valid detection items"]}
 
         # Process VLM response
         task3_vlm_reward_score = 0.0
@@ -1011,11 +1017,11 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
             task3_vlm_reward_score = 1.0 if task3_vlm_reward_score_sum == task3_ans_count else 0.0
             reward_score += task3_vlm_reward_score
             reward_extra_info[f"task{task_id}_vlm_reward"] = task3_vlm_reward_score
-            reward_extra_info[f"task{task_id}_reward_response"] = response
         else:
             reward_score += 0.0
             reward_extra_info[f"task{task_id}_vlm_reward"] = 0.0
-            reward_extra_info[f"task{task_id}_reward_response"] = str(response) if isinstance(response, Exception) else "No response received"
+        
+        reward_extra_info[f"task{task_id}_reward_response"] = response if isinstance(response, Exception) else str(response)
 
         # Process regeneration response
         task3_regeneration_followed_by_editing_reward_score = 0.0
@@ -1128,3 +1134,24 @@ def compute_score_batch_sync(prompts, gen_imgs, feedback_texts, regen_imgs, grou
 def get_server_health_status():
     """Get current server health status - useful for monitoring"""
     return client_manager.get_server_status()
+
+
+def is_meaningful_response(text: str) -> bool:
+    if not text or not text.strip():
+        return False
+
+    start_idx = text.find('{')
+    end_idx = text.rfind('}')
+    
+    if (start_idx == -1) != (end_idx == -1):
+        return False
+
+    if start_idx != -1:
+        if end_idx <= start_idx: return False
+        try:
+            json.loads(text[start_idx : end_idx + 1])
+            return True
+        except:
+            return False
+            
+    return True
