@@ -77,7 +77,7 @@ start-vllm-servers:
 			--async-scheduling ; \
 	done
 
-start-sglang-servers: # fix
+start-sglang-servers:
 	for GPU in 4 5 ; do \
 		PORT=$$((8000 + $$GPU)) ; \
 		docker run --rm -d --name ${SGLANG_CONTAINER_NAME_PREFIX}$$GPU \
@@ -95,9 +95,10 @@ start-sglang-servers: # fix
 			--trust-remote-code \
 			--host 0.0.0.0 \
 			--port 8000 \
-			--mem-fraction-static 0.9 \
-			--max-running-requests 128 \
-			--max-total-tokens 4096 \
+			--mem-fraction-static 0.90 \
+			--max-running-requests 512 \
+			--max-total-tokens 65536 \
+			--chunked-prefill-size 4096 \
 			--attention-backend flashinfer \
 			--sampling-backend flashinfer ; \
 	done
