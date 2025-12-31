@@ -385,7 +385,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
     def _dump_generations(self, uid, prompt_id, prompt, gen_imgs_pil_list, feedback_texts, regen_imgs_pil_list,
-            gts_imgs, gts_tuples, gts_vqas, scores, reward_extra_infos_dict, dump_path
+            gts_imgs, summarizes, gts_tuples, gts_vqas, scores, reward_extra_infos_dict, dump_path
         ):
         """Dump rollout/validation samples as JSONL."""
         os.makedirs(dump_path, exist_ok=True)
@@ -463,6 +463,11 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                         PIL.Image.open(gts_imgs[i]).convert("RGB").save(ground_truth_path)
                         f.write(f"Ground Truth Image: ground_truth_{pid}_{id}.png\n\n")
 
+                # Save summary
+                if summarizes is not None and len(summarizes) > i and summarizes[i] is not None:
+                    summary = summarizes[i]
+                    f.write(f"Summary:\n{summary}\n\n")
+
                 # Save ground truth tuples and VQA
                 if gts_tuples is not None and len(gts_tuples) > i:
                     ground_truth_tuple = gts_tuples[i]
@@ -471,6 +476,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                     ground_truth_vqa_question = gts_vqas[i]
                     f.write(f"Ground Truth VQA:\n{ground_truth_vqa_question}\n\n")
 
+                # Save reward extra info (response, sub task reward)
                 for key, value in reward_extra_infos_dict.items():
                     if key in value and len(value[key]) > i:
                         f.write(f"Reward Extra Infos:\n{key}:\n{value[key][i]}\n\n")
@@ -497,6 +503,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             feedback_texts = batch.non_tensor_batch['task2_feedback_texts'].tolist()
             regen_imgs_pil_list = batch.non_tensor_batch['task3_regen_imgs_pil_list']
             gts_imgs = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
+            summarizes = [item.non_tensor_batch.get("reward_model", {}).get("summary", None) for item in batch]
             gts_tuples = [item.non_tensor_batch.get("reward_model", {}).get("tuple", None) for item in batch]
             gts_vqas = [item.non_tensor_batch.get("reward_model", {}).get("vqa_question", None) for item in batch]
 
@@ -520,6 +527,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                 feedback_texts=feedback_texts,
                 regen_imgs_pil_list=regen_imgs_pil_list,
                 gts_imgs=gts_imgs,
+                summarizes=summarizes,
                 gts_tuples=gts_tuples,
                 gts_vqas=gts_vqas,
                 scores=scores,

@@ -654,7 +654,7 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                     batch = self._post_generate_batch(batch, gen_batch_output, metrics)
                     for task_id in [1, 2, 3]:
                         batch.batch["task_id"] = torch.tensor([task_id for _ in range(len(batch))], dtype=int)
-                        batch, reward_extra_infos_dict = self._process_batch_common(batch, metrics, timing_raw, local_trigger_step=None, task_id=task_id)
+                        batch = self._process_batch_common(batch, metrics, timing_raw, local_trigger_step=None, task_id=task_id)
                         # Remove universal keys from batch
                         batch.pop(batch_keys=["task_id"])
                     
@@ -673,7 +673,14 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
-                    
+
+                    # Reward is already in batch from rollouter
+                    # Get reward_extra_infos_dict from meta_info if available
+                    reward_extra_infos_dict = batch.meta_info.get(f"task{task_id}_reward_extra_info", {})
+
+                    # if reward_extra_infos_dict: # remove reward extra info to non_tensor_batch for logging
+                    #     batch.non_tensor_batch.update({k: np.array(v, dtype=object) for k, v in reward_extra_infos_dict.items()})
+
                     # Log rollout generations if enabled (per task)
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if self.config.trainer.rollout_freq > 0 and (
@@ -822,12 +829,6 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                 batch = batch.union(values)
 
         with marked_timer("adv", timing_raw, color="brown"):
-            # Reward is already in batch from rollouter
-            # Get reward_extra_infos_dict from meta_info if available
-            reward_extra_infos_dict = batch.meta_info.get(f"task{task_id}_reward_extra_info", {})
-
-            # if reward_extra_infos_dict: # remove reward extra info to non_tensor_batch for logging
-            #     batch.non_tensor_batch.update({k: np.array(v, dtype=object) for k, v in reward_extra_infos_dict.items()})
 
             # compute rewards. apply_kl_penalty if available
             if self.config.algorithm.use_kl_in_reward:
@@ -865,32 +866,7 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                 task_id=task_id
             )
 
-        return batch, reward_extra_infos_dict
-
-    def _log_rollout(self, batch, reward_extra_infos_dict, timing_raw):
-        # Log rollout generations if enabled
-        rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
-        if rollout_data_dir:
-            with marked_timer("dump_rollout_generations", timing_raw, color="green"):
-                inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
-                outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
-                scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
-                sample_gts = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
-
-                if "request_id" in batch.non_tensor_batch:
-                    reward_extra_infos_dict.setdefault(
-                        "request_id",
-                        batch.non_tensor_batch["request_id"].tolist(),
-                    )
-
-                self._dump_generations(
-                    inputs=inputs,
-                    outputs=outputs,
-                    gts=sample_gts,
-                    scores=scores,
-                    reward_extra_infos_dict=reward_extra_infos_dict,
-                    dump_path=rollout_data_dir,
-                )
+        return batch
 
     def _validate_metrics(self, is_last_step, last_val_metrics, metrics, timing_raw):
         if (
