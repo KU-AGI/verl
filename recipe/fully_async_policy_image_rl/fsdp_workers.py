@@ -160,7 +160,6 @@ class DetachActorWorker(DetachNcclSync):
         if n in self.cpu_saved_models:
             del self.cpu_saved_models[n]
 
-
 class DetachAsyncRolloutWorker(DetachNcclSync):
     def __init__(self, config: DictConfig, role: str):
         print(f"[DetachAsyncRolloutWorker] {DetachAsyncRolloutWorker.__mro__}")

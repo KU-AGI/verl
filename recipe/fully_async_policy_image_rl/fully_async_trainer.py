@@ -309,10 +309,10 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                     
                     if use_mis:
                         if local_trigger == 1:
-                            ray.get(self.actor_rollout_wg.save_model_to_cpu(1))
+                            self.actor_rollout_wg.save_model_to_cpu(1)
                         elif should_swap:
-                            ray.get(self.actor_rollout_wg.save_model_to_cpu(local_trigger))
-                            ray.get(self.actor_rollout_wg.restore_model_from_cpu(1))
+                            self.actor_rollout_wg.save_model_to_cpu(local_trigger)
+                            self.actor_rollout_wg.restore_model_from_cpu(1)
 
                     for task_id in [1, 2, 3]:
                         batch.batch["task_id"] = torch.tensor([task_id for _ in range(len(batch))], dtype=int)
@@ -320,13 +320,13 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                         # Get pre-computed reward_extra_infos_dict from meta_info
                         reward_extra_infos_dict = batch.meta_info.get(f"task{task_id}_reward_extra_info", {})
 
-                        batch, _ = self._process_batch_common(
+                        batch = self._process_batch_common(
                             batch, metrics, timing_raw, self.local_trigger_step if self.compute_prox_log_prob else None, task_id
                         )
 
                     if should_swap:
-                        ray.get(self.actor_rollout_wg.restore_model_from_cpu(local_trigger))
-                        ray.get(self.actor_rollout_wg.clear_cpu_model(local_trigger))
+                        self.actor_rollout_wg.restore_model_from_cpu(local_trigger)
+                        self.actor_rollout_wg.clear_cpu_model(local_trigger)
                 
                     # update critic
                     if self.use_critic:
