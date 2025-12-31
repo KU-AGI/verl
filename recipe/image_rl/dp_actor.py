@@ -53,8 +53,9 @@ def extract_output_logits(
         if out_len > 0:
             # Extract logits for this sample's output tokens
             # Note: we need logits shifted by 1 position for next token prediction
-            end_pos = start_pos + out_len
-            sample_output_logits = logits[i, start_pos:end_pos]  # (out_len, vocab_size)
+            logit_start_pos = start_pos - 1
+            logit_end_pos = logit_start_pos + out_len
+            sample_output_logits = logits[i, start_pos:logit_end_pos]  # (out_len, vocab_size)
 
             # Pad to max_output_len if needed
             if out_len < max_output_len:
