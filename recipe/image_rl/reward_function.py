@@ -95,6 +95,7 @@ async def borrow_rm_client():
         q.put_nowait(sid)
         await asyncio.sleep(0.05)
 
+
 async def release_rm_client(server_id: int):
     q = await _ensure_rm_slots()
     q.put_nowait(server_id)
@@ -382,31 +383,6 @@ FEEDBACK:
 {part3_feedback}
 """.strip()
 
-TASK2_VLM_CHECK_SYSTEM_PROMPT = """You are an AI assistant that answers a batch of yes/no questions.
-
-Protocol:
-1) For each question, output EXACTLY two lines, in order, both starting with "<index> |".
-2) Line 1 (justification): one or two concise sentences; no lists, no newlines, do NOT include "Answer:".
-3) Line 2 (final): exactly "<index> | Answer: Yes" or "<index> | Answer: No".
-4) Preserve the original question order and indices. Do not skip or renumber.
-5) If evidence is insufficient or the question is malformed/ambiguous, include the phrase "Insufficient evidence." in the justification and set the final line to "Answer: No".
-6) Do NOT reveal chain-of-thought; provide only brief conclusions based on observable evidence.
-7) Do not add any extra text before, between, or after answers.
-
-Output template per question (two lines per question):
-<index> | <one or two concise sentences for justification>
-<index> | Answer: Yes or Answer: No""".strip()
-
-TASK2_VLM_CHECK_INPUT_PROMPT = """
-You will receive multiple questions, one per line, in the format "<index> | <question>".
-For each question, follow the protocol and produce EXACTLY two lines using the template:
-
-<index> | <one or two concise sentences for justification>
-<index> | Answer: Yes or Answer: No
-
-Questions:
-{questions}""".strip()
-
 
 def convert_gen_img_to_base64(gen_img) -> Optional[str]:
     """Convert image to base64 data URL.
@@ -459,8 +435,10 @@ def image_evaluator_parser(text):
     
     return idx_to_ans
 
+# Main message construction function
+def get_messages(*args):
+    prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id = args
 
-def get_messages(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id):
     if task_id == 1:
         system_prompt = TASK1_TASK3_IMAGE_GENERATOR_SYSTEM_PROMPT_TEMPLATE
         user_prompt = TASK1_TASK3_IMAGE_GENERATOR_USER_PROMPT_TEMPLATE.format(questions=vqa_question)
@@ -495,25 +473,12 @@ def get_messages(prompt, gen_img, feedback_text, regen_img, ground_truth_img, fe
         ]
     else:
         raise ValueError(f"Invalid task: {task_id} is must be one of task1, task2, or task3.")
-    
-    return messages
-
-
-def get_messages_task2_align(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id):
-    system_prompt = TASK2_VLM_CHECK_SYSTEM_PROMPT
-    user_prompt = TASK2_VLM_CHECK_INPUT_PROMPT.format(questions=vqa_question)
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": [
-            {"type": "image_url", "image_url": {"url": convert_gen_img_to_base64(gen_img)}},
-            {"type": "text", "text": user_prompt}
-        ]}
-    ]
 
     return messages
 
-async def get_response_once(client, server_id, messages):
-    """딱 1번만 RM 호출. retry는 바깥에서."""
+
+async def get_response_with_client(client, client_id, messages):
+    """Get response from a specific client with improved error handling"""
     try:
         response = await client.chat.completions.create(
             model=MODEL_NAME,
@@ -522,86 +487,43 @@ async def get_response_once(client, server_id, messages):
             extra_body={"repetition_penalty": 1.2},
             timeout=300000.0,
         )
-        client_manager.record_request_result(server_id, success=True)
+        client_manager.record_request_result(client_id, success=True)
         return response.choices[0].message.content
     except Exception as e:
-        client_manager.record_request_result(server_id, success=False, error=e)
+        client_manager.record_request_result(client_id, success=False, error=e)
         raise
 
-async def get_response_with_fallback(prompt, gen_img, feedback_text, regen_img, ground_truth_img,
-                                     feedback_tuple, vqa_question, extra_info, task_id):
-    messages = get_messages(
-        prompt, gen_img, feedback_text, regen_img, ground_truth_img,
-        feedback_tuple, vqa_question, extra_info, task_id
-    )
 
+async def get_response(message_builder_fn, *args):
+    """Generic response fetcher with automatic server fallback
+
+    Args:
+        message_builder_fn: Function that takes *args and returns messages list
+        *args: Arguments to pass to message_builder_fn
+    """
+    messages = message_builder_fn(*args)
+
+    # Try different servers until one succeeds
     max_attempts = len(BASE_URLS) * MAX_RETRIES
+
     for attempt in range(max_attempts):
-        client, sid = await borrow_rm_client()
+        client, client_id = await borrow_rm_client()
         err = None
         try:
-            return await get_response_once(client, sid, messages)
+            return await get_response_with_client(client, client_id, messages)
         except Exception as e:
             err = e
         finally:
-            await release_rm_client(sid)
+            await release_rm_client(client_id)
 
-        # ★ 슬롯 반납 후 backoff
+        # Exponential backoff before retrying
         delay = BASE_DELAY * (2 ** min(attempt, 3)) + random.uniform(0, 1)
         await asyncio.sleep(delay)
 
     return None
 
 
-# Update the main function to use the new fallback mechanism
-async def get_response(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id):
-    """Get response from API with improved load balancing and failover"""
-    return await get_response_with_fallback(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id)
-
-
-async def get_response_with_fallback_task2_align(prompt, gen_img, feedback_text, regen_img, ground_truth_img,
-                                                 feedback_tuple, vqa_question, extra_info, task_id):
-    messages = get_messages_task2_align(
-        prompt, gen_img, feedback_text, regen_img, ground_truth_img,
-        feedback_tuple, vqa_question, extra_info, task_id
-    )
-
-    max_attempts = len(BASE_URLS) * MAX_RETRIES
-    for attempt in range(max_attempts):
-        client, sid = await borrow_rm_client()
-        err = None
-        try:
-            return await get_response_once(client, sid, messages)
-        except Exception as e:
-            err = e
-        finally:
-            await release_rm_client(sid)
-
-        delay = BASE_DELAY * (2 ** min(attempt, 3)) + random.uniform(0, 1)
-        await asyncio.sleep(delay)
-
-    return None
-
-
-# Update the main function to use the new fallback mechanism
-async def get_response_task2_align(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id):
-    """Get response from API with improved load balancing and failover"""
-    return await get_response_with_fallback_task2_align(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id)
-
-
-def compute_reward(response):
-    """Compute reward score from response"""
-    reward_score = 0.0
-    try:
-        boxed_result = last_boxed_only_string(response)
-        if boxed_result is not None:
-            result = remove_boxed(boxed_result)
-            reward_score = float(result.lower() in ["true", "1", "yes"])
-    except Exception as e:
-        print(e)
-    return reward_score
-
-
+# Detection parsing and request functions
 def parse_lines(text):
     if not isinstance(text, str): return []
     return [(int(m.group(1)), m.group(2).strip()) for line in text.strip().split("\n") if (m := re.match(r"(\d+)\s*\|\s*(.*)", line))]
@@ -793,15 +715,18 @@ async def request_detector_single(detection_list: List[Dict[str, Any]], img) -> 
                 errors.append(f"{detect_url} exception: {repr(e)}")
 
             finally:
-                # ★ backoff 전에 반드시 슬롯 반환
+                # slot return
                 slot_q.put_nowait(sid)
 
-            # ★ 슬롯 반환 후 backoff(가볍게)
+            # backoff before next attempt
             await asyncio.sleep(0.1 * (attempt + 1))
 
-    return {"results": results, "details": details, "errors": errors or ["All detector servers failed"]}
-
-
+    # All servers failed
+    return {
+        "results": results,
+        "details": details,
+        "errors": errors if errors else ["All detector servers failed"]
+    }
 
 
 async def request_detector_batch(detection_requests: List[tuple]) -> List[Dict[str, Any]]:
@@ -849,56 +774,65 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
     reward_extra_info = {}
 
     if task_id == 1: # Total score: 3.0
-        # VLM based reward
+        # Launch all API requests in parallel
+        detection_results = verify_detection_single(feedback_tuple)
+
+        # Create tasks
+        vlm_task = asyncio.create_task(
+            get_response(get_messages, prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id)
+        )
+
+        detector_task = None
+        if detection_results:
+            detector_task = asyncio.create_task(
+                request_detector_single(detection_results, gen_img)
+            )
+
+        # Gather results
+        response = await vlm_task
+        detector_response = await detector_task if detector_task else {"results": {}}
+
+        # Process VLM response
         task1_vlm_reward_score = 0.0
-        response = await get_response(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id)
         if response is not None:
-            task1_idx_to_ans: dict = image_evaluator_parser(response)
-
-            task1_vlm_reward_score_sum = sum(task1_idx_to_ans.values())
-            task1_ans_count = len(task1_idx_to_ans)
-
-            task1_vlm_reward_score = 1.0 if task1_vlm_reward_score_sum == task1_ans_count else 0.0
-
-            reward_score += task1_vlm_reward_score
-            reward_extra_info[f"task{task_id}_reward_response"] = response
+            try:
+                task1_idx_to_ans: dict = image_evaluator_parser(response)
+                task1_vlm_reward_score_sum = sum(task1_idx_to_ans.values())
+                task1_ans_count = len(task1_idx_to_ans)
+                task1_vlm_reward_score = 1.0 if task1_vlm_reward_score_sum == task1_ans_count else 0.0
+                reward_score += task1_vlm_reward_score
+                reward_extra_info[f"task{task_id}_vlm_reward"] = task1_vlm_reward_score
+                reward_extra_info[f"task{task_id}_reward_response"] = response
+            except Exception as e:
+                task1_vlm_reward_score = 0.0
+                reward_score += 0.0
+                reward_extra_info[f"task{task_id}_vlm_reward"] = 0.0
+                reward_extra_info[f"task{task_id}_reward_response"] = f"Error parsing response: {str(e)}"
         else:
             reward_score += 0.0
             reward_extra_info[f"task{task_id}_reward_response"] = "No response received"
 
-        # Detector based reward - always populate for batch consistency
-        detection_results = verify_detection_single(feedback_tuple)
-        detector_response = {"results": {}}
-        # det_details_list = [] # can not concat with DataProto meta_info
-
+        # Process detector response
         detector_reward = 0.0
-        if detection_results:
-            detector_response = await request_detector_single(detection_results, gen_img)
-
-            # Calculate detector bonus: +1 if all detections are True
+        if detection_results and detector_response:
             det_results_dict = detector_response.get("results", {})
-            # det_details_list = detector_response.get("details", [])
             if det_results_dict:
                 all_true = all(det_results_dict.values())
                 detector_reward = 1.0 if all_true else 0.0
                 reward_score += detector_reward
                 reward_extra_info[f"task{task_id}_detector_reward"] = detector_reward
-                # reward_extra_info[f"task{task_id}_detector_details"] = det_details_list
             else:
                 reward_score += 0.0
                 reward_extra_info[f"task{task_id}_detector_reward"] = 0.0
-                # reward_extra_info[f"task{task_id}_detector_details"] = det_details_list
         else:
             reward_score += 0.0
             reward_extra_info[f"task{task_id}_detector_reward"] = 0.0
-            # reward_extra_info[f"task{task_id}_detector_details"] = det_details_list
 
-        # Always set detector_response for batch consistency
         reward_extra_info[f"task{task_id}_detector_response"] = detector_response
 
         # Bonus if both perfect
         if task1_vlm_reward_score == 1 and detector_reward == 1:
-            reward_score += 1.0  # bonus for both perfect
+            reward_score += 1.0
             reward_extra_info[f"task{task_id}_vlm_detector_bonus"] = 1.0
         else:
             reward_score += 0.0
@@ -913,7 +847,9 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
         part1, part2, part3 = formatting_evaluator._split_text_into_parts(feedback_text.strip())
 
         # formatting
-        task2_reward_score += 1.0 if all(part is not None for part in [part1, part2, part3]) else 0.0
+        task2_is_exactly_three_parts = all(part is not None for part in [part1, part2, part3])
+        task2_reward_score += 1.0 if task2_is_exactly_three_parts else 0.0
+        reward_extra_info[f"task{task_id}_formatting_reward"] = 1.0 if task2_is_exactly_three_parts else 0.0
         task2_ans_count += 1
 
         # part 1 scoring
@@ -922,140 +858,116 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
         predict_decomposed_ans = formatting_evaluator._extract_answer_paragraphs(part2)
 
         part1_reward_dict = formatting_evaluator._calculate_metrics_for_reward(feedback_parsed_tuple, predict_parsed_tuple, predict_decomposed_ans)
-        task2_reward_score += sum(part1_reward_dict.values())
+        task2_part1_reward = sum(part1_reward_dict.values())
+        task2_reward_score += task2_part1_reward
+        reward_extra_info[f"task{task_id}_part1_reward"] = task2_part1_reward
         task2_ans_count += len(part1_reward_dict)
 
-        # VLM based reward
-        # Part 0: Summarize 단계 metric 추가 (251216)
-        # task2_reward_score += 1, task2_ans_count += 1
-        # Part 1: 추가해야됨 (251216)
-        # Part 2: 추가해야됨 (251216)
-        # Part 3: feedback reward (얘는 밑에 완성됨)
-        response = await get_response(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id)
+        # Launch API request
+        args = (prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id)
+        response = await get_response(get_messages, *args)
+
+        # Process feedback response
+        task2_vlm_reward_score = 0.0
         if response is not None:
             try:
                 raw_json = json.loads(response)
                 label_response = raw_json.get("label", "").lower()
                 if label_response in ["targeted_only", "no_feedback_needed"]:
-                    task2_reward_score += 1.0
-                elif label_response in ["non_target_touched"]:
-                    task2_reward_score += 0.0
-                elif label_response in ["global_or_irrelevant"]:
-                    task2_reward_score += 0.0
+                    task2_vlm_reward_score = 1.0
+                elif label_response in ["non_target_touched", "global_or_irrelevant"]:
+                    task2_vlm_reward_score = 0.0
                 else:
-                    task2_reward_score += 0.0
-                task2_ans_count += 1
+                    task2_vlm_reward_score = 0.0
 
+                task2_reward_score += task2_vlm_reward_score
+                task2_ans_count += 1
             except:
-                raw_json = {}
+                task2_vlm_reward_score = 0.0
                 task2_reward_score += 0.0
         else:
-            task2_reward_score += 0.0
-        
-        reward_extra_info[f"task{task_id}_reward_response"] = response
-
-        # task2 align
-        align_response = await get_response_task2_align(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id)
-        if align_response is not None:
-            try:
-                q_idx_re  = re.compile(r'^\s*(\d+)\s*\|', re.MULTILINE)
-                ans_line_re = re.compile(r'^\s*(\d+)\s*\|\s*Answer:\s*(Yes|No)\s*$', re.IGNORECASE | re.MULTILINE)
-
-                # 1) questions에서 기대 인덱스 추출 (원래 순서 유지)
-                expected_indices = [int(m.group(1)) for m in q_idx_re.finditer(vqa_question)]
-
-                # 2) 출력에서 정답 라인만 파싱 -> {idx: bool}
-                idx_to_ans = {}
-                for idx_str, yn in ans_line_re.findall(align_response):
-                    idx = int(idx_str)
-                    idx_to_ans[idx] = (yn.strip().lower() == "yes")  # 중복 있으면 마지막 값 사용
-
-                # 3) 기대 인덱스 순서대로 answers 구성 (모두 있어야 유효)
-                complete = len(idx_to_ans) == len(expected_indices) and all(idx in idx_to_ans for idx in expected_indices)
-                rm_decomposed_answers = [idx_to_ans[idx] for idx in expected_indices] if complete else []
-
-                # predicted answers와 reference answers 비교
-                predict_decomposed_ans = [p.lower() == "yes" for p in predict_decomposed_ans]
-                task2_reward_score += 1.0 if all(rm_decomposed_answers) == all(predict_decomposed_ans) else 0.0
-                task2_ans_count += 1
-
-            except:
-                raw_json = {}
-                task2_reward_score += 0.0
-        else:
+            task2_vlm_reward_score = 0.0
             task2_reward_score += 0.0
 
         reward_score += (task2_reward_score / task2_ans_count) if task2_ans_count > 0 else 0.0
-        reward_extra_info[f"task{task_id}_reward_align_response"] = align_response
+        # reward_score += task2_reward_score
+        reward_extra_info[f"task{task_id}_vlm_reward"] = task2_vlm_reward_score
+        reward_extra_info[f"task{task_id}_reward_response"] = response
 
     elif task_id == 3: # Total score: 3.0
         formatting_evaluator = FormattingEvaluator()
         last = formatting_evaluator._split_text_into_parts(feedback_text)[-1]
         if last is not None and "No need to generate feedback.".lower() in last.lower():
             reward_score = -100
+            reward_extra_info[f"task{task_id}_vlm_reward"] = 0.0
             reward_extra_info[f"task{task_id}_reward_response"] = "None"
-            # Always populate detector_response for batch consistency
             reward_extra_info[f"task{task_id}_detector_response"] = {"results": {}, "details": [], "errors": ["Skipped: No feedback needed"]}
             reward_extra_info[f"task{task_id}_detector_reward"] = 0.0
             reward_extra_info[f"task{task_id}_detector_details"] = []
-
             reward_extra_info[f"task{task_id}_vlm_detector_bonus"] = 0.0
             return {
                 "score": reward_score,
                 "reward_extra_info": reward_extra_info,
             }
 
-        # VLM based reward
-        task3_vlm_reward_score = 0.0
-        response = await get_response(prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id)
-        if response is not None:
-            task3_idx_to_ans: dict = image_evaluator_parser(response)
+        # Launch all API requests in parallel
+        detection_results = verify_detection_single(feedback_tuple)
+        args = (prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id)
 
+        vlm_task = asyncio.create_task(get_response(get_messages, *args))
+
+        detector_task = None
+        if detection_results:
+            detector_task = asyncio.create_task(request_detector_single(detection_results, gen_img))
+
+        # Gather results
+        if detector_task:
+            response, detector_response = await asyncio.gather(
+                vlm_task, detector_task, return_exceptions=True
+            )
+        else:
+            response = await vlm_task
+            detector_response = {"results": {}}
+
+        # Process VLM response
+        task3_vlm_reward_score = 0.0
+        if not isinstance(response, Exception) and response is not None:
+            task3_idx_to_ans: dict = image_evaluator_parser(response)
             task3_vlm_reward_score_sum = sum(task3_idx_to_ans.values())
             task3_ans_count = len(task3_idx_to_ans)
-
             task3_vlm_reward_score = 1.0 if task3_vlm_reward_score_sum == task3_ans_count else 0.0
             reward_score += task3_vlm_reward_score
+            reward_extra_info[f"task{task_id}_vlm_reward"] = task3_vlm_reward_score
             reward_extra_info[f"task{task_id}_reward_response"] = response
         else:
             reward_score += 0.0
-            reward_extra_info[f"task{task_id}_reward_response"] = "No response received"
+            reward_extra_info[f"task{task_id}_vlm_reward"] = 0.0
+            reward_extra_info[f"task{task_id}_reward_response"] = str(response) if isinstance(response, Exception) else "No response received"
 
-        # Detector based reward - always populate for batch consistency
-        detection_results = verify_detection_single(feedback_tuple)
-        detector_response = {"results": {}}
-        # det_details_list = []
-
+        # Process detector response
         detector_reward = 0.0
-        if detection_results:
-            detector_response = await request_detector_single(detection_results, gen_img)
-
-            # Calculate detector bonus: +1 if all detections are True
+        if detection_results and not isinstance(detector_response, Exception):
             det_results_dict = detector_response.get("results", {})
-            # det_details_list = detector_response.get("details", [])
             if det_results_dict:
                 all_true = all(det_results_dict.values())
                 detector_reward = 1.0 if all_true else 0.0
                 reward_score += detector_reward
                 reward_extra_info[f"task{task_id}_detector_reward"] = detector_reward
-                # reward_extra_info[f"task{task_id}_detector_details"] = det_details_list
             else:
                 reward_score += 0.0
                 reward_extra_info[f"task{task_id}_detector_reward"] = 0.0
-                # reward_extra_info[f"task{task_id}_detector_details"] = det_details_list
         else:
             reward_score += 0.0
             reward_extra_info[f"task{task_id}_detector_reward"] = 0.0
-            # reward_extra_info[f"task{task_id}_detector_details"] = det_details_list
 
-        # Always set detector_response for batch consistency
-        reward_extra_info[f"task{task_id}_detector_response"] = detector_response
+        reward_extra_info[f"task{task_id}_detector_response"] = detector_response if not isinstance(detector_response, Exception) else str(detector_response)
 
         # Bonus if both perfect
         if task3_vlm_reward_score == 1 and detector_reward == 1:
-            reward_score += 1.0  # bonus for both perfect
+            reward_score += 1.0
             reward_extra_info[f"task{task_id}_vlm_detector_bonus"] = 1.0
         else:
+            reward_score += 0.0
             reward_extra_info[f"task{task_id}_vlm_detector_bonus"] = 0.0
 
     return {
@@ -1070,13 +982,11 @@ async def compute_score_batch_async(prompts, gen_imgs, feedback_texts, regen_img
     if n == 0:
         return []
 
-    # Create semaphore for concurrency control
-    
     async def process_single_request(idx, args):
         (prompt, gen_img, feedback_text, regen_img, ground_truth_img, feedback_tuple, vqa_question, extra_info, task_id) = args
         
         # Load ground truth image
-        #ground_truth_img = await asyncio.to_thread(lambda p=ground_truth_img: PIL.Image.open(p).convert("RGB")) if ground_truth_img is not None else ground_truth_img
+        ground_truth_img = await asyncio.to_thread(lambda p=ground_truth_img: PIL.Image.open(p).convert("RGB")) if ground_truth_img is not None else ground_truth_img
         
         # Process the request with improved error handling
         result = await compute_score_single_async(
