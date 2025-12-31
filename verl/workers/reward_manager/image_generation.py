@@ -56,7 +56,7 @@ class ImageGenerationRewardManager:
         gen_imgs_pil_list = data.non_tensor_batch.get('task1_gen_imgs_pil_list', [])
         feedback_texts = data.non_tensor_batch.get('task2_feedback_texts', [])
         regen_imgs_pil_list = data.non_tensor_batch.get('task3_regen_imgs_pil_list', [])
-        ground_truth = data.non_tensor_batch.get('reward_model', {})
+        reward_model = data.non_tensor_batch.get('reward_model', {})
 
         print(f"[VERIFY] Processing batch of {len(prompt)} samples")
 
@@ -65,10 +65,10 @@ class ImageGenerationRewardManager:
         gen_imgs = [gen_imgs_pil_list[i] if i < len(gen_imgs_pil_list) else None for i in range(len(data))]
         feedback_texts_padded = [feedback_texts[i] if i < len(feedback_texts) else "" for i in range(len(data))]
         regen_imgs = [regen_imgs_pil_list[i] if i < len(regen_imgs_pil_list) else None for i in range(len(data))]
-        summarizes = [ground_truth[i].get("summary", None) if i < len(ground_truth) else "" for i in enumerate(data)]
-        ground_truth_imgs = [ground_truth[i].get("ground_truth", None) if i < len(ground_truth) else None for i in range(len(data))]
-        feedback_tuples = [ground_truth[i].get("tuple", None) if i < len(ground_truth) else None for i in range(len(data))]
-        vqa_questions = [ground_truth[i].get("vqa_question", None) if i < len(ground_truth) else None for i in range(len(data))]
+        ground_truth_imgs = [reward_model[i].get("ground_truth", None) if i < len(reward_model) else None for i in range(len(data))]
+        summarizes = [reward_model[i].get("summary", None) if i < len(reward_model) else "" for i in enumerate(data)]
+        feedback_tuples = [reward_model[i].get("tuple", None) if i < len(reward_model) else None for i in range(len(data))]
+        vqa_questions = [reward_model[i].get("vqa_question", None) if i < len(reward_model) else None for i in range(len(data))]
         extra_infos = [data.meta_info.get("extra_info", {})] * len(data)
         task_ids = [task_id] * len(data)
 
