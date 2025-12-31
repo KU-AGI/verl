@@ -168,7 +168,7 @@ class FormattingEvaluatorV2:
         pred_contents = {content for _, content in pred_part2}
         correct_matches = len(gt_contents.intersection(pred_contents))
         total_gt = len(gt_part2)
-        metrics['part1accuracy'] = correct_matches / total_gt if total_gt > 0 else 0.0
+        metrics['part1_accuracy'] = correct_matches / total_gt if total_gt > 0 else 0.0
 
         # 2. Part 2(Verify) 답변 정확도
         correct_answers = 0

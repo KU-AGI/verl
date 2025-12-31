@@ -21,6 +21,7 @@ export NCCL_NET_GDR_LEVEL=2
 export NCCL_SOCKET_TIMEOUT=300000
 export NCCL_IB_TIMEOUT=300
 
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # export VLLM_ATTENTION_BACKEND=XFORMERS
 export HYDRA_FULL_ERROR=1
 # export TORCH_DISTRIBUTED_DEBUG=DETAIL
@@ -36,8 +37,8 @@ RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
 MODEL_PATH=/data/mllm/ckpt/step=014000.ckpt/hf_model # /data/mllm/checkpoints/Janus-Pro-7B
 RM_MODEL_PATH=Qwen/Qwen3-VL-30B-A3B-Instruct # OpenGVLab/InternVL3_5-38B
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
-TRAIN_FILES=/data/mllm/data/train.parquet
-VAL_FILES=/data/mllm/data/val.parquet
+TRAIN_FILES=/data/mllm/data/train_v2.parquet
+VAL_FILES=/data/mllm/data/val_v2.parquet
 
 rollout_name=image_unified
 rollout_mode=async
@@ -94,10 +95,10 @@ sp_size=1
 NNODES=${NNODES:-1}
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
 
-n_gpus_rollout=4
-n_gpus_training=4 # $((NGPUS_PER_NODE - n_gpus_rollout))
+n_gpus_rollout=6
+n_gpus_training=2 # $((NGPUS_PER_NODE - n_gpus_rollout))
 
-fsdp_size=4 # Must be divisible by (n_gpus_training*n_nodes) and (n_gpus_rollout*n_nodes)
+fsdp_size=2 # Must be divisible by (n_gpus_training*n_nodes) and (n_gpus_rollout*n_nodes)
 
 # https://verl.readthedocs.io/en/latest/advance/fully_async.html#parameter-description
 train_prompt_bsz=0 # not used in async mode
@@ -106,13 +107,13 @@ n_resp_per_prompt=8
 rollout_prompt_size=2 # set to number of prompts per actor per batch, used in async mode
 val_rollout_prompt_size=16
 train_prompt_mini_bsz=128
-train_prompt_micro_bsz=16
-total_rollout_steps=$(((512*100)))
+train_prompt_micro_bsz=4
+total_rollout_steps=$(((512*100*3*10)))
 staleness_threshold=1.0
 trigger_parameter_sync_step=4
 require_batches=1
 partial_rollout=False
-log_prob_micro_batch_size_per_gpu=8
+log_prob_micro_batch_size_per_gpu=1
 
 test_freq=100
 save_freq=$((test_freq * trigger_parameter_sync_step * 1))
