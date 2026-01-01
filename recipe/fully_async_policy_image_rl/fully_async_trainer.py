@@ -41,6 +41,7 @@ from verl.utils.debug import marked_timer
 import torch
 from recipe.image_rl.custom_metric_utils import reduce_metrics # custom metric
 from recipe.image_rl.reward import compute_reward, compute_reward_async
+import asyncio
 
 @ray.remote(num_cpus=10)
 class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
@@ -254,8 +255,22 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         self.actor_wg.init_model()
         self.actor_rollout_wg = self.actor_wg  # to be compatible with the functions that not be modified
 
-    def _init_async_rollout_manager(self):
-        pass
+    async def _init_async_rollout_manager(self):
+        # create async rollout manager and request scheduler
+        assert self.config.actor_rollout_ref.rollout.mode == "async"
+        from recipe.fully_async_policy_image_rl.agent_loop import FullyAsyncAgentLoopManager
+
+        self.async_rollout_mode = True
+        self.async_rollout_manager = await FullyAsyncAgentLoopManager.create(
+            config=self.config,
+            worker_group=self.rollout_wg,
+        )
+        num_servers = len(self.async_rollout_manager.server_handles)
+        self.server_token_q = asyncio.Queue()
+        for sid in range(num_servers):
+            self.server_token_q.put_nowait(sid)
+
+        self.server_applied_versions = [-1] * num_servers
 
     def fit(self):
         """
@@ -317,9 +332,6 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                     for task_id in [1, 2, 3]:
                         batch.batch["task_id"] = torch.tensor([task_id for _ in range(len(batch))], dtype=int)
 
-                        # Get pre-computed reward_extra_infos_dict from meta_info
-                        reward_extra_infos_dict = batch.meta_info.get(f"task{task_id}_reward_extra_info", {})
-
                         batch = self._process_batch_common(
                             batch, metrics, timing_raw, self.local_trigger_step if self.compute_prox_log_prob else None, task_id
                         )
@@ -343,6 +355,12 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
+
+                    reward_extra_infos_dict: dict[str, list] = {}
+
+                    for task_id in [1, 2, 3]:
+                        # Get pre-computed reward_extra_infos_dict from meta_info
+                        reward_extra_infos_dict.update({k: v for k, v in batch.meta_info.get(f"task{task_id}_reward_extra_info", {}).items()})
 
                     # Log rollout generations if enabled (per task)
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)

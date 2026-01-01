@@ -55,6 +55,7 @@ from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.torch_functional import masked_mean
 from recipe.image_rl.ray_image_generation_trainer import RayImageGenerationTrainer
 from recipe.image_rl import core_algos
+import asyncio
 
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl", task_id: int = 1):
@@ -265,11 +266,27 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
         self.actor_rollout_wg = self.all_wg[str(Role.ActorRollout)]
         self.actor_rollout_wg.init_model()
 
-    def _init_async_rollout_manager(self):
-        pass
+    async def _init_async_rollout_manager(self):
+        # create async rollout manager and request scheduler
+        assert self.config.actor_rollout_ref.rollout.mode == "async"
+        from recipe.fully_async_policy_image_rl.agent_loop import FullyAsyncAgentLoopManager
+
+        self.async_rollout_mode = True
+        self.async_rollout_manager = await FullyAsyncAgentLoopManager.create(
+            config=self.config,
+            worker_group=self.rollout_wg,
+        )
+        num_servers = len(self.async_rollout_manager.server_handles)
+        self.server_token_q = asyncio.Queue()
+        for sid in range(num_servers):
+            self.server_token_q.put_nowait(sid)
+
+        self.server_applied_versions = [-1] * num_servers
 
     async def _validate_async(self):
-        import asyncio
+
+        if self.async_rollout_manager is None:
+            await self._init_async_rollout_manager()
 
         # task reward tensors collection
         task_reward_tensors = {1: [], 2: [], 3: []}

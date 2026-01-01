@@ -25,7 +25,6 @@ from collections import defaultdict
 import contextlib
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 import numpy as np
-from recipe.image_rl.utils import FormattingEvaluator
 
 
 @register("image_generation")
