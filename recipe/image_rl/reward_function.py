@@ -25,8 +25,11 @@ from recipe.image_rl.gdino_regex import _CONNECTORS, SKIP_KEYWORDS, _COMPILED_RE
 
 # Configuration
 BASE_URLS = [
-    "http://192.169.0.3:8004/v1",
-    "http://192.169.0.3:8005/v1",
+    # "http://10.100.44.4:8006/v1", # main1
+    "http://10.100.44.8:8006/v1", # sub1
+    "http://10.100.44.8:8007/v1",
+    "http://10.100.44.2:8006/v1", # sub2
+    "http://10.100.44.2:8007/v1",
 ]
 API_KEY = "EMPTY"
 MAX_RETRIES = 3
@@ -40,8 +43,12 @@ RECOVERY_CHECK_INTERVAL = 60  # seconds to wait before checking if unhealthy ser
 
 # Detector configuration
 DETECTOR_URLS = [
-    "http://192.169.0.3:8084", # sub2
-    "http://192.169.0.3:8085",
+    # "http://10.100.44.4:8086", # main1
+    # "http://10.100.44.4:8087",
+    # "http://10.100.44.8:8086", # sub1
+    # "http://10.100.44.8:8087",
+    "http://10.100.44.2:8086", # sub2
+    "http://10.100.44.2:8087",
 ]
 DETECTOR_TIMEOUT = 300000.0
 
@@ -229,15 +236,16 @@ class ClientManager:
         return server.client, server_id
         
     def record_request_result(self, server_id: int, success: bool, error: Exception = None):
-        """Record the result of a request for server health tracking"""
         if 0 <= server_id < len(self.servers):
             server = self.servers[server_id]
             if success:
                 server.record_success()
             else:
+                prev_status = server.status
                 server.record_failure()
-                if error:
-                    print(f"Server {server.url} error: {repr(error)}")
+                # Log error: status transition
+                if error and (server.status != prev_status) and (server.status == ServerStatus.UNHEALTHY):
+                    print(f"Server {server.url} marked UNHEALTHY: {repr(error)}")
     
     def get_server_status(self) -> Dict[str, Any]:
         """Get current status of all servers"""
@@ -443,21 +451,16 @@ def get_messages_task3_regeneration_followed_by_editing(*args):
     return messages
 
 
-async def get_response_with_client(client, client_id, messages):
+async def get_response_with_client(client, messages):
     """Get response from a specific client with improved error handling"""
-    try:
-        response = await client.chat.completions.create(
-            model=MODEL_NAME,
-            messages=messages,
-            max_tokens=2048,
-            extra_body={"repetition_penalty": 1.2},
-            timeout=300000.0,
-        )
-        client_manager.record_request_result(client_id, success=True)
-        return response.choices[0].message.content
-    except Exception as e:
-        client_manager.record_request_result(client_id, success=False, error=e)
-        raise
+    response = await client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=messages,
+        max_tokens=2048,
+        extra_body={"repetition_penalty": 1.2},
+        timeout=300000.0,
+    )
+    return response.choices[0].message.content
 
 
 async def get_response(message_builder_fn, *args):
@@ -473,18 +476,28 @@ async def get_response(message_builder_fn, *args):
     max_attempts = len(BASE_URLS) * MAX_RETRIES
 
     for attempt in range(max_attempts):
-        client, client_id = await borrow_rm_client()
-        err = None
+        client, sid = await borrow_rm_client()
         try:
-            response = await get_response_with_client(client, client_id, messages)
-            if is_meaningful_response(response):
-                return response
+            response = await get_response_with_client(client, messages)
+            if not is_meaningful_response(response):
+                # Back off 
+                client_manager.record_request_result(sid, success=False,
+                                                     error=ValueError("Non-meaningful response"))
+                delay = BASE_DELAY * (2 ** min(attempt, 3)) + random.uniform(0, 1)
+                await asyncio.sleep(delay)
+                continue
             else:
-                continue # retry
+                client_manager.record_request_result(sid, success=True)
+                return response
+
         except Exception as e:
-            err = e
+            client_manager.record_request_result(sid, success=False, error=e)
+
         finally:
-            await release_rm_client(client_id)
+            await release_rm_client(sid)
+
+        delay = BASE_DELAY * (2 ** min(attempt, 3)) + random.uniform(0, 1)
+        await asyncio.sleep(delay)
 
         # Exponential backoff before retrying
         delay = BASE_DELAY * (2 ** min(attempt, 3)) + random.uniform(0, 1)
@@ -815,7 +828,7 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
         formatting_evaluator = FormattingEvaluatorV2()
 
         # Rule-based: formatting reward
-        task2_reward_score += 1.0 if all(part is not None for part in [predicted_summarize,predicted_tuple, predicted_answer, predicted_feedback]) else 0.0 # +1
+        task2_reward_score += 1.0 if all(part is not None for part in [predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback]) else 0.0 # +1
 
         # Rule-based: part 1 scoring
         feedback_parsed_tuple = formatting_evaluator._parse_part1(feedback_tuple) # GT Tuple
@@ -830,11 +843,11 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
         # Launch all API requests in parallel
         args = (prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback, vqa_question, extra_info, task_id)
 
-        feedback_task = asyncio.create_task(get_response(get_messages, *args))
-        comparison_summarize_task = asyncio.create_task(get_response(get_messsages_task2_comparison_summarize, *args))
-        comparison_tuple_task = asyncio.create_task(get_response(get_messages_task2_comparison_tuple, *args))
-        hallucination_check_task = asyncio.create_task(get_response(get_messages_task2_hallucination_check, *args))
-        edit_instruction_task = asyncio.create_task(get_response(get_messages_task2_edit_instruction, *args))
+        feedback_task = asyncio.create_task(get_response(get_messages, *args)) # +1
+        comparison_summarize_task = asyncio.create_task(get_response(get_messsages_task2_comparison_summarize, *args)) # +1
+        comparison_tuple_task = asyncio.create_task(get_response(get_messages_task2_comparison_tuple, *args)) # +1
+        hallucination_check_task = asyncio.create_task(get_response(get_messages_task2_hallucination_check, *args)) # +1
+        edit_instruction_task = asyncio.create_task(get_response(get_messages_task2_edit_instruction, *args)) # +1
 
         # Gather all results at once
         (
@@ -875,7 +888,6 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
             task2_reward_score += 0.0
 
         # reward_score += (task2_reward_score / task2_ans_count) if task2_ans_count > 0 else 0.0
-        reward_score += task2_reward_score  # not normalizing
         reward_extra_info[f"task{task_id}_vlm_reward"] = task2_vlm_reward_score
         reward_extra_info[f"task{task_id}_reward_response"] = response
 
@@ -954,7 +966,7 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
         # reward_score += (task2_reward_score / task2_ans_count) if task2_ans_count > 0 else 0.0
         reward_score += task2_reward_score # not normalizing
 
-    elif task_id == 3: # Total score: 3.0
+    elif task_id == 3: # Total score: 4.0
         last = predicted_feedback
         if last is not None and "No need to generate feedback.".lower() in last.lower():
             reward_score = -100
