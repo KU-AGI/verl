@@ -294,7 +294,16 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
             await asyncio.sleep(0.01)
 
     async def _validate_async(self) -> dict:
+        """Perform asynchronous validation on the validation dataset.
 
+        This function uses a producer-processor-finalizer pipeline:
+        1. Producer: Reads validation batches and merges them for efficient generation
+        2. Processor: Dispatches generation tasks to available servers
+        3. Finalizer: Computes rewards and aggregates metrics
+
+        Returns:
+            dict: Validation metrics including per-task scores and sample generations
+        """
         if self.async_rollout_manager is None:
             await self._init_async_rollout_manager()
 
@@ -303,35 +312,36 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
         num_servers = len(self.async_rollout_manager.server_handles)
         assert num_servers > 0
 
-        # merge 크기 (val batch 여러 개를 concat해서 한 번에 generate)
+        # Merge size (concat multiple val batches for batch generation)
         val_rollout_prompt_size = int(self.config.async_training.get("val_rollout_prompt_size", 1))
 
-        # (메모리 보호) finalize backlog 제한
+        # Limit finalize backlog (memory protection)
         max_val_finalize_backlog = self.config.async_training.get("max_val_finalize_backlog_samples", None)
         if max_val_finalize_backlog is None:
             max_val_finalize_backlog = max(num_servers * val_rollout_prompt_size * 8, num_servers * 16)
         max_val_finalize_backlog = int(max_val_finalize_backlog)
 
-        # (리소스 보호) reward 동시 실행 제한
+        # Limit concurrent reward computation (resource protection)
         max_val_reward_concurrency = int(
             self.config.async_training.get("max_val_reward_concurrency", max(num_servers * 3, 8))
         )
         val_reward_sem = asyncio.Semaphore(max_val_reward_concurrency)
 
-        # queues
+        # Queues for pipeline stages
         prepared_q = asyncio.Queue(maxsize=max(num_servers * 4, 8))
         finalize_q = asyncio.Queue(maxsize=max(num_servers * 8, 16))
 
-        # server tokens (validation 전용)
+        # Server tokens (validation-specific pool)
         val_server_token_q = asyncio.Queue()
         for sid in range(num_servers):
             val_server_token_q.put_nowait(sid)
 
-        # finalize budget
+        # Finalize budget tracking (controls memory usage)
         finalize_cond = asyncio.Condition()
         finalize_inflight = 0
 
         async def _acquire_finalize_budget(n: int):
+            """Acquire budget slots to limit finalize queue memory usage."""
             nonlocal finalize_inflight
             async with finalize_cond:
                 while finalize_inflight + n > max_val_finalize_backlog:
@@ -339,6 +349,7 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                 finalize_inflight += n
 
         async def _release_finalize_budget(n: int):
+            """Release budget slots and notify waiting tasks."""
             nonlocal finalize_inflight
             async with finalize_cond:
                 finalize_inflight -= n
@@ -346,11 +357,12 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                     finalize_inflight = 0
                 finalize_cond.notify_all()
 
-        # accumulators
+        # Metric accumulators
         task_reward_tensors = {1: [], 2: [], 3: []}
         task_reward_extra_infos = {1: [], 2: [], 3: []}
         data_source_lst = []
 
+        # Sample data for logging
         sample_prompts = []
         sample_task1_gen_imgs = []
         sample_task2_feedback_texts = []
@@ -359,17 +371,15 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
         sample_task2_scores = []
         sample_task3_scores = []
 
-        # -------------------------
-        # Producer: val_dataloader -> prepared_q
-        # -------------------------
         async def _val_producer():
+            """Read validation batches and merge them for efficient generation."""
             batch_list = []
             batch_idx_list = []
 
             for val_batch_idx, test_data in enumerate(self.val_dataloader):
                 test_batch = DataProto.from_single_dict(test_data)
 
-                # uid 부여
+                # Assign unique IDs to each sample
                 test_batch.non_tensor_batch["uid"] = np.array(
                     [str(uuid.uuid4()) for _ in range(len(test_batch))],
                     dtype=object,
@@ -390,34 +400,43 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                 merged_gen_batch = self._get_gen_batch(merged_batch)
                 await prepared_q.put((merged_batch, merged_gen_batch, batch_idx_list))
 
-            # 종료 신호
+            # Send completion signal
             await prepared_q.put("DONE")
 
-        # -------------------------
-        # Reward task (stage callback에서 즉시 시작)
-        # -------------------------
         async def _compute_val_reward_async(task_id: int, batch_result: DataProto, reward_tensor_dict: dict, reward_extra_infos: dict):
-            # 동시에 너무 많이 돌지 않도록 semaphore로 제한
+            """Compute rewards for a specific task asynchronously."""
+            # Limit concurrent reward computations with semaphore
             async with val_reward_sem:
-                # val_reward_fn이 동기 함수이므로 이벤트루프 블로킹 방지 위해 thread로
-                task_reward_dict = await asyncio.to_thread(
-                    self.val_reward_fn,
-                    batch_result,
-                    task_id=task_id,
-                    eval=True,
-                    return_dict=True,
-                )
-                task_reward_tensor = task_reward_dict[f"task{task_id}_reward_tensor"]
-                task_reward_extra_info = task_reward_dict.get(f"task{task_id}_reward_extra_info", None)
+                try:
+                    from recipe.image_rl.reward import compute_reward_async
 
-                # 메모리 안정: CPU로 내려서 보관
-                reward_tensor_dict[task_id] = task_reward_tensor.detach().cpu()
-                reward_extra_infos[task_id] = task_reward_extra_info
+                    # Launch async reward computation
+                    future = compute_reward_async.remote(
+                        data=batch_result,
+                        config=self.config,
+                        tokenizer=self.tokenizer,
+                        processor=self.processor,
+                        reward_fn=None,
+                        eval=False,
+                        task_id=task_id
+                    )
 
-        # -------------------------
-        # Generator job: generation만, reward는 callback에서 task 발사
-        # -------------------------
+                    # Wait for reward computation to complete
+                    reward_result = await asyncio.to_thread(ray.get, future)
+                    reward_tensor, reward_extra_infos_dict = reward_result
+
+                    # Move to CPU for memory stability
+                    reward_tensor_dict[task_id] = reward_tensor
+                    reward_extra_infos[task_id] = reward_extra_infos_dict
+
+                except Exception as e:
+                    print(f"[Rollouter][RewardTask{task_id}] ERROR: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+
         async def _val_generate(test_batch: DataProto, test_gen_batch: DataProto, server_index: int, budget_n: int, val_batch_idx_list):
+            """Generate sequences and launch reward tasks immediately via callback."""
             token_released = False
             enqueued = False
 
@@ -427,7 +446,7 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                 reward_tasks = []
 
                 def on_task_complete(task_id: int, batch_result: DataProto):
-                    # stage 결과가 올 때마다 reward task를 즉시 발사 (A 방식 핵심)
+                    # Launch reward task immediately when stage completes
                     reward_task = asyncio.create_task(
                         _compute_val_reward_async(int(task_id), batch_result, reward_tensor_dict, reward_extra_infos),
                         name=f"val_reward_task{task_id}",
@@ -459,10 +478,8 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                 if not enqueued:
                     await _release_finalize_budget(budget_n)
 
-        # -------------------------
-        # Processor: prepared_q 읽고 generation task 계속 생성
-        # -------------------------
         async def _val_processor():
+            """Read from prepared_q and continuously create generation tasks."""
             gen_tasks = []
 
             while True:
@@ -474,10 +491,10 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                     test_batch, test_gen_batch, val_batch_idx_list = item
                     bs = len(test_gen_batch)
 
-                    # finalize backlog budget 확보 (메모리 폭주 방지)
+                    # Acquire finalize backlog budget (prevents memory overflow)
                     await _acquire_finalize_budget(bs)
 
-                    # 서버 토큰 획득 후 generation task 생성
+                    # Acquire server token and create generation task
                     sid = await val_server_token_q.get()
                     task = asyncio.create_task(
                         _val_generate(test_batch, test_gen_batch, sid, bs, val_batch_idx_list),
@@ -488,20 +505,18 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                 finally:
                     prepared_q.task_done()
 
-            # 모든 generation 끝날 때까지 대기
+            # Wait for all generation tasks to complete
             if gen_tasks:
                 results = await asyncio.gather(*gen_tasks, return_exceptions=True)
                 for r in results:
                     if isinstance(r, Exception):
                         raise r
 
-            # finalize 종료 신호
+            # Send finalize completion signal
             await finalize_q.put("DONE")
 
-        # -------------------------
-        # Finalize worker: reward gather + 후처리/누적
-        # -------------------------
         async def _val_finalize_worker():
+            """Gather rewards and aggregate metrics for logging."""
             while True:
                 item = await finalize_q.get()
                 try:
@@ -510,12 +525,23 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
 
                     test_batch, result_batch, reward_tensor_dict, reward_extra_infos, reward_tasks, budget_n, _ = item
 
-                    # reward 완료 대기 (A 방식: 여기서 await로 수거)
+                    # Wait for all reward tasks to complete
                     results = await asyncio.gather(*reward_tasks, return_exceptions=True)
                     for r in results:
                         if isinstance(r, Exception):
                             import traceback
                             traceback.print_exception(type(r), r, r.__traceback__)
+
+                    # Save in result batch
+                    for task_id in [1, 2, 3]:
+                        task_reward_tensor = reward_tensor_dict[task_id]
+                        result_batch.batch[f"task{task_id}_token_level_scores"] = task_reward_tensor
+
+                        task_reward_extra_info = reward_extra_infos[task_id]
+                        for k, v in task_reward_extra_info.items():
+                            if not hasattr(result_batch, "meta_info"):
+                                result_batch.meta_info = {}
+                            result_batch.meta_info[k] = v
 
                     # Extend with batch data
                     batch_scores = {}
@@ -535,6 +561,13 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                     task3_regen_imgs_pil_list = [wandb.Image(regen_img, caption=prompts[i]) for i, regen_img in enumerate(task3_regen_imgs_pil_list)]
                     sample_task3_regen_imgs.extend(task3_regen_imgs_pil_list)
 
+                    # Note: If you skip _log_rollout_data process, need to change keys for dump
+                    # # Add all task scores
+                    # for tid in [1, 2, 3]:
+                    #     key = f"task{tid}_token_level_scores"
+                    #     if key in batch.batch:
+                    #         scores[f"task{tid}_scores"] = batch.batch[key].sum(-1).cpu().tolist()
+
                     # Extend reward scores, infos for each task
                     for task_id in [1, 2, 3]:
                         task_reward_tensor = reward_tensor_dict[task_id]
@@ -542,10 +575,10 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
 
                         # Compute per-sample scores
                         per_sample_scores = task_reward_tensor.sum(-1).cpu().tolist()
-
                         batch_scores[f"task{task_id}_scores"] = per_sample_scores
-                        for k, v in task_reward_extra_infos[task_id]:
-                            batch_reward_extra_infos[k].extend(v)
+
+                        for k, v in reward_extra_infos[task_id].items():
+                            batch_reward_extra_infos[k] = v
 
                         if task_id == 1:
                             sample_task1_scores.extend(per_sample_scores)
@@ -555,7 +588,7 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                             sample_task3_scores.extend(per_sample_scores)
 
                     is_last_step = self.global_steps >= self.total_training_steps
-                    # validate
+                    # Dump validation generations if configured
                     if (
                         self.val_reward_fn is not None
                         and self.config.trainer.test_freq > 0
@@ -566,7 +599,7 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                             prompt_id=result_batch.non_tensor_batch["prompt_id"].tolist(),
                             prompt=result_batch.non_tensor_batch["prompt"].tolist(),
                             gen_imgs_pil_list=result_batch.non_tensor_batch.get('task1_gen_imgs_pil_list'),
-                            feedback_texts=result_batch.non_tensor_batch.get('task2_feedback_texts'),
+                            feedback_texts=result_batch.non_tensor_batch.get('task2_feedback_texts').tolist(),
                             regen_imgs_pil_list=result_batch.non_tensor_batch.get('task3_regen_imgs_pil_list'), 
                             gts_imgs=[item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in result_batch],
                             summarizes=[item.non_tensor_batch.get("reward_model", {}).get("summary", None) for item in result_batch],
@@ -586,9 +619,7 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                         await _release_finalize_budget(budget_n)
                     finalize_q.task_done()
 
-        # -------------------------
-        # Run: validation은 끝까지 동기적으로 join
-        # -------------------------
+        # Run all pipeline stages and wait for completion
         producer_t = asyncio.create_task(_val_producer(), name="val_producer")
         processor_t = asyncio.create_task(_val_processor(), name="val_processor")
         finalize_t = asyncio.create_task(_val_finalize_worker(), name="val_finalize")
@@ -601,7 +632,7 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
 
         await finalize_t
 
-        # Store validation samples for logging by Trainer
+        # Prepare validation samples for logging
         validation_samples = list(zip(
             sample_prompts,
             sample_task1_gen_imgs,
@@ -614,12 +645,12 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
 
         data_sources = np.array(data_source_lst)
 
-        # task metrics computation
+        # Compute task-specific metrics
         metric_dict = {}
         for task_id in [1, 2, 3]:
             reward_tensor = torch.cat(task_reward_tensors[task_id], dim=0).sum(-1).cpu()
 
-            # evaluate test_score based on data source
+            # Evaluate scores grouped by data source
             data_source_reward = {}
             for i in range(reward_tensor.shape[0]):
                 data_source = data_sources[i]
@@ -628,12 +659,11 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                 data_source_reward[data_source].append(reward_tensor[i].item())
 
             for data_source, rewards in data_source_reward.items():
-                valid_rewards = [r for r in rewards if r > 0] # positive
+                valid_rewards = [r for r in rewards if r > 0]
                 if valid_rewards:
                     metric_dict[f'val/task{task_id}_score/{data_source}'] = np.mean(valid_rewards)
                 metric_dict[f'val/task{task_id}_positive_ratio/{data_source}'] = np.mean(np.array(rewards) > 0)
 
-        # Include validation generation samples in the result for Trainer to log
         metric_dict['validation_samples'] = validation_samples
 
         return metric_dict

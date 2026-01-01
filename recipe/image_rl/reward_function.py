@@ -496,9 +496,6 @@ async def get_response(message_builder_fn, *args):
         finally:
             await release_rm_client(sid)
 
-        delay = BASE_DELAY * (2 ** min(attempt, 3)) + random.uniform(0, 1)
-        await asyncio.sleep(delay)
-
         # Exponential backoff before retrying
         delay = BASE_DELAY * (2 ** min(attempt, 3)) + random.uniform(0, 1)
         await asyncio.sleep(delay)
