@@ -29,6 +29,7 @@ from typing import Any, Dict, Optional, Type
 
 import numpy as np
 import PIL
+import PIL.Image
 import ray
 import torch
 import wandb
@@ -385,105 +386,159 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
     def _dump_generations(self, uid, prompt_id, prompt, gen_imgs_pil_list, feedback_texts, regen_imgs_pil_list,
-            gts_imgs, summarizes, gts_tuples, gts_vqas, scores, reward_extra_infos_dict, dump_path
-        ):
-        """Dump rollout/validation samples as JSONL."""
-        os.makedirs(dump_path, exist_ok=True)
-        filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
+                        gts_imgs, summarizes, gts_tuples, gts_vqas, scores, reward_extra_infos_dict, dump_path):
 
-        image_dir = os.path.join(dump_path, f"{self.global_steps}")
-        os.makedirs(image_dir, exist_ok=True)
+        step_dir = os.path.abspath(os.path.join(dump_path, str(self.global_steps)))
+        os.makedirs(step_dir, exist_ok=True)
 
         n = len(prompt)
-        base_data = {
-            "prompt_id": prompt_id,
-            "uid": uid,
-            "prompt": prompt,
-            "rollout_id": list(range(n)),
-            **scores,
-            "step": [self.global_steps] * n,
-        }
-
-        lines = []
+        # 1. 샘플별로 인덱스 그룹화 (여기서 순서를 보존합니다)
+        sample_groups = defaultdict(list)
         for i in range(n):
-            entry = {k: v[i] for k, v in base_data.items()}
-            lines.append(json.dumps(entry, ensure_ascii=False))
+            pid_raw = prompt_id[i]
+            pid_clean = pid_raw.replace("gen_img_", "").replace("text_", "")
+            pid_core = pid_clean.split("_uid_")[0]
+            parts = pid_core.split("_")
+            
+            source_parts = []
+            sample_id = "unknown"
+            for p in parts:
+                if p.isdigit() and len(p) >= 4:
+                    sample_id = p
+                    break
+                if p not in ["uid", "chunk", "sample"]:
+                    source_parts.append(p)
+            
+            source_rel_path = os.path.join(*source_parts)
+            sample_key = os.path.join(source_rel_path, sample_id)
+            
+            # 롤아웃 구분 없이 일단 샘플별로 인덱스를 다 모음
+            sample_groups[sample_key].append(i)
 
-        with open(filename, "w") as f:
-            f.write("\n".join(lines) + "\n")
+        # 2. 그룹별 저장 (enumerate를 사용하여 강제로 0, 1, 2... 번호 부여)
+        for sample_rel_path, indices in sample_groups.items():
+            sample_dir = os.path.join(step_dir, sample_rel_path)
+            os.makedirs(sample_dir, exist_ok=True)
+            
+            summary_path = os.path.join(sample_dir, "comparison_summary.txt")
+            summary_header = [
+                f"📋 GRPO COMPARISON SUMMARY | STEP: {self.global_steps}",
+                f"Sample Path: {sample_dir}",
+                "=" * 170,
+                f"{'Rollout':<10} | {'T1':<5} | {'T2':<5} | {'T3':<5} | {'Total':<6} | {'Gen Path (Initial)':<65} | {'Regen Path (Edited)'}",
+                "-" * 170
+            ]
+            summary_rows = []
+
+            # ★ 핵심 수정: enumerate(indices)를 사용하여 중복 방지
+            for rollout_num, i in enumerate(indices):
+                r_idx = rollout_num # 무조건 0, 1, 2, 3... 으로 나감
+                rollout_dir = os.path.join(sample_dir, f"rollout_{r_idx}")
+                os.makedirs(rollout_dir, exist_ok=True)
+
+                # 이미지 저장
+                paths = self._save_images(rollout_dir, i, gen_imgs_pil_list, regen_imgs_pil_list, gts_imgs)
+                
+                # 점수 계산
+                t1 = self._get_safe_val(scores, 'task1_scores', i, 0.0)
+                t2 = self._get_safe_val(scores, 'task2_scores', i, 0.0)
+                t3 = self._get_safe_val(scores, 'task3_scores', i, 0.0)
+                total = t1 + t2 + t3
+                
+                summary_rows.append(f"rollout_{r_idx:<3} | {t1:<5.2f} | {t2:<5.2f} | {t3:<5.2f} | {total:<6.2f} | {paths['gen']:<65} | {paths['regen']}")
+
+                # 개별 리포트 생성
+                item = {'rollout_idx': r_idx, 'uid': uid[i]}
+                self._write_detailed_report(rollout_dir, i, item, paths, prompt, feedback_texts, scores, 
+                                        summarizes, gts_tuples, gts_vqas, reward_extra_infos_dict)
+
+            with open(summary_path, 'w', encoding='utf-8') as f:
+                f.write("\n".join(summary_header + summary_rows) + "\n")
+
+    # --- Helper Methods ---
+
+    def _get_safe_val(self, data, key, idx, default="N/A"):
+        """딕셔너리에서 안전하게 값을 가져오고 수치형이면 float 반환"""
+        if key in data and (isinstance(data[key], list) or isinstance(data[key], np.ndarray)):
+            if len(data[key]) > idx:
+                val = data[key][idx]
+                return float(val) if isinstance(default, float) else val
+        return default
+
+    def _save_images(self, rollout_dir, i, gen_imgs, regen_imgs, gts_imgs):
+        """이미지 저장 후 절대 경로 딕셔너리 반환"""
+        paths = {"gen": "N/A", "regen": "N/A", "gt": "N/A"}
         
-        # save_num = self.reward_kwargs.get("img_saving", {}).get("num", n)
-        for i in range(n): # (min(n, save_num)):
+        # Task 1 Gen Image
+        if gen_imgs is not None and len(gen_imgs) > i:
+            p = os.path.join(rollout_dir, "gen.png")
+            # numpy array 대응
+            img_data = gen_imgs[i]
+            if isinstance(img_data, np.ndarray):
+                PIL.Image.fromarray(img_data.astype(np.uint8)).save(p)
+            else:
+                img_data.save(p)
+            paths["gen"] = os.path.abspath(p)
 
-            # Set uid
-            id = uid[i]
+        # Task 3 Regen Image
+        if regen_imgs is not None and len(regen_imgs) > i:
+            p = os.path.join(rollout_dir, "regen.png")
+            img_data = regen_imgs[i]
+            if isinstance(img_data, np.ndarray):
+                PIL.Image.fromarray(img_data.astype(np.uint8)).save(p)
+            else:
+                img_data.save(p)
+            paths["regen"] = os.path.abspath(p)
 
-            # Prompt id
-            pid = prompt_id[i]
+        # Ground Truth Image
+        if gts_imgs is not None and len(gts_imgs) > i and gts_imgs[i]:
+            p = os.path.join(rollout_dir, "ground_truth.png")
+            if not os.path.exists(p):
+                try:
+                    PIL.Image.open(gts_imgs[i]).convert("RGB").save(p)
+                except: pass
+            paths["gt"] = os.path.abspath(p)
+            
+        return paths
 
-            with open(os.path.join(image_dir, f"text_{pid}_{id}_{i}.txt"), 'w', encoding='utf-8') as f:
-                f.write(f"Sample {pid}'s {i}th {id}\n")
-                f.write("=" * 40 + "\n")
+    def _write_detailed_report(self, rollout_dir, i, item, paths, prompt, feedback_texts, scores, 
+                            summarizes, gts_tuples, gts_vqas, reward_extra_infos_dict):
 
-                # Save input text
-                f.write(f"Input Text: {prompt[i]}\n\n")
+        txt_path = os.path.join(rollout_dir, "txt.txt")
+        with open(txt_path, 'w', encoding='utf-8') as f:
+            f.write(f"📊 ROLLOUT REPORT | STEP: {self.global_steps} | ROLLOUT: {item['rollout_idx']}\n")
+            f.write(f"Location: {os.path.abspath(rollout_dir)}\n")
+            f.write("=" * 100 + "\n")
+            f.write(f"📝 [PROMPT]\n{prompt[i]}\n")
+            f.write("=" * 100 + "\n\n")
 
-                # Save generated image (Task 1)
-                if gen_imgs_pil_list is not None and len(gen_imgs_pil_list) > i:
-                    save_path = os.path.join(image_dir, f"gen_img_{pid}_{id}_{i}.png")
-                    PIL.Image.fromarray(gen_imgs_pil_list[i].astype(np.uint8)).save(save_path)
-                    f.write(f"Generated Image: gen_img_{pid}_{id}_{i}.png\n")
-                    if "task1_scores" in scores and len(scores["task1_scores"]) > i:
-                        task1_score = scores["task1_scores"][i]
-                        f.write(f"Task1 Score: {task1_score}\n")
-                    f.write("\n")
+            # Task 1
+            f.write(f"🖼️ [TASK 1] INITIAL GEN\n")
+            f.write(f"  - Score: {self._get_safe_val(scores, 'task1_scores', i)}\n")
+            f.write(f"  - Path: {paths['gen']}\n")
+            f.write(f"  - VLM Reason:\n{self._get_safe_val(reward_extra_infos_dict, 'task1_reward_response', i)}\n")
+            f.write(f"  - Detector Result: {self._get_safe_val(reward_extra_infos_dict, 'task1_detector_response', i)}\n\n")
 
-                # Save feedback text (Task 2)
-                if feedback_texts is not None and len(feedback_texts) > i:
-                    f.write(f"Feedback Text:\n{feedback_texts[i]}\n")
-                    if "task2_scores" in scores and len(scores["task2_scores"]) > i:
-                        task2_score = scores["task2_scores"][i]
-                        f.write(f"Task2 Score: {task2_score}\n")
-                    f.write("\n")
+            # Task 2
+            f.write(f"💬 [TASK 2] FEEDBACK GENERATION\n")
+            f.write(f"  - Score: {self._get_safe_val(scores, 'task2_scores', i)}\n")
+            f.write(f"  - Model Feedback:\n{feedback_texts[i] if feedback_texts else 'N/A'}\n")
+            f.write(f"  - VLM Evaluation: {self._get_safe_val(reward_extra_infos_dict, 'task2_reward_response', i)}\n")
+            f.write(f"  - Hallucination Check: {self._get_safe_val(reward_extra_infos_dict, 'task2_hallucination_check_response', i)}\n\n")
 
-                # Save regenerated image (Task 3)
-                if regen_imgs_pil_list is not None and len(regen_imgs_pil_list) > i:
-                    regen_path = os.path.join(image_dir, f"regen_img_{pid}_{id}_{i}.png")
-                    PIL.Image.fromarray(regen_imgs_pil_list[i].astype(np.uint8)).save(regen_path)
-                    f.write(f"Regenerated Image: regen_img_{pid}_{id}_{i}.png\n")
-                    if "task3_scores" in scores and len(scores["task3_scores"]) > i:
-                        task3_score = scores["task3_scores"][i]
-                        f.write(f"Task3 Score: {task3_score}\n")
-                    f.write("\n")
+            # Task 3
+            f.write(f"🔄 [TASK 3] RE-GENERATION\n")
+            f.write(f"  - Score: {self._get_safe_val(scores, 'task3_scores', i)}\n")
+            f.write(f"  - Path: {paths['regen']}\n")
+            f.write(f"  - Edit Adherence: {self._get_safe_val(reward_extra_infos_dict, 'task3_regeneration_followed_by_editing_response', i)}\n")
+            f.write(f"  - VLM Final Reason: {self._get_safe_val(reward_extra_infos_dict, 'task3_reward_response', i)}\n\n")
 
-                # Save ground truth image
-                if gts_imgs is not None and len(gts_imgs) > i and gts_imgs[i] is not None:
-                    ground_truth_path = os.path.join(image_dir, f"ground_truth_{pid}_{id}.png")
-                    if not os.path.exists(ground_truth_path):
-                        PIL.Image.open(gts_imgs[i]).convert("RGB").save(ground_truth_path)
-                        f.write(f"Ground Truth Image: ground_truth_{pid}_{id}.png\n\n")
-
-                # Save summary
-                if summarizes is not None and len(summarizes) > i and summarizes[i] is not None:
-                    summary = summarizes[i]
-                    f.write(f"Summary:\n{summary}\n\n")
-
-                # Save ground truth tuples and VQA
-                if gts_tuples is not None and len(gts_tuples) > i:
-                    ground_truth_tuple = gts_tuples[i]
-                    f.write(f"Ground Truth Tuple:\n{ground_truth_tuple}\n")
-                if gts_vqas is not None and len(gts_vqas) > i:
-                    ground_truth_vqa_question = gts_vqas[i]
-                    f.write(f"Ground Truth VQA:\n{ground_truth_vqa_question}\n\n")
-
-                # Save reward extra info (response, sub task reward)
-                for key, value in reward_extra_infos_dict.items():
-                    if key in value and len(value[key]) > i:
-                        f.write(f"Reward Extra Infos:\n{key}:\n{value[key][i]}\n\n")
-
-                f.write("=" * 40 + "\n\n")
-        
-        print(f"Dumped generations to {filename}")
+            # Ground Truth
+            f.write(f"📚 [GROUND TRUTH REFERENCE]\n")
+            f.write(f"  - GT Image: {paths['gt']}\n")
+            f.write(f"  - Summary: {summarizes[i] if summarizes else 'N/A'}\n")
+            f.write(f"  - Tuples: {gts_tuples[i] if gts_tuples else 'N/A'}\n")
+            f.write("=" * 100 + "\n")
 
     def _log_rollout_data(
         self, batch: DataProto, reward_extra_infos_dict: dict, timing_raw: dict, rollout_data_dir: str
@@ -576,6 +631,8 @@ class RayImageGenerationTrainer(RayPPOTrainer):
         sample_task3_scores = []
         self.val_reward_fn.steps = self.global_steps
 
+        val_data_dir = self.config.trainer.get("validation_data_dir", "validation")
+
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
 
@@ -591,6 +648,9 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             test_gen_batch = self._get_gen_batch(test_batch)
             test_output_gen_batch = self.actor_rollout_wg.generate_sequences(test_gen_batch)
             print('validation generation end')
+
+            batch_scores = {}
+            batch_reward_extra_infos = defaultdict(list)
 
             prompts = test_output_gen_batch.non_tensor_batch['prompt'].tolist()
             sample_prompts.extend(prompts)
@@ -619,12 +679,35 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                 # Compute per-sample scores
                 per_sample_scores = task_reward_tensor.sum(-1).cpu().tolist()
 
+                batch_scores[f"task{task_id}_scores"] = per_sample_scores
+                extra_info = task_reward_dict.get(f"task{task_id}_reward_extra_info", {})
+                for k, v in extra_info.items():
+                    batch_reward_extra_infos[k].extend(v)
+
                 if task_id == 1:
                     sample_task1_scores.extend(per_sample_scores)
                 elif task_id == 2:
                     sample_task2_scores.extend(per_sample_scores)
                 else:
                     sample_task3_scores.extend(per_sample_scores)
+
+            self._dump_generations(
+                uid=test_batch.non_tensor_batch["uid"].tolist(),
+                prompt_id=test_batch.non_tensor_batch["prompt_id"].tolist(),
+                prompt=test_batch.non_tensor_batch["prompt"].tolist(),
+                gen_imgs_pil_list=test_output_gen_batch.non_tensor_batch.get('task1_gen_imgs_pil_list'),
+                feedback_texts=test_output_gen_batch.non_tensor_batch.get('task2_feedback_texts'),
+                # Regen이 없으면 .get()에 의해 자동으로 None이 들어감
+                regen_imgs_pil_list=test_output_gen_batch.non_tensor_batch.get('task3_regen_imgs_pil_list'), 
+                gts_imgs=[item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_batch],
+                summarizes=[item.non_tensor_batch.get("reward_model", {}).get("summary", None) for item in test_batch],
+                gts_tuples=[item.non_tensor_batch.get("reward_model", {}).get("tuple", None) for item in test_batch],
+                gts_vqas=[item.non_tensor_batch.get("reward_model", {}).get("vqa_question", None) for item in test_batch],
+                scores=batch_scores,
+                reward_extra_infos_dict=batch_reward_extra_infos,
+                dump_path=val_data_dir
+                )
+
 
             batch_size = len(prompts)
             data_source = test_batch.non_tensor_batch.get('data_source', ['unknown'] * batch_size)

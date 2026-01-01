@@ -288,6 +288,8 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
         if self.async_rollout_manager is None:
             await self._init_async_rollout_manager()
 
+        val_data_dir = self.config.trainer.get("validation_data_dir", "validation")
+
         # task reward tensors collection
         task_reward_tensors = {1: [], 2: [], 3: []}
         task_reward_extra_infos = {1: [], 2: [], 3: []}
@@ -451,6 +453,8 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                                 server_index=server_index,
                                 on_task_complete=on_task_complete
                             )
+                            
+                            val_server_token_q.put_nowait(server_index)
 
                             # Send to reward worker for finalization (don't wait here!)
                             await reward_finalize_queue.put((test_batch, test_output_gen_batch, reward_tensor_dict, reward_reward_extra_infos, reward_tasks, val_batch_idx_list))
@@ -464,8 +468,7 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                             # Immediately continue to next batch (server stays busy!)
 
                     finally:
-                        # Return server token when worker exits
-                        val_server_token_q.put_nowait(server_index)
+                        pass
 
                 # Start producer
                 producer_task = asyncio.create_task(_val_producer_worker())

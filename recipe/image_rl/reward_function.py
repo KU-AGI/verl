@@ -26,10 +26,10 @@ from recipe.image_rl.gdino_regex import _CONNECTORS, SKIP_KEYWORDS, _COMPILED_RE
 # Configuration
 BASE_URLS = [
     # "http://10.100.44.4:8006/v1", # main1
-    "http://10.100.44.2:8006/v1", # sub1
-    "http://10.100.44.2:8007/v1",
-    "http://10.100.44.8:8006/v1", # sub2
+    "http://10.100.44.8:8006/v1", # sub1
     "http://10.100.44.8:8007/v1",
+    "http://10.100.44.2:8006/v1", # sub2
+    "http://10.100.44.2:8007/v1",
 ]
 API_KEY = "EMPTY"
 MAX_RETRIES = 3
@@ -45,10 +45,10 @@ RECOVERY_CHECK_INTERVAL = 60  # seconds to wait before checking if unhealthy ser
 DETECTOR_URLS = [
     # "http://10.100.44.4:8086", # main1
     # "http://10.100.44.4:8087",
-    # "http://10.100.44.2:8086", # sub1
-    # "http://10.100.44.2:8087",
-    "http://10.100.44.8:8086", # sub2
-    "http://10.100.44.8:8087",
+    # "http://10.100.44.8:8086", # sub1
+    # "http://10.100.44.8:8087",
+    "http://10.100.44.2:8086", # sub2
+    "http://10.100.44.2:8087",
 ]
 DETECTOR_TIMEOUT = 300000.0
 
@@ -407,8 +407,8 @@ def get_messages_task2_hallucination_check(*args): # 2: part 3
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": [
-            {"type": "image_url", "image_url": {"url": convert_gen_img_to_base64(ground_truth_img)}},
-            {"type": "text", "text": f"question: {vqa_question}"},
+            {"type": "image_url", "image_url": {"url": convert_gen_img_to_base64(gen_img)}},
+            {"type": "text", "text": f"tuple: {predicted_tuple}"},
             {"type": "text", "text": f"answer: {predicted_answer}"}
         ]}
     ]
