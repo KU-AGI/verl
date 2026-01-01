@@ -115,12 +115,12 @@ require_batches=1
 partial_rollout=False
 log_prob_micro_batch_size_per_gpu=1
 
-test_freq=1
-save_freq=1 # $((test_freq * trigger_parameter_sync_step * 1))
+test_freq=100
+save_freq=# $((test_freq * trigger_parameter_sync_step * 1))
 total_epochs=10
 # total_training_steps=3000
-rollout_freq=1
-log_val_generations=1
+rollout_freq=50
+# log_val_generations=1
 
 ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     --working-dir "${WORKING_DIR}" \
@@ -222,7 +222,6 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     trainer.rollout_data_dir="$CKPTS_DIR/rollout" \
     trainer.rollout_freq=${rollout_freq} \
     trainer.validation_data_dir="$CKPTS_DIR/validation" \
-    trainer.log_val_generations=${log_val_generations} \
     trainer.nnodes="${NNODES}" \
     trainer.n_gpus_per_node="${n_gpus_training}" \
     rollout.nnodes="${NNODES}" \
@@ -230,7 +229,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     actor_rollout_ref.rollout.agent.num_workers=$((NNODES * n_gpus_rollout)) \
     rollout.total_rollout_steps="${total_rollout_steps}" \
     rollout.total_epochs="${total_epochs}" \
-    rollout.test_freq="${test_freq}" \
+    trainer.test_freq="${test_freq}" \
     async_training.rollout_prompt_size="${rollout_prompt_size}" \
     async_training.val_rollout_prompt_size="${val_rollout_prompt_size}" \
     async_training.staleness_threshold="${staleness_threshold}" \

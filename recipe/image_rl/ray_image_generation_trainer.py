@@ -443,7 +443,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                 t1 = self._get_safe_val(scores, 'task1_scores', i, 0.0)
                 t2 = self._get_safe_val(scores, 'task2_scores', i, 0.0)
                 t3 = self._get_safe_val(scores, 'task3_scores', i, 0.0)
-                total = t1 + t2 + t3
+                total = t1 + t2 + t3 > 0 # exclude -100
                 
                 summary_rows.append(f"rollout_{r_idx:<3} | {t1:<5.2f} | {t2:<5.2f} | {t3:<5.2f} | {total:<6.2f} | {paths['gen']:<65} | {paths['regen']}")
 
@@ -514,30 +514,48 @@ class RayImageGenerationTrainer(RayPPOTrainer):
 
             # Task 1
             f.write(f"🖼️ [TASK 1] INITIAL GEN\n")
-            f.write(f"  - Score: {self._get_safe_val(scores, 'task1_scores', i)}\n")
+            f.write(f"  - Total Score: {self._get_safe_val(scores, 'task1_scores', i)}\n")
+            f.write(f"  - VLM Reward: {self._get_safe_val(reward_extra_infos_dict, 'task1_vlm_reward', i)}\n")
+            f.write(f"  - Detector Reward: {self._get_safe_val(reward_extra_infos_dict, 'task1_detector_reward', i)}\n")
+            f.write(f"  - VLM+Detector Bonus: {self._get_safe_val(reward_extra_infos_dict, 'task1_vlm_detector_bonus', i)}\n")
             f.write(f"  - Path: {paths['gen']}\n")
-            f.write(f"  - VLM Reason:\n{self._get_safe_val(reward_extra_infos_dict, 'task1_reward_response', i)}\n")
-            f.write(f"  - Detector Result: {self._get_safe_val(reward_extra_infos_dict, 'task1_detector_response', i)}\n\n")
+            f.write(f"  - VLM Response:\n{self._get_safe_val(reward_extra_infos_dict, 'task1_reward_response', i)}\n")
+            f.write(f"  - Detector Response:\n{self._get_safe_val(reward_extra_infos_dict, 'task1_detector_response', i)}\n\n")
 
             # Task 2
             f.write(f"💬 [TASK 2] FEEDBACK GENERATION\n")
-            f.write(f"  - Score: {self._get_safe_val(scores, 'task2_scores', i)}\n")
+            f.write(f"  - Total Score: {self._get_safe_val(scores, 'task2_scores', i)}\n")
+            f.write(f"  - Part1 Reward (F1 + Consistency): {self._get_safe_val(reward_extra_infos_dict, 'task2_part1_reward', i)}\n")
+            f.write(f"  - VLM Reward: {self._get_safe_val(reward_extra_infos_dict, 'task2_vlm_reward', i)}\n")
+            f.write(f"  - Comparison Summarize Score: {self._get_safe_val(reward_extra_infos_dict, 'task2_comparison_summarize_score', i)}\n")
+            f.write(f"  - Comparison Tuple Score: {self._get_safe_val(reward_extra_infos_dict, 'task2_comparison_tuple_score', i)}\n")
+            f.write(f"  - Hallucination Check Score: {self._get_safe_val(reward_extra_infos_dict, 'task2_hallucination_check_score', i)}\n")
+            f.write(f"  - Edit Instruction Score: {self._get_safe_val(reward_extra_infos_dict, 'task2_edit_instruction_score', i)}\n")
             f.write(f"  - Model Feedback:\n{feedback_texts[i] if feedback_texts else 'N/A'}\n")
-            f.write(f"  - VLM Evaluation: {self._get_safe_val(reward_extra_infos_dict, 'task2_reward_response', i)}\n")
-            f.write(f"  - Hallucination Check: {self._get_safe_val(reward_extra_infos_dict, 'task2_hallucination_check_response', i)}\n\n")
+            f.write(f"  - VLM Response:\n{self._get_safe_val(reward_extra_infos_dict, 'task2_reward_response', i)}\n")
+            f.write(f"  - Comparison Summarize Response:\n{self._get_safe_val(reward_extra_infos_dict, 'task2_comparison_summarize_response', i)}\n")
+            f.write(f"  - Comparison Tuple Response:\n{self._get_safe_val(reward_extra_infos_dict, 'task2_comparison_tuple_response', i)}\n")
+            f.write(f"  - Hallucination Check Response:\n{self._get_safe_val(reward_extra_infos_dict, 'task2_hallucination_check_response', i)}\n")
+            f.write(f"  - Edit Instruction Response:\n{self._get_safe_val(reward_extra_infos_dict, 'task2_edit_instruction_response', i)}\n\n")
 
             # Task 3
             f.write(f"🔄 [TASK 3] RE-GENERATION\n")
-            f.write(f"  - Score: {self._get_safe_val(scores, 'task3_scores', i)}\n")
+            f.write(f"  - Total Score: {self._get_safe_val(scores, 'task3_scores', i)}\n")
+            f.write(f"  - VLM Reward: {self._get_safe_val(reward_extra_infos_dict, 'task3_vlm_reward', i)}\n")
+            f.write(f"  - Detector Reward: {self._get_safe_val(reward_extra_infos_dict, 'task3_detector_reward', i)}\n")
+            f.write(f"  - VLM+Detector Bonus: {self._get_safe_val(reward_extra_infos_dict, 'task3_vlm_detector_bonus', i)}\n")
+            f.write(f"  - Regeneration Followed by Editing Reward: {self._get_safe_val(reward_extra_infos_dict, 'task3_regeneration_followed_by_editing_reward', i)}\n")
             f.write(f"  - Path: {paths['regen']}\n")
-            f.write(f"  - Edit Adherence: {self._get_safe_val(reward_extra_infos_dict, 'task3_regeneration_followed_by_editing_response', i)}\n")
-            f.write(f"  - VLM Final Reason: {self._get_safe_val(reward_extra_infos_dict, 'task3_reward_response', i)}\n\n")
+            f.write(f"  - VLM Response:\n{self._get_safe_val(reward_extra_infos_dict, 'task3_reward_response', i)}\n")
+            f.write(f"  - Detector Response:\n{self._get_safe_val(reward_extra_infos_dict, 'task3_detector_response', i)}\n")
+            f.write(f"  - Regeneration Followed by Editing Response:\n{self._get_safe_val(reward_extra_infos_dict, 'task3_regeneration_followed_by_editing_response', i)}\n\n")
 
             # Ground Truth
             f.write(f"📚 [GROUND TRUTH REFERENCE]\n")
             f.write(f"  - GT Image: {paths['gt']}\n")
             f.write(f"  - Summary: {summarizes[i] if summarizes else 'N/A'}\n")
             f.write(f"  - Tuples: {gts_tuples[i] if gts_tuples else 'N/A'}\n")
+            f.write(f"  - VQA Questions: {gts_vqas[i] if gts_vqas else 'N/A'}\n")
             f.write("=" * 100 + "\n")
 
     def _log_rollout_data(
