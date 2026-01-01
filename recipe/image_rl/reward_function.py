@@ -808,32 +808,24 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
             reward_score += 0.0
             reward_extra_info[f"task{task_id}_vlm_detector_bonus"] = 0.0
 
-    elif task_id == 2: # Total score: 1.0 (normalized)
+    elif task_id == 2:
         task2_reward_score = 0.0
-        # task2_ans_count = 0
-
-        task2_reward_score += 1.0 if all(part is not None for part in [predicted_tuple, predicted_answer, predicted_feedback]) else 0.0
-        # task2_ans_count += 1
 
         # Call FormattingEvaluator
         formatting_evaluator = FormattingEvaluatorV2()
 
         # Rule-based: formatting reward
-        task2_is_exactly_three_parts = all(part is not None for part in [predicted_tuple, predicted_answer, predicted_feedback])
-        task2_reward_score += 1.0 if task2_is_exactly_three_parts else 0.0
-        reward_extra_info[f"task{task_id}_formatting_reward"] = 1.0 if task2_is_exactly_three_parts else 0.0
-        # task2_ans_count += 1
+        task2_reward_score += 1.0 if all(part is not None for part in [predicted_summarize,predicted_tuple, predicted_answer, predicted_feedback]) else 0.0 # +1
 
         # Rule-based: part 1 scoring
-        feedback_parsed_tuple = formatting_evaluator._parse_part1(feedback_tuple)
-        predict_parsed_tuple = formatting_evaluator._parse_part1(predicted_tuple)
+        feedback_parsed_tuple = formatting_evaluator._parse_part1(feedback_tuple) # GT Tuple
+        predict_parsed_tuple = formatting_evaluator._parse_part1(predicted_tuple) # Pred  Tuple
         predict_decomposed_ans = formatting_evaluator._extract_answer_paragraphs(predicted_answer)
 
         part1_reward_dict = formatting_evaluator._calculate_metrics_for_reward(feedback_parsed_tuple, predict_parsed_tuple, predict_decomposed_ans)
         task2_part1_reward = sum(part1_reward_dict.values())
         task2_reward_score += task2_part1_reward
-        reward_extra_info[f"task{task_id}_part1_reward"] = task2_part1_reward
-        # task2_ans_count += len(part1_reward_dict)
+        reward_extra_info[f"task{task_id}_part1_reward"] = task2_part1_reward # +2
 
         # Launch all API requests in parallel
         args = (prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback, vqa_question, extra_info, task_id)

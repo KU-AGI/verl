@@ -38,7 +38,6 @@ If **all ANSWERS are "Yes"**, there is **no need to generate feedback** — the 
 {
   "reason": "All tuples were labeled 'Yes', meaning no edits are required."
   "label": "no_feedback_needed",
-}
 
 ### Labels
 - "targeted_only" : feedback changes only the No-labeled tuples.
