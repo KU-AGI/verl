@@ -156,75 +156,62 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         return self.actor_wg
 
     def _get_samples_from_queue(self) -> tuple[None, None] | tuple[int, Any]:
-        """
-        Get samples from message queue and compose gen_batch_output
-        Uses a loop to continuously collect samples until enough are gathered
-
-        Returns:
-            tuple: (epoch, batch_dict, gen_batch_output)
-        """
-
         print(
-            f"[FullyAsyncTrainer] Requesting {self.required_samples} samples from queue",
+            f"[FullyAsyncTrainer] Requesting {self.required_samples} rows from queue",
             flush=True,
         )
 
         consumer_start = time.time()
         queue_samples = []
+        current_rows = 0
         queue_len = 0
 
-        # Collect individual samples until we have enough
-        while len(queue_samples) < self.required_samples:
+        while current_rows < self.required_samples:
             result = self.message_queue_client.get_sample_sync()
 
             if result is None:
-                print(
-                    f"[FullyAsyncTrainer] Detected termination signal (None), stopping sample collection. "
-                    f"Collected {len(queue_samples)}/{self.required_samples} samples"
-                )
+                print(f"[FullyAsyncTrainer] Termination signal. Collected {current_rows}/{self.required_samples} rows.")
                 break
 
-            # result = (sample_data, queue_len)
             sample_data, queue_len = result
-
             if sample_data is None:
-                print(
-                    f"[FullyAsyncTrainer] Detected termination signal (None), stopping sample collection. "
-                    f"Collected {len(queue_samples)}/{self.required_samples} samples"
-                )
+                f"[FullyAsyncTrainer] Detected termination signal (None), stopping sample collection. "
                 break
 
-            queue_samples.append(sample_data)  # serialized sample
+            deserialized_sample = ray.cloudpickle.loads(sample_data)
+            num_rows_in_sample = len(deserialized_sample.full_batch)
 
-            if len(queue_samples) % 10 == 0:
-                print(
-                    f"[FullyAsyncTrainer] Collected {len(queue_samples)}/{self.required_samples} samples. "
-                    f"mq_len: {queue_len}"
-                )
+            queue_samples.append(deserialized_sample)
+            current_rows += num_rows_in_sample
+
+            
+            print(
+                f"[FullyAsyncTrainer] Progress: {current_rows}/{self.required_samples} rows "
+                f"({len(queue_samples)} groups collected). mq_len: {queue_len}"
+            )
 
         consumer_end = time.time()
 
-        if not queue_samples or len(queue_samples) < self.required_samples:
-            print(f"[FullyAsyncTrainer] not enough samples collected: {len(queue_samples)}/{self.required_samples}")
+        if not queue_samples or current_rows < self.required_samples:
+            print(f"[FullyAsyncTrainer] Not enough rows collected: {current_rows}/{self.required_samples}")
             return None, None
 
         total_wait_time = consumer_end - consumer_start
 
         print(
-            f"[FullyAsyncTrainer] Loop collection completed: {len(queue_samples)}/{self.required_samples} samples, "
-            f"total wait time: {total_wait_time:.2f} seconds. mq_len: {queue_len}"
+            f"[FullyAsyncTrainer] Collection completed: {current_rows} rows from {len(queue_samples)} groups. "
+            f"Wait time: {total_wait_time:.2f}s."
         )
 
-        queue_samples = [ray.cloudpickle.loads(x) for x in queue_samples]
-        # Assemble batch - now working directly with RolloutSample objects
         if self.config.trainer.balance_batch:
             batch = assemble_batch_from_rollout_samples(queue_samples, self.tokenizer, self.config, self._balance_batch)
         else:
             batch = assemble_batch_from_rollout_samples(queue_samples, self.tokenizer, self.config, None)
 
         batch.meta_info["fully_async/total_wait_time"] = total_wait_time
-        batch.meta_info["fully_async/total_sample_count"] = len(queue_samples)
-        batch.meta_info["fully_async/batch_count"] = len(queue_samples)
+        batch.meta_info["fully_async/total_sample_count"] = current_rows
+        batch.meta_info["fully_async/batch_size"] = current_rows
+        
         return 0, batch
 
     def _create_actor_rollout_classes(self):

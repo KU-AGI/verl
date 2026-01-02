@@ -20,6 +20,7 @@ import numpy as np
 import ray
 import torch
 from ray import ObjectRef
+import uuid
 
 from recipe.fully_async_policy_image_rl.detach_utils import (
     RolloutSample,
@@ -492,7 +493,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             full_batch = prepare_single_generation_data(
                 batch_dict, self.global_steps, self.config.actor_rollout_ref.rollout.n
             )
-
+            
             # Accumulate batches
             full_batch_list.append(full_batch)
 
@@ -523,11 +524,20 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
     async def _merge_and_send(self, batch_list, epoch, current_steps):
         """Helper function to merge batch list and send to pending queue"""
         # Merge batches using DataProto.concat
-        merged_batch = DataProto.concat(batch_list)
-        batch_size = len(merged_batch)
+
+        num_prompts = len(batch_list)
+
+        for i, dp in enumerate(batch_list):
+            n_completions = len(dp)
+
+            prompt_idx = current_steps - num_prompts + i
+            unique_uid = f"uid_{epoch}_{prompt_idx}"
+            dp.non_tensor_batch["uid"] = np.array([unique_uid] * n_completions, dtype=object)
 
         # Ensure unique sample_id to avoid conflicts
         sample_id = f"chunk_sample_{epoch}_{current_steps}"
+        merged_batch = DataProto.concat(batch_list)
+        batch_size = len(merged_batch)
 
         rollout_sample = RolloutSample(
             full_batch=merged_batch,
@@ -795,15 +805,12 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
     async def _streaming_generation_main(self):
         """The main entry method for stream processing"""
 
-        # we start from step 1
-        self.global_steps += 1
-
         if self.async_rollout_manager is None:
             await self._init_async_rollout_manager()
 
         # Start the streaming loop
         print(f"[FullyAsyncRollouter] Start streaming mode, maximum concurrent samples: {self.max_concurrent_samples}")
-
+        
         # Start sample feed and processor coroutines (no consumer worker needed)
         self.feed_task = asyncio.create_task(self._feed_samples())
         self.processor_task = asyncio.create_task(self._processor_worker())
@@ -885,7 +892,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                         param_version=individual_sample.param_version,
                     )
                     if success:
-                        success_count += 1
+                        success_count += len(individual_sample.full_batch)
 
                 async with self.lock:
                     self.total_generated_samples += success_count

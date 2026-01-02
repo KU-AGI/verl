@@ -233,24 +233,19 @@ def merge_rollout_sample(config, tokenizer, rs: RolloutSample, processor):
     """
     batch_size = len(rs.full_batch)
     
-    # Step 1: Add uid
-    rs.full_batch.non_tensor_batch["uid"] = np.array(
-        [f"uid_{rs.sample_id}"] * batch_size, dtype=object
-    )
-    
-    # Step 2: Set processing_times from meta_info
+    # Step 1: Set processing_times from meta_info
     rs.processing_times = rs.full_batch.meta_info.get("metrics", {}).get(
         "generate_sequences", [0.0] * batch_size
     )
     
-    # Step 3: Extract param_version_start and param_version_end from meta_info
+    # Step 2: Extract param_version_start and param_version_end from meta_info
     rs.param_version_start = [rs.full_batch.meta_info.get("param_version_start", 0)] * batch_size
     rs.param_version_end = [rs.full_batch.meta_info.get("param_version_end", 0)] * batch_size
     
-    # Step 4: Clear agent_loop_output_list
+    # Step 3: Clear agent_loop_output_list
     rs.agent_loop_output_list = []
     
-    # Step 5: Mask invalid rewards (-100) for each task
+    # Step 4: Mask invalid rewards (-100) for each task
     for task_id in [1, 2, 3]:  # task1, task2, task3
         scores_key = f"task{task_id}_token_level_scores"
         response_mask_key = f"task{task_id}_response_mask"
@@ -271,34 +266,43 @@ def merge_rollout_sample(config, tokenizer, rs: RolloutSample, processor):
 
 
 def expand_rollout_sample(rs: RolloutSample) -> list[RolloutSample]:
-    """
-    Expand a merged RolloutSample (containing multiple samples in batch)
-    back into individual RolloutSamples.
+    uids = rs.full_batch.non_tensor_batch['uid']
+    original_batch_size = len(uids)
+    
+    uid_to_indices = {}
+    for i, uid in enumerate(uids):
+        if uid not in uid_to_indices:
+            uid_to_indices[uid] = []
+        uid_to_indices[uid].append(i)
 
-    This reverses the merge operation and creates individual samples
-    that can be sent through the original put_sample/get_sample pattern.
-    """
-    batch_size = len(rs.full_batch)
+    def deep_slice(data, indices, batch_size):
+        if isinstance(data, dict):
+            return {k: deep_slice(v, indices, batch_size) for k, v in data.items()}
+        elif isinstance(data, list) and len(data) == batch_size:
+            return [data[i] for i in indices]
+        return data
+
     individual_samples = []
 
-    for i in range(batch_size):
-        # Extract single item from batch using DataProto slicing
-        single_batch = rs.full_batch[i:i+1]
+    for uid, indices in uid_to_indices.items():
+        group_batch = rs.full_batch[indices]
+        
+        if hasattr(group_batch, 'meta_info') and group_batch.meta_info:
+            group_batch.meta_info = deep_slice(group_batch.meta_info, indices, original_batch_size)
 
-        # Create individual RolloutSample
+        group_sample_id = f"{rs.sample_id}_{uid}"
         individual_sample = RolloutSample(
-            full_batch=single_batch,
-            agent_loop_output_list=[],  # Already cleared in merge_rollout_sample
-            sample_id=f"{rs.sample_id}_idx{i}",
+            full_batch=group_batch,
+            agent_loop_output_list=[], 
+            sample_id=group_sample_id,
             epoch=rs.epoch,
             tool_calls=rs.tool_calls,
             param_version=rs.param_version,
-            param_version_start=[rs.param_version_start[i]] if rs.param_version_start else [0],
-            param_version_end=[rs.param_version_end[i]] if rs.param_version_end else [0],
-            processing_times=[rs.processing_times[i]] if rs.processing_times else [0.0],
+            param_version_start=[rs.param_version_start[i] for i in indices] if isinstance(rs.param_version_start, list) else rs.param_version_start,
+            param_version_end=[rs.param_version_end[i] for i in indices] if isinstance(rs.param_version_end, list) else rs.param_version_end,
+            processing_times=[rs.processing_times[i] for i in indices] if rs.processing_times else [0.0],
             rollout_status=rs.rollout_status,
         )
-
         individual_samples.append(individual_sample)
 
     return individual_samples
@@ -313,17 +317,23 @@ def assemble_batch_from_rollout_samples(
     if not rollout_samples:
         raise ValueError("Empty rollout_samples provided")
 
-    n_samples = len(rollout_samples)
-    print(f"[BatchUtils] Assembling batch from {n_samples} RolloutSample objects")
+    n_groups = len(rollout_samples)
+    total_rows = sum(len(rs.full_batch) for rs in rollout_samples)
+    print(f"[BatchUtils] Assembling batch from {n_groups} groups (Total {total_rows} samples)")
 
     # Pre-allocate lists
     rollout_samples_batch = [rs.full_batch for rs in rollout_samples]
+    final_batch = DataProto.concat(rollout_samples_batch)
+
     processing_times = [t for rs in rollout_samples for t in rs.processing_times]
+
+    all_param_versions = []
+    for rs in rollout_samples:
+        num_in_group = len(rs.full_batch)
+        all_param_versions.extend([rs.param_version] * num_in_group)
     
     # Prefix rollout_status once
     rollout_status = {f"fully_async/{k}": v for k, v in rollout_samples[0].rollout_status.items()}
-
-    final_batch = DataProto.concat(rollout_samples_batch)
 
     if balance_batch:
         balance_batch(final_batch, metrics={})
@@ -351,8 +361,8 @@ def assemble_batch_from_rollout_samples(
     n_diff = len(param_version_diff)
 
     final_batch.meta_info.update({
-        "rollout_param_versions": param_versions,
-        "param_version_diversity": len(set(param_versions)),
+        "rollout_param_versions": all_param_versions,
+        "param_version_diversity": len(set(all_param_versions)),
         "trajectory_param_versions": [v for rs in rollout_samples for v in rs.param_version_end],
         "fully_async/processing_time/avg": pt_arr.mean(),
         "fully_async/processing_time/max": pt_arr.max(),

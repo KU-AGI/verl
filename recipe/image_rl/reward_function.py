@@ -859,7 +859,7 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
         task2_vlm_reward_score = 0.0
         if not isinstance(response, Exception) and response is not None:
             try:
-                raw_json = json.loads(response)
+                raw_json = safe_json_loads(response)
                 label_response = raw_json.get("label", "").lower()
                 if label_response in ["targeted_only", "no_feedback_needed"]:
                     task2_vlm_reward_score = 1.0
@@ -885,7 +885,7 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
         task2_comparison_summarize_score = 0.0
         if not isinstance(comparison_summarize_response, Exception) and comparison_summarize_response is not None:
             try:
-                reward_data = json.loads(comparison_summarize_response)
+                reward_data = safe_json_loads(comparison_summarize_response)
                 task2_comparison_summarize_score = float(reward_data.get("score", 0.0))
                 task2_reward_score += task2_comparison_summarize_score
                 # task2_ans_count += 1
@@ -903,7 +903,7 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
         task2_comparison_tuple_score = 0.0
         if not isinstance(comparison_tuple_response, Exception) and comparison_tuple_response is not None:
             try:
-                reward_data = json.loads(comparison_tuple_response)
+                reward_data = safe_json_loads(comparison_tuple_response)
                 task2_comparison_tuple_score = float(reward_data.get("accuracy", 0.0))
                 task2_reward_score += task2_comparison_tuple_score
                 # task2_ans_count += 1
@@ -921,7 +921,7 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
         task2_hallucination_check_score = 0.0
         if not isinstance(hallucination_check_response, Exception) and hallucination_check_response is not None:
             try:
-                reward_data = json.loads(hallucination_check_response)
+                reward_data = safe_json_loads(hallucination_check_response)
                 task2_hallucination_check_score = float(reward_data.get("accuracy", 0.0))
                 task2_reward_score += task2_hallucination_check_score
                 # task2_ans_count += 1
@@ -939,7 +939,7 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
         task2_edit_instruction_score = 0.0
         if not isinstance(edit_instruction_response, Exception) and edit_instruction_response is not None:
             try:
-                reward_data = json.loads(edit_instruction_response)
+                reward_data = safe_json_loads(edit_instruction_response)
                 task2_edit_instruction_score = float(reward_data.get("score", 0.0))
                 task2_reward_score += task2_edit_instruction_score
                 # task2_ans_count += 1
@@ -1014,7 +1014,7 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
         task3_regeneration_followed_by_editing_reward_score = 0.0
         if not isinstance(regeneration_followed_by_editing_response, Exception) and regeneration_followed_by_editing_response is not None:
             try:
-                reward_data = json.loads(regeneration_followed_by_editing_response)
+                reward_data = safe_json_loads(regeneration_followed_by_editing_response)
                 task3_regeneration_followed_by_editing_reward_score = float(reward_data.get("score", 0.0))
                 reward_score += task3_regeneration_followed_by_editing_reward_score
             except:
@@ -1142,3 +1142,13 @@ def is_meaningful_response(text: str) -> bool:
             return False
             
     return True
+
+def safe_json_loads(text):
+    try:
+        # Markdown 블록 제거 및 순수 JSON 추출
+        match = re.search(r'\{.*\}', text, re.DOTALL)
+        if match:
+            return json.loads(match.group())
+        return json.loads(text)
+    except:
+        return None
