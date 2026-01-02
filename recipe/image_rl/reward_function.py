@@ -25,11 +25,8 @@ from recipe.image_rl.gdino_regex import _CONNECTORS, SKIP_KEYWORDS, _COMPILED_RE
 
 # Configuration
 BASE_URLS = [
-    # "http://10.100.44.4:8006/v1", # main1
-    "http://10.100.44.8:8006/v1", # sub1
-    "http://10.100.44.8:8007/v1",
-    "http://10.100.44.2:8006/v1", # sub2
-    "http://10.100.44.2:8007/v1",
+    "http://192.169.0.3:8004/v1",
+    "http://192.169.0.3:8005/v1",
 ]
 API_KEY = "EMPTY"
 MAX_RETRIES = 3
@@ -43,12 +40,8 @@ RECOVERY_CHECK_INTERVAL = 60  # seconds to wait before checking if unhealthy ser
 
 # Detector configuration
 DETECTOR_URLS = [
-    # "http://10.100.44.4:8086", # main1
-    # "http://10.100.44.4:8087",
-    # "http://10.100.44.8:8086", # sub1
-    # "http://10.100.44.8:8087",
-    "http://10.100.44.2:8086", # sub2
-    "http://10.100.44.2:8087",
+    "http://192.169.0.3:8086",
+    "http://192.169.0.3:8087",
 ]
 DETECTOR_TIMEOUT = 300000.0
 
@@ -456,8 +449,8 @@ async def get_response_with_client(client, messages):
     response = await client.chat.completions.create(
         model=MODEL_NAME,
         messages=messages,
-        max_tokens=2048,
-        extra_body={"repetition_penalty": 1.2},
+        # max_tokens=2048,
+        # extra_body={"repetition_penalty": 1.2},
         timeout=300000.0,
     )
     return response.choices[0].message.content
