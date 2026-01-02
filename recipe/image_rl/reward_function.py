@@ -25,8 +25,11 @@ from recipe.image_rl.gdino_regex import _CONNECTORS, SKIP_KEYWORDS, _COMPILED_RE
 
 # Configuration
 BASE_URLS = [
-    "http://192.169.0.3:8004/v1",
-    "http://192.169.0.3:8005/v1",
+    # "http://10.100.44.4:8006/v1", # main1
+    "http://10.100.44.8:8006/v1", # sub1
+    "http://10.100.44.8:8007/v1",
+    "http://10.100.44.2:8006/v1", # sub2
+    "http://10.100.44.2:8007/v1",
 ]
 API_KEY = "EMPTY"
 MAX_RETRIES = 3
@@ -40,8 +43,12 @@ RECOVERY_CHECK_INTERVAL = 60  # seconds to wait before checking if unhealthy ser
 
 # Detector configuration
 DETECTOR_URLS = [
-    "http://192.169.0.3:8086",
-    "http://192.169.0.3:8087",
+    # "http://10.100.44.4:8086", # main1
+    # "http://10.100.44.4:8087",
+    # "http://10.100.44.8:8086", # sub1
+    # "http://10.100.44.8:8087",
+    "http://10.100.44.2:8086", # sub2
+    "http://10.100.44.2:8087",
 ]
 DETECTOR_TIMEOUT = 300000.0
 
@@ -369,11 +376,11 @@ def get_messsages_task2_comparison_summarize(*args): # 5: part 1
     prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback, vqa_question, extra_info, task_id = args
 
     system_prompt = TASK2_COMPARISON_SUMMARIZE_SYSTEM_PROMPT
+    user_prompt = "{\n    'prompt': {prompt},\n    'summarize': {predicted_summarize}\n}"
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": [
-            {"type": "text", "text": f"prompt: {prompt}"},
-            {"type": "text", "text": f"summarize: {predicted_summarize}"}
+            {"type": "text", "text": user_prompt.format(prompt, predicted_summarize)},
         ]}
     ]
 
@@ -383,11 +390,11 @@ def get_messages_task2_comparison_tuple(*args): # 1: part 2
     prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback, vqa_question, extra_info, task_id = args
 
     system_prompt = TASK2_COMPARISON_TUPLE_SYSTEM_PROMPT
+    user_prompt = "{\n    'GT': {feedback_tuple},\n    'Pred': {predicted_tuple}\n}"
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": [
-            {"type": "text", "text": f"GT: {feedback_tuple}"},
-            {"type": "text", "text": f"Pred: {predicted_tuple}"}
+            {"type": "text", "text": user_prompt.format(feedback_tuple, predicted_tuple)},
         ]}
     ]
 
@@ -398,12 +405,12 @@ def get_messages_task2_hallucination_check(*args): # 2: part 3
     prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback, vqa_question, extra_info, task_id = args
 
     system_prompt = TASK2_HALLUCINATION_CHECK_SYSTEM_PROMPT
+    user_prompt = "{\n    'tuple': {predicted_tuple},\n    'answer': {predicted_answer}\n}"
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": [
             {"type": "image_url", "image_url": {"url": convert_gen_img_to_base64(gen_img)}},
-            {"type": "text", "text": f"tuple: {predicted_tuple}"},
-            {"type": "text", "text": f"answer: {predicted_answer}"}
+            {"type": "text", "text": user_prompt.format(predicted_tuple, predicted_answer)},
         ]}
     ]
 
@@ -414,12 +421,11 @@ def get_messages_task2_edit_instruction(*args): # 3: part 4
     prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback, vqa_question, extra_info, task_id = args
 
     system_prompt = TASK2_EDIT_INSTRUCTION_SYSTEM_PROMPT
+    user_prompt = "{\n    'prompt': {prompt},\n    'answer': {predicted_answer}\n    'edit_instruction': {predicted_feedback}\n}"
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": [
-            {"type": "text", "text": f"prompt: {prompt}"},
-            {"type": "text", "text": f"answer: {predicted_answer}"},
-            {"type": "text", "text": f"edit_instruction: {predicted_feedback}"},
+            {"type": "text", "text": user_prompt.format(prompt, predicted_answer, predicted_feedback)},
         ]}
     ]
 
@@ -431,13 +437,13 @@ def get_messages_task3_regeneration_followed_by_editing(*args):
     prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback, vqa_question, extra_info, task_id = args
 
     system_prompt = TASK3_REGENERATION_FOLLOWED_BY_EDITING_SYSTEM_PROMPT
+    user_prompt = "{\n    'prompt': {prompt},\n    'edit_instruction': {predicted_feedback}\n}"
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": [
             {"type": "image_url", "image_url": {"url": convert_gen_img_to_base64(gen_img)}},
             {"type": "image_url", "image_url": {"url": convert_gen_img_to_base64(regen_img)}},
-            {"type": "text", "text": f"prompt: {prompt}"},
-            {"type": "text", "text": f"edit_instruction: {predicted_feedback}"},
+            {"type": "text", "text": user_prompt.format(prompt, predicted_feedback)},
         ]}
     ]
 
