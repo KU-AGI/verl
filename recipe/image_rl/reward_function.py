@@ -483,8 +483,6 @@ async def get_response(message_builder_fn, *args):
                 # Back off 
                 client_manager.record_request_result(sid, success=False,
                                                      error=ValueError("Non-meaningful response"))
-                delay = BASE_DELAY * (2 ** min(attempt, 3)) + random.uniform(0, 1)
-                await asyncio.sleep(delay)
                 continue
             else:
                 client_manager.record_request_result(sid, success=True)
@@ -495,10 +493,6 @@ async def get_response(message_builder_fn, *args):
 
         finally:
             await release_rm_client(sid)
-
-        # Exponential backoff before retrying
-        delay = BASE_DELAY * (2 ** min(attempt, 3)) + random.uniform(0, 1)
-        await asyncio.sleep(delay)
 
     return None
 
