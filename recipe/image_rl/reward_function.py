@@ -376,11 +376,11 @@ def get_messsages_task2_comparison_summarize(*args): # 5: part 1
     prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback, vqa_question, extra_info, task_id = args
 
     system_prompt = TASK2_COMPARISON_SUMMARIZE_SYSTEM_PROMPT
-    user_prompt = "{\n    'prompt': {prompt},\n    'summarize': {predicted_summarize}\n}"
+    user_prompt = json.dumps({"prompt": prompt, "summarize": predicted_summarize})
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": [
-            {"type": "text", "text": user_prompt.format(prompt, predicted_summarize)},
+            {"type": "text", "text": user_prompt},
         ]}
     ]
 
@@ -390,11 +390,11 @@ def get_messages_task2_comparison_tuple(*args): # 1: part 2
     prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback, vqa_question, extra_info, task_id = args
 
     system_prompt = TASK2_COMPARISON_TUPLE_SYSTEM_PROMPT
-    user_prompt = "{\n    'GT': {feedback_tuple},\n    'Pred': {predicted_tuple}\n}"
+    user_prompt = json.dumps({"GT": feedback_tuple, "PRED": predicted_tuple})
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": [
-            {"type": "text", "text": user_prompt.format(feedback_tuple, predicted_tuple)},
+            {"type": "text", "text": user_prompt},
         ]}
     ]
 
@@ -405,12 +405,12 @@ def get_messages_task2_hallucination_check(*args): # 2: part 3
     prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback, vqa_question, extra_info, task_id = args
 
     system_prompt = TASK2_HALLUCINATION_CHECK_SYSTEM_PROMPT
-    user_prompt = "{\n    'tuple': {predicted_tuple},\n    'answer': {predicted_answer}\n}"
+    user_prompt = json.dumps({"tuple": predicted_tuple, "answer": predicted_answer})
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": [
             {"type": "image_url", "image_url": {"url": convert_gen_img_to_base64(gen_img)}},
-            {"type": "text", "text": user_prompt.format(predicted_tuple, predicted_answer)},
+            {"type": "text", "text": user_prompt},
         ]}
     ]
 
@@ -421,11 +421,11 @@ def get_messages_task2_edit_instruction(*args): # 3: part 4
     prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback, vqa_question, extra_info, task_id = args
 
     system_prompt = TASK2_EDIT_INSTRUCTION_SYSTEM_PROMPT
-    user_prompt = "{\n    'prompt': {prompt},\n    'answer': {predicted_answer}\n    'edit_instruction': {predicted_feedback}\n}"
+    user_prompt = json.dumps({"prompt": prompt, "answer": predicted_answer, "edit_instruction": predicted_feedback})
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": [
-            {"type": "text", "text": user_prompt.format(prompt, predicted_answer, predicted_feedback)},
+            {"type": "text", "text": user_prompt},
         ]}
     ]
 
@@ -437,13 +437,13 @@ def get_messages_task3_regeneration_followed_by_editing(*args):
     prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback, vqa_question, extra_info, task_id = args
 
     system_prompt = TASK3_REGENERATION_FOLLOWED_BY_EDITING_SYSTEM_PROMPT
-    user_prompt = "{\n    'prompt': {prompt},\n    'edit_instruction': {predicted_feedback}\n}"
+    user_prompt = json.dumps({"prompt": prompt, "edit_instruction": predicted_feedback})
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": [
             {"type": "image_url", "image_url": {"url": convert_gen_img_to_base64(gen_img)}},
             {"type": "image_url", "image_url": {"url": convert_gen_img_to_base64(regen_img)}},
-            {"type": "text", "text": user_prompt.format(prompt, predicted_feedback)},
+            {"type": "text", "text": user_prompt},
         ]}
     ]
 
@@ -482,6 +482,7 @@ async def get_response(message_builder_fn, *args):
                 # Back off 
                 client_manager.record_request_result(sid, success=False,
                                                      error=ValueError("Non-meaningful response"))
+                print(response) # DEBUG
                 continue
             else:
                 client_manager.record_request_result(sid, success=True)

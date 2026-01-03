@@ -53,7 +53,6 @@ If **all ANSWERS are "Yes"**, there is **no need to generate feedback** — the 
 3. Output a single JSON object in this format:
 {
   "targeted_entities": ["..."],
-  "violations": ["..."], // if any
   "reason": "<short explanation>",
   "label": "targeted_only | non_target_touched | global_or_irrelevant"
 }
@@ -81,9 +80,6 @@ FEEDBACK:
 EXPECTED OUTPUT:
 {
   "targeted_entities": ["banana","background"],
-  "violations": [
-    "background color modified even though background was not part of any No-labeled tuple"
-  ],
   "reason": "Feedback correctly changes the banana (a No-labeled tuple) but also modifies the background, which was not among the No targets.",
   "label": "non_target_touched"
 }
@@ -390,17 +386,15 @@ Return exactly ONE JSON object:
   "num_wrong": int,
   "judgment": [
     {
-      "tuple": "<tuple[i]>",
-      "answer": "<answer[i]>",
       "is_correct": true/false,
-      "reason": {"tag": "<tag>", "detail": "<1 sentence>" or ""}
+      "reason": {"tag": "<tag>", "detail": "<MUST BE 1 short sentence>"}
     }
   ]
 }
 
 IMPORTANT:
 - "judgment" must follow the original input order and have length == total.
-- "reason.detail" must be 1 sentence and reference the evaluation criteria.
+- "reason.detail" MUST BE 1 short sentence and reference the evaluation criteria.
 - If is_correct == false, choose ONLY ONE tag from the Reason Tag Set, otherwise leave detail empty.
 
 
@@ -460,10 +454,10 @@ OUTPUT:
   "num_correct": 3,
   "num_wrong": 1,
   "judgment": [
-    {"tuple": "1 | entity - whole (apple)", "answer": "The image clearly shows a red apple placed on the table. Answer: Yes", "is_correct": true, "reason": {"tag": "pass", "detail": ""}},
-    {"tuple": "2 | entity - whole (table)", "answer": "The image shows a round wooden table lying on a surface with a metallic chair. Answer: Yes", "is_correct": true, "reason": {"tag": "pass", "detail": ""}},
-    {"tuple": "3 | attribute - color (apple, red)", "answer": "The apple is known to be red in color. Answer: Yes", "is_correct": false, "reason": {"tag": "insufficient_evidence", "detail": "Uses prior knowledge ('known to be') instead of image evidence."}},
-    {"tuple": "4 | attribute - material (table, wooden)", "answer": "The table surface has visible wood grain. Answer: Yes", "is_correct": true, "reason": {"tag": "pass", "detail": ""}}
+    {"is_correct": true, "reason": {"tag": "pass", "detail": "None"}},
+    {"is_correct": true, "reason": {"tag": "pass", "detail": "None"}},
+    {"is_correct": false, "reason": {"tag": "insufficient_evidence", "detail": "Uses prior knowledge ('known to be') instead of image evidence."}},
+    {"is_correct": true, "reason": {"tag": "pass", "detail": "None"}}
   ]
 }
 
@@ -481,10 +475,10 @@ OUTPUT:
   "num_correct": 4,
   "num_wrong": 0,
   "judgment": [
-    {"tuple": "1 | entity - whole (dog)", "answer": "A dog is visible near the center of the image. Answer: Yes", "is_correct": true, "reason": {"tag": "pass", "detail": ""}},
-    {"tuple": "2 | entity - whole (grass)", "answer": "The scene shows a lush grass with soft lighting. Answer: Yes", "is_correct": true, "reason": {"tag": "pass", "detail": ""}},
-    {"tuple": "3 | attribute - color (dog, brown)", "answer": "The dog has a brown fur coat. Answer: Yes", "is_correct": true, "reason": {"tag": "pass", "detail": ""}},
-    {"tuple": "4 | action - (dog, sitting on, grass)", "answer": "The dog appears to be running on the grassy area, not sitting. Answer: No", "is_correct": true, "reason": {"tag": "pass", "detail": ""}}
+    {"is_correct": true, "reason": {"tag": "pass", "detail": "None"}},
+    {"is_correct": true, "reason": {"tag": "pass", "detail": "None"}},
+    {"is_correct": true, "reason": {"tag": "pass", "detail": "None"}},
+    {"is_correct": true, "reason": {"tag": "pass", "detail": "None"}}
   ]
 }
 
@@ -506,9 +500,9 @@ OUTPUT:
   "num_correct": 2,
   "num_wrong": 1,
   "judgment": [
-    {"tuple": "1 | entity - whole (woman)", "answer": "The image clearly shows a person with long brown hair, wearing a black top, and positioned on the turtle, exhibiting human features and attire. Answer: Yes", "is_correct": true, "reason": {"tag": "pass", "detail": ""}},
-    {"tuple": "2 | entity - whole (turtle)", "answer": "The image clearly shows a large reptile with a broad shell, flippers, and a head with eyes and mandibles, which are characteristic features of a turtle. Answer: Yes", "is_correct": true, "reason": {"tag": "pass", "detail": ""}},
-    {"tuple": "3 | relation - spatial (woman, turtle, behind)", "answer": "The woman is positioned next to the turtle, with her arms resting on its shell, not behind it. Answer: No", "is_correct": false, "reason": {"tag": "hallucination", "detail": "Claims a 'next to' relation that is not supported by the image description (she is above/on it)."}}
+    {"is_correct": true, "reason": {"tag": "pass", "detail": "None"}},
+    {"is_correct": true, "reason": {"tag": "pass", "detail": "None"}},
+    {"is_correct": false, "reason": {"tag": "hallucination", "detail": "Claims a 'next to' relation that is not supported by the image description (she is above/on it)."}}
   ]
 }
 """.strip()
@@ -550,7 +544,7 @@ Return exactly ONE JSON object:
   "problem": [
     {
       "tag": "<category>",
-      "detail": ""<1 sentence with short explanation>"
+      "detail": "<MUST BE 1 short sentence with short explanation>"
     }
   ]
 }
@@ -712,7 +706,7 @@ Return exactly ONE JSON object:
   "is_acceptable": true/false,
   "num_error": int,
   "error": [
-    {"tag": "<error_type>", "detail": "<1 sentence>"}
+    {"tag": "<error_type>", "detail": "<MUST BE 1 short sentence>"}
   ],
 }
 
