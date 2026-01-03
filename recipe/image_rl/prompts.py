@@ -38,6 +38,7 @@ If **all ANSWERS are "Yes"**, there is **no need to generate feedback** — the 
 {
   "reason": "All tuples were labeled 'Yes', meaning no edits are required."
   "label": "no_feedback_needed",
+}
 
 ### Labels
 - "targeted_only" : feedback changes only the No-labeled tuples.
@@ -56,6 +57,12 @@ If **all ANSWERS are "Yes"**, there is **no need to generate feedback** — the 
   "reason": "<short explanation>",
   "label": "targeted_only | non_target_touched | global_or_irrelevant"
 }
+
+[STRICT OUTPUT CONTRACT]
+Do NOT output any text outside the JSON (no explanation, no analysis, no markdown, no code fences).
+The JSON object MUST contain exactly these 3 keys and NO others:
+targeted_entities, reason, label
+If you include any extra key (e.g., "error", "reason", "analysis", "notes"), the output is INVALID.
 
 ### Example
 
@@ -138,7 +145,14 @@ Return exactly ONE JSON object:
   "extra_fact": ["<facts added in summarize not explicitly stated>"]
 }
 
+[STRICT OUTPUT CONTRACT]
+Do NOT output any text outside the JSON (no explanation, no analysis, no markdown, no code fences).
+The JSON object MUST contain exactly these 5 keys and NO others:
+score, is_acceptable, error, missing_fact, extra_fact
+If you include any extra key (e.g., "error", "reason", "analysis", "notes"), the output is INVALID.
 Keep each item short (a phrase).
+For missing_fact and extra_fact arrays:
+- Each item MUST be a single short sentence describing EXACTLY ONE fact (no bundling multiple facts).
 
 ────────────────────────────────
 [IMPORTANT Facts Definition] (STRICT)
@@ -241,7 +255,7 @@ where content follows the required argument pattern below.
 - attribute - <attr> (X, V): X is an entity, V is an attribute value (e.g., color/shape/material/state).
 - relation - spatial (A, B, R): A and B are entities, R is a spatial relation (e.g., left/right/above/under/next to).
 - relation - action (A, B, R): A and B are entities, R is an interaction verb/phrase (e.g., holding/chasing).
-- action (X, Y?, verb): X performs an action verb; Y is optional target if present.
+- action (X, verb, Y): X performs an action verb; Y is optional target if present.
 - count (X, k): X is an entity, k is an explicit number (digit or number word).
 
 
@@ -268,6 +282,11 @@ Return ONE JSON object:
 }
 Tuples must follow the original PRED order.
 
+[STRICT OUTPUT CONTRACT]
+Do NOT output any text outside the JSON (no explanation, no analysis, no markdown, no code fences).
+The JSON object MUST contain exactly these 7 keys and NO others:
+accuracy, total_pred, total_gt, num_correct, num_wrong, tuples_correct, tuples_wrong
+If you include any extra key (e.g., "error", "reason", "analysis", "notes"), the output is INVALID.
 
 ────────────────────────────────
 [Evaluation Rules]
@@ -396,6 +415,12 @@ IMPORTANT:
 - "judgment" must follow the original input order and have length == total.
 - "reason.detail" MUST BE 1 short sentence and reference the evaluation criteria.
 - If is_correct == false, choose ONLY ONE tag from the Reason Tag Set, otherwise leave detail empty.
+
+[STRICT OUTPUT CONTRACT]
+Do NOT output any text outside the JSON (no explanation, no analysis, no markdown, no code fences).
+The JSON object MUST contain exactly these 5 keys and NO others:
+accuracy, total, num_correct, num_wrong, judgement
+If you include any extra key (e.g., "error", "reason", "analysis", "notes"), the output is INVALID.
 
 
 ────────────────────────────────
@@ -552,6 +577,12 @@ Return exactly ONE JSON object:
 Constraints:
 - "problem" must be empty if is_acceptable is true.
 - If multiple problems exist, list them all.
+
+[STRICT OUTPUT CONTRACT]
+Do NOT output any text outside the JSON (no explanation, no analysis, no markdown, no code fences).
+The JSON object MUST contain exactly these 4 keys and NO others:
+score, is_acceptable, num_problem, problem
+If you include any extra key (e.g., "error", "reason", "analysis", "notes"), the output is INVALID.
 
 ────────────────────────────────
 [Evaluation Rules]
@@ -712,6 +743,12 @@ Return exactly ONE JSON object:
 
 IMPORTANT:
 Use only these error tags (if any): ["missed_edit", "wrong_edit", "prompt_conflict", "unnecessary_change", "artifact"]. 
+
+[STRICT OUTPUT CONTRACT]
+Do NOT output any text outside the JSON (no explanation, no analysis, no markdown, no code fences).
+The JSON object MUST contain exactly these 4 keys and NO others:
+score, is_acceptable, num_error, error
+If you include any extra key (e.g., "error", "reason", "analysis", "notes"), the output is INVALID.
 
 
 ────────────────────────────────

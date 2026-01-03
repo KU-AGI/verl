@@ -386,9 +386,10 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
     def _dump_generations(self, uid, prompt_id, prompt, gen_imgs_pil_list, feedback_texts, regen_imgs_pil_list,
-                        gts_imgs, summarizes, gts_tuples, gts_vqas, scores, reward_extra_infos_dict, dump_path):
+                        gts_imgs, summarizes, gts_tuples, gts_vqas, scores, reward_extra_infos_dict, sample_versions, dump_path):
 
-        step_dir = os.path.abspath(os.path.join(dump_path, str(self.global_steps)))
+        trainer_ver = getattr(self, "current_param_version", self.global_steps)
+        step_dir = os.path.abspath(os.path.join(dump_path, str(trainer_ver)))
         os.makedirs(step_dir, exist_ok=True)
 
         n = len(prompt)
@@ -417,12 +418,18 @@ class RayImageGenerationTrainer(RayPPOTrainer):
 
         # 2. 그룹별 저장 (enumerate를 사용하여 강제로 0, 1, 2... 번호 부여)
         for sample_rel_path, indices in sample_groups.items():
-            sample_dir = os.path.join(step_dir, sample_rel_path)
+            # sample_dir = os.path.join(step_dir, sample_rel_path)
+            # os.makedirs(sample_dir, exist_ok=True)
+
+            first_idx = indices[0]
+            source_ver = sample_versions[first_idx]
+
+            sample_dir = os.path.join(step_dir, f"rollouter_source_v{source_ver}", sample_rel_path)
             os.makedirs(sample_dir, exist_ok=True)
             
             summary_path = os.path.join(sample_dir, "comparison_summary.txt")
             summary_header = [
-                f"📋 GRPO COMPARISON SUMMARY | STEP: {self.global_steps}",
+                f"📋 GRPO COMPARISON SUMMARY | STEP: {self.current_param_version}",
                 f"Sample Path: {sample_dir}",
                 "=" * 170,
                 f"{'Rollout':<10} | {'T1':<5} | {'T2':<5} | {'T3':<5} | {'Total':<6} | {'Gen Path (Initial)':<65} | {'Regen Path (Edited)'}",
@@ -580,6 +587,12 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             gts_tuples = [item.non_tensor_batch.get("reward_model", {}).get("tuple", None) for item in batch]
             gts_vqas = [item.non_tensor_batch.get("reward_model", {}).get("vqa_question", None) for item in batch]
 
+            sample_versions = batch.non_tensor_batch.get('param_version')
+            if sample_versions is not None:
+                sample_versions = sample_versions.tolist()
+            else:
+                sample_versions = [self.current_param_version] * len(batch)
+
             scores = {}
             # Add all task scores
             for tid in [1, 2, 3]:
@@ -605,6 +618,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                 gts_vqas=gts_vqas,
                 scores=scores,
                 reward_extra_infos_dict=reward_extra_infos_to_dump,
+                sample_versions=sample_versions,
                 dump_path=dump_path,
             )
 

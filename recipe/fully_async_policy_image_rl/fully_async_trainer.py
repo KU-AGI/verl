@@ -161,10 +161,13 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             flush=True,
         )
 
+        staleness_threshold = self.config.async_training.get("staleness_threshold", 1)
+
         consumer_start = time.time()
         queue_samples = []
         current_rows = 0
         queue_len = 0
+        dropped_rows = 0
 
         while current_rows < self.required_samples:
             result = self.message_queue_client.get_sample_sync()
@@ -179,6 +182,17 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                 break
 
             deserialized_sample = ray.cloudpickle.loads(sample_data)
+
+            sample_ver = deserialized_sample.param_version
+            version_gap = self.current_param_version - sample_ver
+
+            # version_gap > 0이면 on_plolicy
+            # default는 verison_gap > staleness_threshold
+            if version_gap > 0:
+                num_rows = len(deserialized_sample.full_batch)
+                dropped_rows += num_rows
+                continue
+
             num_rows_in_sample = len(deserialized_sample.full_batch)
 
             queue_samples.append(deserialized_sample)

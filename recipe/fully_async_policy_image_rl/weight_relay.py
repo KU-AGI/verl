@@ -5,6 +5,7 @@ import asyncio
 import ray
 import torch
 import numpy as np
+import glob
 
 @ray.remote(num_cpus=1)
 class WeightRelayActor:
@@ -38,11 +39,19 @@ class WeightRelayActor:
 
         self.latest_version = version
         
-        # 3. 이전 버전 정리
-        old_path = f"/dev/shm/weights_v{version-1}.pt"
-        if os.path.exists(old_path):
-            try: os.remove(old_path)
-            except: pass
+        try:
+            # /dev/shm에 있는 모든 가중치 파일 목록을 가져옵니다.
+            all_weight_files = glob.glob("/dev/shm/weights_v*.pt")
+            for f in all_weight_files:
+                # 방금 저장한 파일이 아니라면 삭제
+                if os.path.abspath(f) != os.path.abspath(file_path):
+                    try:
+                        os.remove(f)
+                        print(f"[Cleanup] Deleted old version: {f}")
+                    except:
+                        pass
+        except Exception as e:
+            print(f"[Cleanup] Error during glob/remove: {e}")
             
-        print(f"[WeightRelayActor][Node {self.node_id}] v{version} prefetch done.")
+        print(f"[WeightRelayActor][Node {self.node_id}] v{version} prefetch done. (Only v{version} kept)")
         return file_path

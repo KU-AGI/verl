@@ -587,12 +587,16 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                         else:
                             sample_task3_scores.extend(per_sample_scores)
 
+                    batch_size = len(prompts)
+                    current_v = getattr(self, "current_param_version", self.global_steps)
+                    v_list = [current_v] * batch_size
+                    
                     is_last_step = self.global_steps >= self.total_training_steps
                     # Dump validation generations if configured
                     if (
                         self.val_reward_fn is not None
                         and self.config.trainer.test_freq > 0
-                        and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
+                        and (is_last_step or current_v % self.config.trainer.test_freq == 0)
                     ):
                         self._dump_generations(
                             uid=result_batch.non_tensor_batch["uid"].tolist(),
@@ -607,10 +611,10 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                             gts_vqas=[item.non_tensor_batch.get("reward_model", {}).get("vqa_question", None) for item in result_batch],
                             scores=batch_scores,
                             reward_extra_infos_dict=batch_reward_extra_infos,
+                            sample_versions=v_list,
                             dump_path=val_data_dir
                             )
 
-                    batch_size = len(prompts)
                     data_source = test_batch.non_tensor_batch.get('data_source', ['unknown'] * batch_size)
                     data_source_lst.extend(data_source)
 

@@ -455,8 +455,8 @@ async def get_response_with_client(client, messages):
     response = await client.chat.completions.create(
         model=MODEL_NAME,
         messages=messages,
-        # max_tokens=2048,
-        # extra_body={"repetition_penalty": 1.2},
+        max_tokens=4096,
+        extra_body={"repetition_penalty": 1.2},
         timeout=300000.0,
     )
     return response.choices[0].message.content
