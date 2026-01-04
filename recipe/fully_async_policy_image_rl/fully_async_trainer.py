@@ -358,10 +358,9 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                         metrics.update(actor_output_metrics)
 
                     reward_extra_infos_dict: dict[str, list] = {}
-
                     for task_id in [1, 2, 3]:
                         # Get pre-computed reward_extra_infos_dict from meta_info
-                        reward_extra_infos_dict.update({k: v for k, v in batch.meta_info.get(f"task{task_id}_reward_extra_info", {}).items()})
+                        reward_extra_infos_dict.update({k: v for k, v in batch.meta_info.items()})
 
                     # Log rollout generations if enabled (per task)
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)

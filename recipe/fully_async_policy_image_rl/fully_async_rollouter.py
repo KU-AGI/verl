@@ -873,7 +873,10 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 if "meta_info" in reward_results:
                     if not hasattr(rollout_sample.full_batch, "meta_info"):
                         rollout_sample.full_batch.meta_info = {}
-                    rollout_sample.full_batch.meta_info.update(reward_results["meta_info"])
+                    
+                    for task_key, task_extra_info in reward_results["meta_info"].items():
+                        for k, v in task_extra_info.items():
+                            rollout_sample.full_batch.meta_info[k] = v
 
                 rollout_sample.param_version = used_version
                 rollout_sample.rollout_status = {
