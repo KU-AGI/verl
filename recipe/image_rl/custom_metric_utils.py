@@ -266,6 +266,55 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         metrics["tool_call_counts/max"] = tool_call_counts.max()
         metrics["tool_call_counts/mean"] = tool_call_counts.mean()
 
+    if "data_source" in batch.non_tensor_batch:
+        data_sources = batch.non_tensor_batch["data_source"]
+        # 1. Compute score & reward statistics by data_source
+        data_src2scores = defaultdict(list)
+        data_src2rewards = defaultdict(list)
+        
+        for idx, data_source in enumerate(data_sources):
+            if non_aborted_mask[idx]:  # Only non-aborted samples
+                data_src2scores[data_source].append(sequence_score[idx].item())
+                data_src2rewards[data_source].append(sequence_reward[idx].item())
+        for data_source in data_src2scores.keys():
+            scores = data_src2scores[data_source]
+            rewards = data_src2rewards[data_source]
+            
+            if len(scores) > 0:
+                metrics[f"critic/task{task_id}/score/{data_source}/mean"] = np.mean(scores)
+                metrics[f"critic/task{task_id}/score/{data_source}/max"] = np.max(scores)
+                metrics[f"critic/task{task_id}/score/{data_source}/min"] = np.min(scores)
+                
+                metrics[f"critic/task{task_id}/rewards/{data_source}/mean"] = np.mean(rewards)
+                metrics[f"critic/task{task_id}/rewards/{data_source}/max"] = np.max(rewards)
+                metrics[f"critic/task{task_id}/rewards/{data_source}/min"] = np.min(rewards)
+    
+    # 2. Compute statistics for all _reward & _score metrics in reward_extra_info (overall)
+    for metric_name, metric_values in batch.meta_info.items():
+        if metric_name.endswith("_reward") or metric_name.endswith("_score"):
+            if len(metric_values) > 0:
+                metrics[f"critic/task{task_id}/{metric_name}/mean"] = np.mean(metric_values)
+                metrics[f"critic/task{task_id}/{metric_name}/max"] = np.max(metric_values)
+                metrics[f"critic/task{task_id}/{metric_name}/min"] = np.min(metric_values)
+    
+    # 3. Compute statistics for _reward & _score metrics by data_source
+    if "data_source" in batch.non_tensor_batch:
+        data_sources = batch.non_tensor_batch["data_source"]
+        
+        for metric_name, metric_values in batch.meta_info.items():
+            if metric_name.endswith("_reward") or metric_name.endswith("_score"):
+                # Group by data_source
+                data_src2metric_vals = defaultdict(list)
+                for idx, data_source in enumerate(data_sources):
+                    if non_aborted_mask[idx] and idx < len(metric_values):
+                        data_src2metric_vals[data_source].append(metric_values[idx])
+                
+                # Compute statistics for each data_source
+                for data_source, vals in data_src2metric_vals.items():
+                    if len(vals) > 0:
+                        metrics[f"critic/task{task_id}/{metric_name}/{data_source}/mean"] = np.mean(vals)
+                        metrics[f"critic/task{task_id}/{metric_name}/{data_source}/max"] = np.max(vals)
+                        metrics[f"critic/task{task_id}/{metric_name}/{data_source}/min"] = np.min(vals)
     return metrics
 
 
@@ -377,6 +426,35 @@ def compute_group_reward_metrics(batch: DataProto) -> dict[str, Any]:
             task_reward_section[f"group_rewards/task{task_id}/{name}/max"] = np.max(value)
             task_reward_section[f"group_rewards/task{task_id}/{name}/min"] = np.min(value)
             task_reward_section[f"group_rewards/task{task_id}/{name}/positive_ratio"] = np.mean(np.array(value) > 0)
+
+    # Advantage collapse
+    sequence_score = batch.batch[f"task{task_id}_token_level_scores"].sum(-1)
+
+    # Filter out negative scores
+    positive_mask = sequence_score > 0
+    positive_sequence_score = sequence_score[positive_mask]
+
+    if positive_sequence_score.numel() > 0:
+        # unique score ratio
+        unique_scores = torch.unique(positive_sequence_score)
+        all_same_ratio = float(len(unique_scores) == 1)
+        score_std = torch.std(positive_sequence_score).item()
+        score_mean = torch.mean(positive_sequence_score).item()
+        # coefficient of variation
+        cv_threshold = 0.01  # under 1%: regard as collapse
+        collapse_ratio = float(score_std / (abs(score_mean) + 1e-8) < cv_threshold)
+    else:
+        all_same_ratio = 0.0
+        collapse_ratio = 0.0
+        score_std = 0.0
+        score_mean = 0.0
+
+    task_reward_section.update({
+        f"group_rewards/task{task_id}/advantage_collapse/all_same_ratio": all_same_ratio,
+        f"group_rewards/task{task_id}/advantage_collapse/collapse_ratio": collapse_ratio,
+        f"group_rewards/task{task_id}/advantage_collapse/score_std": score_std,
+        f"group_rewards/task{task_id}/advantage_collapse/score_cv": score_std / (abs(score_mean) + 1e-8) if score_mean != 0.0 else 0.0,
+    })
 
     return task_reward_section
 
@@ -494,6 +572,8 @@ def process_validation_metrics(
         - "worst@N/std": Standard deviation of the worst values in bootstrap samples
         - "maj@N/mean": Mean of majority voting results in bootstrap samples (if "pred" exists)
         - "maj@N/std": Standard deviation of majority voting results (if "pred" exists)
+        - "advantage_collapse/all_same_ratio": Ratio of prompts where all values are identical
+        - "advantage_collapse/collapse_ratio": Ratio of prompts with CV < 1%
 
     Example:
         >>> data_sources = ["source1", "source1", "source2"]
@@ -524,6 +604,21 @@ def process_validation_metrics(
 
                 if n_resps > 1:
                     metric[f"std@{n_resps}"] = np.std(var_vals)
+
+                if n_resps > 1:
+                    metric[f"std@{n_resps}"] = np.std(var_vals)
+
+                    # Collapse detection
+                    unique_vals = np.unique(var_vals)
+                    all_same = len(unique_vals) == 1
+                    metric["advantage_collapse/all_same_ratio"] = float(all_same)
+                    
+                    val_std = np.std(var_vals)
+                    val_mean = np.mean(var_vals)
+                    cv = val_std / (abs(val_mean) + 1e-8)
+                    
+                    cv_threshold = 0.01 # under 1%: regard as collapse
+                    metric["advantage_collapse/collapse_ratio"] = float(cv < cv_threshold)
 
                     ns = []
                     n = 2

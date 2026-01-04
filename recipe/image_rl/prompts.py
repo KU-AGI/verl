@@ -54,7 +54,7 @@ If **all ANSWERS are "Yes"**, there is **no need to generate feedback** — the 
 3. Output a single JSON object in this format:
 {
   "targeted_entities": ["..."],
-  "reason": "<short explanation>",
+  "reason": "<MUST BE 1 SHORT explanation>",
   "label": "targeted_only | non_target_touched | global_or_irrelevant"
 }
 
@@ -308,7 +308,7 @@ Semantic equivalence guidelines for content:
 One-to-one matching:
 - Each GT tuple can match at most ONE PRED tuple.
 - If PRED duplicates the same correct tuple multiple times, only one can be counted correct; the rest are incorrect.
-
+- DO NOT answer about reason of the each error.
 
 [Scoring]
 Accuracy = (# correct PRED tuples) / (# total PRED tuples)
@@ -406,14 +406,14 @@ Return exactly ONE JSON object:
   "judgment": [
     {
       "is_correct": true/false,
-      "reason": {"tag": "<tag>", "detail": "<MUST BE 1 short sentence>"}
+      "reason": {"tag": "<tag>", "detail": "<MUST BE 1 SHORT sentence>"}
     }
   ]
 }
 
 IMPORTANT:
 - "judgment" must follow the original input order and have length == total.
-- "reason.detail" MUST BE 1 short sentence and reference the evaluation criteria.
+- "reason.detail" MUST BE 1 SHORT sentence and reference the evaluation criteria.
 - If is_correct == false, choose ONLY ONE tag from the Reason Tag Set, otherwise leave detail empty.
 
 [STRICT OUTPUT CONTRACT]
