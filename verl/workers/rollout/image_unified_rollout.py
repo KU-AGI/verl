@@ -404,6 +404,7 @@ class ImageUnifiedRollout(BaseRollout):
         inputs = self.processor.tokenizer(
             input_format,
             padding=True,
+            padding_side='left',
             return_tensors="pt"
         )
 
@@ -585,6 +586,7 @@ class ImageUnifiedRollout(BaseRollout):
         
         inputs = self.processor.tokenizer(
             input_format,
+            padding_side='left',
             padding=True,
             return_tensors="pt"
         )
@@ -616,7 +618,7 @@ class ImageUnifiedRollout(BaseRollout):
         # For computing logits: output
         data_proto.non_tensor_batch["task2_feedback_texts"] = np.array(feedback_texts, dtype=object)
         self.processor.tokenizer.pad_token_id = self.processor.tokenizer.eos_token_id # Right padding w/ eos_token_id
-        outputs = self.processor.tokenizer(feedback_texts, padding=True, padding_side='right', return_tensors="pt")
+        outputs = self.processor.tokenizer(feedback_texts, padding=True, padding_side='right', return_tensors="pt", add_special_tokens=False)
         data_proto.batch["task2_feedback_ids"] = outputs["input_ids"]
 
         feedback_ids = data_proto.batch["task2_feedback_ids"]

@@ -268,7 +268,7 @@ class DataParallelImageGenerationActor(BasePPOActor):
             task_id=task_id,
             batch=micro_batch,
         )
-
+        
         if local_has_output == 0:
             # This rank has no output, but we still did the forward pass above
             # Keep gradient connection to forward pass for FSDP synchronization
@@ -391,12 +391,12 @@ class DataParallelImageGenerationActor(BasePPOActor):
         for i, micro_batch in enumerate(micro_batches):
             micro_batch = micro_batch.to(get_device_id())
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
-
+            
             with torch.no_grad():
                 entropy, log_probs = self._forward_micro_batch(
                     model_inputs, temperature=temperature, calculate_entropy=calculate_entropy, task_id=task_id
                 )
-
+            
             need = torch.ones(log_probs.size(0), device=log_probs.device, dtype=torch.bool)
 
             # Pad log_probs to global_max_len for consistent concatenation
