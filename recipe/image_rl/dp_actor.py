@@ -296,9 +296,12 @@ class DataParallelImageGenerationActor(BasePPOActor):
         entropy = None
         if calculate_entropy:
             if not self.config.entropy_checkpointing:
-                entropy = self.compute_entropy_from_logits(task_logits)
+                compact_entropy = self.compute_entropy_from_logits(task_logits)
             else:
-                entropy = torch.utils.checkpoint.checkpoint(self.compute_entropy_from_logits, task_logits)
+                compact_entropy = torch.utils.checkpoint.checkpoint(self.compute_entropy_from_logits, task_logits)
+        
+            entropy = self._restore_log_probs_to_original_length(compact_entropy, original_response_mask)
+
         return entropy, log_probs
 
     def _optimizer_step(self):

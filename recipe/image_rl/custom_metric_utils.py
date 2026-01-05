@@ -422,10 +422,10 @@ def compute_group_reward_metrics(batch: DataProto) -> dict[str, Any]:
     task_reward_section = {}
     for name, value in task_reward_extra_info.items():
         if name.endswith("_reward") or name.endswith("_score"):
-            task_reward_section[f"group_rewards/task{task_id}/{name}/mean"] = np.mean(value)
-            task_reward_section[f"group_rewards/task{task_id}/{name}/max"] = np.max(value)
-            task_reward_section[f"group_rewards/task{task_id}/{name}/min"] = np.min(value)
-            task_reward_section[f"group_rewards/task{task_id}/{name}/positive_ratio"] = np.mean(np.array(value) > 0)
+            task_reward_section[f"group_rewards/{name}/mean"] = np.mean(value)
+            task_reward_section[f"group_rewards/{name}/max"] = np.max(value)
+            task_reward_section[f"group_rewards/{name}/min"] = np.min(value)
+            task_reward_section[f"group_rewards/{name}/positive_ratio"] = np.mean(np.array(value) > 0)
 
     # Advantage collapse
     sequence_score = batch.batch[f"task{task_id}_token_level_scores"].sum(-1)
