@@ -835,11 +835,12 @@ class RayPPOTrainer:
                         missing_count = expected_length - current_key_length
                         if "forward" in key:
                             reward_extra_infos_dict[key].extend([None] * missing_count)
-                        elif "retro" in key:
+                        elif "retro" in key: ## EDITED ##
                             # For retro, we pad in the middle
-                            onethird_idx = expected_length // 2
-                            twothird_idx = 2 * expected_length // 2
-                            reward_extra_infos_dict[key] = [None] * onethird_idx + reward_extra_infos_dict[key]
+                            # onethird_idx = expected_length // 2
+                            # twothird_idx = 2 * expected_length // 2
+                            reward_extra_infos_dict[key] = reward_extra_infos_dict[key] 
+                            # reward_extra_infos_dict[key] = [None] * 100 + reward_extra_infos_dict[key]
                             # reward_extra_infos_dict[key] = [None] * onethird_idx + reward_extra_infos_dict[key] + [None] * onethird_idx
                         # elif "reagent" in key:
                         #     # For reagent, we pad at the start

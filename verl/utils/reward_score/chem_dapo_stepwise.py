@@ -13,17 +13,107 @@
 # limitations under the License.
 # Adapted from https://github.com/EleutherAI/lm-evaluation-harness/blob/main/lm_eval/tasks/hendrycks_math/utils.py
 
-import re, json, ast
+import inspect, re, json, ast
 from typing import Optional, Dict, Any, Tuple, Set, List, Union
 from dataclasses import dataclass, field
 from abc import ABC, abstractmethod
 from enum import Enum
-from rdkit import Chem, RDLogger
+from rdkit import Chem, DataStructs, RDLogger
+from rdkit.Chem import MACCSkeys, AllChem, Fragments
 from collections import defaultdict
 from pprint import pprint
 from nltk.translate.bleu_score import corpus_bleu
 
 RDLogger.DisableLog('rdApp.*')
+
+frag_to_name = {
+    "fr_Al_COO": "aliphatic carboxylic acids",
+    "fr_Al_OH": "aliphatic hydroxyl groups",
+    "fr_Al_OH_noTert": "aliphatic hydroxyl groups excluding tert-OH",
+    "fr_ArN": "N functional groups attached to aromatics",
+    "fr_Ar_COO": "Aromatic carboxylic acide",
+    "fr_Ar_N": "aromatic nitrogens",
+    "fr_Ar_NH": "aromatic amines",
+    "fr_Ar_OH": "aromatic hydroxyl groups",
+    "fr_COO": "carboxylic acids",
+    "fr_COO2": "carboxylic acids",
+    "fr_C_O": "carbonyl O",
+    "fr_C_O_noCOO": "carbonyl O, excluding COOH",
+    "fr_C_S": "thiocarbonyl",
+    "fr_HOCCN": "C(OH)CCN-Ctert-alkyl or C(OH)CCNcyclic",
+    "fr_Imine": "Imines",
+    "fr_NH0": "Tertiary amines",
+    "fr_NH1": "Secondary amines",
+    "fr_NH2": "Primary amines",
+    "fr_N_O": "hydroxylamine groups",
+    "fr_Ndealkylation1": "XCCNR groups",
+    "fr_Ndealkylation2": "tert-alicyclic amines (no heteroatoms, not quinine-like bridged N)",
+    "fr_Nhpyrrole": "H-pyrrole nitrogens",
+    "fr_SH": "thiol groups",
+    "fr_aldehyde": "aldehydes",
+    "fr_alkyl_carbamate": "alkyl carbamates (subject to hydrolysis)",
+    "fr_alkyl_halide": "alkyl halides",
+    "fr_allylic_oxid": "allylic oxidation sites excluding steroid dienone",
+    "fr_amide": "amides",
+    "fr_amidine": "amidine groups",
+    "fr_aniline": "anilines",
+    "fr_aryl_methyl": "aryl methyl sites for hydroxylation",
+    "fr_azide": "azide groups",
+    "fr_azo": "azo groups",
+    "fr_barbitur": "barbiturate groups",
+    "fr_benzene": "benzene rings",
+    "fr_benzodiazepine": "benzodiazepines with no additional fused rings",
+    "fr_bicyclic": "Bicyclic",
+    "fr_diazo": "diazo groups",
+    "fr_dihydropyridine": "dihydropyridines",
+    "fr_epoxide": "epoxide rings",
+    "fr_ester": "esters",
+    "fr_ether": "ether oxygens (including phenoxy)",
+    "fr_furan": "furan rings",
+    "fr_guanido": "guanidine groups",
+    "fr_halogen": "halogens",
+    "fr_hdrzine": "hydrazine groups",
+    "fr_hdrzone": "hydrazone groups",
+    "fr_imidazole": "imidazole rings",
+    "fr_imide": "imide groups",
+    "fr_isocyan": "isocyanates",
+    "fr_isothiocyan": "isothiocyanates",
+    "fr_ketone": "ketones",
+    "fr_ketone_Topliss": "ketones excluding diaryl, a,b-unsat. dienones, heteroatom on Calpha",
+    "fr_lactam": "beta lactams",
+    "fr_lactone": "cyclic esters (lactones)",
+    "fr_methoxy": "methoxy groups",
+    "fr_morpholine": "morpholine rings",
+    "fr_nitrile": "nitriles",
+    "fr_nitro": "nitro groups",
+    "fr_nitro_arom": "nitro benzene ring substituents",
+    "fr_nitro_arom_nonortho": "non-ortho nitro benzene ring substituents",
+    "fr_nitroso": "nitroso groups, excluding NO2",
+    "fr_oxazole": "oxazole rings",
+    "fr_oxime": "oxime groups",
+    "fr_para_hydroxylation": "para-hydroxylation sites",
+    "fr_phenol": "phenols",
+    "fr_phenol_noOrthoHbond": "phenolic OH excluding ortho intramolecular Hbond substituents",
+    "fr_phos_acid": "phosphoric acid groups",
+    "fr_phos_ester": "phosphoric ester groups",
+    "fr_piperdine": "piperdine rings",
+    "fr_piperzine": "piperzine rings",
+    "fr_priamide": "primary amides",
+    "fr_prisulfonamd": "primary sulfonamides",
+    "fr_pyridine": "pyridine rings",
+    "fr_quatN": "quaternary nitrogens",
+    "fr_sulfide": "thioether",
+    "fr_sulfonamd": "sulfonamides",
+    "fr_sulfone": "sulfone groups",
+    "fr_term_acetylene": "terminal acetylenes",
+    "fr_tetrazole": "tetrazole rings",
+    "fr_thiazole": "thiazole rings",
+    "fr_thiocyan": "thiocyanates",
+    "fr_thiophene": "thiophene rings",
+    "fr_unbrch_alkane": "unbranched alkanes of at least 4 members (excludes halogenated alkanes)",
+    "fr_urea": "urea groups"
+}
+
 
 # Constants
 class Tags:
@@ -968,6 +1058,217 @@ class StepEvaluator():
     def __init__(self):
         pass
 
+    def _set_atom_mapping(self, smiles: str):
+        if smiles == "":
+            return smiles
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            raise ValueError("Invalid SMILES (RDKit failed to parse).")
+        for atom in mol.GetAtoms():
+            atom.SetAtomMapNum(atom.GetIdx() + 1)
+        mapped_smiles = Chem.MolToSmiles(mol, canonical=False)
+        return mapped_smiles
+
+
+    def _masked_smiles(
+        self,
+        mol: Chem.Mol,
+        keep_atoms: Tuple[int, ...]
+    ) -> str:
+        """
+        Return a masked SMILES whose length is identical to the
+        RDKit-generated (non-canonical) SMILES for `mol`.
+        • 매치되지 않은 원자  → '*'
+        • 그 원자와 붙어 있는 결합문자·기호·링번호 → '*'
+        *문자 삭제는 일절 하지 않는다.*
+        """
+        _aux_chars = set("-=#:/\\.@[]") | set("()0123456789")
+        # ─ 1) non-matched 원자를 dummy('*')로 변환
+        rw = Chem.RWMol(mol)
+        keep = set(keep_atoms)
+        for idx in range(rw.GetNumAtoms()):
+            if idx not in keep:
+                a = rw.GetAtomWithIdx(idx)
+                a.SetAtomicNum(0)          # dummy atom (*)
+                a.SetIsotope(0)
+                a.SetFormalCharge(0)
+                a.SetNoImplicit(True)
+                a.SetNumExplicitHs(0)
+
+        # ─ 2) 입력 순서 유지(canonical=False)로 SMILES 생성
+        smi = Chem.MolToSmiles(
+            rw.GetMol(),
+            canonical=False,
+            isomericSmiles=True
+        ).replace(':', '')
+
+        # ─ 3) 결합/괄호/링번호 치환(삭제 X)
+        chars = list(smi)
+        n = len(chars)
+
+        for i, ch in enumerate(chars):
+            if ch in _aux_chars:
+                left_x  = (i > 0     and chars[i - 1] == '*')
+                right_x = (i < n - 1 and chars[i + 1] == '*')
+                if left_x or right_x:      # ‘*’와 인접하면 마스킹
+                    chars[i] = '*'
+
+        return ''.join(chars).replace("*", "_")
+
+    def _maccs_pattern_and_thr(self, bit_id: int) -> Tuple[str | None, int]:
+        smarts, thr = MACCSkeys.smartsPatts.get(bit_id, (None, 0))
+        return (None if smarts in (None, "?") else smarts), thr
+
+    def _dedupe(self, matches: Tuple[Tuple[int, ...], ...]) -> List[Tuple[int, ...]]:
+        seen, out = set(), []
+        for atoms in matches:
+            key = tuple(sorted(atoms))
+            if key not in seen:
+                seen.add(key)
+                out.append(atoms)
+        return out
+
+    def _fragement_subs_info(
+        self,
+        smiles: str,
+        *,
+        include_rdkit: bool = True,
+        include_maccs: bool = True,
+        include_no_pattern: bool = False,         # MACCS only
+        return_indices: bool = True,
+        return_subsmiles: bool = True,
+        return_masked_smiles: bool = True,        # ★ NEW ★
+    ) -> Dict[str, Any]:
+        """
+        Combine RDKit fragment counters and MACCS key explanations.
+
+        Each match entry may now contain:
+            * atom_ids          – 1-based indices         (optional)
+            * smiles            – substructure SMILES     (optional)
+            * masked_smiles     – outside atoms → 'X'     (optional)
+        """
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            raise ValueError(f"Invalid SMILES: {smiles}")
+
+        results: Dict[str, Any] = {}
+
+        # ─ RDKit fragment counters ──────────────────────────
+        if include_rdkit:
+            rd_out = {}
+            need_details = return_indices or return_subsmiles or return_masked_smiles
+
+            for name, fn in self._iter_fragment_funcs():
+                count = fn(mol)
+                if not count:
+                    continue
+
+                entry = {"count": count}
+                if need_details:
+                    patt = self._frag_pattern(fn)
+                    if patt is not None:
+                        hits = mol.GetSubstructMatches(patt, uniquify=True)[:count]
+                        entry["matches"] = [
+                            {
+                                **({"atom_ids": [i + 1 for i in atoms]}
+                                if return_indices else {}),
+                                **({"smiles": Chem.MolFragmentToSmiles(
+                                        mol, atomsToUse=atoms,
+                                        canonical=True, isomericSmiles=True)
+                                } if return_subsmiles else {}),
+                                **({"masked_smiles": self._masked_smiles(mol, atoms)}
+                                if return_masked_smiles else {}),
+                            }
+                            for atoms in hits
+                        ]
+                rd_out[name] = entry
+            results["rdkit"] = rd_out
+
+        # ─ MACCS keys ───────────────────────────────────────
+        if include_maccs:
+            mc_out = {}
+            max_hits = mol.GetNumAtoms() ** 2  # generous upper bound
+
+            for bid in range(1, 167):
+                smarts, thr = self._maccs_pattern_and_thr(bid)
+                if smarts is None and not include_no_pattern:
+                    continue
+
+                matches = []
+                if smarts:
+                    q = Chem.MolFromSmarts(smarts)
+                    if q:
+                        raw = mol.GetSubstructMatches(q, uniquify=False,
+                                                    maxMatches=max_hits)
+                        matches = self._dedupe(raw)
+
+                if len(matches) <= thr:
+                    if smarts is None and include_no_pattern:
+                        mc_out[bid] = {"count": 0, "matches": []}
+                    continue
+
+                mc_out[bid] = {
+                    "count": len(matches),
+                    "matches": [
+                        {
+                            **({"atom_ids": [i + 1 for i in atoms]}
+                            if return_indices else {}),
+                            **({"smiles": Chem.MolFragmentToSmiles(
+                                    mol, atomsToUse=atoms,
+                                    canonical=True, isomericSmiles=True)
+                            } if return_subsmiles else {}),
+                            **({"masked_smiles": self._masked_smiles(mol, atoms)}
+                            if return_masked_smiles else {}),
+                        }
+                        for atoms in matches
+                    ],
+                }
+            results["maccs"] = mc_out
+
+        return results
+
+    def _get_rdkit_subs(self, smiles: str):
+        info = self._fragement_subs_info(smiles)
+        rdkit_info = info.get('rdkit', {})
+        related_info = []
+        for name, entry in rdkit_info.items():
+            for match in entry['matches']:
+                related_info.append({
+                    "name": frag_to_name[name],
+                    "related_atom_ids": match['atom_ids'],
+                    "masked_smiles": self._compress_underbar(match['masked_smiles']),
+                })
+        return related_info
+
+    def _iter_fragment_funcs(self):
+        for name in dir(Fragments):
+            if name.startswith("fr_"):
+                fn = getattr(Fragments, name)
+                if callable(fn):
+                    yield name, fn
+
+    def _compress_underbar(self, s: str) -> str:
+        return re.sub(r'\_+', '_', s).strip('_')
+
+    def _frag_pattern(self, fn):
+        sig = inspect.signature(fn)
+        p = sig.parameters.get("pattern")
+        if p and isinstance(p.default, Chem.Mol):      # ≥ 2024.09
+            return p.default
+        smarts_dict = getattr(Fragments, "_fragFuncSMARTS", None) \
+                    or getattr(Fragments, "_fragmentSmarts", None)
+        return smarts_dict.get(fn.__name__) if smarts_dict else None
+
+    def _get_minimal_funcgroup_info(self, funcgroup_info: List[Dict[str, Any]]):
+        minimal_info = []
+        for entry in funcgroup_info:
+            name = entry['name']
+            ids_str = str(sorted(entry['related_atom_ids']))
+            masked_smiles = entry['masked_smiles']
+            minimal_info.append(f"{name} | {masked_smiles} | {ids_str}")
+        return minimal_info
+
+
     def parse_reactant_reagent_in_forward(self, input_str):
         """
         Parses a string of the format "... reactant XX ... reagent YY" and extracts XX and YY.
@@ -1045,16 +1346,17 @@ class StepEvaluator():
 
 
     def extract_json_in_tags(self, rationale: str, tag: str) -> str:
-        match = re.search(fr"<{tag}>(.*?)</{tag}>", rationale, re.DOTALL)
-        if match:
-            try:
-                json_str = match.group(1).strip()
-                json_dict = json.loads(json_str)
-            except:
-                json_dict = {}
+        matches = re.findall(fr"<{tag}>(.*?)</{tag}>", rationale, re.DOTALL)
+        if matches:
+            for match in matches:
+                try:
+                    json_dict = json.loads(match.strip())
+                    return json_dict
+                except json.JSONDecodeError:
+                    continue
+            return None
         else:
-            json_dict = {}
-        return json_dict
+            return None
 
 
     def calcualte_forward_rationale_metrics(self, info, GT_rationale, predicted_rationale):
@@ -1128,76 +1430,102 @@ class StepEvaluator():
         }
 
 
-    def calcualte_retro_rationale_metrics(self, info, GT_rationale, predicted_rationale):
-        product_funcgroup_dict = self.extract_json_in_tags(predicted_rationale, "PRODUCT_FUNCGROUP")
-        product_stat_dict = self.extract_json_in_tags(predicted_rationale, "PRODUCT_STAT")
-        bond_disconnect_list = self.extract_json_in_tags(predicted_rationale, "BOND_DISCONNECT")
-        synthon_list = self.extract_json_in_tags(predicted_rationale, "SYNTHON")
-        synthon_list_new = self.extract_json_in_tags(predicted_rationale, "SYNTHON_GROUP")
-        synthetic_equivalent_list = self.extract_json_in_tags(predicted_rationale, "SYNTHETIC_EQUIVALENT")
-        if len(synthon_list_new) > 0:
-            synthon_list = synthon_list_new
+    def calcualte_retro_rationale_metrics(self, info, GT_rationale, predicted_rationale): ## EDITED ##
+        product_info_dict = self.extract_json_in_tags(predicted_rationale, "PRODUCT_INFO")
+        candidate_atoms_list = self.extract_json_in_tags(predicted_rationale, "CANDIDATE_ATOMS")
+        stratetic_bond_disconnection_dict = self.extract_json_in_tags(predicted_rationale, "STRATEGIC_BOND_DISCONNECTION")
+        synthetic_equivalents_list = self.extract_json_in_tags(predicted_rationale, "SYNTHETIC_EQUIVALENT")
+        if product_info_dict is None:
+            product_info_dict = {}
+        if candidate_atoms_list is None:
+            candidate_atoms_list = []
+        if stratetic_bond_disconnection_dict is None:
+            stratetic_bond_disconnection_dict = {}
+        if synthetic_equivalents_list is None:
+            synthetic_equivalents_list = []
 
-        # Metric 1: Product functional groups
+        # Metric 1: Product info
+        gt_product_info_dict = {
+            "Atom mapped SMILES": info['product_mapping'],
+            "Functional groups": info['product_minimal_funcgroup_info'],
+            "SMILES statistics": info['product_smiles_stat'],
+        }
+        # Metric 1-1: product atom mapped SMILES
         try:
-            gt_product_funcgroup_dict = info["bond_funcgroup_and_count"]
-            correct_product_funcgroup = True
-            for funcgroup, gt_count in gt_product_funcgroup_dict.items():
-                pred_count = product_funcgroup_dict.get(funcgroup, None)
-                if pred_count != gt_count:
-                    correct_product_funcgroup = False
-                    break
-            if set(gt_product_funcgroup_dict.keys()) != set(product_funcgroup_dict.keys()):
-                correct_product_funcgroup = False
+            correct_product_atom_mapped_smiles = product_info_dict.get("Atom mapped SMILES", "") == gt_product_info_dict["Atom mapped SMILES"]
+        except:
+            correct_product_atom_mapped_smiles = False
+        # Metric 1-2: product functional groups
+        try:
+            predict_funcgroups = product_info_dict.get("Functional groups", [])
+            gt_funcgroups = gt_product_info_dict["Functional groups"]
+            correct_product_funcgroup = set(predict_funcgroups) == set(gt_funcgroups)
         except:
             correct_product_funcgroup = False
-
-        # Metric 2: Product statistics
+        # Metric 1-3: product SMILES statistics
         try:
-            gt_product_stat_dict = info["product_smiles_stat"]
-            correct_product_stat = True
-            for key, gt_value in gt_product_stat_dict.items():
-                pred_value = product_stat_dict.get(key, None)
-                if pred_value != gt_value:
-                    correct_product_stat = False
-                    break
-            if set(gt_product_stat_dict.keys()) != set(product_stat_dict.keys()):
-                correct_product_stat = False
+            predict_smiles_stat = product_info_dict.get("SMILES statistics", {})
+            gt_smiles_stat = gt_product_info_dict["SMILES statistics"]
+            correct_product_smiles_stat = predict_smiles_stat == gt_smiles_stat
         except:
-            correct_product_stat = False
+            correct_product_smiles_stat = False
+        
+        correct_product_info = all([
+            correct_product_atom_mapped_smiles,
+            correct_product_funcgroup,
+            correct_product_smiles_stat,
+        ])
 
-        # Metric 3: Bond disconnection
+        # Metric 2: Candidate atoms
         try:
-            gt_bond_disconnect_list = info['bond_list'] # [[1, 2, "Double"], [3, 4, "Single"], ...]
-            gt_bond_disconnect_list = [tuple(bond) for bond in gt_bond_disconnect_list]
-            pred_bond_disconnect_list = []
-            for bond in bond_disconnect_list:
-                bond_tuple = tuple(bond)
-                pred_bond_disconnect_list.append(bond_tuple)
-            correct_bond_disconnect = set(gt_bond_disconnect_list) == set(pred_bond_disconnect_list)
-        except:
-            correct_bond_disconnect = False
+            gt_candidate_atoms = info["template"]["atoms_to_use_product"][0]
+            predicted_candidate_atoms = [int(c)-1 for c in candidate_atoms_list]
+            correct_candidate_atoms = set(predicted_candidate_atoms) == set(gt_candidate_atoms)
+        except Exception:
+            correct_candidate_atoms = False
+        
+        # Metric 3: Strategic bond disconnection
+        try:
+            gt_strategic_bond_disconnection = {
+                "Disconnect bonds": info["bond_list"],
+                "Synthons": info["synthons_list"],
+            }
+            predicted_disconnect_bonds = stratetic_bond_disconnection_dict.get("Disconnect bonds", [])
+            predicted_synthons = stratetic_bond_disconnection_dict.get("Synthons", [])
+            gt_disconnect_bonds = [tuple(bond) for bond in gt_strategic_bond_disconnection["Disconnect bonds"]]
+            predicted_disconnect_bonds = [tuple(bond) for bond in predicted_disconnect_bonds]
+            correct_disconnect_bonds = set(predicted_disconnect_bonds) == set(gt_disconnect_bonds)
+            correct_synthons = set(predicted_synthons) == set(gt_strategic_bond_disconnection["Synthons"])
+        except Exception:
+            correct_disconnect_bonds = False
+            correct_synthons = False
 
-        # Metric 4: Synthons
+        # Metric 4: Synthetic equivalents
         try:
-            gt_synthons_list = info['synthons_list_new']
-            correct_synthon = set(gt_synthons_list) == set(synthon_list)
-        except:
-            correct_synthon = False
+            gt_synthetic_equivalents = info["synthetic_equivalents_list"]
+            predicted_synthetic_equivalents = synthetic_equivalents_list
+            correct_synthetic_equivalents = set(predicted_synthetic_equivalents) == set(gt_synthetic_equivalents)
+        except Exception:
+            correct_synthetic_equivalents = False
 
-        # Metric 5: Synthetic equivalents
-        try:
-            gt_synthetic_equivalent_list = info['synthetic_equivalents_list']
-            correct_synthetic_equivalent = set(gt_synthetic_equivalent_list) == set(synthetic_equivalent_list)
-        except:
-            correct_synthetic_equivalent = False
         return {
+            "retro/correct_product_atom_mapped_smiles": int(correct_product_atom_mapped_smiles),
             "retro/correct_product_funcgroup": int(correct_product_funcgroup),
-            "retro/correct_product_stat": int(correct_product_stat),
-            "retro/correct_bond_disconnect": int(correct_bond_disconnect),
-            "retro/correct_synthon": int(correct_synthon),
-            "retro/correct_synthetic_equivalent": int(correct_synthetic_equivalent),
+            "retro/correct_product_smiles_stat": int(correct_product_smiles_stat),
+            "retro/correct_product_info": int(correct_product_info),
+            "retro/correct_candidate_atoms": int(correct_candidate_atoms),
+            "retro/correct_disconnect_bonds": int(correct_disconnect_bonds),
+            "retro/correct_synthons": int(correct_synthons),
+            "retro/correct_synthetic_equivalents": int(correct_synthetic_equivalents),
         }
+
+        # return {
+        #     "retro/correct_product_funcgroup": int(correct_product_funcgroup),
+        #     "retro/correct_product_stat": int(correct_product_stat),
+        #     "retro/correct_bond_disconnect": int(correct_bond_disconnect),
+        #     "retro/correct_synthon": int(correct_synthon),
+        #     "retro/correct_synthetic_equivalent": int(correct_synthetic_equivalent),
+        # }
 
 
     def calcualte_condition_rationale_metrics(self, info, GT_rationale, predicted_rationale):
@@ -1445,6 +1773,26 @@ class ChemistryEvaluator:
         smiles = smiles_match.group(1).strip() if smiles_match else ""
         return reasoning_steps, smiles
 
+    def maccs_similarity(self, ot_m, gt_m):
+        return DataStructs.FingerprintSimilarity(
+            MACCSkeys.GenMACCSKeys(gt_m), 
+            MACCSkeys.GenMACCSKeys(ot_m), 
+            metric=DataStructs.TanimotoSimilarity
+        )
+
+    def morgan_similarity(self, ot_m, gt_m, radius=2):
+        return DataStructs.TanimotoSimilarity(
+            AllChem.GetMorganFingerprint(gt_m, radius), 
+            AllChem.GetMorganFingerprint(ot_m, radius)
+        )
+
+    def rdk_similarity(self, ot_m, gt_m):
+        return DataStructs.FingerprintSimilarity(
+            Chem.RDKFingerprint(gt_m), 
+            Chem.RDKFingerprint(ot_m), 
+            metric=DataStructs.TanimotoSimilarity
+        )
+
     def compute_score(self,
                       solution_str: str,
                       ground_truth: str,
@@ -1456,7 +1804,7 @@ class ChemistryEvaluator:
                       ) -> Union[EvaluationResult, Dict[str, Any]]:
         """Compute comprehensive evaluation score."""
         task = extra_info['task']
-        correct_structure = self.validate_structure(solution_str, task)
+        # correct_structure = self.validate_structure(solution_str, task)
         correct, pred = self.verify(solution_str, ground_truth, extra_info)
 
         pred_rationale, pred_smiles = self.parse_raw_response(solution_str)
@@ -1472,11 +1820,26 @@ class ChemistryEvaluator:
             step_eval_results = self.step_evaluator.calcualte_forward_rationale_metrics(info, gt_rationale, pred_rationale)
             answer_correct = self.step_evaluator._exact_match(pred_smiles, gt_smiles)
         elif task == "retro":
-            info['bond_funcgroup_and_count'] = ast.literal_eval(info['bond_funcgroup_and_count'])
-            info['product_smiles_stat'] = ast.literal_eval(info['product_smiles_stat'])
+
+            ## EDITED ##
             info['bond_list'] = ast.literal_eval(info['bond_list'])
-            info['synthons_list_new'] = ast.literal_eval(info['synthons_list_new'])
+            info['product_mapping'] = info['product_mapping']
+            info['product_minimal_funcgroup_info'] = ast.literal_eval(info['product_minimal_funcgroup_info'])
+            info['product_reactive_atoms'] = ast.literal_eval(info['product_reactive_atoms'])
+            info['product_smiles_stat'] = ast.literal_eval(info['product_smiles_stat'])
+            info['reactant_str'] = info['reactant_str']
+            info['product_str'] = info['product_str']
+            info['synthons_list'] = ast.literal_eval(info['synthons_list'])
             info['synthetic_equivalents_list'] = ast.literal_eval(info['synthetic_equivalents_list'])
+            info['template'] = ast.literal_eval(info['template'])
+            ############
+
+
+            # info['bond_funcgroup_and_count'] = ast.literal_eval(info['bond_funcgroup_and_count'])
+            # info['product_smiles_stat'] = ast.literal_eval(info['product_smiles_stat'])
+            # info['bond_list'] = ast.literal_eval(info['bond_list'])
+            # info['synthons_list_new'] = ast.literal_eval(info['synthons_list_new'])
+            # info['synthetic_equivalents_list'] = ast.literal_eval(info['synthetic_equivalents_list'])
             step_eval_results = self.step_evaluator.calcualte_retro_rationale_metrics(info, gt_rationale, pred_rationale)
             answer_correct = self.step_evaluator._exact_match(pred_smiles, gt_smiles)
         elif task == "condition":
@@ -1484,8 +1847,17 @@ class ChemistryEvaluator:
         else:
             raise ValueError(f"Unknown task type: {task}")
 
+        try:
+            maccs_sim = self.maccs_similarity(Chem.MolFromSmiles(pred_smiles), Chem.MolFromSmiles(gt_smiles))
+            morgan_sim = self.morgan_similarity(Chem.MolFromSmiles(pred_smiles), Chem.MolFromSmiles(gt_smiles))
+            rdk_sim = self.rdk_similarity(Chem.MolFromSmiles(pred_smiles), Chem.MolFromSmiles(gt_smiles))
+        except:
+            maccs_sim = 0.0
+            morgan_sim = 0.0
+            rdk_sim = 0.0
 
         reward = answer_correct
+        # reward = maccs_sim
 
 
 
@@ -1532,10 +1904,13 @@ class ChemistryEvaluator:
 
         reward_metric_dict = {
             f"{task}/reward/answer_correct": answer_correct,
-            f"{task}/reward/valid_structure": int(correct_structure),
+            f"{task}/reward/maccs_similarity": maccs_sim,
+            f"{task}/reward/morgan_similarity": morgan_sim,
+            f"{task}/reward/rdk_similarity": rdk_sim,
+            # f"{task}/reward/valid_structure": int(correct_structure),
         }
-        if not correct_structure:
-            reward -= 2.0
+        # if not correct_structure:
+        #     reward -= 2.0
         if use_content_reward:
             content_reward = sum(step_eval_results.values()) / len(step_eval_results)
             reward += content_reward

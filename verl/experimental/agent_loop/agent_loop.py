@@ -517,6 +517,7 @@ class AgentLoopWorkerBase:
                     batch=batch,
                     non_tensor_batch=non_tensor_batch,
                 )
+                # breakpoint()
                 result = await self.reward_manager_worker.compute_score.remote(data)
                 output.reward_score = result["reward_score"]
                 output.extra_fields["reward_extra_info"] = result["reward_extra_info"]

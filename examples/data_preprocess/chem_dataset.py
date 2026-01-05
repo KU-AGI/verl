@@ -117,12 +117,19 @@ def unify_struct(x):
         new_info['precursor_with_solvent_smiles_stat'] = info['precursor_with_solvent_smiles_stat']
         new_info['reactant_funcgroup_and_count'] = info['reactant_funcgroup_and_count']
         new_info['template'] = info['template']
+    ## EDITED ##
     elif x['task'] == 'retro':
-        new_info['bond_funcgroup_and_count'] = info['bond_funcgroup_and_count']
-        new_info['product_smiles_stat'] = info['product_smiles_stat']
         new_info['bond_list'] = info['bond_list']
-        new_info['synthons_list_new'] = info['synthons_list_new']
+        new_info['product_mapping'] = info['product_mapping']
+        new_info['product_minimal_funcgroup_info'] = info['product_minimal_funcgroup_info']
+        new_info['product_reactive_atoms'] = info['product_reactive_atoms']
+        new_info['product_smiles_stat'] = info['product_smiles_stat']
+        new_info['reactant_str'] = info['reactant_str']
+        new_info['product_str'] = info['product_str']
+        new_info['synthons_list'] = info['synthons_list']
         new_info['synthetic_equivalents_list'] = info['synthetic_equivalents_list']
+        new_info['template'] = info['template']
+    ############
     x['info_json_str'] = json.dumps(new_info)
     return x
 
@@ -180,7 +187,7 @@ def append_info(data):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--train_dir", default="/data/llm-reaction-reasoning/data/orderly/main_training_v11")
+    parser.add_argument("--train_dir", default="/data/llm-reaction-reasoning/data/orderly/main_training_v12")
     parser.add_argument("--val_dir", default="/data/llm-reaction-reasoning/data/orderly/excluded_val_test")
     parser.add_argument("--test_dir", default="/data/llm-reaction-reasoning/data/orderly/excluded_val_test")
     parser.add_argument("--output_dir", default="/data/verl/data")
@@ -192,19 +199,20 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     concatenated = []
-    args.test = True
+    args.train = True
 
-    with open('/data/llm-reaction-reasoning/data/orderly/retro_related/precursor_with_solvent_to_multiple_products.json', 'r') as f:
-        precursor_with_solvent_to_multiple_products = json.load(f)
-        multiple_precursor_with_solvent_set = set(precursor_with_solvent_to_multiple_products.keys())
+    # with open('/data/llm-reaction-reasoning/data/orderly/retro_related/precursor_with_solvent_to_multiple_products.json', 'r') as f:
+    #     precursor_with_solvent_to_multiple_products = json.load(f)
+    #     multiple_precursor_with_solvent_set = set(precursor_with_solvent_to_multiple_products.keys())
     with open('/data/llm-reaction-reasoning/data/orderly/retro_related/product_to_multiple_reactants.json', 'r') as f:
         product_to_multiple_reactants = json.load(f)
         multiple_product_set = set(product_to_multiple_reactants.keys())
 
-    tasks = ["forward", "retro"]
+    # tasks = ["forward", "retro"]
+    tasks = ["retro"]
     for task in tasks:
         if args.train:
-            dataset_paths = sorted(glob(os.path.join(f"{args.train_dir}/{task}", "*.json")), key=_sort_key)[-30:]
+            dataset_paths = sorted(glob(os.path.join(f"{args.train_dir}/{task}", "*.json")), key=_sort_key)
             split = "train"
         elif args.val:
             # dataset_paths = sorted(glob(os.path.join(f"{args.val_dir}", f"{task}*val.json")))

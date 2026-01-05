@@ -6,7 +6,7 @@ export WANDB_PROJECT="verl-dapo"
 export NCCL_DEBUG="WARN"
 
 project_name='verl-dapo'
-exp_name='debug_v11'
+exp_name='retro_smallset_steprwd_group16_v12'
 
 # Ray
 RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
@@ -16,7 +16,7 @@ RUNTIME_ENV=${RUNTIME_ENV:-"/verl/recipe/fully_async_policy/shell/runtime_env.ya
 HOME="/data"
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
 # very important! please modify the max_position_embeddings in config.json to 32768 after downloading from huggingface
-MODEL_PATH="'/data/llm-reaction-reasoning/all_checkpoints/epoch-epoch=06-step-step=056084.ckpt/hf_model'"
+MODEL_PATH="'/data/llm-reaction-reasoning/all_checkpoints/main_100k_8b_v12_retro/epoch=07-step=008994-exact_match_sum=0.420.ckpt/hf_model'"
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
 DUMP_DIR=${DUMP_DIR:-"${RAY_DATA_HOME}/dumps/${project_name}/${exp_name}"}
 TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/chem_dapo/syntheticreact_train.parquet"}
@@ -58,7 +58,7 @@ reflection_bonus_weight=0.0
 
 # Response length parameters
 max_prompt_length=550 # $((1024 * 2))
-max_response_length=2100 # $((1024 * 8))
+max_response_length=3000 # $((1024 * 8))
 enable_overlong_buffer=False
 overlong_buffer_len=0 # $((1024 * 4))
 overlong_penalty_factor=1.0
@@ -95,15 +95,15 @@ n_gpus_training=$((NGPUS_PER_NODE - n_gpus_rollout))
 # (train_prompt_mini_bsz * require_batches * n_resp_per_prompt) % total_trainer_gpus == 0 must be satisfied
 train_prompt_bsz=0
 gen_prompt_bsz=1
-n_resp_per_prompt=4
+n_resp_per_prompt=16
 train_prompt_mini_bsz=16
 total_rollout_steps=$(((512*100000)))
 test_freq=6
 staleness_threshold=0.0
-trigger_parameter_sync_step=10
+trigger_parameter_sync_step=5
 require_batches=3
 partial_rollout=False
-save_freq=$((test_freq * trigger_parameter_sync_step * 60))
+save_freq=$((test_freq * trigger_parameter_sync_step * 10))
 
 
 # ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
@@ -131,7 +131,7 @@ python -m recipe.fully_async_policy.fully_async_main \
     algorithm.use_kl_in_reward=${use_kl_in_reward} \
     algorithm.kl_ctrl.kl_coef=${kl_coef} \
     algorithm.filter_groups.enable=${enable_filter_groups} \
-    +algorithm.filter_nonanswered.enable=True \
+    +algorithm.filter_nonanswered.enable=False \
     algorithm.filter_groups.max_num_gen_batches=${max_num_gen_batches} \
     algorithm.filter_groups.metric=${filter_groups_metric} \
     algorithm.rollout_is_threshold=2.0 \
