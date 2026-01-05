@@ -11,7 +11,7 @@ exec > >(tee -a "${SCRIPT_LOG}")
 exec 2>&1
 
 project_name='mllm_reasoning'
-exp_name='nipa_debug'
+exp_name='0105_logging_fix'
 
 export NCCL_IB_GID_INDEX=0
 export NCCL_CUDA_DEVICE_MAX_CONNECTIONS=8
@@ -35,10 +35,12 @@ RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/recipe/fully_async_policy_image_rl/sh
 HOME="/data"
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
 MODEL_PATH=/data/mllm/ckpt/step=014000.ckpt/hf_model # /data/mllm/checkpoints/Janus-Pro-7B
-RM_MODEL_PATH=Qwen/Qwen3-VL-30B-A3B-Instruct # OpenGVLab/InternVL3_5-38B
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
 TRAIN_FILES=/data/mllm/data/train_v2.parquet
 VAL_FILES=/data/mllm/data/val_v2.parquet
+
+export RM_VLM_MODEL_PATH="Qwen/Qwen3-VL-30B-A3B-Instruct" # OpenGVLab/InternVL3_5-38B
+export RM_LLM_MODEL_PATH="Qwen/Qwen3-30B-A3B-Instruct-2507" # OpenGVLab/InternVL3_5-38B
 
 rollout_name=image_unified
 rollout_mode=async
@@ -50,6 +52,7 @@ use_kl_in_reward=False
 kl_coef=0.0
 use_kl_loss=False
 kl_loss_coef=0.04
+entropy_coeff=0.001
 
 clip_ratio_low=0.2
 clip_ratio_high=0.2
@@ -110,13 +113,13 @@ train_prompt_mini_bsz=128
 train_prompt_micro_bsz=4
 total_rollout_steps=$(((512*100*3*10)))
 staleness_threshold=1.0
-trigger_parameter_sync_step=4
+trigger_parameter_sync_step=1
 require_batches=1
 partial_rollout=False
 log_prob_micro_batch_size_per_gpu=1
 
 test_freq=100
-save_freq=# $((test_freq * trigger_parameter_sync_step * 1))
+save_freq=$((test_freq * trigger_parameter_sync_step * 1))
 total_epochs=10
 # total_training_steps=3000
 rollout_freq=50
@@ -151,7 +154,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     actor_rollout_ref.actor.use_kl_loss=${use_kl_loss} \
     actor_rollout_ref.actor.kl_loss_coef=${kl_loss_coef} \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
-    actor_rollout_ref.actor.entropy_coeff=-0.00 \
+    actor_rollout_ref.actor.entropy_coeff=${entropy_coeff} \
     actor_rollout_ref.actor.grad_clip=1.0 \
     actor_rollout_ref.actor.clip_ratio_low=${clip_ratio_low} \
     actor_rollout_ref.actor.clip_ratio_high=${clip_ratio_high} \

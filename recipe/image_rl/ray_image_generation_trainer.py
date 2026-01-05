@@ -540,6 +540,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             # Task 2
             f.write(f"💬 [TASK 2] FEEDBACK GENERATION\n")
             f.write(f"  - Total Score: {self._get_safe_val(scores, 'task2_scores', i)}\n")
+            f.write(f"  - Format Reward: {self._get_safe_val(reward_extra_infos_dict, 'task2_format_reward', i)}\n")
             f.write(f"  - Part1 Reward (F1 + Consistency): {self._get_safe_val(reward_extra_infos_dict, 'task2_part1_reward', i)}\n")
             f.write(f"  - VLM Reward: {self._get_safe_val(reward_extra_infos_dict, 'task2_vlm_reward', i)}\n")
             f.write(f"  - Comparison Summarize Score: {self._get_safe_val(reward_extra_infos_dict, 'task2_comparison_summarize_score', i)}\n")

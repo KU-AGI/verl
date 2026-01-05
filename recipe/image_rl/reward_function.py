@@ -24,17 +24,17 @@ import aiohttp
 from recipe.image_rl.gdino_regex import _CONNECTORS, SKIP_KEYWORDS, _COMPILED_RELATIONS
 
 # Configuration
-BASE_URLS = [
-    # "http://10.100.44.4:8006/v1", # main1
-    "http://10.100.44.8:8006/v1", # sub1
-    "http://10.100.44.8:8007/v1",
-    "http://10.100.44.2:8006/v1", # sub2
-    "http://10.100.44.2:8007/v1",
+VLM_BASE_URLS = [
+    "http://192.169.0.3:8004/v1",
+]
+LLM_BASE_URLS = [
+    "http://192.169.0.3:8005/v1",
 ]
 API_KEY = "EMPTY"
 MAX_RETRIES = 3
 BASE_DELAY = 2
-MODEL_NAME = os.environ.get("RM_MODEL_PATH", "Qwen/Qwen3-VL-30B-A3B-Instruct")
+RM_VLM_MODEL_PATH = os.environ.get("RM_VLM_MODEL_PATH", "Qwen/Qwen3-VL-30B-A3B-Instruct")
+RM_LLM_MODEL_PATH = os.environ.get("RM_LLM_MODEL_PATH", "Qwen/Qwen3-30B-A3B-Instruct-2507")
 
 # Health checking configuration
 HEALTH_CHECK_INTERVAL = 30  # seconds
@@ -43,62 +43,77 @@ RECOVERY_CHECK_INTERVAL = 60  # seconds to wait before checking if unhealthy ser
 
 # Detector configuration
 DETECTOR_URLS = [
-    # "http://10.100.44.4:8086", # main1
-    # "http://10.100.44.4:8087",
-    # "http://10.100.44.8:8086", # sub1
-    # "http://10.100.44.8:8087",
-    "http://10.100.44.2:8086", # sub2
-    "http://10.100.44.2:8087",
+    "http://192.169.0.3:8084",
+    "http://192.169.0.3:8085",
 ]
 DETECTOR_TIMEOUT = 300000.0
 
 DETECTOR_MAX_RETRIES = 2
 
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-
 RM_PER_SERVER_INFLIGHT = 16
-_rm_slot_state = {}
+_rm_slot_lock = threading.Lock()
+_rm_slot_queues = {}  # {(loop_id, is_vlm): queue}
 
 DET_PER_SERVER_INFLIGHT = 4  
-_det_slot_state = {}       
+_det_slot_lock = threading.Lock()
+_det_slot_queues = {}  # {loop_id: queue}
 
-async def _ensure_rm_slots() -> asyncio.Queue:
+async def _ensure_rm_slots(is_vlm=True) -> asyncio.Queue:
+    """Ensure slot queue exists for current event loop and model type"""
     loop = asyncio.get_running_loop()
-    state = _rm_slot_state.get(loop)
-    if state is None:
-        state = {"lock": asyncio.Lock(), "q": None}
-        _rm_slot_state[loop] = state
+    loop_id = id(loop)
+    key = (loop_id, is_vlm)
+    
+    # Quick check without lock
+    if key in _rm_slot_queues:
+        queue = _rm_slot_queues[key]
+        # Verify queue is still valid for this loop
+        try:
+            # Try a quick operation to verify queue is accessible
+            queue.qsize()
+            return queue
+        except RuntimeError:
+            # Queue is bound to different loop, need to recreate
+            pass
+    
+    # Create new queue with lock
+    with _rm_slot_lock:
+        # Double-check after acquiring lock
+        if key in _rm_slot_queues:
+            queue = _rm_slot_queues[key]
+            try:
+                queue.qsize()
+                return queue
+            except RuntimeError:
+                # Remove invalid queue
+                del _rm_slot_queues[key]
+        
+        # Create new queue
+        q = asyncio.Queue()
+        base_urls = VLM_BASE_URLS if is_vlm else LLM_BASE_URLS
+        start = random.randrange(len(base_urls))
+        for i in range(RM_PER_SERVER_INFLIGHT * len(base_urls)):
+            sid = (start + i) % len(base_urls)
+            q.put_nowait(sid)
+        
+        _rm_slot_queues[key] = q
+        return q
 
-    if state["q"] is not None:
-        return state["q"]
 
-    async with state["lock"]:
-        if state["q"] is None:
-            q = asyncio.Queue()
-
-            start = random.randrange(len(BASE_URLS))
-            for i in range(RM_PER_SERVER_INFLIGHT * len(BASE_URLS)):
-                sid = (start + i) % len(BASE_URLS)
-                q.put_nowait(sid)
-
-            state["q"] = q
-
-    return state["q"]
-
-
-async def borrow_rm_client():
-    q = await _ensure_rm_slots()
+async def borrow_rm_client(is_vlm=True):
+    q = await _ensure_rm_slots(is_vlm)
+    manager = vlm_client_manager if is_vlm else llm_client_manager
     while True:
         sid = await q.get()
-        s = client_manager.servers[sid]
+        s = manager.servers[sid]
         if s.status != ServerStatus.UNHEALTHY or s.should_retry_unhealthy():
-            return s.client, sid
+            return s.client, sid, is_vlm
         q.put_nowait(sid)
         await asyncio.sleep(0.05)
 
 
-async def release_rm_client(server_id: int):
-    q = await _ensure_rm_slots()
+async def release_rm_client(server_id: int, is_vlm: bool):
+    q = await _ensure_rm_slots(is_vlm)
     q.put_nowait(server_id)
 
 
@@ -155,10 +170,11 @@ class ServerInfo:
 
 # client manager with failover support and round robin load balancing
 class ClientManager:
-    def __init__(self, base_urls: List[str]):
+    def __init__(self, base_urls: List[str], name: str = ""):
         self.servers = []
         self.lock = threading.Lock()
         self.current_index = 0  # Round robin counter
+        self.name = name
         
         # Initialize servers
         for url in base_urls:
@@ -187,7 +203,7 @@ class ClientManager:
         healthy_servers = self.get_healthy_servers()
         
         if not healthy_servers:
-            print("WARNING: No healthy servers available! Using any available server...")
+            print(f"WARNING: No healthy {self.name} servers available! Using any available server...")
             if self.servers:
                 return 0, self.servers[0]
             return None, None
@@ -214,7 +230,7 @@ class ClientManager:
         healthy_servers = self.get_healthy_servers()
         
         if not healthy_servers:
-            print("WARNING: No healthy servers available! Using any available server...")
+            print(f"WARNING: No healthy {self.name} servers available! Using any available server...")
             return self.servers[0] if self.servers else None
             
         # Sort by status (healthy first) then by success rate
@@ -252,7 +268,7 @@ class ClientManager:
         with self.lock:
             status = {}
             for i, server in enumerate(self.servers):
-                status[f"server_{i}"] = {
+                status[f"{self.name}_server_{i}"] = {
                     "url": server.url,
                     "status": server.status.value,
                     "consecutive_failures": server.consecutive_failures,
@@ -270,15 +286,16 @@ class ClientManager:
                 # Print server status periodically
                 if time.time() % 120 < 1:  # Every 2 minutes
                     status = self.get_server_status()
-                    print(f"Server Health Status: {json.dumps(status, indent=2, default=str)}")
+                    print(f"{self.name} Server Health Status: {json.dumps(status, indent=2, default=str)}")
                 
                 time.sleep(HEALTH_CHECK_INTERVAL)
             except Exception as e:
-                print(f"Health monitor error: {e}")
+                print(f"{self.name} Health monitor error: {e}")
                 time.sleep(HEALTH_CHECK_INTERVAL)
 
-# Initialize the client manager
-client_manager = ClientManager(BASE_URLS)
+# Initialize the client managers
+vlm_client_manager = ClientManager(VLM_BASE_URLS, name="VLM")
+llm_client_manager = ClientManager(LLM_BASE_URLS, name="LLM")
 
 
 def convert_gen_img_to_base64(gen_img) -> Optional[str]:
@@ -346,6 +363,7 @@ def get_messages(*args):
                 {"type": "text", "text": user_prompt}
             ]}
         ]
+        model = RM_VLM_MODEL_PATH
     elif task_id == 2:
         system_prompt = TASK2_FEEDBACK_GENERATOR_SYSTEM_PROMPT_TEMPLATE
         user_prompt = TASK2_FEEDBACK_GENERATOR_USER_PROMPT_TEMPLATE.format(prompt=prompt, part2_tuples=predicted_tuple, part3_answers=predicted_answer, part4_feedback=predicted_feedback)
@@ -355,6 +373,7 @@ def get_messages(*args):
                 {"type": "text", "text": user_prompt},
             ]}
         ]
+        model = RM_LLM_MODEL_PATH
     elif task_id == 3:
         system_prompt = TASK1_TASK3_IMAGE_GENERATOR_SYSTEM_PROMPT_TEMPLATE
         user_prompt = TASK1_TASK3_IMAGE_GENERATOR_USER_PROMPT_TEMPLATE.format(questions=vqa_question)
@@ -365,10 +384,11 @@ def get_messages(*args):
                 {"type": "text", "text": user_prompt}
             ]}
         ]
+        model = RM_VLM_MODEL_PATH
     else:
         raise ValueError(f"Invalid task: {task_id} is must be one of task1, task2, or task3.")
 
-    return messages
+    return messages, model
 
 
 # Additional message constructors for task 2 subtasks
@@ -383,8 +403,9 @@ def get_messsages_task2_comparison_summarize(*args): # 5: part 1
             {"type": "text", "text": user_prompt},
         ]}
     ]
+    model = RM_LLM_MODEL_PATH
 
-    return messages
+    return messages, model
 
 def get_messages_task2_comparison_tuple(*args): # 1: part 2
     prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback, vqa_question, extra_info, task_id = args
@@ -397,8 +418,9 @@ def get_messages_task2_comparison_tuple(*args): # 1: part 2
             {"type": "text", "text": user_prompt},
         ]}
     ]
+    model = RM_LLM_MODEL_PATH
 
-    return messages
+    return messages, model
 
 
 def get_messages_task2_hallucination_check(*args): # 2: part 3
@@ -413,8 +435,9 @@ def get_messages_task2_hallucination_check(*args): # 2: part 3
             {"type": "text", "text": user_prompt},
         ]}
     ]
+    model = RM_VLM_MODEL_PATH
 
-    return messages
+    return messages, model
 
 
 def get_messages_task2_edit_instruction(*args): # 3: part 4
@@ -428,8 +451,9 @@ def get_messages_task2_edit_instruction(*args): # 3: part 4
             {"type": "text", "text": user_prompt},
         ]}
     ]
+    model = RM_LLM_MODEL_PATH
 
-    return messages
+    return messages, model
 
 
 # Additional message constructors for task 1 alignment
@@ -446,14 +470,15 @@ def get_messages_task3_regeneration_followed_by_editing(*args):
             {"type": "text", "text": user_prompt},
         ]}
     ]
+    model = RM_VLM_MODEL_PATH
 
-    return messages
+    return messages, model
 
 
-async def get_response_with_client(client, messages):
+async def get_response_with_client(client, messages, model):
     """Get response from a specific client with improved error handling"""
     response = await client.chat.completions.create(
-        model=MODEL_NAME,
+        model=model,
         messages=messages,
         max_tokens=4096,
         extra_body={"repetition_penalty": 1.2},
@@ -466,33 +491,39 @@ async def get_response(message_builder_fn, *args):
     """Generic response fetcher with automatic server fallback
 
     Args:
-        message_builder_fn: Function that takes *args and returns messages list
+        message_builder_fn: Function that takes *args and returns (messages list, model_name)
         *args: Arguments to pass to message_builder_fn
     """
-    messages = message_builder_fn(*args)
+    messages, model = message_builder_fn(*args)
+    
+    # Determine if we need VLM or LLM based on model name
+    is_vlm = (model == RM_VLM_MODEL_PATH)
+    base_urls = VLM_BASE_URLS if is_vlm else LLM_BASE_URLS
 
     # Try different servers until one succeeds
-    max_attempts = len(BASE_URLS) * MAX_RETRIES
+    max_attempts = len(base_urls) * MAX_RETRIES
 
     for attempt in range(max_attempts):
-        client, sid = await borrow_rm_client()
+        client, sid, _ = await borrow_rm_client(is_vlm)
+        manager = vlm_client_manager if is_vlm else llm_client_manager
+        
         try:
-            response = await get_response_with_client(client, messages)
+            response = await get_response_with_client(client, messages, model)
             if not is_meaningful_response(response):
                 # Back off 
-                client_manager.record_request_result(sid, success=False,
+                manager.record_request_result(sid, success=False,
                                                      error=ValueError("Non-meaningful response"))
                 print(response) # DEBUG
                 continue
             else:
-                client_manager.record_request_result(sid, success=True)
+                manager.record_request_result(sid, success=True)
                 return response
 
         except Exception as e:
-            client_manager.record_request_result(sid, success=False, error=e)
+            manager.record_request_result(sid, success=False, error=e)
 
         finally:
-            await release_rm_client(sid)
+            await release_rm_client(sid, is_vlm)
 
     return None
 
@@ -569,26 +600,37 @@ async def request_detector_single(detection_list: List[Dict[str, Any]], img) -> 
 
     # -------- loop-local slot queue init --------
     async def _ensure_det_slots() -> asyncio.Queue:
+        """Ensure slot queue exists for current event loop"""
         loop = asyncio.get_running_loop()
-        state = _det_slot_state.get(loop)
-        if state is None:
-            state = {"lock": asyncio.Lock(), "q": None}
-            _det_slot_state[loop] = state
-
-        if state["q"] is not None:
-            return state["q"]
-
-        async with state["lock"]:
-            if state["q"] is None:
-                q = asyncio.Queue()
-
-                start = random.randrange(len(DETECTOR_URLS))
-                for i in range(DET_PER_SERVER_INFLIGHT * len(DETECTOR_URLS)):
-                    sid = (start + i) % len(DETECTOR_URLS)
-                    q.put_nowait(sid)
-
-                state["q"] = q
-        return state["q"]
+        loop_id = id(loop)
+        
+        # Quick check without lock
+        if loop_id in _det_slot_queues:
+            queue = _det_slot_queues[loop_id]
+            try:
+                queue.qsize()
+                return queue
+            except RuntimeError:
+                pass
+        
+        # Create new queue with lock
+        with _det_slot_lock:
+            if loop_id in _det_slot_queues:
+                queue = _det_slot_queues[loop_id]
+                try:
+                    queue.qsize()
+                    return queue
+                except RuntimeError:
+                    del _det_slot_queues[loop_id]
+            
+            q = asyncio.Queue()
+            start = random.randrange(len(DETECTOR_URLS))
+            for i in range(DET_PER_SERVER_INFLIGHT * len(DETECTOR_URLS)):
+                sid = (start + i) % len(DETECTOR_URLS)
+                q.put_nowait(sid)
+            
+            _det_slot_queues[loop_id] = q
+            return q
 
     slot_q = await _ensure_det_slots()
 
@@ -819,11 +861,13 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
         formatting_evaluator = FormattingEvaluatorV2()
 
         # Rule-based: formatting reward
-        task2_reward_score += 1.0 if all(part is not None for part in [predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback]) else 0.0 # +1
+        task2_format_reward = 1.0 if all(part is not None for part in [predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback]) else 0.0
+        task2_reward_score += task2_format_reward
+        reward_extra_info[f"task{task_id}_format_reward"] = task2_format_reward
 
         # Rule-based: part 1 scoring
         feedback_parsed_tuple = formatting_evaluator._parse_part1(feedback_tuple) # GT Tuple
-        predict_parsed_tuple = formatting_evaluator._parse_part1(predicted_tuple) # Pred  Tuple
+        predict_parsed_tuple = formatting_evaluator._parse_part1(predicted_tuple) # Pred Tuple
         predict_decomposed_ans = formatting_evaluator._extract_answer_paragraphs(predicted_answer)
 
         part1_reward_dict = formatting_evaluator._calculate_metrics_for_reward(feedback_parsed_tuple, predict_parsed_tuple, predict_decomposed_ans)
@@ -1121,7 +1165,10 @@ def compute_score_batch_sync(prompts, gen_imgs, feedback_texts, regen_imgs, grou
 
 def get_server_health_status():
     """Get current server health status - useful for monitoring"""
-    return client_manager.get_server_status()
+    return {
+        "vlm": vlm_client_manager.get_server_status(),
+        "llm": llm_client_manager.get_server_status()
+    }
 
 
 def is_meaningful_response(text: str) -> bool:
