@@ -324,29 +324,7 @@ def assemble_batch_from_rollout_samples(
     # Pre-allocate lists
     rollout_samples_batch = [rs.full_batch for rs in rollout_samples]
     final_batch = DataProto.concat(rollout_samples_batch)
-
-    all_meta_keys = set()
-    for rs in rollout_samples:
-        if rs.full_batch.meta_info:
-            all_meta_keys.update(rs.full_batch.meta_info.keys())
-
-    for key in all_meta_keys:
-        if key in ["global_token_num", "rollout_param_versions", "trajectory_param_versions"]:
-            continue
-            
-        merged_values = []
-        for rs in rollout_samples:
-            val = rs.full_batch.meta_info.get(key, None)
-            n_rows = len(rs.full_batch)
-
-            if isinstance(val, list):
-                
-                merged_values.extend(val)
-            else:
-                merged_values.extend([val] * n_rows)
-        
-        final_batch.meta_info[key] = merged_values
-
+    
     processing_times = [t for rs in rollout_samples for t in rs.processing_times]
 
     all_param_versions = []
