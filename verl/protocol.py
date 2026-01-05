@@ -982,6 +982,22 @@ class DataProto:
         self.batch = self.batch[indices]
         self.non_tensor_batch = {key: val[indices_np] for key, val in self.non_tensor_batch.items()}
 
+        indices_list = indices.detach().cpu().tolist()
+        batch_size = len(indices_np)
+
+        if hasattr(self, "meta_info") and isinstance(self.meta_info, dict):
+            new_meta_info = {}
+            for k, v in self.meta_info.items():
+                # python list
+                if isinstance(v, list) and len(v) == batch_size:
+                    new_meta_info[k] = [v[i] for i in indices_list]
+
+                else:
+                    # scalar / trajectory-level / mismatched length
+                    new_meta_info[k] = v
+
+            self.meta_info = new_meta_info
+
     def repeat(self, repeat_times=2, interleave=True):
         """
         Repeat the batch data a specified number of times.
