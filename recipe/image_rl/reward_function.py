@@ -1005,13 +1005,13 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
         last = predicted_feedback
         if last is not None and "No need to generate feedback.".lower() in last.lower():
             reward_score = -100
-            reward_extra_info[f"task{task_id}_vlm_reward"] = 0.0
+            reward_extra_info[f"task{task_id}_vlm_reward"] = reward_score
             reward_extra_info[f"task{task_id}_reward_response"] = "None"
-            reward_extra_info[f"task{task_id}_detector_reward"] = 0.0
+            reward_extra_info[f"task{task_id}_detector_reward"] = reward_score
             reward_extra_info[f"task{task_id}_detector_response"] = {"results": {}, "details": [], "errors": []}
             reward_extra_info[f"task{task_id}_detector_details"] = []
-            reward_extra_info[f"task{task_id}_vlm_detector_bonus"] = 0.0
-            reward_extra_info[f"task{task_id}_regeneration_followed_by_editing_reward"] = 0.0
+            reward_extra_info[f"task{task_id}_vlm_detector_bonus"] = reward_score
+            reward_extra_info[f"task{task_id}_regeneration_followed_by_editing_reward"] = reward_score
             reward_extra_info[f"task{task_id}_regeneration_followed_by_editing_response"] = "No need to respond reward."
             return {
                 "score": reward_score,
