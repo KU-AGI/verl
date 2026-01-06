@@ -128,6 +128,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     data.val_files="${VAL_FILES}" \
     data.shuffle=False \
     data.prompt_key=prompt \
+    +data.preprocessed_cache_dir="$CKPTS_DIR/cache_dir" \
     data.train_batch_size=${train_prompt_bsz} \
     data.gen_batch_size=${train_prompt_bsz} \
     data.val_batch_size=${val_prompt_bsz} \
