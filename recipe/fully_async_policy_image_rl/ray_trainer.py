@@ -753,6 +753,9 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
 
                 batch, gen_batch = self._prepare_generate_batch(batch_dict)
 
+                if "task_id" in batch.batch:
+                    batch.pop(batch_keys=["task_id"])
+
                 is_last_step = self.global_steps >= self.total_training_steps
 
                 with marked_timer("step", timing_raw):
