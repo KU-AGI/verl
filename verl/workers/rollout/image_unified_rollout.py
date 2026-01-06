@@ -124,24 +124,46 @@ class _HFModelWrapper:
                     print(f"[ImageUnifiedRollout] Weight map initialized: {len(self._weight_map)} tensors, Total numel: {self._total_numel}")
 
                 @torch.no_grad()
-                def load_weights(self, flat_tensor: torch.Tensor, **kwargs):
-                    if flat_tensor.numel() != self._total_numel:
-                        raise ValueError(f"Size mismatch! Expected {self._total_numel}, got {flat_tensor.numel()}")
+                def load_weights(self, weights, **kwargs):
+                    # Handle both flat tensor and dict/generator of weights
+                    if isinstance(weights, torch.Tensor):
+                        # Original flat tensor path
+                        flat_tensor = weights
+                        if flat_tensor.numel() != self._total_numel:
+                            raise ValueError(f"Size mismatch! Expected {self._total_numel}, got {flat_tensor.numel()}")
 
-                    actual_module = self._module
-                    if hasattr(actual_module, "_fsdp_wrapped_module"):
-                        actual_module = actual_module._fsdp_wrapped_module
-                    
-                    device = next(actual_module.parameters()).device
-                    gpu_flat_tensor = flat_tensor.to(device, non_blocking=True)
-                    
-                    for weight_info in self._weight_map:
-                        target = weight_info['target']
-                        source_slice = gpu_flat_tensor[weight_info['start']:weight_info['end']]
-                        
-                        target.copy_(source_slice.view_as(target))
-                    
-                    return {"loaded_elements": self._total_numel, "status": "success"}
+                        actual_module = self._module
+                        if hasattr(actual_module, "_fsdp_wrapped_module"):
+                            actual_module = actual_module._fsdp_wrapped_module
+
+                        device = next(actual_module.parameters()).device
+                        gpu_flat_tensor = flat_tensor.to(device, non_blocking=True)
+
+                        for weight_info in self._weight_map:
+                            target = weight_info['target']
+                            source_slice = gpu_flat_tensor[weight_info['start']:weight_info['end']]
+
+                            target.copy_(source_slice.view_as(target))
+
+                        return {"loaded_elements": self._total_numel, "status": "success"}
+                    else:
+                        # Handle dict or generator of (name, tensor) pairs
+                        # ImageUnifiedRollout uses a separate non-FSDP module for rollout
+                        actual_module = self._module
+                        if hasattr(actual_module, "_fsdp_wrapped_module"):
+                            actual_module = actual_module._fsdp_wrapped_module
+
+                        # Convert generator to dict if needed (memory efficient approach)
+                        if not isinstance(weights, dict):
+                            weights = dict(weights)
+
+                        # Use load_state_dict for efficient loading
+                        # strict=False because we might only be loading a subset of weights
+                        missing_keys, unexpected_keys = actual_module.load_state_dict(weights, strict=False)
+
+                        loaded_count = len(weights) - len(missing_keys)
+
+                        return {"loaded_elements": loaded_count, "status": "success"}
                 
                 @torch.no_grad()
                 def load_weights_from_path(self, file_path: str):

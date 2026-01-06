@@ -173,7 +173,10 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
         self._create_worker_classes()
         self._init_worker_groups()
         self._init_models()
-        self._init_async_rollout_manager()
+        # Check if async rollout mode is enabled
+        self.async_rollout_mode = self.config.actor_rollout_ref.rollout.mode == "async"
+        # Async rollout manager will be initialized in fit() since it's an async method
+        self.async_rollout_manager = None
 
     def _init_resource_pools(self):
         self.resource_pool_manager.create_resource_pool()
@@ -187,7 +190,14 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
         self._create_reward_model_class()
 
     def _create_actor_rollout_classes(self):
-        raise NotImplementedError
+        # create actor and rollout
+        resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
+        actor_rollout_cls = RayClassWithInitArgs(
+            cls=self.role_worker_mapping[Role.ActorRollout],
+            config=self.config.actor_rollout_ref,
+            role=str(Role.ActorRollout),
+        )
+        self.resource_pool_to_cls[resource_pool][str(Role.ActorRollout)] = actor_rollout_cls
 
     def _create_critic_class(self):
         # create critic
@@ -746,37 +756,37 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                 is_last_step = self.global_steps >= self.total_training_steps
 
                 with marked_timer("step", timing_raw):
-                    # generate a batch
-                    with marked_timer("gen", timing_raw, color="red"):
-                        if not self.async_rollout_mode:
-                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
-                        else:
-                            gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
-                        timing_raw.update(gen_batch_output.meta_info["timing"])
-                        gen_batch_output.meta_info.pop("timing", None)
+                    # # generate a batch
+                    # with marked_timer("gen", timing_raw, color="red"):
+                    #     if not self.async_rollout_mode:
+                    #         gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                    #     else:
+                    #         gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
+                    #     timing_raw.update(gen_batch_output.meta_info["timing"])
+                    #     gen_batch_output.meta_info.pop("timing", None)
 
-                    if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
-                        if self.reward_fn is None:
-                            raise ValueError("A reward_fn is required for REMAX advantage estimation.")
+                    # if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
+                    #     if self.reward_fn is None:
+                    #         raise ValueError("A reward_fn is required for REMAX advantage estimation.")
 
-                        with marked_timer("gen_max", timing_raw, color="purple"):
-                            gen_baseline_batch = deepcopy(gen_batch)
-                            gen_baseline_batch.meta_info["do_sample"] = False
-                            if not self.async_rollout_mode:
-                                gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
-                            else:
-                                gen_baseline_output = self.async_rollout_manager.generate_sequences(gen_baseline_batch)
-                            batch = batch.union(gen_baseline_output)
-                            reward_baseline_tensor = self.reward_fn(batch)
-                            reward_baseline_tensor = reward_baseline_tensor.sum(dim=-1)
+                    #     with marked_timer("gen_max", timing_raw, color="purple"):
+                    #         gen_baseline_batch = deepcopy(gen_batch)
+                    #         gen_baseline_batch.meta_info["do_sample"] = False
+                    #         if not self.async_rollout_mode:
+                    #             gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
+                    #         else:
+                    #             gen_baseline_output = self.async_rollout_manager.generate_sequences(gen_baseline_batch)
+                    #         batch = batch.union(gen_baseline_output)
+                    #         reward_baseline_tensor = self.reward_fn(batch)
+                    #         reward_baseline_tensor = reward_baseline_tensor.sum(dim=-1)
 
-                            batch.pop(batch_keys=list(gen_baseline_output.batch.keys()))
+                    #         batch.pop(batch_keys=list(gen_baseline_output.batch.keys()))
 
-                            batch.batch["reward_baselines"] = reward_baseline_tensor
+                    #         batch.batch["reward_baselines"] = reward_baseline_tensor
 
-                            del gen_baseline_batch, gen_baseline_output
+                    #         del gen_baseline_batch, gen_baseline_output
 
-                    batch = self._post_generate_batch(batch, gen_batch_output, metrics)
+                    # batch = self._post_generate_batch(batch, gen_batch_output, metrics)
                     for task_id in [1, 2, 3]:
                         batch.batch["task_id"] = torch.tensor([task_id for _ in range(len(batch))], dtype=int)
                         batch = self._process_batch_common(batch, metrics, timing_raw, local_trigger_step=None, task_id=task_id)
