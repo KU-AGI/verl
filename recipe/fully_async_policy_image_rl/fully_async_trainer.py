@@ -42,6 +42,7 @@ import torch
 from recipe.image_rl.custom_metric_utils import reduce_metrics # custom metric
 from recipe.image_rl.reward import compute_reward, compute_reward_async
 import asyncio
+import numpy as np
 
 @ray.remote(num_cpus=10)
 class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
@@ -122,6 +123,13 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         self.batch_buffer = queue.Queue(maxsize=1)
         self.stop_prefetch = False
         self.prefetch_thread = None
+
+        # Parquet saving configuration
+        self.arrow_buffer = []
+        self.arrow_buffer_size = self.config.trainer.get("arrow_buffer_size", 1000)
+        self.arrow_output_dir = None
+        self.arrow_file_counter = 21 # 0
+        self.schema_metadata = {}
 
     def _run_prefetch(self):
         print("[FullyAsyncTrainer] Prefetch thread started.")
@@ -273,6 +281,332 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
 
         self.server_applied_versions = [-1] * num_servers
 
+    def _save_batch_to_arrow(self, batch):
+        """Accumulate batch data - preserving batch/non_tensor_batch/meta_info structure"""
+        import pandas as pd
+        import os
+        from PIL import Image
+        import io
+        
+        # Initialize output directory
+        if self.arrow_output_dir is None:
+            self.arrow_output_dir = self.config.trainer.get(
+                "arrow_output_dir", 
+                os.path.join(self.config.trainer.default_local_dir, "arrow_data")
+            )
+            os.makedirs(self.arrow_output_dir, exist_ok=True)
+            print(f"[FullyAsyncTrainer] Arrow output directory: {self.arrow_output_dir}")
+        
+        batch_size = len(batch)
+        
+        for i in range(batch_size):
+            sample_dict = {
+                # Training metadata (not from batch)
+                'global_step': self.global_steps,
+                'param_version': self.current_param_version,
+                'local_trigger_step': self.local_trigger_step,
+                
+                # Prepare nested structures for batch/non_tensor_batch/meta_info
+                'batch': {},
+                'non_tensor_batch': {},
+                'meta_info': {},
+            }
+            
+            # Add tensor data from batch.batch
+            for key, tensor in batch.batch.items():
+                try:
+                    value = tensor[i].cpu()
+                    # Track metadata for schema
+                    self._update_schema_metadata(f'batch.{key}', value, is_tensor=True)
+                    # Store in nested dict
+                    sample_dict['batch'][key] = self._convert_to_serializable(value, key)
+                except Exception as e:
+                    print(f"[Warning] Failed to process batch.{key}: {e}")
+                    sample_dict['batch'][key] = None
+        
+            # Add non-tensor data from batch.non_tensor_batch
+            for key, val in batch.non_tensor_batch.items():
+                try:
+                    item = val[i]
+                    self._update_schema_metadata(f'non_tensor_batch.{key}', item, is_tensor=False)
+                    sample_dict['non_tensor_batch'][key] = self._convert_to_serializable(item, key)
+                except Exception as e:
+                    print(f"[Warning] Failed to process non_tensor_batch.{key}: {e}")
+                    sample_dict['non_tensor_batch'][key] = None
+            
+            # Add meta_info (shared across all samples in this batch)
+            # Only include per-sample meta_info if it's a list with correct length
+            for key, value in batch.meta_info.items():
+                try:
+                    if isinstance(value, list) and len(value) == batch_size:
+                        # Per-sample meta_info - track as sample-level
+                        item = value[i]
+                        self._update_schema_metadata(
+                            f'meta_info.{key}', 
+                            item, 
+                            is_tensor=False,
+                            is_batch_level=False
+                        )
+                        sample_dict['meta_info'][key] = self._convert_to_serializable(item, key)
+                    else:
+                        # Batch-level meta_info (same for all samples)
+                        if i == 0:  # Track only once
+                            self._update_schema_metadata(
+                                f'meta_info.{key}', 
+                                value, 
+                                is_tensor=False,
+                                is_batch_level=True
+                            )
+                        # Store as serialized value
+                        sample_dict['meta_info'][key] = self._convert_to_serializable(value, key)
+                except Exception as e:
+                    print(f"[Warning] Failed to process meta_info.{key}: {e}")
+        
+            # Clean empty dicts to avoid PyArrow errors
+            if not sample_dict['batch']:
+                sample_dict['batch'] = None
+            if not sample_dict['non_tensor_batch']:
+                sample_dict['non_tensor_batch'] = None
+            if not sample_dict['meta_info']:
+                sample_dict['meta_info'] = None
+            
+            # Track metadata for training fields
+            if i == 0:  # Track once
+                self._update_schema_metadata('global_step', self.global_steps)
+                self._update_schema_metadata('param_version', self.current_param_version)
+                self._update_schema_metadata('local_trigger_step', self.local_trigger_step)
+            
+            self.arrow_buffer.append(sample_dict)
+        
+        # Save when buffer is full
+        if len(self.arrow_buffer) >= self.arrow_buffer_size:
+            self._flush_arrow_buffer()
+
+    def _convert_to_serializable(self, item, key_name=""):
+        """Convert all types to HuggingFace datasets compatible format"""
+        from PIL import Image
+        import io
+        
+        # Handle None
+        if item is None:
+            return None
+        
+        # Handle primitives
+        if isinstance(item, (int, float, bool, str)):
+            return item
+        
+        # Handle PIL Images - convert to bytes dict for HF Image feature
+        if isinstance(item, Image.Image):
+            # Convert PIL to bytes
+            img_byte_arr = io.BytesIO()
+            img_format = item.format if item.format else 'PNG'
+            item.save(img_byte_arr, format=img_format)
+            img_byte_arr.seek(0)
+            
+            # Return as dict with bytes and path (HF datasets Image format)
+            return {
+                'bytes': img_byte_arr.getvalue(),
+                'path': None
+            }
+        
+        # Handle torch tensors
+        if torch.is_tensor(item):
+            if item.numel() == 0:
+                return None
+            # Convert to numpy first, then to list
+            return item.cpu().numpy().tolist()
+        
+        # Handle numpy arrays
+        if isinstance(item, np.ndarray):
+            if item.size == 0:
+                return None
+            # Keep as list for compatibility
+            return item.tolist()
+        
+        # Handle lists
+        if isinstance(item, list):
+            if len(item) == 0:
+                return None
+            # Check if list contains PIL images
+            if len(item) > 0 and isinstance(item[0], Image.Image):
+                # List of PIL images
+                return [self._convert_to_serializable(img, key_name) for img in item]
+            # Recursively process list items
+            return [self._convert_to_serializable(x, key_name) for x in item]
+        
+        # Handle tuples - convert to list
+        if isinstance(item, tuple):
+            if len(item) == 0:
+                return None
+            return [self._convert_to_serializable(x, key_name) for x in item]
+        
+        # Handle dicts
+        if isinstance(item, dict):
+            if len(item) == 0:
+                return None  # Empty dict causes PyArrow error
+            # Recursively process dict values
+            return {k: self._convert_to_serializable(v, f"{key_name}.{k}") for k, v in item.items()}
+        
+        # Fallback
+        return str(item)
+
+    def _update_schema_metadata(self, key, value, is_tensor=False, is_batch_level=None):
+        """Track original type and shape information for each key"""
+        from PIL import Image
+        
+        if key in self.schema_metadata:
+            return  # Already tracked
+        
+        metadata = {
+            'key': key,
+            'is_tensor': is_tensor,
+            'is_batch_level': is_batch_level,  # None, True, or False
+            'dtype': None,
+            'shape': None,
+            'value_type': type(value).__name__,
+        }
+        
+        if value is None:
+            metadata['value_type'] = 'NoneType'
+        elif isinstance(value, (int, float, bool, str)):
+            metadata['dtype'] = type(value).__name__
+            metadata['shape'] = []  # Scalar
+        elif torch.is_tensor(value):
+            metadata['dtype'] = str(value.dtype)
+            metadata['shape'] = list(value.shape)
+            metadata['is_tensor'] = True
+        elif isinstance(value, np.ndarray):
+            metadata['dtype'] = str(value.dtype)
+            metadata['shape'] = list(value.shape)
+        elif isinstance(value, Image.Image):
+            metadata['value_type'] = 'PIL.Image'
+            metadata['dtype'] = value.mode  # RGB, RGBA, L, etc.
+            metadata['shape'] = [value.height, value.width]
+        elif isinstance(value, dict):
+            metadata['value_type'] = 'dict'
+            metadata['shape'] = [len(value)]
+            if value:
+                # Track dict structure
+                metadata['dict_keys'] = list(value.keys())
+                first_key = list(value.keys())[0]
+                metadata['sample_value_type'] = type(value[first_key]).__name__
+        elif isinstance(value, list):
+            metadata['shape'] = [len(value)]
+            if len(value) > 0:
+                first_item = value[0]
+                if isinstance(first_item, Image.Image):
+                    metadata['value_type'] = 'List[PIL.Image]'
+                    metadata['dtype'] = first_item.mode
+                    metadata['shape'].extend([first_item.height, first_item.width])
+                elif torch.is_tensor(first_item):
+                    metadata['value_type'] = 'List[Tensor]'
+                    metadata['dtype'] = str(first_item.dtype)
+                    metadata['shape'].extend(list(first_item.shape))
+                elif isinstance(first_item, list):
+                    metadata['value_type'] = 'List[List]'
+                    metadata['shape'].append(len(first_item))
+                    if len(first_item) > 0:
+                        metadata['dtype'] = type(first_item[0]).__name__
+                elif isinstance(first_item, dict):
+                    metadata['value_type'] = 'List[dict]'
+                    metadata['dict_keys'] = list(first_item.keys()) if first_item else []
+                else:
+                    metadata['dtype'] = type(first_item).__name__
+        
+        self.schema_metadata[key] = metadata
+
+    def _flush_arrow_buffer(self):
+        """Save buffer to arrow format preserving structure"""
+        if not self.arrow_buffer:
+            return
+        
+        import json
+        from datasets import Dataset
+        
+        try:
+            # Create HuggingFace Dataset from buffer
+            dataset = Dataset.from_list(self.arrow_buffer)
+            
+            # Save to disk
+            self.arrow_file_counter += 1
+            filename = f"training_data_part{self.arrow_file_counter:04d}_step{self.global_steps}"
+            filepath = os.path.join(self.arrow_output_dir, filename)
+            dataset.save_to_disk(filepath)
+            
+            print(f"[FullyAsyncTrainer] Saved {len(dataset)} samples to {filepath}")
+            
+            # Save metadata JSON on first flush
+            if self.arrow_file_counter == 1:
+                # Organize schema by category
+                batch_schema = {k: v for k, v in self.schema_metadata.items() if k.startswith('batch.')}
+                non_tensor_schema = {k: v for k, v in self.schema_metadata.items() if k.startswith('non_tensor_batch.')}
+                meta_info_schema = {k: v for k, v in self.schema_metadata.items() if k.startswith('meta_info.')}
+                other_schema = {k: v for k, v in self.schema_metadata.items() 
+                            if not (k.startswith('batch.') or k.startswith('non_tensor_batch.') or k.startswith('meta_info.'))}
+                
+                meta_filepath = os.path.join(self.arrow_output_dir, "schema_metadata.json")
+                with open(meta_filepath, 'w') as f:
+                    json.dump({
+                        'structure': {
+                            'batch': 'dict - contains all tensor data from batch.batch',
+                            'non_tensor_batch': 'dict - contains all non-tensor data from batch.non_tensor_batch',
+                            'meta_info': 'dict - contains metadata from batch.meta_info',
+                            'global_step': 'int - training step',
+                            'param_version': 'int - parameter version',
+                            'local_trigger_step': 'int - local trigger step',
+                        },
+                        'schema': {
+                            'batch': batch_schema,
+                            'non_tensor_batch': non_tensor_schema,
+                            'meta_info': meta_info_schema,
+                            'training_metadata': other_schema,
+                        },
+                        'created_at_step': self.global_steps,
+                        'total_fields': len(self.schema_metadata),
+                    }, f, indent=2)
+                print(f"[FullyAsyncTrainer] Saved schema metadata to {meta_filepath}")
+                
+                # Print summary
+                print(f"[Schema Summary]")
+                print(f"  - batch fields: {len(batch_schema)}")
+                print(f"  - non_tensor_batch fields: {len(non_tensor_schema)}")
+                print(f"  - meta_info fields: {len(meta_info_schema)}")
+                print(f"  - training metadata: {len(other_schema)}")
+            
+            self.arrow_buffer = []
+            
+        except Exception as e:
+            print(f"[Error] Failed to save arrow: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # Force clear to prevent memory issues
+            if len(self.arrow_buffer) > self.arrow_buffer_size * 2:
+                print("[Warning] Clearing oversized buffer")
+                self.arrow_buffer = []
+
+    def _finalize_arrow_saving(self):
+        """Flush remaining buffer and update final metadata"""
+        if self.arrow_buffer:
+            print(f"[FullyAsyncTrainer] Flushing final arrow buffer ({len(self.arrow_buffer)} samples)")
+            self._flush_arrow_buffer()
+        
+        # Update final metadata
+        import json
+        summary_path = os.path.join(self.arrow_output_dir, "summary.json")
+        with open(summary_path, 'w') as f:
+            json.dump({
+                'total_files': self.arrow_file_counter,
+                'final_global_step': self.global_steps,
+                'final_param_version': self.current_param_version,
+                'structure': {
+                    'batch': 'dict containing tensor data',
+                    'non_tensor_batch': 'dict containing non-tensor data',
+                    'meta_info': 'dict containing metadata',
+                }
+            }, f, indent=2)
+        print(f"[FullyAsyncTrainer] Saved summary: {self.arrow_file_counter} files")
+
     def fit(self):
         """
         The training loop of PPO.
@@ -314,88 +648,97 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                     if batch is None: break
                     self._collect_metrics_from_samples(batch, metrics)
 
-                    # Collect timing info from rollouter (reward computation time)
-                    if hasattr(batch, 'meta_info') and 'reward' in batch.meta_info:
-                        timing_raw['reward'] = batch.meta_info['reward']
+                    if self.config.trainer.get("save_to_arrow", False):
+                        self._save_batch_to_arrow(batch)
 
-                    async_training = self.config.get("async_training", None)
-                    use_mis = async_training and async_training.use_rollout_log_probs
-                    local_trigger = self.local_trigger_step if self.compute_prox_log_prob else None
-                    should_swap = use_mis and local_trigger is not None and local_trigger > 1
+        # ===== TMP =====
+        #             # Collect timing info from rollouter (reward computation time)
+        #             if hasattr(batch, 'meta_info') and 'reward' in batch.meta_info:
+        #                 timing_raw['reward'] = batch.meta_info['reward']
+
+        #             async_training = self.config.get("async_training", None)
+        #             use_mis = async_training and async_training.use_rollout_log_probs
+        #             local_trigger = self.local_trigger_step if self.compute_prox_log_prob else None
+        #             should_swap = use_mis and local_trigger is not None and local_trigger > 1
                     
-                    if use_mis:
-                        if local_trigger == 1:
-                            self.actor_rollout_wg.save_model_to_cpu(1)
-                        elif should_swap:
-                            self.actor_rollout_wg.save_model_to_cpu(local_trigger)
-                            self.actor_rollout_wg.restore_model_from_cpu(1)
+        #             if use_mis:
+        #                 if local_trigger == 1:
+        #                     self.actor_rollout_wg.save_model_to_cpu(1)
+        #                 elif should_swap:
+        #                     self.actor_rollout_wg.save_model_to_cpu(local_trigger)
+        #                     self.actor_rollout_wg.restore_model_from_cpu(1)
 
-                    for task_id in [1, 2, 3]:
-                        batch.batch["task_id"] = torch.tensor([task_id for _ in range(len(batch))], dtype=int)
+        #             for task_id in [1, 2, 3]:
+        #                 batch.batch["task_id"] = torch.tensor([task_id for _ in range(len(batch))], dtype=int)
 
-                        batch = self._process_batch_common(
-                            batch, metrics, timing_raw, self.local_trigger_step if self.compute_prox_log_prob else None, task_id
-                        )
+        #                 batch = self._process_batch_common(
+        #                     batch, metrics, timing_raw, self.local_trigger_step if self.compute_prox_log_prob else None, task_id
+        #                 )
 
-                    if should_swap:
-                        self.actor_rollout_wg.restore_model_from_cpu(local_trigger)
-                        self.actor_rollout_wg.clear_cpu_model(local_trigger)
+        #             if should_swap:
+        #                 self.actor_rollout_wg.restore_model_from_cpu(local_trigger)
+        #                 self.actor_rollout_wg.clear_cpu_model(local_trigger)
                 
-                    # update critic
-                    if self.use_critic:
-                        with marked_timer("update_critic", timing_raw, color="pink"):
-                            critic_output = self.critic_wg.update_critic(batch)
-                        critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
-                        metrics.update(critic_output_metrics)
+        #             # update critic
+        #             if self.use_critic:
+        #                 with marked_timer("update_critic", timing_raw, color="pink"):
+        #                     critic_output = self.critic_wg.update_critic(batch)
+        #                 critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
+        #                 metrics.update(critic_output_metrics)
 
-                    # implement critic warmup
-                    if self.config.trainer.critic_warmup <= self.global_steps:
-                        # update actor
-                        with marked_timer("update_actor", timing_raw, color="red"):
-                            batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
-                            actor_output = self.actor_rollout_wg.update_actor(batch)
-                        actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
-                        metrics.update(actor_output_metrics)
+        #             # implement critic warmup
+        #             if self.config.trainer.critic_warmup <= self.global_steps:
+        #                 # update actor
+        #                 with marked_timer("update_actor", timing_raw, color="red"):
+        #                     batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+        #                     actor_output = self.actor_rollout_wg.update_actor(batch)
+        #                 actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+        #                 metrics.update(actor_output_metrics)
 
-                    reward_extra_infos_dict: dict[str, list] = {}
-                    for task_id in [1, 2, 3]:
-                        # Get pre-computed reward_extra_infos_dict from meta_info
-                        reward_extra_infos_dict.update({k: v for k, v in batch.meta_info.items()})
+        #             reward_extra_infos_dict: dict[str, list] = {}
+        #             for task_id in [1, 2, 3]:
+        #                 # Get pre-computed reward_extra_infos_dict from meta_info
+        #                 reward_extra_infos_dict.update({k: v for k, v in batch.meta_info.items()})
 
-                    # Log rollout generations if enabled (per task)
-                    rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
-                    if self.config.trainer.rollout_freq > 0 and (
-                        self.global_steps % self.config.trainer.rollout_freq == 0 and rollout_data_dir
-                    ):
-                        self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
+        #             # Log rollout generations if enabled (per task)
+        #             rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+        #             if self.config.trainer.rollout_freq > 0 and (
+        #                 self.global_steps % self.config.trainer.rollout_freq == 0 and rollout_data_dir
+        #             ):
+        #                 self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
 
-            self._collect_metrics(batch, 0, metrics, timing_raw)
-            self.metrics_aggregator.add_step_metrics(
-                metrics=metrics, sample_count=self.required_samples, timestamp=time.time()
-            )
-            # Trigger parameter synchronization after training step
-            time_str = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-            print(
-                f"[FullyAsyncTrainer] global_steps: {self.global_steps} "
-                f"local_trigger_step: {self.local_trigger_step} "
-                f"trigger_parameter_sync_step: {self.trigger_parameter_sync_step} "
-                f"{time_str}"
-            )
-            self._trigger_parameter_sync_after_step(global_steps=self.global_steps)
-            self._log_validation_data()
-            self._check_save_checkpoint(timing_raw)
-            self.global_steps += 1
+        #     self._collect_metrics(batch, 0, metrics, timing_raw)
+        #     self.metrics_aggregator.add_step_metrics(
+        #         metrics=metrics, sample_count=self.required_samples, timestamp=time.time()
+        #     )
+        #     # Trigger parameter synchronization after training step
+        #     time_str = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        #     print(
+        #         f"[FullyAsyncTrainer] global_steps: {self.global_steps} "
+        #         f"local_trigger_step: {self.local_trigger_step} "
+        #         f"trigger_parameter_sync_step: {self.trigger_parameter_sync_step} "
+        #         f"{time_str}"
+        #     )
+        #     self._trigger_parameter_sync_after_step(global_steps=self.global_steps)
+        #     self._log_validation_data()
+        #     self._check_save_checkpoint(timing_raw)
+        #     self.global_steps += 1
 
-        # final parameter sync and validate
-        # 1. waiting remaining validate task
-        ray.get(self.param_synchronizer.wait_last_valid.remote())
-        self._log_validation_data()
-        # 2. perform addtional parameter_sync and validate if trainer already updated
-        if self.current_param_version % self.config.rollout.test_freq != 0 or self.local_trigger_step > 1:
-            self._trigger_parameter_sync_after_step(validate=True, global_steps=self.global_steps)
-            ray.get(self.param_synchronizer.wait_last_valid.remote())
-            self._log_validation_data()
-            
+        # # final parameter sync and validate
+        # # 1. waiting remaining validate task
+        # ray.get(self.param_synchronizer.wait_last_valid.remote())
+        # self._log_validation_data()
+        # # 2. perform addtional parameter_sync and validate if trainer already updated
+        # if self.current_param_version % self.config.rollout.test_freq != 0 or self.local_trigger_step > 1:
+        #     self._trigger_parameter_sync_after_step(validate=True, global_steps=self.global_steps)
+        #     ray.get(self.param_synchronizer.wait_last_valid.remote())
+        #     self._log_validation_data()
+        # ===== TMP =====
+
+        # Training loop ended, flush remaining buffer
+        if self.config.trainer.get("save_to_arrow", False):
+            self._finalize_arrow_saving()
+
         self.progress_bar.close()
         self.stop_prefetch = True
 
