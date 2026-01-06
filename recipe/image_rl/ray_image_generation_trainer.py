@@ -708,12 +708,12 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             sample_task3_regen_imgs.extend(task3_regen_imgs_pil_list)
 
             if self.config.reward_model.enable and not self.config.reward_model.paired:
-                reward_tensor = self.rm_wg.compute_rm_score(test_batch)
-                test_batch = test_batch.union(reward_tensor)
+                reward_tensor = self.rm_wg.compute_rm_score(test_output_gen_batch)
+                test_output_gen_batch = test_output_gen_batch.union(reward_tensor)
 
             # evaluate using reward_function for each task
             for task_id in [1, 2, 3]:
-                task_reward_dict = self.val_reward_fn(test_batch, eval=True, task_id=task_id, return_dict=True)
+                task_reward_dict = self.val_reward_fn(test_output_gen_batch, eval=True, task_id=task_id, return_dict=True)
                 task_reward_tensor = task_reward_dict[f"task{task_id}_reward_tensor"]
                 task_reward_tensors[task_id].append(task_reward_tensor)
 
@@ -733,22 +733,20 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                     sample_task3_scores.extend(per_sample_scores)
 
             self._dump_generations(
-                uid=test_batch.non_tensor_batch["uid"].tolist(),
-                prompt_id=test_batch.non_tensor_batch["prompt_id"].tolist(),
-                prompt=test_batch.non_tensor_batch["prompt"].tolist(),
+                uid=test_output_gen_batch.non_tensor_batch["uid"].tolist(),
+                prompt_id=test_output_gen_batch.non_tensor_batch["prompt_id"].tolist(),
+                prompt=test_output_gen_batch.non_tensor_batch["prompt"].tolist(),
                 gen_imgs_pil_list=test_output_gen_batch.non_tensor_batch.get('task1_gen_imgs_pil_list'),
                 feedback_texts=test_output_gen_batch.non_tensor_batch.get('task2_feedback_texts'),
-                # Regen이 없으면 .get()에 의해 자동으로 None이 들어감
                 regen_imgs_pil_list=test_output_gen_batch.non_tensor_batch.get('task3_regen_imgs_pil_list'), 
-                gts_imgs=[item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_batch],
-                summarizes=[item.non_tensor_batch.get("reward_model", {}).get("summary", None) for item in test_batch],
-                gts_tuples=[item.non_tensor_batch.get("reward_model", {}).get("tuple", None) for item in test_batch],
-                gts_vqas=[item.non_tensor_batch.get("reward_model", {}).get("vqa_question", None) for item in test_batch],
+                gts_imgs=[item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_output_gen_batch],
+                summarizes=[item.non_tensor_batch.get("reward_model", {}).get("summary", None) for item in test_output_gen_batch],
+                gts_tuples=[item.non_tensor_batch.get("reward_model", {}).get("tuple", None) for item in test_output_gen_batch],
+                gts_vqas=[item.non_tensor_batch.get("reward_model", {}).get("vqa_question", None) for item in test_output_gen_batch],
                 scores=batch_scores,
                 reward_extra_infos_dict=batch_reward_extra_infos,
                 dump_path=val_data_dir
                 )
-
 
             batch_size = len(prompts)
             data_source = test_batch.non_tensor_batch.get('data_source', ['unknown'] * batch_size)
@@ -803,11 +801,11 @@ class RayImageGenerationTrainer(RayPPOTrainer):
         return metric_dict
 
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
-        reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
+        # reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
 
         # pop those keys for generation
         batch_keys_to_pop = ["dummy_tensor"]
-        non_tensor_batch_keys_to_pop = set(batch.non_tensor_batch.keys()) - reward_model_keys
+        non_tensor_batch_keys_to_pop = set(batch.non_tensor_batch.keys()) # - reward_model_keys
         gen_batch = batch.pop(
             batch_keys=batch_keys_to_pop,
             non_tensor_batch_keys=list(non_tensor_batch_keys_to_pop),
