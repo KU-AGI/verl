@@ -51,6 +51,7 @@ from verl.models.transformers.monkey_patch import apply_monkey_patch
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
 from verl.utils import hf_processor, hf_tokenizer
+from verl.utils.ray_utils import get_event_loop
 from verl.utils.activation_offload import enable_activation_offloading
 from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.utils.config import omega_conf_to_dataclass
@@ -595,6 +596,18 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
                 config=rollout_config, model_config=model_config, device_mesh=rollout_device_mesh
             )
         log_gpu_memory_usage(f"After building {self.config.rollout.name} rollout", logger=logger)
+
+        # used for LoRA
+        self.base_sync_done: bool = "dummy" not in self.config.rollout.load_format
+        self.layered_summon = self.config.rollout.get("layered_summon", False)
+
+        # 5. switch to trainer mode
+        # NOTE: It's critical that hybrid engine in trainer mode initially to load checkpoint.
+        # For sync mode, we directly switch to trainer mode here.
+        # For async mode, we can't call run_until_complete here, so we will switch to trainer mode in AgentLoopManager.
+        if rollout_config.mode == "sync" and self._is_actor:
+            loop = get_event_loop()
+            loop.run_until_complete(self.trainer_mode())
 
     async def rollout_mode(self):
         """Context switch hybridengine to rollout mode."""
