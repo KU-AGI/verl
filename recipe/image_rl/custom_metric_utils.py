@@ -253,18 +253,18 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         f"prompt_length/task{task_id}/clip_ratio": torch.mean(torch.eq(prompt_length, max_prompt_length).float()).detach().item(),
     }
 
-    # multi-turn conversation: not use
-    if "__num_turns__" in batch.non_tensor_batch:
-        num_turns = batch.non_tensor_batch["__num_turns__"]
-        metrics["num_turns/min"] = num_turns.min()
-        metrics["num_turns/max"] = num_turns.max()
-        metrics["num_turns/mean"] = num_turns.mean()
+    # # multi-turn conversation: not use
+    # if "__num_turns__" in batch.non_tensor_batch:
+    #     num_turns = batch.non_tensor_batch["__num_turns__"]
+    #     metrics["num_turns/min"] = num_turns.min()
+    #     metrics["num_turns/max"] = num_turns.max()
+    #     metrics["num_turns/mean"] = num_turns.mean()
 
-    if "tool_call_counts" in batch.non_tensor_batch:
-        tool_call_counts = batch.non_tensor_batch["tool_call_counts"]
-        metrics["tool_call_counts/min"] = tool_call_counts.min()
-        metrics["tool_call_counts/max"] = tool_call_counts.max()
-        metrics["tool_call_counts/mean"] = tool_call_counts.mean()
+    # if "tool_call_counts" in batch.non_tensor_batch:
+    #     tool_call_counts = batch.non_tensor_batch["tool_call_counts"]
+    #     metrics["tool_call_counts/min"] = tool_call_counts.min()
+    #     metrics["tool_call_counts/max"] = tool_call_counts.max()
+    #     metrics["tool_call_counts/mean"] = tool_call_counts.mean()
 
     if "data_source" in batch.non_tensor_batch:
         data_sources = batch.non_tensor_batch["data_source"]
