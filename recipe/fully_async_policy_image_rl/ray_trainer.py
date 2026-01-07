@@ -751,10 +751,25 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                         else curr_step_profile
                     )
 
-                batch, gen_batch = self._prepare_generate_batch(batch_dict)
+                tensors = {}
+                non_tensors = {}
+                meta_info = {}
 
-                if "task_id" in batch.batch:
-                    batch.pop(batch_keys=["task_id"])
+                for k, v in batch_dict.items():
+                    if isinstance(v, torch.Tensor):
+                        tensors[k] = v
+                    elif isinstance(v, np.ndarray):
+                        non_tensors[k] = v
+                    else:
+                        # scalar, dict, list 등은 meta_info로
+                        meta_info[k] = v
+
+                # batch, gen_batch = self._prepare_generate_batch(batch_dict)
+                batch: DataProto = DataProto.from_dict(
+                    tensors=tensors,
+                    non_tensors=non_tensors,
+                    meta_info=meta_info
+                )
 
                 is_last_step = self.global_steps >= self.total_training_steps
 
@@ -790,6 +805,20 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                     #         del gen_baseline_batch, gen_baseline_output
 
                     # batch = self._post_generate_batch(batch, gen_batch_output, metrics)
+
+                    # compute global_valid tokens
+                    batch.batch["attention_mask"] = torch.cat([
+                        batch.batch["task1_attention_mask"], batch.batch["task1_response_mask"],
+                        batch.batch["task2_attention_mask"], batch.batch["task2_response_mask"],
+                        batch.batch["task3_attention_mask"], batch.batch["task3_response_mask"]
+                    ], dim=1)
+
+                    if self.config.trainer.balance_batch:
+                        self._balance_batch(batch, metrics=metrics)
+
+                    # compute global_valid tokens
+                    batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+
                     for task_id in [1, 2, 3]:
                         batch.batch["task_id"] = torch.tensor([task_id for _ in range(len(batch))], dtype=int)
                         batch = self._process_batch_common(batch, metrics, timing_raw, local_trigger_step=None, task_id=task_id)
@@ -814,7 +843,8 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
 
                     # Reward is already in batch from rollouter
                     # Get reward_extra_infos_dict from meta_info if available
-                    reward_extra_infos_dict = batch.meta_info.get(f"task{task_id}_reward_extra_info", {})
+                    # reward_extra_infos_dict = batch.meta_info.get(f"task{task_id}_reward_extra_info", {}) ###
+                    reward_extra_infos_dict = {k: v for k, v in batch.meta_info.items()}
 
                     # if reward_extra_infos_dict: # remove reward extra info to non_tensor_batch for logging
                     #     batch.non_tensor_batch.update({k: np.array(v, dtype=object) for k, v in reward_extra_infos_dict.items()})
@@ -892,9 +922,11 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
         # TODO: Decouple the DP balancing and mini-batching.
 
         # compute global_valid tokens
-        batch.batch["attention_mask"] = batch.batch["task1_attention_mask"].sum(dim=-1) + batch.batch["task1_response_mask"].sum(dim=-1) \
-                                      + batch.batch["task2_attention_mask"].sum(dim=-1) + batch.batch["task2_response_mask"].sum(dim=-1) \
-                                      + batch.batch["task3_attention_mask"].sum(dim=-1) + batch.batch["task3_response_mask"].sum(dim=-1)
+        batch.batch["attention_mask"] = torch.cat([
+            batch.batch["task1_attention_mask"], batch.batch["task1_response_mask"],
+            batch.batch["task2_attention_mask"], batch.batch["task2_response_mask"],
+            batch.batch["task3_attention_mask"], batch.batch["task3_response_mask"]
+        ], dim=1)
         
         if self.config.trainer.balance_batch:
             self._balance_batch(batch, metrics=metrics)

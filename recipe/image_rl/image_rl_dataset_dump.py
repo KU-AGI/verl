@@ -18,74 +18,25 @@ import copy
 import logging
 import os
 import re
-from collections import defaultdict
-from typing import List, Union, Optional
+from collections import defaultdict, OrderedDict
+from pathlib import Path
+from typing import List, Optional, Union, Tuple, Any
 
-import datasets
 import numpy as np
 import torch
+import pyarrow as pa
+from datasets import load_dataset, load_from_disk
 from omegaconf import DictConfig, ListConfig
+from PIL import Image
+import io as _io
+
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer, ProcessorMixin
-
-import verl.utils.torch_functional as verl_F
-from verl.utils.model import compute_position_id_with_mask
-from datasets import load_dataset, load_from_disk, concatenate_datasets
-from functools import partial
-from recipe.image_rl.preprocess_utils import preprocess_row_wrapper, _make_cache_key
-
 
 logger = logging.getLogger(__name__)
 
 
-def collate_fn(data_list: list[dict]) -> dict:
-    """
-    Collate a batch of sample dicts into batched tensors and arrays.
-
-    Args:
-        data_list: List of dicts mapping feature names to torch.Tensor or other values.
-
-    Returns:
-        Dict where tensor entries are stacked into a torch.Tensor of shape
-        (batch_size, *dims) and non-tensor entries are converted to
-        np.ndarray of dtype object with shape (batch_size,).
-    """
-    tensors = defaultdict(list)
-    non_tensors = defaultdict(list)
-
-    for data in data_list:
-        for key, val in data.items():
-            if isinstance(val, torch.Tensor):
-                tensors[key].append(val)
-            else:
-                non_tensors[key].append(val)
-
-    for key, val in tensors.items():
-        tensors[key] = torch.stack(val, dim=0)
-
-    for key, val in non_tensors.items():
-        non_tensors[key] = np.fromiter(val, dtype=object, count=len(val))
-
-    return {**tensors, **non_tensors}
-
-
 class ImageRLDataset(Dataset):
-    """
-    Load and preprocess RLHF data from Parquet/Arrow files.
-
-    - Caches files locally.
-    - Reads into a HuggingFace Dataset and tokenizes prompts.
-    - Optionally handles images/videos via a ProcessorMixin.
-    - Filters prompts over a max length.
-    - Supports resuming from checkpoints.
-
-    Args:
-        data_files (str or list): Path(s) to Parquet/Arrow file(s) or directory.
-        tokenizer (PreTrainedTokenizer): For the tokenization of text to token IDs.
-        config (DictConfig): Options like cache_dir, prompt_key, max_prompt_length, truncation, etc.
-        processor (ProcessorMixin, optional): Multimodal preprocessor for images/videos.
-    """
-
     def __init__(
         self,
         data_files: str | list[str],
@@ -94,11 +45,11 @@ class ImageRLDataset(Dataset):
         processor: Optional[ProcessorMixin] = None,
         max_samples: int = -1,
     ):
-        if not isinstance(data_files, list | ListConfig):
+        if not isinstance(data_files, (list, ListConfig)):
             data_files = [data_files]
 
-        self.data_files = copy.deepcopy(data_files)
-        self.original_data_files = copy.deepcopy(data_files)  # use for resume
+        self.data_files = copy.deepcopy(list(data_files))
+        self.original_data_files = copy.deepcopy(list(data_files))
         self.tokenizer = tokenizer
         self.processor = processor
         self.max_samples = max_samples
@@ -125,171 +76,646 @@ class ImageRLDataset(Dataset):
         self.return_multi_modal_inputs = config.get("return_multi_modal_inputs", True)
         self.shuffle = config.get("shuffle", False)
         self.seed = config.get("seed")
-        
-        # Schema metadata for arrow data restoration
-        self.schema_metadata = None
-        self.is_nested_structure = False  # Flag to check if data has nested structure
 
-        # Load fromo cache
-        self.preprocessed_cache_dir = config.get("preprocessed_cache_dir", None)
-        self.force_rebuild_preprocessed = config.get("force_rebuild_preprocessed", False)
+        self.schema_metadata = None
+        self.is_nested_structure = False
+
+        self.use_sample_cache = config.get("use_sample_cache", False)
+        self.cache_size = config.get("sample_cache_size", 1000)
+        self._sample_cache = {} if self.use_sample_cache else None
+
+        self.decode_tensors = config.get("decode_tensors", True)
+        self.decode_images = config.get("decode_images", True)
+        self.device = config.get("device", "cpu")
+        self.max_cached_chunks = config.get("max_cached_chunks", 5)
+
+        self._chunk_cache = OrderedDict()
+        self.chunk_types: List[str] = []
+        self.chunk_dirs: List[Path] = []
 
         self._download()
-        self._read_files_and_tokenize()
+        self._read_files_and_build_index()
 
-    def _download(self, use_origin_parquet=False):
+    # ----------------------------- IO / discovery -----------------------------
+
+    def _download(self, use_origin_parquet: bool = False):
         from verl.utils.fs import copy_to_local
-
         data_files = self.data_files if not use_origin_parquet else self.original_data_files
-        for i, parquet_file in enumerate(data_files):
-            self.data_files[i] = copy_to_local(src=parquet_file, cache_dir=self.cache_dir, use_shm=self.use_shm)
+        for i, f in enumerate(data_files):
+            self.data_files[i] = copy_to_local(src=f, cache_dir=self.cache_dir, use_shm=self.use_shm)
 
-    def _load_schema_metadata(self, arrow_dir):
-        """Load schema metadata from arrow directory"""
+    def _load_schema_metadata(self, base_dir: str):
         import json
-        
-        # Try new format first (schema_metadata.json)
-        meta_filepath = os.path.join(arrow_dir, "schema_metadata.json")
+        meta_filepath = os.path.join(base_dir, "schema_metadata.json")
         if os.path.exists(meta_filepath):
-            with open(meta_filepath, 'r') as f:
+            with open(meta_filepath, "r") as f:
                 meta = json.load(f)
-                self.schema_metadata = meta.get('structure', {})
-                self.is_nested_structure = True  # New format uses nested structure
-                print(f"[ImageRLDataset] Loaded schema metadata (nested structure) with {len(self.schema_metadata)} fields")
-            return
+            self.schema_metadata = meta.get("structure", {})
+            self.is_nested_structure = True
+            print(f"[ImageRLDataset] Loaded schema metadata with {len(self.schema_metadata)} fields from {base_dir}")
 
-    def _read_files_and_tokenize(self):
-        cache_dir = None
-        if self.preprocessed_cache_dir:
-            cache_key = _make_cache_key(self.data_files)
-            cache_dir = os.path.join(self.preprocessed_cache_dir, f"preprocessed_{cache_key}")
+    def _is_parquet_file(self, path: Path) -> bool:
+        return path.is_file() and path.suffix.lower() in [".parquet", ".pq"]
 
-        if cache_dir and os.path.exists(os.path.join(cache_dir, "dataset_info.json")) and not self.force_rebuild_preprocessed:
-            print(f"[ImageRLDataset] Loading preprocessed dataset from cache: {cache_dir}")
-            self.dataframe = load_from_disk(cache_dir)
-            # 이미 flatten + 타입복원까지 끝난 데이터로 간주
-            self.preprocessed_data = None
-            return
+    def _is_arrow_dataset(self, path: Path) -> bool:
+        if not path.is_dir():
+            return False
+        if (path / "dataset_info.json").exists():
+            return True
+        if list(path.glob("*.arrow")):
+            return True
+        if list(path.glob("data-*")):
+            return True
+        return False
 
-        dataframes = []
+    def _discover_arrow_dataset_under(self, container: Path, max_depth: int = 2) -> List[Path]:
+        found: List[Path] = []
+        if not container.is_dir():
+            return found
+
+        frontier = [(container, 0)]
+        seen = set()
+        while frontier:
+            p, d = frontier.pop()
+            if str(p) in seen:
+                continue
+            seen.add(str(p))
+
+            if self._is_arrow_dataset(p):
+                found.append(p)
+                continue
+
+            if d >= max_depth:
+                continue
+
+            try:
+                for child in p.iterdir():
+                    if child.is_dir():
+                        frontier.append((child, d + 1))
+            except PermissionError:
+                continue
+
+        uniq = []
+        seen2 = set()
+        for p in found:
+            if str(p) not in seen2:
+                uniq.append(p)
+                seen2.add(str(p))
+        return uniq
+
+    def _find_chunks(self, data_path: Path) -> List[Tuple[Path, str, Path]]:
+        chunks: List[Tuple[Path, str, Path]] = []
+
+        if not data_path.exists():
+            logger.error(f"Path does not exist: {data_path}")
+            return chunks
+
+        if self._is_parquet_file(data_path):
+            return [(data_path, "parquet", data_path.parent)]
+
+        if self._is_arrow_dataset(data_path):
+            return [(data_path, "arrow", data_path)]
+
+        if not data_path.is_dir():
+            logger.error(f"Path is not a directory: {data_path}")
+            return chunks
+
+        chunk_pattern = re.compile(r"^chunk_\d+$")
+        chunk_dirs: List[Path] = []
+        try:
+            for item in data_path.iterdir():
+                if item.is_dir() and chunk_pattern.match(item.name):
+                    chunk_dirs.append(item)
+        except PermissionError:
+            logger.error(f"Permission denied: {data_path}")
+            return chunks
+
+        if chunk_dirs:
+            chunk_dirs = sorted(chunk_dirs, key=lambda x: int(x.name.split("_")[1]))
+            for chunk_dir in chunk_dirs:
+                found_in_chunk = False
+
+                if self._is_arrow_dataset(chunk_dir):
+                    chunks.append((chunk_dir, "arrow", chunk_dir))
+                    found_in_chunk = True
+
+                parquet_files = list(chunk_dir.glob("*.parquet")) + list(chunk_dir.glob("*.pq"))
+                if parquet_files:
+                    for pq_file in parquet_files:
+                        chunks.append((pq_file, "parquet", chunk_dir))
+                    found_in_chunk = True
+
+                if not found_in_chunk:
+                    arrow_files = list(chunk_dir.glob("*.arrow"))
+                    if arrow_files:
+                        chunks.append((chunk_dir, "arrow_files", chunk_dir))
+                        found_in_chunk = True
+
+                if not found_in_chunk:
+                    nested_arrow = self._discover_arrow_dataset_under(chunk_dir, max_depth=2)
+                    if nested_arrow:
+                        for adir in nested_arrow:
+                            chunks.append((adir, "arrow", chunk_dir))
+                        found_in_chunk = True
+
+                if not found_in_chunk:
+                    logger.warning(f"Skipping {chunk_dir} (no data found)")
+        else:
+            parquet_files = sorted(data_path.glob("*.parquet")) + sorted(data_path.glob("*.pq"))
+            for pq_file in parquet_files:
+                chunks.append((pq_file, "parquet", data_path))
+
+            for subdir in data_path.iterdir():
+                if subdir.is_dir() and self._is_arrow_dataset(subdir):
+                    chunks.append((subdir, "arrow", subdir))
+
+        return chunks
+
+    # ----------------------- indexing / length computation --------------------
+
+    def _get_chunk_length(self, chunk_path: Path, chunk_type: str) -> int:
+        if chunk_type == "parquet":
+            ds = load_dataset("parquet", data_files=str(chunk_path), split="train")
+            return int(len(ds))
+
+        if chunk_type == "arrow":
+            try:
+                ds = load_from_disk(str(chunk_path))
+                return int(len(ds))
+            except Exception:
+                arrow_files = list(Path(chunk_path).glob("*.arrow"))
+                if not arrow_files:
+                    raise
+                import pyarrow.dataset as pads
+                dset = pads.dataset(arrow_files, format="arrow")
+                if hasattr(dset, "count_rows"):
+                    return int(dset.count_rows())
+                return int(dset.to_table().num_rows)
+
+        if chunk_type == "arrow_files":
+            arrow_files = list(chunk_path.glob("*.arrow"))
+            import pyarrow.dataset as pads
+            dset = pads.dataset(arrow_files, format="arrow")
+            if hasattr(dset, "count_rows"):
+                return int(dset.count_rows())
+            return int(dset.to_table().num_rows)
+
+        raise ValueError(f"Unknown chunk type: {chunk_type}")
+
+    def _read_files_and_build_index(self):
+        all_chunks: List[Tuple[Path, str, Path]] = []
 
         for data_path in self.data_files:
-            # Check if it's an arrow directory (contains dataset_info.json)
-            if os.path.isdir(data_path):
-                dataset_info_path = os.path.join(data_path, "dataset_info.json")
-                if os.path.exists(dataset_info_path):
-                    # Load arrow dataset
-                    print(f"[ImageRLDataset] Loading arrow dataset from {data_path}")
-                    dataframe = load_from_disk(data_path)
-                    dataframes.append(dataframe)
-                    
-                    # Load schema metadata from parent directory
-                    parent_dir = os.path.dirname(data_path)
-                    if self.schema_metadata is None:
-                        self._load_schema_metadata(parent_dir)
-                else:
-                    # Directory containing multiple arrow datasets
-                    subdirs = [os.path.join(data_path, d) for d in os.listdir(data_path) 
-                              if os.path.isdir(os.path.join(data_path, d))]
-                    for subdir in subdirs:
-                        if os.path.exists(os.path.join(subdir, "dataset_info.json")):
-                            print(f"[ImageRLDataset] Loading arrow dataset from {subdir}")
-                            dataframe = load_from_disk(subdir)
-                            dataframes.append(dataframe)
-                    
-                    # Load schema metadata from parent directory
-                    if self.schema_metadata is None:
-                        self._load_schema_metadata(data_path)
-            else:
-                # Load parquet file
-                dataframe = datasets.load_dataset("parquet", data_files=data_path)["train"]
-                dataframes.append(dataframe)
-        
-        self.dataframe: datasets.Dataset = datasets.concatenate_datasets(dataframes)
+            path = Path(data_path)
+            if path.is_dir() and self.schema_metadata is None:
+                self._load_schema_metadata(str(path))
+            all_chunks.extend(self._find_chunks(path))
 
-        total = len(self.dataframe)
-        print(f"dataset len: {len(self.dataframe)}")
+        if not all_chunks:
+            raise ValueError(f"No valid data files found in {self.data_files}")
 
-        if self.max_samples > 0 and self.max_samples < total:
-            if self.shuffle:
-                rngs_args = (self.seed,) if self.seed is not None else ()
-                rng = np.random.default_rng(*rngs_args)
-                indices = rng.choice(total, size=self.max_samples, replace=False)
-            else:
-                indices = np.arange(self.max_samples)
-            self.dataframe = self.dataframe.select(indices.tolist())
-            print(f"selected {self.max_samples} random samples out of {total}")
+        if self.schema_metadata is None:
+            for p, t, _d in all_chunks:
+                if t == "arrow" and p.is_dir():
+                    self._load_schema_metadata(str(p))
+                    if self.schema_metadata is not None:
+                        break
 
-        preprocess_func = partial(
-            preprocess_row_wrapper,
-            schema_metadata=self.schema_metadata,
-            is_nested_structure=self.is_nested_structure
-        )
+        self.chunk_files = [c[0] for c in all_chunks]
+        self.chunk_types = [c[1] for c in all_chunks]
+        self.chunk_dirs = [c[2] for c in all_chunks]
 
-        self.dataframe = self.dataframe.map(
-            preprocess_func,
-            num_proc=64, # self.num_workers,
-            desc="Restoring data types",
-            load_from_cache_file=False,
-        )
+        print(f"[ImageRLDataset] Found {len(self.chunk_files)} chunks total:")
+        for p, t in zip(self.chunk_files, self.chunk_types):
+            print(f"  - {p} ({t})")
 
-        if cache_dir:
-            print(f"[ImageRLDataset] Saving preprocessed dataset to: {cache_dir}")
-            os.makedirs(cache_dir, exist_ok=True)
-            self.dataframe.save_to_disk(cache_dir)
+        self.chunk_offsets = []
+        total_length = 0
+        failed: List[Tuple[str, str, str]] = []
+
+        for chunk_idx, (chunk_path, chunk_type) in enumerate(zip(self.chunk_files, self.chunk_types)):
             try:
-                import json
-                meta_path = os.path.join(cache_dir, "schema_metadata.json")
-                with open(meta_path, "w") as f:
-                    json.dump({"structure": self.schema_metadata}, f)
+                chunk_len = self._get_chunk_length(chunk_path, chunk_type)
+                if chunk_len <= 0:
+                    failed.append((str(chunk_path), chunk_type, "len==0"))
+                    continue
+                self.chunk_offsets.append((chunk_idx, total_length, chunk_len))
+                total_length += chunk_len
             except Exception as e:
-                print(f"[ImageRLDataset] Warning: failed to save schema_metadata.json: {e}")
+                failed.append((str(chunk_path), chunk_type, repr(e)))
+                continue
 
-    def resume_dataset_state(self):
-        self.serialize_dataset = not hasattr(self, "original_data_files")
-        # resume dataframe if not it's serialized in data.pt
-        if not self.serialize_dataset:
-            self._download(use_origin_parquet=True)  # download and resume from original parquet files
-            self._read_files_and_tokenize()
+        self.total_length = int(total_length)
+        print(f"[ImageRLDataset] Total samples: {self.total_length}")
+
+        if self.total_length == 0:
+            preview = "\n".join([f"  - {p} ({t}) -> {err}" for p, t, err in failed[:80]])
+            raise ValueError(
+                "All chunks failed to load or had zero length; dataset would be empty.\n"
+                "First failures:\n" + preview
+            )
+
+        if self.max_samples > 0 and self.max_samples < self.total_length:
+            self.total_length = int(self.max_samples)
+            print(f"[ImageRLDataset] Limited to {self.max_samples} samples")
+
+    # ------------------------------ chunk cache ------------------------------
+
+    def _get_chunk_for_index(self, idx: int) -> tuple:
+        for chunk_idx, start_idx, chunk_len in self.chunk_offsets:
+            if start_idx <= idx < start_idx + chunk_len:
+                return chunk_idx, idx - start_idx
+        raise IndexError(f"Index {idx} out of range")
+
+    # ============= 최적화된 컬럼 단위 로드 (핵심 변경) =============
+    @staticmethod
+    def _as_array(col):
+        """ChunkedArray를 Array로 변환"""
+        if isinstance(col, pa.ChunkedArray):
+            combined = col.combine_chunks()
+            if isinstance(combined, pa.ChunkedArray):
+                return combined.chunk(0)
+            return combined
+        return col
+
+    @staticmethod
+    def _flatten_fully(table: pa.Table, max_iter: int = 16) -> pa.Table:
+        """struct 타입을 완전히 flatten"""
+        t = table
+        for _ in range(max_iter):
+            if any(pa.types.is_struct(f.type) for f in t.schema):
+                t = t.flatten()
+            else:
+                break
+        return t
+
+    def _extract_group_columns_fast(
+        self,
+        table: pa.Table,
+        group: str,
+    ) -> dict[str, list]:
+        """
+        group struct를 컬럼 단위로 한 번에 로드 (row dict 접근 없음)
+        Returns: dict[field_name] = list(len=chunk_size)
+        """
+        if group not in table.column_names:
+            return {}
+
+        gt = self._flatten_fully(table.select([group]))
+        out = {}
+
+        prefix = group + "."
+        for colname in gt.column_names:
+            if not colname.startswith(prefix):
+                continue
+            
+            field = colname[len(prefix):]
+
+            if field in {"attention_mask", "task_id"}:
+                continue
+
+            arr = self._as_array(gt[colname])
+            # ✨ 핵심: to_pylist()를 컬럼당 1번만 실행
+            out[field] = arr.to_pylist()
+
+        return out
+
+    def _load_chunk(self, chunk_idx: int) -> tuple:
+        """청크를 로드하고 컬럼 단위로 전처리"""
+        if chunk_idx in self._chunk_cache:
+            self._chunk_cache.move_to_end(chunk_idx)
+            return self._chunk_cache[chunk_idx]
+
+        chunk_path = self.chunk_files[chunk_idx]
+        chunk_type = self.chunk_types[chunk_idx]
+        chunk_dir = self.chunk_dirs[chunk_idx]
+
+        # 1. 데이터셋 로드
+        if chunk_type == "arrow":
+            try:
+                ds = load_from_disk(str(chunk_path))
+            except Exception as e:
+                logger.warning(f"load_from_disk failed for {chunk_path}, trying arrow-shard fallback: {e}")
+                arrow_files = list(Path(chunk_path).glob("*.arrow"))
+                if not arrow_files:
+                    raise
+                import pyarrow.dataset as pads
+                dset = pads.dataset(arrow_files, format="arrow")
+                from datasets import Dataset as HFDataset
+                table = dset.to_table()
+                ds = HFDataset(table)
+
+        elif chunk_type == "arrow_files":
+            arrow_files = list(Path(chunk_path).glob("*.arrow"))
+            if not arrow_files:
+                raise ValueError(f"No arrow files found in {chunk_path}")
+            import pyarrow.dataset as pads
+            dset = pads.dataset(arrow_files, format="arrow")
+            from datasets import Dataset as HFDataset
+            table = dset.to_table()
+            ds = HFDataset(table)
+
+        elif chunk_type == "parquet":
+            ds = load_dataset("parquet", data_files=str(chunk_path), split="train")
         else:
-            print(r"old dataloader ckpt file is used, please train from scratch for better ckpt performance")
+            raise ValueError(f"Unknown chunk type: {chunk_type}")
+
+        ds.reset_format()
+        table = ds.data
+
+        # 2. 컬럼 단위로 전체 데이터 추출 (한 번에!)
+        chunk_data = {
+            "table": table,
+            "chunk_type": chunk_type,
+            "chunk_dir": chunk_dir,
+            "top_level": {},
+            "batch": {},
+            "non_tensor_batch": {},
+            "meta_info": {},
+            "is_flat": False  # ✨ flat 구조 여부 추적
+        }
+
+        # top-level 컬럼들
+        for k in ["global_step", "param_version", "local_trigger_step", "images_dir"]:
+            if k in table.column_names:
+                arr = self._as_array(table[k])
+                chunk_data["top_level"][k] = arr.to_pylist()
+
+        # ✨ nested structure 시도 (arrow와 parquet 공통)
+        batch_cols = self._extract_group_columns_fast(table, "batch")
+        non_tensor_cols = self._extract_group_columns_fast(table, "non_tensor_batch")
+        meta_cols = self._extract_group_columns_fast(table, "meta_info")
+        
+        if batch_cols or non_tensor_cols or meta_cols:
+            # nested structure 존재
+            chunk_data["batch"] = batch_cols
+            chunk_data["non_tensor_batch"] = non_tensor_cols
+            chunk_data["meta_info"] = meta_cols
+            chunk_data["is_flat"] = False
+        else:
+            # flat structure - 모든 컬럼을 직접 로드
+            chunk_data["is_flat"] = True
+            processed_cols = set(chunk_data["top_level"].keys())
+            
+            for col_name in table.column_names:
+                if col_name in processed_cols:
+                    continue
+                
+                arr = self._as_array(table[col_name])
+                values = arr.to_pylist()
+                
+                # ✨ 컬럼 이름으로 분류 (개선된 휴리스틱)
+                # 1. prompt와 메타데이터
+                if col_name in [self.prompt_key, "uid", "index"]:
+                    chunk_data["non_tensor_batch"][col_name] = values
+                # 2. 딕셔너리 타입 (extra_info, tools_kwargs 등)
+                elif col_name in ["extra_info", "tools_kwargs", "interaction_kwargs"]:
+                    chunk_data["non_tensor_batch"][col_name] = values
+                # 3. 이미지 관련
+                elif col_name.endswith(("_pil", "_pil_list", "_image", "_images")):
+                    chunk_data["non_tensor_batch"][col_name] = values
+                elif "image" in col_name.lower() or "pil" in col_name.lower():
+                    chunk_data["non_tensor_batch"][col_name] = values
+                # 4. tensor 관련
+                elif col_name.endswith(("_ids", "_mask", "_tokens", "_pixel_values", "_scores")):
+                    chunk_data["batch"][col_name] = values
+                # 5. 메타 정보 (step, version 등)
+                elif col_name.endswith(("_step", "_version", "_dir")):
+                    chunk_data["meta_info"][col_name] = values
+                # 6. 기타는 non_tensor_batch에
+                else:
+                    chunk_data["non_tensor_batch"][col_name] = values
+            
+            logger.info(
+                f"[Flat parquet] {chunk_path}: "
+                f"batch={len(chunk_data['batch'])}, "
+                f"non_tensor={len(chunk_data['non_tensor_batch'])}, "
+                f"meta={len(chunk_data['meta_info'])}"
+            )
+        
+        # 3. 캐시에 저장
+        result = chunk_data
+        self._chunk_cache[chunk_idx] = result
+        if len(self._chunk_cache) > self.max_cached_chunks:
+            self._chunk_cache.popitem(last=False)
+
+        return result
+
+    # ----------------------------- decode helpers ----------------------------
+
+    def _convert_to_pil_if_needed(self, value):
+        if value is None:
+            return None
+        if isinstance(value, (list, np.ndarray)):
+            arr = np.array(value)
+            if arr.shape == (384, 384, 3):
+                return Image.fromarray(arr.astype(np.uint8))
+        return value
+
+    def _convert_list_to_tensor(self, value):
+        if value is None:
+            return None
+        if isinstance(value, list):
+            try:
+                arr = np.array(value)
+                t = torch.from_numpy(arr)
+                return t.to(self.device) if self.device != "cpu" else t
+            except Exception as e:
+                logger.warning(f"Failed to convert list to tensor: {e}")
+                return value
+        return value
+
+    # ------------------------------ torch Dataset ----------------------------
 
     def __len__(self):
-        return len(self.dataframe)
+        return int(self.total_length)
 
-    def __getitem__(self, item):
-        row_dict: dict = self.dataframe[item]
-        prompt = row_dict.pop(self.prompt_key, None)
+    def _resolve_image_path(self, value, chunk_dir: Path):
+        """이미지 경로를 절대 경로로 변환"""
+        if value is None or value == "N/A":
+            return value
+        
+        # 문자열인 경우 (상대 경로)
+        if isinstance(value, str):
+            # 이미 절대 경로면 그대로 반환
+            if os.path.isabs(value):
+                return value
+            # 상대 경로면 chunk_dir/images/와 결합
+            return str(chunk_dir / "images" / value)
+        
+        # 리스트인 경우 재귀적으로 처리
+        elif isinstance(value, list):
+            return [self._resolve_image_path(item, chunk_dir) for item in value]
+        
+        return value
+    
+    def _resolve_image_paths_in_dict(self, d: dict, chunk_dir: Path, prefix: str = "") -> dict:
+        """딕셔너리 내의 모든 이미지 경로를 재귀적으로 변환"""
+        if not isinstance(d, dict):
+            return d
+        
+        result = {}
+        for key, value in d.items():
+            full_key = f"{prefix}.{key}" if prefix else key
+            
+            # 이미지 필드 판별 (스키마 또는 키 이름 기반)
+            is_image_field = False
+            if self.schema_metadata:
+                meta = self.schema_metadata.get(full_key, {})
+                v_type = meta.get("value_type", "")
+                is_image_field = v_type in ["PIL.Image", "List[PIL.Image]"]
+            
+            # 키 이름으로도 판별
+            if not is_image_field:
+                is_image_field = ("image" in key.lower() or 
+                                 "pil" in key.lower() or
+                                 key in ["gen", "regen", "gt", "ground_truth"])
+            
+            # 이미지 경로 변환
+            if is_image_field and isinstance(value, str):
+                result[key] = self._resolve_image_path(value, chunk_dir)
+            # 중첩된 딕셔너리 처리
+            elif isinstance(value, dict):
+                result[key] = self._resolve_image_paths_in_dict(value, chunk_dir, full_key)
+            # 리스트 처리 (이미지 리스트일 수 있음)
+            elif isinstance(value, list) and is_image_field:
+                result[key] = self._resolve_image_path(value, chunk_dir)
+            else:
+                result[key] = value
+        
+        return result
 
+    def __getitem__(self, item: int):
+        """최적화된 샘플 추출: 캐시된 컬럼 리스트에서 인덱싱만"""
+        if self._sample_cache is not None and item in self._sample_cache:
+            return copy.deepcopy(self._sample_cache[item])
+
+        if item < 0 or item >= self.total_length:
+            raise IndexError(f"Index {item} out of range [0, {self.total_length})")
+
+        chunk_idx, local_idx = self._get_chunk_for_index(item)
+        chunk_data = self._load_chunk(chunk_idx)
+
+        chunk_type = chunk_data["chunk_type"]
+        chunk_dir = chunk_data["chunk_dir"]
+        is_flat = chunk_data.get("is_flat", False)
+        row_dict: dict[str, Any] = {}
+
+        # top-level fields
+        for k, values in chunk_data["top_level"].items():
+            row_dict[k] = values[local_idx]
+
+        # batch 그룹 (tensor로 변환)
+        batch_dict = {}
+        batch_data = chunk_data.get("batch", {})
+        if not isinstance(batch_data, dict):
+            logger.error(f"batch is not dict: type={type(batch_data)}, item={item}")
+            batch_data = {}
+        
+        for field, values in batch_data.items():
+            try:
+                value = values[local_idx]
+                
+                # tensor 변환
+                if field.endswith(("_ids", "_mask", "_tokens", "_pixel_values", "_scores")):
+                    value = self._convert_list_to_tensor(value)
+                
+                batch_dict[field] = value
+            except Exception as e:
+                logger.warning(f"Failed to process batch field {field} at item {item}: {e}")
+                continue
+
+        # non_tensor_batch 그룹
+        non_tensor_dict = {}
+        non_tensor_data = chunk_data.get("non_tensor_batch", {})
+        if not isinstance(non_tensor_data, dict):
+            logger.error(f"non_tensor_batch is not dict: type={type(non_tensor_data)}, item={item}")
+            non_tensor_data = {}
+        
+        for field, values in non_tensor_data.items():
+            try:
+                value = values[local_idx]
+                
+                # ✨ 이미지 경로 변환 (PIL 변환 전에)
+                if isinstance(value, str) and ("image" in field.lower() or "pil" in field.lower()):
+                    value = self._resolve_image_path(value, chunk_dir)
+                
+                # PIL 변환
+                if field.endswith("_pil_list") or field.endswith("_pil") or "image" in field.lower():
+                    if isinstance(value, str) and os.path.exists(value):
+                        try:
+                            value = Image.open(value).convert("RGB")
+                        except Exception as e:
+                            logger.warning(f"Failed to load image from {value}: {e}")
+                    else:
+                        value = self._convert_to_pil_if_needed(value)
+                
+                non_tensor_dict[field] = value
+            except Exception as e:
+                logger.warning(f"Failed to process non_tensor field {field} at item {item}: {e}")
+                continue
+
+        # meta_info 그룹
+        meta_dict = {}
+        meta_data = chunk_data.get("meta_info", {})
+        if not isinstance(meta_data, dict):
+            logger.error(f"meta_info is not dict: type={type(meta_data)}, item={item}")
+            meta_data = {}
+        
+        for field, values in meta_data.items():
+            try:
+                value = values[local_idx]
+                meta_dict[field] = value
+            except Exception as e:
+                logger.warning(f"Failed to process meta field {field} at item {item}: {e}")
+                continue
+
+        # ✨ 이미지 경로 변환 적용
+        try:
+            batch_dict = self._resolve_image_paths_in_dict(batch_dict, chunk_dir, "batch")
+            non_tensor_dict = self._resolve_image_paths_in_dict(non_tensor_dict, chunk_dir, "non_tensor_batch")
+        except Exception as e:
+            logger.warning(f"Failed to resolve image paths at item {item}: {e}")
+        
+        # ✨ row_dict 구성 - 빈 딕셔너리도 명시적으로 생성
+        row_dict["batch"] = batch_dict if batch_dict else {}
+        row_dict["non_tensor_batch"] = non_tensor_dict if non_tensor_dict else {}
+        row_dict["meta_info"] = meta_dict if meta_dict else {}
+        
+        # top-level로도 노출 (batch만)
+        row_dict.update(batch_dict)
+        # meta_info도 top-level로 노출
+        row_dict.update(meta_dict)
+
+        # Promote prompt
+        nt = row_dict["non_tensor_batch"]
+        prompt = row_dict.get(self.prompt_key, None)
+        if prompt is None and isinstance(nt, dict):
+            prompt = nt.get(self.prompt_key, None)
         row_dict["prompt"] = prompt
 
-        # for tensor batch in DataProto
-        row_dict["dummy_tensor"] = torch.zeros(1)
+        # Promote extra_info
+        if ("extra_info" not in row_dict or row_dict["extra_info"] is None) and isinstance(nt, dict):
+            row_dict["extra_info"] = nt.get("extra_info", {}) or {}
+        elif "extra_info" not in row_dict or row_dict["extra_info"] is None:
+            row_dict["extra_info"] = {}
 
-        # add index for each prompt
-        if "extra_info" not in row_dict or row_dict["extra_info"] is None:
-            row_dict["extra_info"] = dict()
-        
-        index = row_dict.get("extra_info", {}).get("index", 0)
-        tools_kwargs = row_dict.get("extra_info", {}).get("tools_kwargs", {})
-        interaction_kwargs = row_dict.get("extra_info", {}).get("interaction_kwargs", {})
-        need_tools_kwargs = row_dict.get("extra_info", {}).get("need_tools_kwargs", self.need_tools_kwargs)
-        
-        if need_tools_kwargs and not tools_kwargs:
-            logger.warning("tools_kwargs is empty for index {}, data source: {}", index, row_dict.get("data_source"))
-        
+        # Compute index/tools/interaction
+        extra_info = row_dict.get("extra_info", {}) or {}
+        index = extra_info.get("index", item) if isinstance(extra_info, dict) else item
+
         row_dict["index"] = index
-        row_dict["tools_kwargs"] = tools_kwargs
-        row_dict["interaction_kwargs"] = interaction_kwargs
+        # Ensure uid
+        if isinstance(nt, dict):
+            if "uid" not in nt or nt["uid"] is None:
+                nt["uid"] = f"uid_{index}"
+
+        # Always provide a tensor
+        if "dummy_tensor" not in row_dict:
+            row_dict["dummy_tensor"] = torch.zeros(1)
+
+        # Cache
+        if self._sample_cache is not None and len(self._sample_cache) < self.cache_size:
+            self._sample_cache[item] = copy.deepcopy(row_dict)
 
         return row_dict
-
-    def __getstate__(self):
-        if not self.serialize_dataset:
-            state = self.__dict__.copy()
-
-            if "dataframe" in state:
-                del state["dataframe"]
-            return state
-
-        return self.__dict__.copy()

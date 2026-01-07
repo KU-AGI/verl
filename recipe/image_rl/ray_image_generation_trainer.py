@@ -331,9 +331,11 @@ class RayImageGenerationTrainer(RayPPOTrainer):
         if train_sampler is None:
             train_sampler = create_rl_sampler(self.config.data, self.train_dataset)
         if collate_fn is None:
-            from verl.utils.dataset.rl_dataset import collate_fn as default_collate_fn
+            # from verl.utils.dataset.rl_dataset import collate_fn as default_collate_fn
+            from recipe.image_rl.rl_dataset import collate_fn
 
-            collate_fn = default_collate_fn
+            # collate_fn = default_collate_fn
+            collate_fn = collate_fn
 
         num_workers = self.config.data["dataloader_num_workers"]
 
@@ -429,7 +431,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             
             summary_path = os.path.join(sample_dir, "comparison_summary.txt")
             summary_header = [
-                f"📋 GRPO COMPARISON SUMMARY | STEP: {self.current_param_version}",
+                f"📋 GRPO COMPARISON SUMMARY | STEP: {trainer_ver}",
                 f"Sample Path: {sample_dir}",
                 "=" * 170,
                 f"{'Rollout':<10} | {'T1':<5} | {'T2':<5} | {'T3':<5} | {'Total':<6} | {'Gen Path (Initial)':<65} | {'Regen Path (Edited)'}",
@@ -487,31 +489,50 @@ class RayImageGenerationTrainer(RayPPOTrainer):
         # Task 1 Gen Image
         if gen_imgs is not None and len(gen_imgs) > i:
             p = os.path.join(rollout_dir, "gen.png")
-            # numpy array 대응
             img_data = gen_imgs[i]
-            if isinstance(img_data, np.ndarray):
+            
+            if isinstance(img_data, str):
+                if os.path.exists(img_data):
+                    PIL.Image.open(img_data).convert("RGB").save(p)
+                else:
+                    print(f"Warning: Image path does not exist: {img_data}")
+            elif isinstance(img_data, np.ndarray):
                 PIL.Image.fromarray(img_data.astype(np.uint8)).save(p)
             else:
                 img_data.save(p)
             paths["gen"] = os.path.abspath(p)
-
+        
         # Task 3 Regen Image
         if regen_imgs is not None and len(regen_imgs) > i:
             p = os.path.join(rollout_dir, "regen.png")
             img_data = regen_imgs[i]
-            if isinstance(img_data, np.ndarray):
+            
+            if isinstance(img_data, str):
+                if os.path.exists(img_data):
+                    PIL.Image.open(img_data).convert("RGB").save(p)
+                else:
+                    print(f"Warning: Image path does not exist: {img_data}")
+            elif isinstance(img_data, np.ndarray):
                 PIL.Image.fromarray(img_data.astype(np.uint8)).save(p)
             else:
                 img_data.save(p)
             paths["regen"] = os.path.abspath(p)
-
+        
         # Ground Truth Image
         if gts_imgs is not None and len(gts_imgs) > i and gts_imgs[i]:
             p = os.path.join(rollout_dir, "ground_truth.png")
             if not os.path.exists(p):
                 try:
-                    PIL.Image.open(gts_imgs[i]).convert("RGB").save(p)
-                except: pass
+                    gt_data = gts_imgs[i]
+                    if isinstance(gt_data, str):
+                        if os.path.exists(gt_data):
+                            PIL.Image.open(gt_data).convert("RGB").save(p)
+                    elif isinstance(gt_data, np.ndarray):
+                        PIL.Image.fromarray(gt_data.astype(np.uint8)).save(p)
+                    else:
+                        gt_data.save(p)
+                except Exception as e:
+                    print(f"Warning: Failed to save ground truth: {e}")
             paths["gt"] = os.path.abspath(p)
             
         return paths
@@ -596,11 +617,9 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             gts_tuples = [item.non_tensor_batch.get("reward_model", {}).get("tuple", None) for item in batch]
             gts_vqas = [item.non_tensor_batch.get("reward_model", {}).get("vqa_question", None) for item in batch]
 
-            sample_versions = batch.non_tensor_batch.get('param_version')
-            if sample_versions is not None:
-                sample_versions = sample_versions.tolist()
-            else:
-                sample_versions = [self.current_param_version] * len(batch)
+            batch_size = len(prompt)
+            current_v = getattr(self, "current_param_version", self.global_steps)
+            v_list = [current_v] * batch_size
 
             scores = {}
             # Add all task scores
@@ -627,7 +646,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                 gts_vqas=gts_vqas,
                 scores=scores,
                 reward_extra_infos_dict=reward_extra_infos_to_dump,
-                sample_versions=sample_versions,
+                sample_versions=v_list,
                 dump_path=dump_path,
             )
 
@@ -732,12 +751,16 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                 else:
                     sample_task3_scores.extend(per_sample_scores)
 
+            batch_size = len(prompts)
+            current_v = getattr(self, "current_param_version", self.global_steps)
+            v_list = [current_v] * batch_size
+
             self._dump_generations(
                 uid=test_output_gen_batch.non_tensor_batch["uid"].tolist(),
                 prompt_id=test_output_gen_batch.non_tensor_batch["prompt_id"].tolist(),
                 prompt=test_output_gen_batch.non_tensor_batch["prompt"].tolist(),
                 gen_imgs_pil_list=test_output_gen_batch.non_tensor_batch.get('task1_gen_imgs_pil_list'),
-                feedback_texts=test_output_gen_batch.non_tensor_batch.get('task2_feedback_texts'),
+                feedback_texts=test_output_gen_batch.non_tensor_batch.get('task2_feedback_texts').tolist(),
                 regen_imgs_pil_list=test_output_gen_batch.non_tensor_batch.get('task3_regen_imgs_pil_list'), 
                 gts_imgs=[item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_output_gen_batch],
                 summarizes=[item.non_tensor_batch.get("reward_model", {}).get("summary", None) for item in test_output_gen_batch],
@@ -745,10 +768,10 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                 gts_vqas=[item.non_tensor_batch.get("reward_model", {}).get("vqa_question", None) for item in test_output_gen_batch],
                 scores=batch_scores,
                 reward_extra_infos_dict=batch_reward_extra_infos,
+                sample_versions=v_list,
                 dump_path=val_data_dir
                 )
 
-            batch_size = len(prompts)
             data_source = test_batch.non_tensor_batch.get('data_source', ['unknown'] * batch_size)
             data_source_lst.extend(data_source)
 

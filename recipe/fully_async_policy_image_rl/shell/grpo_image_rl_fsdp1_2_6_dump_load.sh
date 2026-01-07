@@ -36,7 +36,7 @@ HOME="/data"
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
 MODEL_PATH=/data/mllm/ckpt/step=014000.ckpt/hf_model # /data/mllm/checkpoints/Janus-Pro-7B
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
-TRAIN_FILES=/data/verl/ckpts/mllm_reasoning/0105_rollout_freeze_dump/freeze_dump
+TRAIN_FILES=/data/verl/ckpts/mllm_reasoning/0105_rollout_freeze_dump/train_packed_png
 VAL_FILES=/data/mllm/data/val_v2.parquet
 
 export RM_VLM_MODEL_PATH="Qwen/Qwen3-VL-30B-A3B-Instruct" # OpenGVLab/InternVL3_5-38B
@@ -113,11 +113,11 @@ train_prompt_mini_bsz=128
 train_prompt_micro_bsz=4
 log_prob_micro_batch_size_per_gpu=1
 
-test_freq=1
-save_freq=1 # $((test_freq * trigger_parameter_sync_step * 1))
+test_freq=10
+save_freq=50
 total_epochs=10
 # total_training_steps=3000
-rollout_freq=1
+rollout_freq=10
 # log_val_generations=1
 
 ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
@@ -128,7 +128,6 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     data.val_files="${VAL_FILES}" \
     data.shuffle=False \
     data.prompt_key=prompt \
-    +data.preprocessed_cache_dir="$CKPTS_DIR/cache_dir" \
     data.train_batch_size=${train_prompt_bsz} \
     data.gen_batch_size=${train_prompt_bsz} \
     data.val_batch_size=${val_prompt_bsz} \
@@ -210,8 +209,8 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     algorithm.filter_groups.metric=${filter_groups_metric} \
     algorithm.norm_adv_by_std_in_grpo=${norm_adv_by_std_in_grpo} \
     trainer.critic_warmup=0 \
-    trainer.logger=['console'] \
-    trainer.val_before_train=False \
+    trainer.logger=['console','wandb'] \
+    trainer.val_before_train=True \
     trainer.balance_batch=True \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
