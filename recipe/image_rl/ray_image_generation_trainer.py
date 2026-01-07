@@ -452,7 +452,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                 t1 = self._get_safe_val(scores, 'task1_scores', i, 0.0)
                 t2 = self._get_safe_val(scores, 'task2_scores', i, 0.0)
                 t3 = self._get_safe_val(scores, 'task3_scores', i, 0.0)
-                total = t1 + t2 + t3 > 0 # exclude -100
+                total = t1 + t2 + (t3 > 0) # exclude -100
                 
                 summary_rows.append(f"rollout_{r_idx:<3} | {t1:<5.2f} | {t2:<5.2f} | {t3:<5.2f} | {total:<6.2f} | {paths['gen']:<65} | {paths['regen']}")
 
@@ -697,8 +697,8 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             test_batch = DataProto.from_single_dict(test_data)
 
             # repeat test batch
-            test_batch = test_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n,
-                                        interleave=True)
+            # test_batch = test_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n,
+            #                             interleave=True)
 
             # add uid to batch <- dummy tensor in batch
             test_batch.non_tensor_batch["uid"] = np.array(
@@ -775,16 +775,16 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             data_source = test_batch.non_tensor_batch.get('data_source', ['unknown'] * batch_size)
             data_source_lst.extend(data_source)
 
-        # Log validation generations
-        self._maybe_log_val_generations(
-            prompts=sample_prompts,
-            task1_gen_imgs=sample_task1_gen_imgs,
-            task2_feedback_text=sample_task2_feedback_texts,
-            task3_regen_imgs=sample_task3_regen_imgs,
-            task1_scores=sample_task1_scores,
-            task2_scores=sample_task2_scores,
-            task3_scores=sample_task3_scores
-        )
+        # # Log validation generations
+        # self._maybe_log_val_generations(
+        #     prompts=sample_prompts,
+        #     task1_gen_imgs=sample_task1_gen_imgs,
+        #     task2_feedback_text=sample_task2_feedback_texts,
+        #     task3_regen_imgs=sample_task3_regen_imgs,
+        #     task1_scores=sample_task1_scores,
+        #     task2_scores=sample_task2_scores,
+        #     task3_scores=sample_task3_scores
+        # )
 
         # Store validation samples for logging by Trainer
         validation_samples = list(zip(
@@ -819,7 +819,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                 metric_dict[f'val/task{task_id}_positive_ratio/{data_source}'] = np.mean(np.array(rewards) > 0)
 
         # Include validation generation samples in the result for Trainer to log
-        metric_dict['validation_samples'] = validation_samples
+        # metric_dict['validation_samples'] = validation_samples
 
         return metric_dict
 
