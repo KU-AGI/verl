@@ -289,8 +289,11 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
                 metrics[f"critic/task{task_id}/rewards/{data_source}/max"] = np.max(rewards)
                 metrics[f"critic/task{task_id}/rewards/{data_source}/min"] = np.min(rewards)
     
+    # Required columns
+    meta_info = {k: v for k, v in batch.meta_info.items() if isinstance(v, (list, np.ndarray))}
+
     # 2. Compute statistics for all _reward & _score metrics in reward_extra_info (overall)
-    for metric_name, metric_values in batch.meta_info.items():
+    for metric_name, metric_values in meta_info.items():
         if metric_name.endswith("_reward") or metric_name.endswith("_score"):
             if len(metric_values) > 0:
                 metrics[f"critic/task{task_id}/{metric_name}/mean"] = np.mean(metric_values)
@@ -301,7 +304,7 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     if "data_source" in batch.non_tensor_batch:
         data_sources = batch.non_tensor_batch["data_source"]
         
-        for metric_name, metric_values in batch.meta_info.items():
+        for metric_name, metric_values in meta_info.items():
             if metric_name.endswith("_reward") or metric_name.endswith("_score"):
                 # Group by data_source
                 data_src2metric_vals = defaultdict(list)
@@ -417,7 +420,8 @@ def compute_group_reward_metrics(batch: DataProto) -> dict[str, Any]:
             - group_rewards/task{task_id}/positive_ratio: Ratio of sequences with positive rewards
     """
     task_id = batch.batch["task_id"].view(-1)[0].item()
-    task_reward_extra_info = batch.meta_info.get(f"task{task_id}_reward_extra_info", {})
+    # task_reward_extra_info = batch.meta_info.get(f"task{task_id}_reward_extra_info", {})
+    task_reward_extra_info = {k: v for k, v in batch.meta_info.items() if k.startswith("task")}
 
     task_reward_section = {}
     for name, value in task_reward_extra_info.items():
