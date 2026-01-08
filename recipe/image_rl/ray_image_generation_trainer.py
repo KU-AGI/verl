@@ -771,8 +771,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                 sample_versions=v_list,
                 dump_path=val_data_dir
                 )
-
-            data_source = test_batch.non_tensor_batch.get('data_source', ['unknown'] * batch_size)
+            data_source = test_output_gen_batch.non_tensor_batch.get('data_source', ['unknown'] * batch_size)
             data_source_lst.extend(data_source)
 
         # # Log validation generations
@@ -813,10 +812,10 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                 data_source_reward[data_source].append(reward_tensor[i].item())
 
             for data_source, rewards in data_source_reward.items():
-                valid_rewards = [r for r in rewards if r > 0] # positive
+                valid_rewards = [r for r in rewards if r >= 0] # positive
                 if valid_rewards:
                     metric_dict[f'val/task{task_id}_score/{data_source}'] = np.mean(valid_rewards)
-                metric_dict[f'val/task{task_id}_positive_ratio/{data_source}'] = np.mean(np.array(rewards) > 0)
+                metric_dict[f'val/task{task_id}_positive_ratio/{data_source}'] = np.mean(np.array(rewards) >= 0)
 
         # Include validation generation samples in the result for Trainer to log
         # metric_dict['validation_samples'] = validation_samples
