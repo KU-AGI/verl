@@ -11,7 +11,7 @@ exec > >(tee -a "${SCRIPT_LOG}")
 exec 2>&1
 
 project_name='mllm_reasoning'
-exp_name='0105_logging_fix'
+exp_name='0107_fully_on_policy_nipa'
 
 export NCCL_IB_GID_INDEX=0
 export NCCL_CUDA_DEVICE_MAX_CONNECTIONS=8
@@ -50,9 +50,9 @@ adv_estimator=grpo_task_skip
 
 use_kl_in_reward=False
 kl_coef=0.0
-use_kl_loss=False
+use_kl_loss=True
 kl_loss_coef=0.04
-entropy_coeff=0.001
+entropy_coeff=0.00
 
 clip_ratio_low=0.2
 clip_ratio_high=0.2
@@ -74,6 +74,7 @@ overlong_penalty_factor=1.0
 loss_agg_mode="token-mean"
 
 # Algorithm
+cfg_weight=5.0
 temperature=1.2
 # txt_top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
 # txt_top_p=1.0
@@ -118,11 +119,11 @@ require_batches=1
 partial_rollout=False
 log_prob_micro_batch_size_per_gpu=1
 
-test_freq=100
+test_freq=10
 save_freq=$((test_freq * trigger_parameter_sync_step * 1))
 total_epochs=10
 # total_training_steps=3000
-rollout_freq=50
+rollout_freq=1
 # log_val_generations=1
 
 ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
@@ -188,7 +189,8 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     actor_rollout_ref.rollout.name=${rollout_name} \
     actor_rollout_ref.rollout.mode=${rollout_mode} \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
-    actor_rollout_ref.rollout.cfg_weight=5.0 \
+    actor_rollout_ref.rollout.cfg_weight=${cfg_weight} \
+    actor_rollout_ref.rollout.temperature=${temperature} \
     actor_rollout_ref.rollout.image_token_num_per_image=576 \
     actor_rollout_ref.rollout.prompt_length=${max_prompt_length} \
     actor_rollout_ref.rollout.response_length=${max_response_length} \

@@ -1,6 +1,6 @@
 excludes: [
   "/.git/",
-  "verl/third_party/dynamo",
+  "verl/third_party/*",
   "bench/"
 ]
 env_vars:

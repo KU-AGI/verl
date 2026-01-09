@@ -70,6 +70,7 @@ overlong_penalty_factor=1.0
 loss_agg_mode="token-mean"
 
 # Algorithm
+cfg_weight=5.0
 temperature=1.2
 # txt_top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
 # txt_top_p=1.0
@@ -184,7 +185,8 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     actor_rollout_ref.rollout.name=${rollout_name} \
     actor_rollout_ref.rollout.mode=${rollout_mode} \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
-    actor_rollout_ref.rollout.cfg_weight=5.0 \
+    actor_rollout_ref.rollout.cfg_weight=${cfg_weight} \
+    actor_rollout_ref.rollout.temperature=${temperature} \
     actor_rollout_ref.rollout.image_token_num_per_image=576 \
     actor_rollout_ref.rollout.prompt_length=${max_prompt_length} \
     actor_rollout_ref.rollout.response_length=${max_response_length} \
