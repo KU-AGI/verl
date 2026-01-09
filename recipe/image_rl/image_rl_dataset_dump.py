@@ -183,9 +183,12 @@ class ImageRLDataset(Dataset):
         chunk_pattern = re.compile(r"^chunk_\d+$")
         chunk_dirs: List[Path] = []
         try:
+            idx = 0
             for item in data_path.iterdir():
+                if idx >= 8: break
                 if item.is_dir() and chunk_pattern.match(item.name):
                     chunk_dirs.append(item)
+                    idx += 1
         except PermissionError:
             logger.error(f"Permission denied: {data_path}")
             return chunks

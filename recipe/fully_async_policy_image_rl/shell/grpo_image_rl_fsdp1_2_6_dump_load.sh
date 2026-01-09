@@ -11,7 +11,7 @@ exec > >(tee -a "${SCRIPT_LOG}")
 exec 2>&1
 
 project_name='mllm_reasoning'
-exp_name='0105_rollout_freeze_test'
+exp_name='0105_rollout_freeze_overfit'
 
 export NCCL_IB_GID_INDEX=0
 export NCCL_CUDA_DEVICE_MAX_CONNECTIONS=8
@@ -37,7 +37,7 @@ RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
 MODEL_PATH=/data/mllm/ckpt/step=014000.ckpt/hf_model # /data/mllm/checkpoints/Janus-Pro-7B
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
 TRAIN_FILES=/data/verl/ckpts/mllm_reasoning/0105_rollout_freeze_dump/train_packed_png
-VAL_FILES=/data/mllm/data/val_v2.parquet
+VAL_FILES=/data/mllm/data/train_subset.parquet
 
 export RM_VLM_MODEL_PATH="Qwen/Qwen3-VL-30B-A3B-Instruct" # OpenGVLab/InternVL3_5-38B
 export RM_LLM_MODEL_PATH="Qwen/Qwen3-30B-A3B-Instruct-2507" # OpenGVLab/InternVL3_5-38B
@@ -52,7 +52,7 @@ use_kl_in_reward=False
 kl_coef=0.0
 use_kl_loss=False
 kl_loss_coef=0.04
-entropy_coeff=0.001
+entropy_coeff=0.00
 
 clip_ratio_low=0.2
 clip_ratio_high=0.2
@@ -110,11 +110,11 @@ train_prompt_bsz=128
 val_prompt_bsz=16
 n_resp_per_prompt=8
 train_prompt_mini_bsz=128
-train_prompt_micro_bsz=4
-log_prob_micro_batch_size_per_gpu=1
+train_prompt_micro_bsz=128
+log_prob_micro_batch_size_per_gpu=16
 
 test_freq=10
-save_freq=50
+save_freq=100
 total_epochs=10
 # total_training_steps=3000
 rollout_freq=10
@@ -137,7 +137,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     data.custom_cls.name=ImageRLDataset \
     actor_rollout_ref.nccl_timeout=120000000 \
     actor_rollout_ref.model.path=\"${MODEL_PATH}\" \
-    actor_rollout_ref.actor.optim.lr=2e-6 \
+    actor_rollout_ref.actor.optim.lr=2e-5 \
     actor_rollout_ref.actor.optim.warmup_style=constant \
     actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
     actor_rollout_ref.actor.optim.weight_decay=0.1 \
