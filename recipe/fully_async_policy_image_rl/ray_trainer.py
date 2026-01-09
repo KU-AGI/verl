@@ -378,6 +378,7 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
 
             for val_batch_idx, test_data in enumerate(self.val_dataloader):
                 test_batch = DataProto.from_single_dict(test_data)
+                test_batch.meta_info["validate"] = True
 
                 # Assign unique IDs to each sample
                 test_batch.non_tensor_batch["uid"] = np.array(

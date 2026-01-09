@@ -342,38 +342,24 @@ class ImageUnifiedRollout(BaseRollout):
         return stats
 
     def set_generation_config(self, prompt: DataProto):
-        do_sample = prompt.meta_info.get("do_sample", self.config.do_sample)
         is_validate = prompt.meta_info.get("validate", False)
 
-        temperature = prompt.meta_info.get("temperature", self.config.temperature)
-        response_length = prompt.meta_info.get("response_length", self.config.response_length)
-        top_p = prompt.meta_info.get("top_p", self.config.get("top_p", 1.0))
-        top_k = max(0, prompt.meta_info.get("top_k", self.config.get("top_k", 0)))
-        
-        if not do_sample:
-            kwargs = {
-                "do_sample": False,
-                "num_beams": 1,
-                "num_return_sequences": 1,  # Set to 1 for for-loop processing
-            }
-        elif is_validate:
-            kwargs = {
-                "do_sample": True,
-                "num_beams": 1,
-                "top_k": max(0, self.config.val_kwargs.top_k),
-                "top_p": self.config.val_kwargs.top_p,
-                "temperature": self.config.val_kwargs.temperature,
-                "num_return_sequences": 1,  # Set to 1 for for-loop processing
-            }
+        if is_validate:
+            # Validation mode: use val_kwargs
+            self.cfg_weight = getattr(self.config.val_kwargs, 'val_cfg_weight', 5.0)
+            self.temperature = getattr(self.config.val_kwargs, 'val_temperature', 1.0)
+            self.txt_top_k = getattr(self.config.val_kwargs, 'val_txt_top_k', 50)
+            self.txt_top_p = getattr(self.config.val_kwargs, 'val_txt_top_p', 1.0)
+            self.img_top_k = getattr(self.config.val_kwargs, 'val_img_top_k', 4096)
+            self.img_top_p = getattr(self.config.val_kwargs, 'val_img_top_p', 1.0)
         else:
-            kwargs = {
-                "do_sample": True,
-                "num_beams": 1,
-                "top_p": top_p,
-                "top_k": top_k,
-                "temperature": temperature,
-                "num_return_sequences": 1,  # Set to 1 for for-loop processing
-            }
+            # Training mode: use config values (already set in __init__)
+            self.cfg_weight = getattr(self.config, "cfg_weight", 5.0)
+            self.temperature = getattr(self.config, "temperature", 1.0)
+            self.txt_top_k = getattr(self.config, "txt_top_k", 50)
+            self.txt_top_p = getattr(self.config, "txt_top_p", 1.0)
+            self.img_top_k = getattr(self.config, "img_top_k", 4096)
+            self.img_top_p = getattr(self.config, "img_top_p", 1.0)
 
         # Additional settings
         self.image_start_tag = self.processor.image_start_tag

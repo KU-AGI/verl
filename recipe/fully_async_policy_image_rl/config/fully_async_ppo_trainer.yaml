@@ -81,6 +81,8 @@ actor_rollout_ref:
     image_token_num_per_image: 576
     val_kwargs:
       _target_: recipe.image_rl.config.ImageGenerationSamplingConfig
+      val_cfg_weight: 5.0
+      val_temperature: 1.0
       val_txt_top_k: 50
       val_txt_top_p: 1.0
       val_img_top_k: 4096

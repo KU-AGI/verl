@@ -676,6 +676,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
+            test_batch.meta_info["validate"] = True
 
             # repeat test batch
             test_batch = test_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n,

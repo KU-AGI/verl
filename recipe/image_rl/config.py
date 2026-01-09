@@ -26,6 +26,7 @@ class ImageGenerationSamplingConfig(SamplingConfig):
     txt_top_p: float = None
     img_top_k: int = None
     img_top_p: float = None
+    val_cfg_weight: float = 1.0
     val_temperature: float = 1.0
     val_txt_top_k: int = None
     val_txt_top_p: float = None
