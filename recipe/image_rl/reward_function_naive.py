@@ -32,14 +32,15 @@ VLM_BASE_URLS = [
     "http://10.100.44.2:8001/v1",
     "http://10.100.44.2:8002/v1",
     "http://10.100.44.2:8003/v1",
+    # "http://10.100.44.2:8004/v1", # sub2
+    # "http://10.100.44.2:8005/v1",
+    # "http://10.100.44.2:8006/v1",
+    # "http://10.100.44.2:8007/v1",
+    
 ]
 LLM_BASE_URLS = [
     # "http://10.100.44.2:8006/v1", # sub2
     # "http://10.100.44.2:8007/v1",
-    "http://10.100.44.2:8004/v1", # sub2
-    "http://10.100.44.2:8005/v1",
-    "http://10.100.44.2:8006/v1",
-    "http://10.100.44.2:8007/v1",
 ]
 API_KEY = "EMPTY"
 MAX_RETRIES = 3
@@ -58,10 +59,8 @@ DETECTOR_URLS = [
     # "http://10.100.44.4:8087",
     # "http://10.100.44.8:8086", # sub1
     # "http://10.100.44.8:8087",
-    "http://10.100.44.2:8084",
-    "http://10.100.44.2:8085",
-    "http://10.100.44.2:8086", # sub2
-    "http://10.100.44.2:8087",
+    # "http://10.100.44.2:8086", # sub2
+    # "http://10.100.44.2:8087",
 ]
 DETECTOR_TIMEOUT = 300000.0
 
@@ -366,6 +365,7 @@ def image_evaluator_parser(text):
     
     return idx_to_ans
 
+
 # Main message construction function
 def get_messages(*args):
     prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback, vqa_question, extra_info, task_id = args
@@ -382,15 +382,16 @@ def get_messages(*args):
         ]
         model = RM_VLM_MODEL_PATH
     elif task_id == 2:
-        system_prompt = TASK2_FEEDBACK_GENERATOR_SYSTEM_PROMPT_TEMPLATE
-        user_prompt = TASK2_FEEDBACK_GENERATOR_USER_PROMPT_TEMPLATE.format(prompt=prompt, part2_tuples=predicted_tuple, part3_answers=predicted_answer, part4_feedback=predicted_feedback)
+        system_prompt = TASK2_FEEDBACK_GENERATOR_SYSTEM_PROMPT_TEMPLATE_NAIVE
+        user_prompt = TASK2_FEEDBACK_GENERATOR_USER_PROMPT_TEMPLATE_NAIVE.format(prompt=prompt, part4_feedback=predicted_feedback)
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": convert_gen_img_to_base64(gen_img)}},
                 {"type": "text", "text": user_prompt},
             ]}
         ]
-        model = RM_LLM_MODEL_PATH
+        model = RM_VLM_MODEL_PATH
     elif task_id == 3:
         system_prompt = TASK1_TASK3_IMAGE_GENERATOR_SYSTEM_PROMPT_TEMPLATE
         user_prompt = TASK1_TASK3_IMAGE_GENERATOR_USER_PROMPT_TEMPLATE.format(questions=vqa_question)
@@ -404,90 +405,6 @@ def get_messages(*args):
         model = RM_VLM_MODEL_PATH
     else:
         raise ValueError(f"Invalid task: {task_id} is must be one of task1, task2, or task3.")
-
-    return messages, model
-
-
-# Additional message constructors for task 2 subtasks
-def get_messsages_task2_comparison_summarize(*args): # 5: part 1
-    prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback, vqa_question, extra_info, task_id = args
-
-    system_prompt = TASK2_COMPARISON_SUMMARIZE_SYSTEM_PROMPT
-    user_prompt = json.dumps({"prompt": prompt, "summarize": predicted_summarize})
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": [
-            {"type": "text", "text": user_prompt},
-        ]}
-    ]
-    model = RM_LLM_MODEL_PATH
-
-    return messages, model
-
-def get_messages_task2_comparison_tuple(*args): # 1: part 2
-    prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback, vqa_question, extra_info, task_id = args
-
-    system_prompt = TASK2_COMPARISON_TUPLE_SYSTEM_PROMPT
-    user_prompt = json.dumps({"GT": feedback_tuple, "PRED": predicted_tuple})
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": [
-            {"type": "text", "text": user_prompt},
-        ]}
-    ]
-    model = RM_LLM_MODEL_PATH
-
-    return messages, model
-
-
-def get_messages_task2_hallucination_check(*args): # 2: part 3
-    prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback, vqa_question, extra_info, task_id = args
-
-    system_prompt = TASK2_HALLUCINATION_CHECK_SYSTEM_PROMPT
-    user_prompt = json.dumps({"tuple": predicted_tuple, "answer": predicted_answer})
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": [
-            {"type": "image_url", "image_url": {"url": convert_gen_img_to_base64(gen_img)}},
-            {"type": "text", "text": user_prompt},
-        ]}
-    ]
-    model = RM_VLM_MODEL_PATH
-
-    return messages, model
-
-
-def get_messages_task2_edit_instruction(*args): # 3: part 4
-    prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback, vqa_question, extra_info, task_id = args
-
-    system_prompt = TASK2_EDIT_INSTRUCTION_SYSTEM_PROMPT
-    user_prompt = json.dumps({"prompt": prompt, "answer": predicted_answer, "edit_instruction": predicted_feedback})
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": [
-            {"type": "text", "text": user_prompt},
-        ]}
-    ]
-    model = RM_LLM_MODEL_PATH
-
-    return messages, model
-
-
-# Additional message constructors for task 1 alignment
-def get_messages_task3_regeneration_followed_by_editing(*args):
-    prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback, vqa_question, extra_info, task_id = args
-
-    system_prompt = TASK3_REGENERATION_FOLLOWED_BY_EDITING_SYSTEM_PROMPT
-    user_prompt = json.dumps({"prompt": prompt, "edit_instruction": predicted_feedback})
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": [
-            {"type": "image_url", "image_url": {"url": convert_gen_img_to_base64(gen_img)}},
-            {"type": "image_url", "image_url": {"url": convert_gen_img_to_base64(regen_img)}},
-            {"type": "text", "text": user_prompt},
-        ]}
-    ]
-    model = RM_VLM_MODEL_PATH
 
     return messages, model
 
@@ -545,285 +462,19 @@ async def get_response(message_builder_fn, *args):
     return None
 
 
-# Detection parsing and request functions
-def parse_lines(text):
-    if not isinstance(text, str): return []
-    return [(int(m.group(1)), m.group(2).strip()) for line in text.strip().split("\n") if (m := re.match(r"(\d+)\s*\|\s*(.*)", line))]
-
-
-def verify_detection_single(feedback_tuple: list) -> List[Dict[str, Any]]: # 
-    parsed_tup = parse_lines(feedback_tuple)
-    
-    results = []
-    for num, content in parsed_tup: # [(1, 'entity - whole (banana)'), ...]
-        info = None
-        if 'spatial' in content:
-            if m := re.search(r'\((.*?)\)', content): # (obj1, obj2, relation) 파싱
-                parts = [p.strip() for p in m.group(1).split(',')]
-                if len(parts) >= 3: # Spatial
-                    s, o = parts[0], parts[1]
-                    r_text = ", ".join(parts[2:]) # 관계 텍스트 (예: "is on the left of")
-                    
-                    cs = re.sub(r"_\d+$", "", _CONNECTORS.sub('', s).strip())
-                    co = re.sub(r"_\d+$", "", _CONNECTORS.sub('', o).strip())
-                    
-                    # Subject/Object가 방향 지시어면 스킵
-                    if not (cs.lower() in SKIP_KEYWORDS or co.lower() in SKIP_KEYWORDS or cs.startswith('[')):
-                        
-                        # [핵심] 정규식 리스트를 순회하며 매칭 확인
-                        # 매칭되면 'c'(Canonical Name, 예: "left of")를 반환
-                        canonical_rel = next((c for c, p, _ in _COMPILED_RELATIONS if p.search(r_text)), None)
-                        
-                        if canonical_rel:
-                            # Prompt는 GDino가 이해하기 쉬운 단순 형태로 구성 (필요시 canonical_rel 사용 가능)
-                            info = {
-                                "subject": cs,
-                                "object": co,
-                                "relation": canonical_rel,  # <--- 여기에 통일된 단어("left of")가 들어감
-                                "tuple_idx": num,
-                                "type": "spatial"
-                            }
-
-        elif 'count' in content:
-            if m := re.search(r'\((.*?)\)', content):
-                parts = [p.strip() for p in m.group(1).split(',')]
-                if len(parts) >= 2: # Counting
-                    s, expr = parts[0], parts[1]
-                    cs = re.sub(r"_\d+$", "", _CONNECTORS.sub('', s).strip())
-                    if not (cs.lower() in SKIP_KEYWORDS or cs.startswith('[')) and re.search(r'\d', expr):
-                        info = {
-                            "subject": cs, 
-                            "object": cs, 
-                            "num": expr, 
-                            "tuple_idx": num,
-                            "type": "counting"
-                        }
-        
-        if info is not None:    
-            results.append(info)
-
-    return results # [], [info1, info2, ...]
-
-    
-async def request_detector_single(detection_list: List[Dict[str, Any]], img) -> Dict[str, Any]:
-    """
-    - detector 서버 4개를 고루 사용 (slot token 기반)
-    - 서버당 inflight cap (DET_PER_SERVER_INFLIGHT)
-    - failover/retry (DETECTOR_MAX_RETRIES) 동안 슬롯 점유하지 않음
-    """
-
-    if not detection_list:
-        return {"results": {}, "details": [], "errors": []}
-
-    # -------- loop-local slot queue init --------
-    async def _ensure_det_slots() -> asyncio.Queue:
-        """Ensure slot queue exists for current event loop"""
-        loop = asyncio.get_running_loop()
-        loop_id = id(loop)
-        
-        # Quick check without lock
-        if loop_id in _det_slot_queues:
-            queue = _det_slot_queues[loop_id]
-            try:
-                queue.qsize()
-                return queue
-            except RuntimeError:
-                pass
-        
-        # Create new queue with lock
-        with _det_slot_lock:
-            if loop_id in _det_slot_queues:
-                queue = _det_slot_queues[loop_id]
-                try:
-                    queue.qsize()
-                    return queue
-                except RuntimeError:
-                    del _det_slot_queues[loop_id]
-            
-            q = asyncio.Queue()
-            start = random.randrange(len(DETECTOR_URLS))
-            for i in range(DET_PER_SERVER_INFLIGHT * len(DETECTOR_URLS)):
-                sid = (start + i) % len(DETECTOR_URLS)
-                q.put_nowait(sid)
-            
-            _det_slot_queues[loop_id] = q
-            return q
-
-    slot_q = await _ensure_det_slots()
-
-    # -------- image -> raw base64 --------
-    img_b64 = convert_gen_img_to_base64(img)
-    if img_b64.startswith("data:"):
-        img_b64 = img_b64.split(",", 1)[1]
-
-    # -------- build payload --------
-    info_list = []
-    idx_mapping = {}
-
-    for det_info in detection_list:
-        det_type = det_info.get("type", "")
-        api_info = None
-
-        if det_type == "spatial":
-            api_info = {
-                "type": "spatial",
-                "subject": det_info.get("subject"),
-                "object": det_info.get("object"),
-                "relation": det_info.get("relation"),
-            }
-        elif det_type in ["counting", "numeracy"]:
-            api_info = {
-                "type": "numeracy",
-                "object": det_info.get("object"),
-                "num": str(det_info.get("num", "")),
-            }
-
-        if api_info is None:
-            continue
-
-        idx_mapping[len(info_list)] = det_info.get("tuple_idx", len(info_list))
-        info_list.append(api_info)
-
-    if not info_list:
-        return {"results": {}, "details": [], "errors": ["No valid detection items"]}
-
-    payload = {"info_list": info_list, "img_url": img_b64}
-
-    # -------- retry bookkeeping --------
-    per_server_attempts = {sid: 0 for sid in range(len(DETECTOR_URLS))}
-    max_total_attempts = len(DETECTOR_URLS) * DETECTOR_MAX_RETRIES
-
-    results: Dict[int, bool] = {}
-    details: List[Dict[str, Any]] = []
-    errors: List[str] = []
-
-    timeout = aiohttp.ClientTimeout(total=DETECTOR_TIMEOUT)
-
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        for attempt in range(max_total_attempts):
-            sid = await slot_q.get()
-
-            # 서버당 시도 횟수 제한
-            if per_server_attempts[sid] >= DETECTOR_MAX_RETRIES:
-                slot_q.put_nowait(sid)
-                continue
-            per_server_attempts[sid] += 1
-
-            detect_url = f"{DETECTOR_URLS[sid]}/detect"
-
-            err = None
-            try:
-                async with session.post(detect_url, json=payload) as resp:
-                    if resp.status != 200:
-                        txt = await resp.text()
-                        errors.append(f"{detect_url} -> {resp.status}: {txt[:200]}")
-                        continue
-
-                    data = await resp.json()
-                    api_results = data.get("results", [])
-
-                    for api_idx, result_list in enumerate(api_results):
-                        if api_idx not in idx_mapping or not result_list:
-                            continue
-                        tuple_idx = idx_mapping[api_idx]
-                        r0 = result_list[0]
-
-                        det_judge = bool(r0.get("det_judge", False))
-                        results[tuple_idx] = det_judge
-                        details.append(
-                            {
-                                "tuple_idx": tuple_idx,
-                                "det_judge": det_judge,
-                                "det_reason": r0.get("det_reason", ""),
-                                "det_info": r0.get("det_info", {}),
-                                "vis_data": r0.get("vis_data"),
-                                "server": DETECTOR_URLS[sid],
-                            }
-                        )
-
-                    return {"results": results, "details": details, "errors": errors}
-
-            except Exception as e:
-                err = e
-                errors.append(f"{detect_url} exception: {repr(e)}")
-
-            finally:
-                # slot return
-                slot_q.put_nowait(sid)
-
-            # backoff before next attempt
-            await asyncio.sleep(0.1 * (attempt + 1))
-
-    # All servers failed
-    return {
-        "results": results,
-        "details": details,
-        "errors": errors if errors else ["All detector servers failed"]
-    }
-
-
-async def request_detector_batch(detection_requests: List[tuple]) -> List[Dict[str, Any]]:
-    """
-    Batch process multiple detection requests concurrently.
-    
-    Args:
-        detection_requests: List of (detection_list, img) tuples
-    
-    Returns:
-        List of detection results corresponding to each request
-    """
-    if not detection_requests:
-        return []
-    
-    # Create semaphore to limit concurrent detector requests
-    semaphore = asyncio.Semaphore(4)  # Limit concurrent detector calls
-    
-    async def process_single(idx, det_list, img):
-        async with semaphore:
-            result = await request_detector_single(det_list, img)
-            return idx, result
-    
-    tasks = [
-        asyncio.create_task(process_single(i, det_list, img))
-        for i, (det_list, img) in enumerate(detection_requests)
-    ]
-    
-    results = [None] * len(detection_requests)
-    completed = await asyncio.gather(*tasks, return_exceptions=True)
-    
-    for item in completed:
-        if isinstance(item, Exception):
-            print(f"Detector batch request failed: {item}")
-        else:
-            idx, result = item
-            results[idx] = result
-    
-    return results
-
-
 async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback, vqa_question, extra_info, task_id):
     """Async version of compute_score"""
     reward_score = 0.0
     reward_extra_info = {}
 
     if task_id == 1: # Total score: 3.0
-        # Launch all API requests in parallel
-        detection_results = verify_detection_single(feedback_tuple)
-
         # Create tasks
         vlm_task = asyncio.create_task(
             get_response(get_messages, prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback, vqa_question, extra_info, task_id)
         )
 
-        detector_task = None
-        if detection_results:
-            detector_task = asyncio.create_task(
-                request_detector_single(detection_results, gen_img)
-            )
-
         # Gather results
         response = await vlm_task
-        detector_response = await detector_task if detector_task else {"results": {}, "details": [], "errors": ["No valid detection items"]}
 
         # Process VLM response
         task1_vlm_reward_score = 0.0
@@ -844,32 +495,6 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
             reward_extra_info[f"task{task_id}_vlm_reward"] = 0.0
 
         reward_extra_info[f"task{task_id}_reward_response"] = response if not isinstance(response, Exception) else str(response)
-
-        # Process detector response
-        detector_reward = 0.0
-        if detection_results and detector_response:
-            det_results_dict = detector_response.get("results", {})
-            if det_results_dict:
-                all_true = all(det_results_dict.values())
-                detector_reward = 1.0 if all_true else 0.0
-                reward_score += detector_reward
-                reward_extra_info[f"task{task_id}_detector_reward"] = detector_reward
-            else:
-                reward_score += 0.0
-                reward_extra_info[f"task{task_id}_detector_reward"] = 0.0
-        else:
-            reward_score += 0.0
-            reward_extra_info[f"task{task_id}_detector_reward"] = 0.0
-
-        reward_extra_info[f"task{task_id}_detector_response"] = detector_response
-
-        # Bonus if both perfect
-        if task1_vlm_reward_score == 1 and detector_reward == 1:
-            reward_score += 1.0
-            reward_extra_info[f"task{task_id}_vlm_detector_bonus"] = 1.0
-        else:
-            reward_score += 0.0
-            reward_extra_info[f"task{task_id}_vlm_detector_bonus"] = 0.0
 
     elif task_id == 2:
         task2_reward_score = 0.0
@@ -896,26 +521,9 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
         args = (prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback, vqa_question, extra_info, task_id)
 
         feedback_task = asyncio.create_task(get_response(get_messages, *args)) # +1
-        comparison_summarize_task = asyncio.create_task(get_response(get_messsages_task2_comparison_summarize, *args)) # +1
-        comparison_tuple_task = asyncio.create_task(get_response(get_messages_task2_comparison_tuple, *args)) # +1
-        hallucination_check_task = asyncio.create_task(get_response(get_messages_task2_hallucination_check, *args)) # +1
-        edit_instruction_task = asyncio.create_task(get_response(get_messages_task2_edit_instruction, *args)) # +1
 
         # Gather all results at once
-        (
-            response,
-            comparison_summarize_response,
-            comparison_tuple_response,
-            hallucination_check_response,
-            edit_instruction_response
-        ) = await asyncio.gather(
-            feedback_task,
-            comparison_summarize_task,
-            comparison_tuple_task,
-            hallucination_check_task,
-            edit_instruction_task,
-            return_exceptions=True
-        )
+        response = await feedback_task
 
         # Process feedback response
         task2_vlm_reward_score = 0.0
@@ -943,78 +551,6 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
         reward_extra_info[f"task{task_id}_vlm_reward"] = task2_vlm_reward_score
         reward_extra_info[f"task{task_id}_reward_response"] = response
 
-        # Process comparison_summarize response
-        task2_comparison_summarize_score = 0.0
-        if not isinstance(comparison_summarize_response, Exception) and comparison_summarize_response is not None:
-            try:
-                reward_data = safe_json_loads(comparison_summarize_response)
-                task2_comparison_summarize_score = float(reward_data.get("score", 0.0))
-                task2_reward_score += task2_comparison_summarize_score
-                # task2_ans_count += 1
-            except:
-                task2_comparison_summarize_score = 0.0
-                task2_reward_score += 0.0
-        else:
-            task2_comparison_summarize_score = 0.0
-            task2_reward_score += 0.0
-
-        reward_extra_info[f"task{task_id}_comparison_summarize_score"] = task2_comparison_summarize_score
-        reward_extra_info[f"task{task_id}_comparison_summarize_response"] = comparison_summarize_response if not isinstance(comparison_summarize_response, Exception) else str(comparison_summarize_response)
-
-        # Process comparison_tuple response
-        task2_comparison_tuple_score = 0.0
-        if not isinstance(comparison_tuple_response, Exception) and comparison_tuple_response is not None:
-            try:
-                reward_data = safe_json_loads(comparison_tuple_response)
-                task2_comparison_tuple_score = float(reward_data.get("accuracy", 0.0))
-                task2_reward_score += task2_comparison_tuple_score
-                # task2_ans_count += 1
-            except:
-                task2_comparison_tuple_score = 0.0
-                task2_reward_score += 0.0
-        else:
-            task2_comparison_tuple_score = 0.0
-            task2_reward_score += 0.0
-
-        reward_extra_info[f"task{task_id}_comparison_tuple_score"] = task2_comparison_tuple_score
-        reward_extra_info[f"task{task_id}_comparison_tuple_response"] = comparison_tuple_response if not isinstance(comparison_tuple_response, Exception) else str(comparison_tuple_response)
-
-        # Process hallucination_check response
-        task2_hallucination_check_score = 0.0
-        if not isinstance(hallucination_check_response, Exception) and hallucination_check_response is not None:
-            try:
-                reward_data = safe_json_loads(hallucination_check_response)
-                task2_hallucination_check_score = float(reward_data.get("accuracy", 0.0))
-                task2_reward_score += task2_hallucination_check_score
-                # task2_ans_count += 1
-            except:
-                task2_hallucination_check_score = 0.0
-                task2_reward_score += 0.0
-        else:
-            task2_hallucination_check_score = 0.0
-            task2_reward_score += 0.0
-        
-        reward_extra_info[f"task{task_id}_hallucination_check_score"] = task2_hallucination_check_score
-        reward_extra_info[f"task{task_id}_hallucination_check_response"] = hallucination_check_response if not isinstance(hallucination_check_response, Exception) else str(hallucination_check_response)
-
-        # Process edit_instruction response
-        task2_edit_instruction_score = 0.0
-        if not isinstance(edit_instruction_response, Exception) and edit_instruction_response is not None:
-            try:
-                reward_data = safe_json_loads(edit_instruction_response)
-                task2_edit_instruction_score = float(reward_data.get("score", 0.0))
-                task2_reward_score += task2_edit_instruction_score
-                # task2_ans_count += 1
-            except:
-                task2_edit_instruction_score = 0.0
-                task2_reward_score += 0.0
-        else:
-            task2_edit_instruction_score = 0.0
-            task2_reward_score += 0.0
-        
-        reward_extra_info[f"task{task_id}_edit_instruction_score"] = task2_edit_instruction_score
-        reward_extra_info[f"task{task_id}_edit_instruction_response"] = edit_instruction_response if not isinstance(edit_instruction_response, Exception) else str(edit_instruction_response)
-
         # reward_score += (task2_reward_score / task2_ans_count) if task2_ans_count > 0 else 0.0
         reward_score += task2_reward_score # not normalizing
 
@@ -1024,38 +560,16 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
             reward_score = -100
             reward_extra_info[f"task{task_id}_vlm_reward"] = reward_score
             reward_extra_info[f"task{task_id}_reward_response"] = "None"
-            reward_extra_info[f"task{task_id}_detector_reward"] = reward_score
-            reward_extra_info[f"task{task_id}_detector_response"] = {"results": {}, "details": [], "errors": []}
-            reward_extra_info[f"task{task_id}_detector_details"] = []
-            reward_extra_info[f"task{task_id}_vlm_detector_bonus"] = reward_score
-            reward_extra_info[f"task{task_id}_regeneration_followed_by_editing_reward"] = reward_score
-            reward_extra_info[f"task{task_id}_regeneration_followed_by_editing_response"] = "No need to respond reward."
             return {
                 "score": reward_score,
                 "reward_extra_info": reward_extra_info,
             }
 
-        # Launch all API requests in parallel
-        detection_results = verify_detection_single(feedback_tuple)
         args = (prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback, vqa_question, extra_info, task_id)
 
         vlm_task = asyncio.create_task(get_response(get_messages, *args))
-        regeneration_task = asyncio.create_task(get_response(get_messages_task3_regeneration_followed_by_editing, *args))
 
-        detector_task = None
-        if detection_results:
-            detector_task = asyncio.create_task(request_detector_single(detection_results, gen_img))
-
-        # Gather results
-        if detector_task:
-            response, regeneration_followed_by_editing_response, detector_response = await asyncio.gather(
-                vlm_task, regeneration_task, detector_task, return_exceptions=True
-            )
-        else:
-            response, regeneration_followed_by_editing_response = await asyncio.gather(
-                vlm_task, regeneration_task, return_exceptions=True
-            )
-            detector_response = {"results": {}, "details": [], "errors": ["No valid detection items"]}
+        response = await vlm_task
 
         # Process VLM response
         task3_vlm_reward_score = 0.0
@@ -1071,49 +585,6 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
             reward_extra_info[f"task{task_id}_vlm_reward"] = 0.0
         
         reward_extra_info[f"task{task_id}_reward_response"] = response if isinstance(response, Exception) else str(response)
-
-        # Process regeneration response
-        task3_regeneration_followed_by_editing_reward_score = 0.0
-        if not isinstance(regeneration_followed_by_editing_response, Exception) and regeneration_followed_by_editing_response is not None:
-            try:
-                reward_data = safe_json_loads(regeneration_followed_by_editing_response)
-                task3_regeneration_followed_by_editing_reward_score = float(reward_data.get("score", 0.0))
-                reward_score += task3_regeneration_followed_by_editing_reward_score
-            except:
-                task3_regeneration_followed_by_editing_reward_score = 0.0
-                reward_score += 0.0
-        else:
-            task3_regeneration_followed_by_editing_reward_score = 0.0
-            reward_score += 0.0
-
-        reward_extra_info[f"task{task_id}_regeneration_followed_by_editing_reward"] = task3_regeneration_followed_by_editing_reward_score
-        reward_extra_info[f"task{task_id}_regeneration_followed_by_editing_response"] = regeneration_followed_by_editing_response if not isinstance(regeneration_followed_by_editing_response, Exception) else str(regeneration_followed_by_editing_response)
-
-        # Process detector response
-        detector_reward = 0.0
-        if detection_results and not isinstance(detector_response, Exception):
-            det_results_dict = detector_response.get("results", {})
-            if det_results_dict:
-                all_true = all(det_results_dict.values())
-                detector_reward = 1.0 if all_true else 0.0
-                reward_score += detector_reward
-                reward_extra_info[f"task{task_id}_detector_reward"] = detector_reward
-            else:
-                reward_score += 0.0
-                reward_extra_info[f"task{task_id}_detector_reward"] = 0.0
-        else:
-            reward_score += 0.0
-            reward_extra_info[f"task{task_id}_detector_reward"] = 0.0
-
-        reward_extra_info[f"task{task_id}_detector_response"] = detector_response if not isinstance(detector_response, Exception) else str(detector_response)
-
-        # Bonus if both perfect
-        if task3_vlm_reward_score == 1 and detector_reward == 1:
-            reward_score += 1.0
-            reward_extra_info[f"task{task_id}_vlm_detector_bonus"] = 1.0
-        else:
-            reward_score += 0.0
-            reward_extra_info[f"task{task_id}_vlm_detector_bonus"] = 0.0
 
     return {
         "score": reward_score,

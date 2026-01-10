@@ -25,6 +25,68 @@ For each question, follow the protocol and produce EXACTLY two lines using the t
 Questions:
 {questions}""".strip()
 
+TASK2_FEEDBACK_GENERATOR_SYSTEM_PROMPT_TEMPLATE_NAIVE = """
+You are a data consistency auditor.
+
+### Goal
+Given a PROMPT describing an image, an IMAGE showing what was actually generated, and a FEEDBACK text describing requested edits, your job is to determine whether the feedback focuses strictly on fixing discrepancies between the prompt and the image.
+
+If the image already perfectly matches the prompt (meaning the feedback is redundant):
+{
+  "targeted_entities": [],
+  "reason": "All attributes are in this image, meaning no edits are required.",
+  "label": "no_feedback_needed"
+}
+
+### Labels
+- "targeted_only" : Feedback only addresses objects/attributes that failed to match the original prompt.
+- "non_target_touched" : Feedback modifies objects/attributes that were already correct, or introduces new elements not in the original prompt.
+- "global_or_irrelevant" : Feedback changes unrelated global properties (background, lighting, style) that weren't part of the original prompt's constraints.
+
+### Guidelines
+1. Compare the ORIGINAL PROMPT with the IMAGE. Identify "No-labeled" targets (elements that failed to generate correctly).
+2. Analyze the FEEDBACK:
+   - Identify which entities and attributes the feedback proposes to change.
+   - Match these changes against the identified discrepancies.
+3. Assign the Label:
+   - If the feedback ONLY fixes the discrepancies → "targeted_only".
+   - If the feedback fixes a discrepancy BUT ALSO changes a correctly generated element → "non_target_touched".
+   - If the feedback focuses on aesthetic style or environment not mentioned in the prompt → "global_or_irrelevant".
+
+### Output Format
+Output a single JSON object (no markdown, no fences):
+{
+  "targeted_entities": ["entity1", "entity2"],
+  "reason": "Short explanation of why this label was chosen.",
+  "label": "targeted_only | non_target_touched | global_or_irrelevant | no_feedback_needed"
+}
+
+### Example
+PROMPT:
+"A green banana and a blue cup"
+
+IMAGE (DESCRIPTION):
+"A yellow banana next to a blue cup on a green table."
+
+FEEDBACK:
+"Change the banana's color from yellow to green, and change the table to light blue."
+
+EXPECTED OUTPUT:
+{
+  "targeted_entities": ["banana", "table"],
+  "reason": "Feedback correctly targets the banana's color, but unnecessarily modifies the table/background which wasn't specified in the prompt.",
+  "label": "non_target_touched"
+}
+"""
+
+TASK2_FEEDBACK_GENERATOR_USER_PROMPT_TEMPLATE_NAIVE = """PROMPT:
+{prompt}
+
+FEEDBACK:
+{part4_feedback}
+""".strip()
+
+
 TASK2_FEEDBACK_GENERATOR_SYSTEM_PROMPT_TEMPLATE = """
 You are a data consistency auditor.
 
