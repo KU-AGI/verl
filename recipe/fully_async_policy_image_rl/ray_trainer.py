@@ -359,8 +359,10 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
 
         # Metric accumulators
         task_reward_tensors = {1: [], 2: [], 3: []}
-        task_reward_extra_infos = {1: [], 2: [], 3: []}
         data_source_lst = []
+        sample_uids = []
+
+        all_reward_extra_infos_batches = []
 
         # Sample data for logging
         sample_prompts = []
@@ -526,12 +528,19 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
 
                     test_batch, result_batch, reward_tensor_dict, reward_extra_infos, reward_tasks, budget_n, _ = item
 
-                    # Wait for all reward tasks to complete
+                    # Wait for all reward tasks
                     results = await asyncio.gather(*reward_tasks, return_exceptions=True)
-                    for r in results:
-                        if isinstance(r, Exception):
-                            import traceback
-                            traceback.print_exception(type(r), r, r.__traceback__)
+                    
+                    # Collect data
+                    batch_size = len(result_batch.non_tensor_batch['prompt'])
+                    
+                    # Collect UIDs
+                    uids = result_batch.non_tensor_batch["uid"].tolist()
+                    sample_uids.extend(uids)
+                    
+                    # Collect data sources
+                    data_source = result_batch.non_tensor_batch.get('data_source', ['unknown'] * batch_size)
+                    data_source_lst.extend(data_source)
 
                     # Save in result batch
                     for task_id in [1, 2, 3]:
@@ -573,6 +582,8 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                     for task_id in [1, 2, 3]:
                         task_reward_tensor = reward_tensor_dict[task_id]
                         task_reward_tensors[task_id].append(task_reward_tensor)
+
+                        all_reward_extra_infos_batches.append(reward_extra_infos[task_id])
 
                         # Compute per-sample scores
                         per_sample_scores = task_reward_tensor.sum(-1).cpu().tolist()
@@ -616,9 +627,6 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                             dump_path=val_data_dir
                             )
 
-                    data_source = test_batch.non_tensor_batch.get('data_source', ['unknown'] * batch_size)
-                    data_source_lst.extend(data_source)
-
                 finally:
                     if item != "DONE":
                         await _release_finalize_budget(budget_n)
@@ -648,29 +656,48 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
             sample_task3_scores
         ))
 
+        # Flatten batched reward_extra_infos
+        reward_extra_infos_dict = {}
+        if all_reward_extra_infos_batches:
+            # Get all keys from first batch
+            all_keys = set()
+            for batch_infos in all_reward_extra_infos_batches:
+                all_keys.update(batch_infos.keys())
+            
+            # Flatten each key
+            for key in all_keys:
+                values = []
+                for batch_infos in all_reward_extra_infos_batches:
+                    v = batch_infos.get(key, [])
+                    if not isinstance(v, list):
+                        # Single value - need to expand based on batch size
+                        # This shouldn't happen if rewards are computed correctly
+                        values.append(v)
+                    else:
+                        values.extend(v)
+                reward_extra_infos_dict[key] = values
+
+        # Compute metrics
         data_sources = np.array(data_source_lst)
-
-        # Compute task-specific metrics
+        data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
+        
         metric_dict = {}
-        for task_id in [1, 2, 3]:
-            reward_tensor = torch.cat(task_reward_tensors[task_id], dim=0).sum(-1).cpu()
-
-            # Evaluate scores grouped by data source
-            data_source_reward = {}
-            for i in range(reward_tensor.shape[0]):
-                data_source = data_sources[i]
-                if data_source not in data_source_reward:
-                    data_source_reward[data_source] = []
-                data_source_reward[data_source].append(reward_tensor[i].item())
-
-            for data_source, rewards in data_source_reward.items():
-                valid_rewards = [r for r in rewards if r > 0]
-                if valid_rewards:
-                    metric_dict[f'val/task{task_id}_score/{data_source}'] = np.mean(valid_rewards)
-                metric_dict[f'val/task{task_id}_positive_ratio/{data_source}'] = np.mean(np.array(rewards) > 0)
-
-        metric_dict['validation_samples'] = validation_samples
-
+        for data_source, var2metric2val in data_src2var2metric2val.items():
+            core_var = "acc" if "acc" in var2metric2val else "reward"
+            for var_name, metric2val in var2metric2val.items():
+                n_max = max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys()])
+                for metric_name, metric_val in metric2val.items():
+                    if (
+                        (var_name == core_var)
+                        and any(metric_name.startswith(pfx) for pfx in ["mean", "maj", "best"])
+                        and (f"@{n_max}" in metric_name)
+                    ):
+                        metric_sec = "val-core"
+                    else:
+                        metric_sec = "val-aux"
+                    pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
+                    metric_dict[pfx] = metric_val
+        
         return metric_dict
 
     def fit(self):
