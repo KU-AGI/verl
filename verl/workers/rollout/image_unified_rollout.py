@@ -378,6 +378,7 @@ class ImageUnifiedRollout(BaseRollout):
     @torch.no_grad()
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         self.module.eval()
+        self.module.gen_vision_model.eval()
 
         batch_size = prompts.batch.batch_size[0]
 
@@ -446,7 +447,6 @@ class ImageUnifiedRollout(BaseRollout):
         gen_final_cfg_embeds, gen_final_cfg_attention_mask = self._prepare_cfg_embeds(data_proto)
         generated_tokens = self.generate_img(gen_final_cfg_embeds, gen_final_cfg_attention_mask)
         # For reproducing generated images
-        data_proto.batch["task1_gen_img_tokens"] = generated_tokens
 
         decoded_images = self._decode_image_tokens(generated_tokens)
         gen_imgs_pil_list = [PIL.Image.fromarray(img_array) for img_array in decoded_images]
@@ -467,6 +467,7 @@ class ImageUnifiedRollout(BaseRollout):
 
             image_embeds = self.module.gen_aligner(self.module.gen_embed(image_ids))
 
+        data_proto.batch["task1_gen_img_tokens"] = image_ids
         data_proto.batch["task1_response_mask"] = torch.ones((B, image_embeds.size(1)), dtype=torch.long, device=image_embeds.device)
         if dist.get_rank() == 0:
             print(f"[IMG_GEN] Created DataProto with batch_size: {batch_size}")
@@ -679,19 +680,14 @@ class ImageUnifiedRollout(BaseRollout):
 
         B, C, H, W = gen_imgs_pixel_values.shape
 
-        gen_imgs_pixel_values = gen_imgs_pixel_values.to(self.device, dtype=torch.bfloat16)
-
         # embedding
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-            _, _, all_image_ids = self.module.gen_vision_model.encode(gen_imgs_pixel_values)
-    
-            image_ids = all_image_ids[2]
-            image_ids = image_ids.view(B, -1)
+        image_ids = data_proto.batch.get('task1_gen_img_tokens', [])
+        image_ids.to(self.device, dtype=torch.bfloat16)
 
-            image_embeds = self.module.gen_aligner(self.module.gen_embed(image_ids))
-            text_embeds = self.module.language_model.get_input_embeddings()(batched_total_ids)
-            image_embeds = image_embeds.to(dtype=torch.bfloat16)
-            text_embeds = text_embeds.to(dtype=torch.bfloat16)
+        image_embeds = self.module.gen_aligner(self.module.gen_embed(image_ids))
+        text_embeds = self.module.language_model.get_input_embeddings()(batched_total_ids)
+        image_embeds = image_embeds.to(dtype=torch.bfloat16)
+        text_embeds = text_embeds.to(dtype=torch.bfloat16)
 
         # merge text and image embeds
         merged_embeds = self.merge_text_and_image_embeds(text_embeds, image_embeds, all_image_start_indices)
@@ -703,8 +699,6 @@ class ImageUnifiedRollout(BaseRollout):
 
         regen_final_cfg_embeds, regen_final_cfg_attention_mask = self._prepare_regen_cfg_embeds(data_proto)
         regenerated_tokens = self.generate_img(regen_final_cfg_embeds, regen_final_cfg_attention_mask)
-        # For reproducing regen images
-        data_proto.batch["task3_regen_img_tokens"] = regenerated_tokens
 
         regen_decoded_images = self._decode_image_tokens(regenerated_tokens)
         regen_imgs_pil_list = [PIL.Image.fromarray(img_array) for img_array in regen_decoded_images]
@@ -724,6 +718,9 @@ class ImageUnifiedRollout(BaseRollout):
             image_ids = image_ids.view(B, -1)
 
             image_embeds = self.module.gen_aligner(self.module.gen_embed(image_ids))
+
+        # For reproducing regen images
+        data_proto.batch["task3_regen_img_tokens"] = image_ids
 
         data_proto.batch["task3_response_mask"] = torch.ones((B, image_embeds.size(1)), dtype=torch.long, device=image_embeds.device)
         if dist.get_rank() == 0:

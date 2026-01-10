@@ -264,6 +264,7 @@ class DataParallelImageGenerationActor(BasePPOActor):
 
         # IMPORTANT: Always do forward pass even if no valid output
         # FSDP requires all ranks to participate in forward/backward for synchronization
+
         output = self.actor_module(
             task_id=task_id,
             batch=micro_batch,

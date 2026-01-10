@@ -1024,10 +1024,7 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
 
         # Output processing
         gen_imgs_pixel_values = batch["task1_gen_imgs_pixel_values"]
-        # Ensure gen_vision_model encode is done with torch.no_grad() since it's frozen
-        with torch.no_grad():
-            _, _, all_image_ids = self.gen_vision_model.encode(gen_imgs_pixel_values)
-        task1_image_ids = all_image_ids[2].view(gen_imgs_pixel_values.size(0), -1)
+        task1_image_ids = batch["task1_gen_img_tokens"]
         task1_gen_img_embeds = self.gen_aligner(self.gen_embed(task1_image_ids))
 
         # Response mask
@@ -1095,11 +1092,8 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
         task3_input_ids = batch["task3_input_ids"]
         task3_attention_mask = batch["task3_attention_mask"]
         gen_imgs_pixel_values = batch["task1_gen_imgs_pixel_values"]
+        task3_image_ids = batch["task1_gen_img_tokens"]
 
-        # Ensure gen_vision_model encode is done with torch.no_grad() since it's frozen
-        with torch.no_grad():
-            _, _, all_image_ids = self.gen_vision_model.encode(gen_imgs_pixel_values)
-        task3_image_ids = all_image_ids[2].view(gen_imgs_pixel_values.size(0), -1)
         task3_image_embeds = self.gen_aligner(self.gen_embed(task3_image_ids))
         task3_text_embeds = self.language_model.get_input_embeddings()(task3_input_ids)
 
@@ -1129,10 +1123,7 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
 
         # Output processing
         regen_imgs_pixel_values = batch["task3_regen_imgs_pixel_values"]
-        # Ensure gen_vision_model encode is done with torch.no_grad() since it's frozen
-        with torch.no_grad():
-            _, _, all_image_ids = self.gen_vision_model.encode(regen_imgs_pixel_values)
-        task3_image_ids = all_image_ids[2].view(regen_imgs_pixel_values.size(0), -1)
+        task3_image_ids = batch["task3_regen_img_tokens"]
         task3_regen_img_embeds = self.gen_aligner(self.gen_embed(task3_image_ids))
 
         # Response mask
