@@ -33,7 +33,7 @@ from recipe.fully_async_policy_image_rl.message_queue import MessageQueueClient
 from recipe.fully_async_policy_image_rl.ray_trainer import FullyAsyncRayPPOTrainer
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager
-from recipe.image_rl.reward import load_reward_manager
+from verl.trainer.ppo.reward import load_reward_manager
 from verl.trainer.ppo.utils import Role, WorkerType
 from verl import DataProto
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
@@ -65,10 +65,10 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         self.config = config
         print("[FullyAsyncRollouter] Loading reward functions...")
         self.reward_fn = load_reward_manager(
-            config, tokenizer, processor, num_examine=0, **config.reward_model.get("reward_kwargs", {})
+            config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {})
         )
         self.val_reward_fn = load_reward_manager(
-            config, tokenizer, processor, num_examine=1, **config.reward_model.get("reward_kwargs", {})
+            config, tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {})
         )
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
 
@@ -493,7 +493,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             full_batch = prepare_single_generation_data(
                 batch_dict, self.global_steps, self.config.actor_rollout_ref.rollout.n
             )
-            
+
             # Accumulate batches
             full_batch_list.append(full_batch)
 
@@ -533,6 +533,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             prompt_idx = current_steps - num_prompts + i
             unique_uid = f"uid_{epoch}_{prompt_idx}"
             dp.non_tensor_batch["uid"] = np.array([unique_uid] * n_completions, dtype=object)
+            dp.batch["task_id"] = np.array([2] * n_completions, dtype=np.int64)
 
         # Ensure unique sample_id to avoid conflicts
         sample_id = f"chunk_sample_{epoch}_{current_steps}"
@@ -701,17 +702,12 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
     ):
         """Compute reward for a single task asynchronously"""
         try:
-            from recipe.image_rl.reward import compute_reward_async
+            from verl.trainer.ppo.reward import compute_reward_async
 
             # Launch async reward computation
             future = compute_reward_async.remote(
                 data=batch_result,
-                config=self.config,
-                tokenizer=self.tokenizer,
-                processor=self.processor,
-                reward_fn=None,
-                eval=False,
-                task_id=task_id
+                reward_fn=self.reward_fn,
             )
 
             # Wait for reward computation to complete

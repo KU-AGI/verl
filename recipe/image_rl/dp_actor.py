@@ -244,6 +244,10 @@ class DataParallelImageGenerationActor(BasePPOActor):
             entropy: (bs, response_len) or None
             log_probs: (bs, response_len)
         """
+        input_ids = micro_batch[f"task{task_id}_input_ids"]
+        attention_mask = micro_batch[f"task{task_id}_attention_mask"]
+        position_ids = micro_batch[f"task{task_id}_position_ids"]
+
         # Get original response mask for length restoration
         original_response_mask = micro_batch[f"task{task_id}_response_mask"]
 
@@ -259,31 +263,39 @@ class DataParallelImageGenerationActor(BasePPOActor):
 
         valid_output_tokens = self._extract_valid_output_tokens(output_tokens, original_response_mask)
 
+        input_lengths = [attention_mask[i].sum().item() for i in range(attention_mask.size(0))]
         output_lengths = [original_response_mask[i].sum().item() for i in range(original_response_mask.size(0))]
-        local_has_output = 1 if max(output_lengths) > 0 else 0
 
-        # IMPORTANT: Always do forward pass even if no valid output
-        # FSDP requires all ranks to participate in forward/backward for synchronization
-        output = self.actor_module(
-            task_id=task_id,
-            batch=micro_batch,
-        )
+        concat_ids = torch.cat([input_ids, valid_output_tokens], dim=-1)
+
+        # Extend attention_mask
+        bs, output_len = valid_output_tokens.shape
+        output_attention = torch.ones(bs, output_len, dtype=attention_mask.dtype, device=attention_mask.device)
+        extended_attention_mask = torch.cat([attention_mask, output_attention], dim=-1)
         
-        if local_has_output == 0:
-            # This rank has no output, but we still did the forward pass above
-            # Keep gradient connection to forward pass for FSDP synchronization
-            dummy_scalar = output.logits.flatten()[0] * 0.0
-            log_probs = torch.zeros_like(original_response_mask, dtype=output.logits.dtype, device=output.logits.device) + dummy_scalar
-            entropy = None
-            if calculate_entropy:
-                entropy = torch.zeros_like(original_response_mask, dtype=output.logits.dtype, device=output.logits.device) + dummy_scalar
-            return entropy, log_probs
+        # Extend position_ids
+        # Assume position_ids continues from where input ends
+        batch_size = position_ids.size(0)
+        input_lengths_tensor = torch.tensor(input_lengths, device=position_ids.device)
+        output_position_ids = torch.arange(output_len, device=position_ids.device).unsqueeze(0).expand(batch_size, -1)
+        output_position_ids = output_position_ids + input_lengths_tensor.unsqueeze(-1)
+        extended_position_ids = torch.cat([position_ids, output_position_ids], dim=-1)
+        
+        extra_args = {}
+        if self.use_fused_kernels:
+            extra_args["temperature"] = temperature
+            extra_args["return_dict"] = True
 
-        # Extract output_starts from model
-        output_starts = self.actor_module.get_output_starts()
+        output = self.actor_module(
+            input_ids=concat_ids,
+            attention_mask=extended_attention_mask,
+            position_ids=extended_position_ids,
+            use_cache=False,
+            **extra_args,
+        )  # prevent model thinks we are generating
 
         logits = output.logits
-        task_logits = extract_output_logits(logits, output_starts, output_lengths)
+        task_logits = extract_output_logits(logits, input_lengths, output_lengths)
 
         del logits
         del output
@@ -346,9 +358,9 @@ class DataParallelImageGenerationActor(BasePPOActor):
             non_tensor_batch_keys = []
         elif task_id == 2:
             select_batch_keys = [
-                "task1_input_ids", "task1_attention_mask", "task1_gen_imgs_pixel_values", 
-                "task1_gen_img_tokens", "task1_response_mask",
-                "task2_input_ids", "task2_attention_mask", "task2_feedback_ids", 
+                # "task1_input_ids", "task1_attention_mask", "task1_gen_imgs_pixel_values", 
+                # "task1_gen_img_tokens", "task1_response_mask",
+                "task2_input_ids", "task2_attention_mask", "task2_position_ids", "task2_feedback_ids", 
                 "task2_response_mask", "task_id"
             ]
             non_tensor_batch_keys = ["task2_feedback_texts"]
@@ -436,47 +448,16 @@ class DataParallelImageGenerationActor(BasePPOActor):
 
         return log_probs, entropys
 
-    def freeze_param(self):
-        """Freeze and unfreeze parameters for training"""
-        for n, p in self.actor_module.language_model.named_parameters():
-            p.requires_grad = True
-        self.actor_module.language_model.train()
-
-        for n, p in self.actor_module.gen_embed.named_parameters():
-            p.requires_grad = False
-        self.actor_module.gen_embed.eval()
-
-        for n, p in self.actor_module.gen_head.named_parameters():
-            p.requires_grad = True
-        self.actor_module.gen_head.train()
-
-        for n, p in self.actor_module.gen_aligner.named_parameters():
-            p.requires_grad = True
-        self.actor_module.gen_aligner.train()
-
-        for n, p in self.actor_module.aligner.named_parameters():
-            p.requires_grad = True
-        self.actor_module.aligner.train()
-
-        for n, p in self.actor_module.vision_model.named_parameters():
-            p.requires_grad = False
-        self.actor_module.vision_model.eval()
-
-        for n, p in self.actor_module.gen_vision_model.named_parameters():
-            p.requires_grad = False
-        self.actor_module.gen_vision_model.eval()
-
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
         """Update policy with multi-task support"""
         self.actor_module.train()
-        self.freeze_param()
         
         temperature = data.meta_info["temperature"]
         
         # Multi-task configuration
         multi_task_config = self.config.get("multi_task", {})
-        enable_multi_task = multi_task_config.get("enable", True) # After remove "task_id" in batch
+        enable_multi_task = multi_task_config.get("enable", False) # After remove "task_id" in batch
         task_weights = multi_task_config.get("task_weights", [1.0, 1.0, 1.0])
         task_selection = multi_task_config.get("task_selection", "all")
         
@@ -501,6 +482,7 @@ class DataParallelImageGenerationActor(BasePPOActor):
             task_keys = [
                 f"task{task_id}_input_ids", 
                 f"task{task_id}_attention_mask",
+                f"task{task_id}_position_ids",
                 f"task{task_id}_response_mask",
                 f"task{task_id}_old_log_probs",
                 f"task{task_id}_advantages",

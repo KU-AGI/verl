@@ -255,8 +255,7 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
     ):
         from torch import optim
         from torch.distributed.fsdp import CPUOffload, MixedPrecision
-        from transformers import AutoModelForCausalLM, AutoConfig
-        from janus.models import MultiModalityCausalLM, VLChatProcessor
+        from transformers import AutoConfig, AutoModel, AutoModelForCausalLM, AutoModelForVision2Seq
 
         from verl.utils.model import get_generation_config, print_model_size, update_model_config
         from verl.utils.torch_dtypes import PrecisionType
@@ -266,27 +265,47 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
         log_gpu_memory_usage(f"Before init {role} from HF AutoModel", logger=logger)
         local_path = model_path
 
+        # note that we have to create model in fp32. Otherwise, the optimizer is in bf16, which is incorrect
+        # TODO(zhangchi.usc1992): 1. support create from random initialized model. 2. Support init with FSDP directly
+        self.tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
+        self.processor = hf_processor(local_path, trust_remote_code=trust_remote_code)
+
+        if self.config.model.get("custom_chat_template", None) is not None:
+            if self.processor is not None:
+                self.processor.chat_template = self.config.model.custom_chat_template
+            else:
+                self.tokenizer.chat_template = self.config.model.custom_chat_template
+
         torch_dtype = fsdp_config.get("model_dtype", None)
         if torch_dtype is None:
             torch_dtype = torch.float32 if self._is_actor else torch.bfloat16
         else:
             torch_dtype = PrecisionType.to_dtype(torch_dtype)
 
-        # override model kwargs: for Janus
-        actor_model_config = AutoConfig.from_pretrained(local_path)
-        actor_model_config.language_config.use_flash_attention_2 = True
-        actor_model_config.language_config._attn_implementation = "flash_attention_2"
-
+        # override model kwargs
+        attn_implementation = override_model_config.get("attn_implementation", "flash_attention_2")
+        actor_model_config = AutoConfig.from_pretrained(
+            local_path, trust_remote_code=trust_remote_code, attn_implementation=attn_implementation
+        )
         # TODO: VL models use VisionAttention, which directly uses flash_attention in transformers>=4.53
         # which will be patched by _ulysses_flash_attention_forward, but errorly misses position_ids
         # Maybe support Ulysses in VisionAttention in the future and remove this patch
         if self.ulysses_sequence_parallel_size > 1 and hasattr(actor_model_config, "vision_config"):
             actor_model_config.vision_config._attn_implementation = "eager"
 
-        # patch for janus
-        self.processor = VLChatProcessor.from_pretrained(local_path)
-        self.tokenizer = self.processor.tokenizer
+        # patch for kimi-vl
+        if getattr(actor_model_config, "model_type", None) == "kimi_vl":
+            actor_model_config.text_config.topk_method = "greedy"
 
+        self.generation_config = get_generation_config(local_path, trust_remote_code=trust_remote_code)
+
+        override_config_kwargs = {
+            "bos_token_id": self.tokenizer.bos_token_id,
+            "eos_token_id": self.tokenizer.eos_token_id,
+            "pad_token_id": self.tokenizer.pad_token_id,
+        }
+        override_config_kwargs.update(override_model_config)
+        update_model_config(actor_model_config, override_config_kwargs=override_config_kwargs)
         if self.rank == 0:
             print(f"Model config after override: {actor_model_config}")
 
@@ -297,28 +316,49 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
 
         with init_context(), warnings.catch_warnings():
             warnings.simplefilter("ignore")
+            has_remote_code = hasattr(actor_model_config, "auto_map") and any(
+                actor_model_config.architectures[0] in val for val in actor_model_config.auto_map.values()
+            )
+            if has_remote_code:
+                auto_class = next(
+                    k for k, v in actor_model_config.auto_map.items() if actor_model_config.architectures[0] in v
+                )
+                match auto_class:
+                    case "AutoModelForVision2Seq":
+                        actor_module_class = AutoModelForVision2Seq
+                    case "AutoModelForCausalLM":
+                        actor_module_class = AutoModelForCausalLM
+                    case _:
+                        actor_module_class = AutoModel
+            else:
+                if type(actor_model_config) in AutoModelForVision2Seq._model_mapping.keys():
+                    actor_module_class = AutoModelForVision2Seq
+                elif type(actor_model_config) in AutoModelForCausalLM._model_mapping.keys():
+                    actor_module_class = AutoModelForCausalLM
+                else:
+                    actor_module_class = AutoModel
 
-            actor_module = AutoModelForCausalLM.from_pretrained(
+            actor_module = actor_module_class.from_pretrained(
                 pretrained_model_name_or_path=local_path,
                 torch_dtype=torch_dtype,
                 config=actor_model_config,
                 trust_remote_code=trust_remote_code,
+                attn_implementation=attn_implementation,
             )
 
             # Apply Liger kernel to the model if use_liger is set to True
             if use_liger:
                 from liger_kernel.transformers.monkey_patch import _apply_liger_kernel_to_instance
-                
-                _apply_liger_kernel_to_instance(model=actor_module.language_model)
+
+                _apply_liger_kernel_to_instance(model=actor_module)
 
             fused_kernel_options = self.config.model.get("fused_kernel_options", None)
             fused_kernels_backend = (
                 fused_kernel_options.get("impl_backend", None) if fused_kernel_options is not None else None
             )
 
-            # Apply Liger kernel to the model if use_liger is set to True
             apply_monkey_patch(
-                model=actor_module.language_model,
+                model=actor_module,
                 use_remove_padding=use_remove_padding,
                 ulysses_sp_size=self.ulysses_sequence_parallel_size,
                 use_fused_kernels=use_fused_kernels,
@@ -329,8 +369,7 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
             actor_module.to(torch_dtype)
 
             if enable_gradient_checkpointing:
-                actor_module.language_model.config.use_cache = True
-                actor_module.language_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+                actor_module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
         if self._is_lora:
             print("Applying LoRA to actor module")
@@ -568,8 +607,7 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
                 config=rollout_model_config,
                 trust_remote_code=trust_remote_code,
             )
-            
-            # GPU로 이동
+
             rollout_module = rollout_module.to(get_device_id())
             rollout_module.eval()
             
@@ -578,23 +616,42 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
             
             log_gpu_memory_usage(f"After building rollout module", logger=logger)
         else:
-            rollout_module = self.actor_module_fsdp
+            use_shm = self.config.model.get("use_shm", False)
+            local_path = copy_to_local(self.config.model.path, use_shm=use_shm)
+            rollout_model_config = AutoConfig.from_pretrained(local_path)
+
+            rollout_module = AutoModelForCausalLM.from_pretrained(
+                pretrained_model_name_or_path=local_path,
+                torch_dtype=torch.bfloat16,
+                config=rollout_model_config,
+                trust_remote_code=trust_remote_code,
+                attn_implementation="flash_attention_2",
+            )
+
+            rollout_module = rollout_module.to(get_device_id())
+            rollout_module.eval()
+            
+            if self.rank == 0:
+                print(f"[Rollout] Initialized separate rollout module (non-FSDP)")
+            
+            log_gpu_memory_usage(f"After building rollout module", logger=logger)
+            
         # ================================================================
 
         # 4. build rollout model
         log_gpu_memory_usage(f"Before building {self.config.rollout.name} rollout", logger=logger)
-        if rollout_name == 'image_unified':
-            from verl.workers.rollout import ImageUnifiedRollout
-            self.rollout = ImageUnifiedRollout(
-                module=rollout_module,
-                config=self.config.rollout, 
-                model_config=model_config, 
-                device_mesh=rollout_device_mesh
-            )
-        else:
-            self.rollout = get_rollout_class(rollout_config.name, rollout_config.mode)(
-                config=rollout_config, model_config=model_config, device_mesh=rollout_device_mesh
-            )
+        # if rollout_name == 'image_unified':
+        from verl.workers.rollout import ImageUnifiedRollout
+        self.rollout = ImageUnifiedRollout(
+            module=rollout_module,
+            config=self.config.rollout, 
+            model_config=model_config, 
+            device_mesh=rollout_device_mesh
+        )
+        # else:
+        #     self.rollout = get_rollout_class(rollout_config.name, rollout_config.mode)(
+        #         config=rollout_config, model_config=model_config, device_mesh=rollout_device_mesh
+        #     )
         log_gpu_memory_usage(f"After building {self.config.rollout.name} rollout", logger=logger)
 
         # used for LoRA
@@ -873,13 +930,19 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
         assert self._is_rollout
         prompts = prompts.to(get_device_id())
 
+        meta_info = {
+            "eos_token_id": self.generation_config.eos_token_id
+            if self.generation_config is not None
+            else self.tokenizer.eos_token_id,
+            "pad_token_id": self.generation_config.pad_token_id
+            if self.generation_config is not None
+            else self.tokenizer.pad_token_id,
+        }
+        prompts.meta_info.update(meta_info)
+
         timing_generate = {}
         if self._is_actor:  # For rollout only, we do not switch context.
-            try:
-                loop = asyncio.get_event_loop()
-            except RuntimeError:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
+            loop = get_event_loop()
             loop.run_until_complete(self.rollout_mode())
             log_gpu_memory_usage("After switch to rollout mode", logger=logger)
 

@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
 
-project_name='DAPO'
-exp_name='DAPO-Qwen2.5-7b-MATH-0527a1-fsdp2-fully-async-4-4'
+project_name='verl-dapo-math-fully-async'
+exp_name='DAPO-Qwen2.5-7b-MATH-0527a1-fsdp2-fully-async-4-4-at32'
 
 # Ray
 # RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
 # WORKING_DIR=${WORKING_DIR:-"${PWD}"}
 # RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/verl/trainer/runtime_env.yaml"}
 # Paths
+HOME="/data"
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
 # very important! please modify the max_position_embeddings in config.json to 32768 after downloading from huggingface
 MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/Qwen2.5-Math-7B"}
@@ -58,7 +59,7 @@ ref_offload=True
 actor_offload=False
 gen_tp=1
 sp_size=1
-fsdp_size=2
+fsdp_size=4
 
 # Fully async specific parameters
 NNODES=${NNODES:-1}
@@ -115,11 +116,12 @@ python -m recipe.fully_async_policy.fully_async_main \
     actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
     actor_rollout_ref.actor.fsdp_config.param_offload=${actor_offload} \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=${actor_offload} \
+    actor_rollout_ref.actor.fsdp_config.wrap_policy.transformer_layer_cls_to_wrap=['Qwen2DecoderLayer'] \
     actor_rollout_ref.actor.entropy_coeff=0 \
     actor_rollout_ref.actor.grad_clip=1.0 \
     actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=${sp_size} \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.80 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.60 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${gen_tp} \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.rollout.max_num_batched_tokens=$((max_prompt_length + max_response_length)) \
@@ -130,9 +132,10 @@ python -m recipe.fully_async_policy.fully_async_main \
     actor_rollout_ref.rollout.val_kwargs.top_p=${val_top_p} \
     actor_rollout_ref.rollout.val_kwargs.top_k=${top_k} \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
-    actor_rollout_ref.rollout.val_kwargs.n=1 \
+    actor_rollout_ref.rollout.val_kwargs.n=32 \
     actor_rollout_ref.rollout.calculate_log_probs=True \
     actor_rollout_ref.ref.fsdp_config.param_offload=${ref_offload} \
+    actor_rollout_ref.ref.fsdp_config.wrap_policy.transformer_layer_cls_to_wrap=['Qwen2DecoderLayer'] \
     actor_rollout_ref.ref.ulysses_sequence_parallel_size=${sp_size} \
     actor_rollout_ref.actor.fsdp_config.fsdp_size=${fsdp_size} \
     actor_rollout_ref.rollout.name=${rollout_name} \
@@ -143,7 +146,7 @@ python -m recipe.fully_async_policy.fully_async_main \
     +reward_model.reward_kwargs.overlong_buffer_cfg.penalty_factor=${overlong_penalty_factor} \
     +reward_model.reward_kwargs.overlong_buffer_cfg.log=False \
     +reward_model.reward_kwargs.max_resp_len=${max_response_length} \
-    trainer.logger=['console','tensorboard'] \
+    trainer.logger=['console','wandb','tensorboard'] \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
     trainer.val_before_train=False \

@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
 
-project_name='DAPO'
-exp_name='DAPO-Qwen2.5-7b-MATH-0527a1-fsdp2-fully-async-4-4'
+project_name='dapo-fully-async-policy-image-rl'
+exp_name='DAPO-Qwen2.5-7b-MATH-0527a1-fsdp2-fully-async-4-4-ours'
 
 # Ray
-# RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
-# WORKING_DIR=${WORKING_DIR:-"${PWD}"}
-# RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/verl/trainer/runtime_env.yaml"}
+RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
+WORKING_DIR=${WORKING_DIR:-"${PWD}"}
+RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/recipe/fully_async_policy_image_rl/shell/runtime_env.yaml"}
+
 # Paths
+HOME="/data"
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
 # very important! please modify the max_position_embeddings in config.json to 32768 after downloading from huggingface
 MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/Qwen2.5-Math-7B"}
@@ -47,14 +49,14 @@ loss_agg_mode="token-mean"
 # Algorithm
 temperature=1.0
 top_p=1.0
-top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
+top_k=50 # 0 for HF rollout, -1 for vLLM rollout
 val_top_p=0.7
 
 # Performance Related Parameter
-use_dynamic_bsz=True
+use_dynamic_bsz=False
 actor_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 2))
 infer_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 3))
-ref_offload=True
+ref_offload=False
 actor_offload=False
 gen_tp=1
 sp_size=1
@@ -64,21 +66,31 @@ fsdp_size=2
 NNODES=${NNODES:-1}
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
 
-n_gpus_rollout=4
+n_gpus_rollout=6
 n_gpus_training=$((NGPUS_PER_NODE - n_gpus_rollout))
 
 train_prompt_bsz=0
 gen_prompt_bsz=1
+val_prompt_bsz=8
 n_resp_per_prompt=16
+rollout_prompt_size=4 # set to number of prompts per actor per batch, used in async mode
+val_rollout_prompt_size=16
 train_prompt_mini_bsz=32
+train_prompt_micro_bsz=1
 total_rollout_steps=$(((512*100)))
 test_freq=10
 staleness_threshold=0.1
 trigger_parameter_sync_step=4
-require_batches=4
+require_batches=6
 partial_rollout=True
+log_prob_micro_batch_size_per_gpu=1
 
-python -m recipe.fully_async_policy.fully_async_main \
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
+    --working-dir "${WORKING_DIR}" \
+    -- python -m recipe.fully_async_policy_image_rl.fully_async_main \
+    --config-name="fully_async_ppo_trainer.yaml" \
     data.train_files="${TRAIN_FILE}" \
     data.val_files="${TEST_FILE}" \
     data.prompt_key=prompt \
@@ -87,13 +99,13 @@ python -m recipe.fully_async_policy.fully_async_main \
     data.max_response_length=${max_response_length} \
     data.train_batch_size=${train_prompt_bsz} \
     data.gen_batch_size=${gen_prompt_bsz} \
+    data.val_batch_size=${val_prompt_bsz} \
     data.return_raw_chat=${return_raw_chat} \
     actor_rollout_ref.rollout.n=${n_resp_per_prompt} \
     algorithm.adv_estimator=${adv_estimator} \
     algorithm.use_kl_in_reward=${use_kl_in_reward} \
     algorithm.kl_ctrl.kl_coef=${kl_coef} \
-    actor_rollout_ref.actor.strategy=fsdp2 \
-    critic.strategy=fsdp2 \
+    actor_rollout_ref.actor.strategy=fsdp \
     actor_rollout_ref.actor.use_kl_loss=${use_kl_loss} \
     actor_rollout_ref.actor.kl_loss_coef=${kl_loss_coef} \
     actor_rollout_ref.actor.clip_ratio_low=${clip_ratio_low} \
@@ -104,17 +116,24 @@ python -m recipe.fully_async_policy.fully_async_main \
     +actor_rollout_ref.model.override_config.max_position_embeddings=32768 \
     actor_rollout_ref.actor.use_dynamic_bsz=${use_dynamic_bsz} \
     actor_rollout_ref.ref.log_prob_use_dynamic_bsz=${use_dynamic_bsz} \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=${log_prob_micro_batch_size_per_gpu} \
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=${use_dynamic_bsz} \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=${log_prob_micro_batch_size_per_gpu} \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${actor_ppo_max_token_len} \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
+    actor_rollout_ref.model.use_liger=True \
+    actor_rollout_ref.actor.entropy_from_logits_with_chunking=True \
+    actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
     actor_rollout_ref.actor.optim.weight_decay=0.1 \
     actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${train_prompt_micro_bsz} \
     actor_rollout_ref.actor.fsdp_config.param_offload=${actor_offload} \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=${actor_offload} \
+    actor_rollout_ref.actor.fsdp_config.wrap_policy.transformer_layer_cls_to_wrap=['Qwen2DecoderLayer'] \
     actor_rollout_ref.actor.entropy_coeff=0 \
     actor_rollout_ref.actor.grad_clip=1.0 \
     actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
@@ -133,17 +152,20 @@ python -m recipe.fully_async_policy.fully_async_main \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
     actor_rollout_ref.rollout.calculate_log_probs=True \
     actor_rollout_ref.ref.fsdp_config.param_offload=${ref_offload} \
+    actor_rollout_ref.ref.fsdp_config.wrap_policy.transformer_layer_cls_to_wrap=['Qwen2DecoderLayer'] \
     actor_rollout_ref.ref.ulysses_sequence_parallel_size=${sp_size} \
     actor_rollout_ref.actor.fsdp_config.fsdp_size=${fsdp_size} \
     actor_rollout_ref.rollout.name=${rollout_name} \
     actor_rollout_ref.rollout.mode=${rollout_mode} \
+    actor_rollout_ref.rollout.prompt_length=${max_prompt_length} \
+    actor_rollout_ref.rollout.response_length=${max_response_length} \
     reward_model.reward_manager=dapo \
     +reward_model.reward_kwargs.overlong_buffer_cfg.enable=${enable_overlong_buffer} \
     +reward_model.reward_kwargs.overlong_buffer_cfg.len=${overlong_buffer_len} \
     +reward_model.reward_kwargs.overlong_buffer_cfg.penalty_factor=${overlong_penalty_factor} \
     +reward_model.reward_kwargs.overlong_buffer_cfg.log=False \
     +reward_model.reward_kwargs.max_resp_len=${max_response_length} \
-    trainer.logger=['console','tensorboard'] \
+    trainer.logger=['console','wandb'] \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
     trainer.val_before_train=False \
@@ -154,11 +176,15 @@ python -m recipe.fully_async_policy.fully_async_main \
     trainer.n_gpus_per_node="${n_gpus_training}" \
     rollout.nnodes="${NNODES}" \
     rollout.n_gpus_per_node="${n_gpus_rollout}" \
+    actor_rollout_ref.rollout.agent.num_workers=$((NNODES * n_gpus_rollout)) \
     rollout.total_rollout_steps="${total_rollout_steps}" \
     rollout.total_epochs=10 \
     rollout.test_freq="${test_freq}" \
+    async_training.rollout_prompt_size="${rollout_prompt_size}" \
+    async_training.val_rollout_prompt_size="${val_rollout_prompt_size}" \
     async_training.staleness_threshold="${staleness_threshold}" \
     async_training.trigger_parameter_sync_step="${trigger_parameter_sync_step}" \
     async_training.require_batches="${require_batches}" \
     async_training.partial_rollout="${partial_rollout}" \
-    async_training.use_rollout_log_probs=True
+    async_training.use_rollout_log_probs=True \
+    async_training.compute_prox_log_prob=True \

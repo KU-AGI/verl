@@ -5,5 +5,5 @@ excludes: [
 ]
 env_vars:
   VLLM_USE_V1: "1"
-  NCCL_DEBUG: "INFO"
+  NCCL_DEBUG: "OFF"
   HYDRA_FULL_ERROR: "1"

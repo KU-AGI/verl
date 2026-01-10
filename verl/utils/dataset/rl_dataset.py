@@ -413,9 +413,12 @@ class RLHFDataset(Dataset):
         else:
             position_ids = compute_position_id_with_mask(attention_mask)
 
-        row_dict["input_ids"] = input_ids[0]
-        row_dict["attention_mask"] = attention_mask[0]
-        row_dict["position_ids"] = position_ids[0]
+        row_dict["prompt"] = raw_prompt
+        # row_dict["input_ids"] = input_ids[0]
+        # row_dict["attention_mask"] = attention_mask[0]
+        # row_dict["position_ids"] = position_ids[0]
+
+        row_dict["dummy_tensor"] = torch.tensor(0)  # to avoid empty dict in collate_fn
 
         raw_prompt_ids = self.tokenizer.encode(raw_prompt, add_special_tokens=False)
         if len(raw_prompt_ids) > self.max_prompt_length:

@@ -142,12 +142,21 @@ class FullyAsyncAgentLoopWorker(AgentLoopWorkerBase):
             top_p=config.top_p,
             repetition_penalty=1.0,
             logprobs=config.calculate_log_probs,
+            cfg_weight=config.cfg_weight,
+            txt_top_k=config.txt_top_k,
+            txt_top_p=config.txt_top_p,
+            img_top_k=config.img_top_k,
+            img_top_p=config.img_top_p,
         )
 
         # override sampling params for validation
         if batch.meta_info.get("validate", False):
-            sampling_params["top_p"] = config.val_kwargs.top_p
-            sampling_params["temperature"] = config.val_kwargs.temperature
+            sampling_params["temperature"] = config.val_kwargs.val_temperature
+            sampling_params["cfg_weight"] = config.val_kwargs.val_cfg_weight
+            sampling_params["txt_top_k"] = config.val_kwargs.val_txt_top_k
+            sampling_params["txt_top_p"] = config.val_kwargs.val_txt_top_p
+            sampling_params["img_top_k"] = config.val_kwargs.val_img_top_k
+            sampling_params["img_top_p"] = config.val_kwargs.val_img_top_p
 
         # by default, we assume it's a single turn agent
         if "agent_name" not in batch.non_tensor_batch:
@@ -388,10 +397,19 @@ class FullyAsyncAgentLoopWorker(AgentLoopWorkerBase):
             top_p=config.top_p,
             repetition_penalty=1.0,
             logprobs=config.calculate_log_probs,
+            cfg_weight=config.cfg_weight,
+            txt_top_k=config.txt_top_k,
+            txt_top_p=config.txt_top_p,
+            img_top_k=config.img_top_k,
+            img_top_p=config.img_top_p,
         )
         if prompts.meta_info.get("validate", False):
-            sampling_params["top_p"] = config.val_kwargs.top_p
-            sampling_params["temperature"] = config.val_kwargs.temperature
+            sampling_params["temperature"] = config.val_kwargs.val_temperature
+            sampling_params["cfg_weight"] = config.val_kwargs.val_cfg_weight
+            sampling_params["txt_top_k"] = config.val_kwargs.val_txt_top_k
+            sampling_params["txt_top_p"] = config.val_kwargs.val_txt_top_p
+            sampling_params["img_top_k"] = config.val_kwargs.val_img_top_k
+            sampling_params["img_top_p"] = config.val_kwargs.val_img_top_p
 
         # server_index로 “한 번만” 호출 (batch 전체)
         from uuid import uuid4

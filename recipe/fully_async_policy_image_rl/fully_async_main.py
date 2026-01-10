@@ -215,11 +215,13 @@ class FullyAsyncTaskRunner:
         local_path = copy_to_local(
             config.actor_rollout_ref.model.path, use_shm=config.actor_rollout_ref.model.get("use_shm", False)
         )
-        # instantiate tokenizer: for Janus
-        from janus.models import VLChatProcessor
+        from verl.utils import hf_processor, hf_tokenizer
 
-        processor = VLChatProcessor.from_pretrained(local_path, use_fast=True)
-        tokenizer = processor.tokenizer
+        trust_remote_code = config.data.get("trust_remote_code", False)
+        tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
+
+        # Used for multimodal LLM, could be None
+        processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
 
         self.components["tokenizer"] = tokenizer
         self.components["processor"] = processor
