@@ -389,9 +389,8 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
         concat_embeds_padded = torch.stack(padded_embeds, dim=0)  # (B, max_total_len, D)
         concat_mask_padded = torch.stack(padded_masks, dim=0)     # (B, max_total_len)
 
-        position_ids = torch.arange(
-            max_total_len, device=device, dtype=torch.long
-        ).unsqueeze(0).expand(B, -1)
+        position_ids = (concat_mask_padded.cumsum(dim=-1) - 1).clamp(min=0).to(torch.long)
+        position_ids = position_ids.masked_fill(concat_mask_padded == 0, 0)
 
         return concat_embeds_padded, concat_mask_padded, position_ids, output_starts
 
