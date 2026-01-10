@@ -674,6 +674,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
 
         val_data_dir = self.config.trainer.get("validation_data_dir", "validation")
 
+        print(f"VALIDATION EPOCH: {len(self.val_dataloader)}")
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
             test_batch.meta_info["validate"] = True

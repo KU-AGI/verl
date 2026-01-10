@@ -39,11 +39,11 @@ RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/recipe/fully_async_policy_image_rl/sh
 HOME="/home/work/AGILAB"
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
 # very important! please modify the max_position_embeddings in config.json to 32768 after downloading from huggingface
-MODEL_PATH=/home/work/AGILAB/mllm_reasoning/data/experiments/ckpt/janus_sft/1204_v9_sft_constant_sch/version_0/step=012000.ckpt/hf_model # /data/mllm/checkpoints/Janus-Pro-7B
+MODEL_PATH=/home/work/AGILAB/mllm_reasoning/data/experiments/ckpt/janus_sft/1223_v10_sft_warmup_constant_long_prompt/version_1/step=014000.ckpt/hf_model # /data/mllm/checkpoints/Janus-Pro-7B
 RM_MODEL_PATH=/home/work/AGILAB/mllm_reasoning/data/checkpoints/Qwen3-VL-30B-A3B-Instruct # OpenGVLab/InternVL3_5-38B
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
-TRAIN_FILES=/home/work/AGILAB/mllm_reasoning/pimang62/data/train.parquet
-VAL_FILES=/home/work/AGILAB/mllm_reasoning/pimang62/data/val.parquet
+TRAIN_FILES=/home/work/AGILAB/mllm_reasoning/pimang62/data/train_v2.parquet
+VAL_FILES=/home/work/AGILAB/mllm_reasoning/pimang62/data/val_v2.parquet
 
 rollout_name=image_unified
 rollout_mode=async
@@ -111,22 +111,22 @@ train_prompt_bsz=0 # not used in async mode
 gen_prompt_bsz=1 # streaming generation, set to 1
 n_resp_per_prompt=8
 rollout_prompt_size=2 # set to number of prompts per actor per batch, used in async mode
-val_rollout_prompt_size=16
+val_rollout_prompt_size=12
 train_prompt_mini_bsz=128
 train_prompt_micro_bsz=128
 total_rollout_steps=$(((512*100*3*10)))
-staleness_threshold=1.0
-trigger_parameter_sync_step=4
+staleness_threshold=10.0
+trigger_parameter_sync_step=1
 require_batches=1
 partial_rollout=False
 log_prob_micro_batch_size_per_gpu=16
 
-test_freq=100
-save_freq=$((test_freq * trigger_parameter_sync_step * 1))
+test_freq=20
+save_freq=$((test_freq * trigger_parameter_sync_step * 1)) # 100
 total_epochs=10
 # total_training_steps=3000
-rollout_freq=50
-log_val_generations=20
+rollout_freq=1
+# log_val_generations=5
 
 ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     --working-dir "${WORKING_DIR}" \
@@ -134,7 +134,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     --config-name="fully_async_ppo_trainer.yaml" \
     data.train_files="${TRAIN_FILES}" \
     data.val_files="${VAL_FILES}" \
-    data.shuffle=False \
+    data.shuffle=True \
     data.prompt_key=prompt \
     data.train_batch_size=${train_prompt_bsz} \
     data.gen_batch_size=${gen_prompt_bsz} \
@@ -229,7 +229,6 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     trainer.rollout_data_dir="$CKPTS_DIR/rollout" \
     trainer.rollout_freq=${rollout_freq} \
     trainer.validation_data_dir="$CKPTS_DIR/validation" \
-    trainer.log_val_generations=${log_val_generations} \
     trainer.nnodes=1 \
     trainer.n_gpus_per_node=8 \
     rollout.nnodes=2 \
@@ -237,7 +236,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     actor_rollout_ref.rollout.agent.num_workers=12 \
     rollout.total_rollout_steps="${total_rollout_steps}" \
     rollout.total_epochs=${total_epochs} \
-    rollout.test_freq="${test_freq}" \
+    trainer.test_freq="${test_freq}" \
     async_training.rollout_prompt_size="${rollout_prompt_size}" \
     async_training.val_rollout_prompt_size="${val_rollout_prompt_size}" \
     async_training.staleness_threshold="${staleness_threshold}" \
