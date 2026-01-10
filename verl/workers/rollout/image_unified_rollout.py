@@ -383,23 +383,6 @@ class ImageUnifiedRollout(BaseRollout):
 
         self.set_generation_config(prompts[0])
 
-        input_format = [self.get_sft_format(prompt) for prompt in prompts.non_tensor_batch["prompt"]]
-
-        self.processor.tokenizer.pad_token_id = self.processor.pad_id
-
-        inputs = self.processor.tokenizer(
-            input_format,
-            padding=True,
-            padding_side='left',
-            return_tensors="pt"
-        )
-
-        input_ids = inputs["input_ids"].to(self.device)
-        attention_mask = inputs["attention_mask"].to(self.device)
-
-        prompts.batch["task1_input_ids"] = input_ids
-        prompts.batch["task1_attention_mask"] = attention_mask
-
         task_funcs = {
             1: self._generate_minibatch_image_generation,
             2: self._generate_minibatch_text_generation,
@@ -430,6 +413,23 @@ class ImageUnifiedRollout(BaseRollout):
 
     @torch.no_grad()
     def _generate_minibatch_image_generation(self, data_proto: DataProto) -> DataProto:
+        input_format = [self.get_sft_format(prompt) for prompt in data_proto.non_tensor_batch["prompt"]]
+
+        self.processor.tokenizer.pad_token_id = self.processor.pad_id
+
+        inputs = self.processor.tokenizer(
+            input_format,
+            padding=True,
+            padding_side='left',
+            return_tensors="pt"
+        )
+
+        input_ids = inputs["input_ids"].to(self.device)
+        attention_mask = inputs["attention_mask"].to(self.device)
+
+        data_proto.batch["task1_input_ids"] = input_ids
+        data_proto.batch["task1_attention_mask"] = attention_mask
+
         batch_size = data_proto.batch.batch_size[0]
         
         input_ids = data_proto.batch["task1_input_ids"]
