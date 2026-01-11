@@ -6,7 +6,7 @@ export WANDB_PROJECT="verl-dapo"
 export NCCL_DEBUG="WARN"
 
 project_name='verl-dapo'
-exp_name='retro_smallset_steprwd_group16_v12'
+exp_name='retro_fullset_v13_wo_steprwd'
 
 # Ray
 RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
@@ -16,7 +16,7 @@ RUNTIME_ENV=${RUNTIME_ENV:-"/verl/recipe/fully_async_policy/shell/runtime_env.ya
 HOME="/data"
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
 # very important! please modify the max_position_embeddings in config.json to 32768 after downloading from huggingface
-MODEL_PATH="'/data/llm-reaction-reasoning/all_checkpoints/main_100k_8b_v12_retro/epoch=07-step=008994-exact_match_sum=0.420.ckpt/hf_model'"
+MODEL_PATH="'/data/llm-reaction-reasoning/all_checkpoints/main_full_8b_v13_retro_v13/epoch=18-step=116997-exact_match_sum=0.563.ckpt/hf_model'"
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
 DUMP_DIR=${DUMP_DIR:-"${RAY_DATA_HOME}/dumps/${project_name}/${exp_name}"}
 TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/chem_dapo/syntheticreact_train.parquet"}
@@ -51,7 +51,7 @@ balance_task=False
 use_response_mask_to_reflection_step=False
 
 # Reward related parameters
-use_content_reward=True
+use_content_reward=False
 use_decision_reward=False
 use_reflection_bonus=False
 reflection_bonus_weight=0.0
@@ -193,7 +193,7 @@ python -m recipe.fully_async_policy.fully_async_main \
     +reward_model.reward_kwargs.use_decision_reward=${use_decision_reward} \
     +reward_model.reward_kwargs.use_reflection_bonus=${use_reflection_bonus} \
     +reward_model.reward_kwargs.reflection_bonus_weight=${reflection_bonus_weight} \
-    trainer.logger=['console','wandb'] \
+    trainer.logger=['console','wandb','tensorboard'] \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
     trainer.val_before_train=True \

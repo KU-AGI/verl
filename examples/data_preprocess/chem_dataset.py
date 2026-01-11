@@ -122,7 +122,7 @@ def unify_struct(x):
         new_info['bond_list'] = info['bond_list']
         new_info['product_mapping'] = info['product_mapping']
         new_info['product_minimal_funcgroup_info'] = info['product_minimal_funcgroup_info']
-        new_info['product_reactive_atoms'] = info['product_reactive_atoms']
+        new_info['bond_containing_main_info'] = info['bond_containing_main_info']
         new_info['product_smiles_stat'] = info['product_smiles_stat']
         new_info['reactant_str'] = info['reactant_str']
         new_info['product_str'] = info['product_str']
@@ -187,7 +187,7 @@ def append_info(data):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--train_dir", default="/data/llm-reaction-reasoning/data/orderly/main_training_v12")
+    parser.add_argument("--train_dir", default="/data/llm-reaction-reasoning/data/orderly/main_training_v13")
     parser.add_argument("--val_dir", default="/data/llm-reaction-reasoning/data/orderly/excluded_val_test")
     parser.add_argument("--test_dir", default="/data/llm-reaction-reasoning/data/orderly/excluded_val_test")
     parser.add_argument("--output_dir", default="/data/verl/data")
@@ -211,6 +211,13 @@ if __name__ == "__main__":
     # tasks = ["forward", "retro"]
     tasks = ["retro"]
     for task in tasks:
+        with open(f"/data/llm-reaction-reasoning/data/orderly/excluded_val_test/{task}_val.json", "r") as f:
+            excluded_val = json.load(f)
+        with open(f"/data/llm-reaction-reasoning/data/orderly/excluded_val_test/{task}_test.json", "r") as f:
+            excluded_test = json.load(f)
+        excluded_rxns = set()
+        for d in excluded_val + excluded_test:
+            excluded_rxns.add(d['rxn_str'])
         if args.train:
             dataset_paths = sorted(glob(os.path.join(f"{args.train_dir}/{task}", "*.json")), key=_sort_key)
             split = "train"
@@ -247,6 +254,8 @@ if __name__ == "__main__":
                     if convert_to_canonical_smiles(".".join(d['reactants'] + d['reagents'] + d['solvents'])) in multiple_precursor_with_solvent_set:
                         continue
                 elif args.train and task == "retro":
+                    if d['rxn_str'] in excluded_rxns:
+                        continue
                     if convert_to_canonical_smiles(".".join(d['products'])) in multiple_product_set:
                         continue
                     rxn_str = d['rxn_str']

@@ -723,7 +723,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                 accs_2 = batch.non_tensor_batch[f'{task}/correct_product_funcgroup'][uid_inds]
                 accs_3 = batch.non_tensor_batch[f'{task}/correct_product_smiles_stat'][uid_inds]
                 accs_4 = batch.non_tensor_batch[f'{task}/correct_product_info'][uid_inds]
-                accs_5 = batch.non_tensor_batch[f'{task}/correct_candidate_atoms'][uid_inds]
+                accs_5 = batch.non_tensor_batch[f'{task}/correct_candidate_structure'][uid_inds]
                 accs_6 = batch.non_tensor_batch[f'{task}/correct_disconnect_bonds'][uid_inds]
                 accs_7 = batch.non_tensor_batch[f'{task}/correct_synthons'][uid_inds]
                 accs_8 = batch.non_tensor_batch[f'{task}/correct_synthetic_equivalents'][uid_inds]
@@ -787,11 +787,11 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                 task_group_metrics[f"group_metrics/{task}/correct_product_info/all_same"].append(all_same_4)
                 task_group_metrics[f"group_metrics/{task}/correct_product_info/not_all_same"].append(not_all_same_4)
                 task_group_metrics[f"group_metrics/{task}/correct_product_info/not_exact_all"].append(not_exact_all_4)
-                task_group_metrics[f"group_metrics/{task}/correct_candidate_atoms/exact_k"].append(exact_k_5)
-                task_group_metrics[f"group_metrics/{task}/correct_candidate_atoms/exact_all"].append(exact_all_5)
-                task_group_metrics[f"group_metrics/{task}/correct_candidate_atoms/all_same"].append(all_same_5)
-                task_group_metrics[f"group_metrics/{task}/correct_candidate_atoms/not_all_same"].append(not_all_same_5)
-                task_group_metrics[f"group_metrics/{task}/correct_candidate_atoms/not_exact_all"].append(not_exact_all_5)
+                task_group_metrics[f"group_metrics/{task}/correct_candidate_structure/exact_k"].append(exact_k_5)
+                task_group_metrics[f"group_metrics/{task}/correct_candidate_structure/exact_all"].append(exact_all_5)
+                task_group_metrics[f"group_metrics/{task}/correct_candidate_structure/all_same"].append(all_same_5)
+                task_group_metrics[f"group_metrics/{task}/correct_candidate_structure/not_all_same"].append(not_all_same_5)
+                task_group_metrics[f"group_metrics/{task}/correct_candidate_structure/not_exact_all"].append(not_exact_all_5)
                 task_group_metrics[f"group_metrics/{task}/correct_disconnect_bonds/exact_k"].append(exact_k_6)
                 task_group_metrics[f"group_metrics/{task}/correct_disconnect_bonds/exact_all"].append(exact_all_6)
                 task_group_metrics[f"group_metrics/{task}/correct_disconnect_bonds/all_same"].append(all_same_6)

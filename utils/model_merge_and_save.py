@@ -12,46 +12,34 @@ def main(args):
     )
     tokenizer = AutoTokenizer.from_pretrained(args.base_model)
 
-    reactant_funcgroup_start = "<REACTANT_FUNCGROUP>" # 151669
-    reactant_funcgroup_end = "</REACTANT_FUNCGROUP>" # 151670
-    product_funcgroup_start = "<PRODUCT_FUNCGROUP>" # 151671
-    product_funcgroup_end = "</PRODUCT_FUNCGROUP>" # 151672
-    molecular_role_start = "<MOLECULAR_ROLE>" # 151673
-    molecular_role_end = "</MOLECULAR_ROLE>" # 151674
-    condition_start = "<CONDITION>" # 151675
-    condition_end = "</CONDITION>" # 151676
-    precursor_stat_start = "<PRECURSOR_STAT>" # 151677
-    precursor_stat_end = "</PRECURSOR_STAT>" # 151678
-    reactant_stat_start = "<REACTANT_STAT>" # 151679
-    reactant_stat_end = "</REACTANT_STAT>" # 151680
-    product_stat_start = "<PRODUCT_STAT>" # 151681
-    product_stat_end = "</PRODUCT_STAT>" # 151682
-    template_start = "<TEMPLATE>" # 151683
-    template_end = "</TEMPLATE>" # 151684
-    bond_disconnect_start = "<BOND_DISCONNECT>" # 151685
-    bond_disconnect_end = "</BOND_DISCONNECT>" # 151686
-    synthon_start = "<SYNTHON>" # 151687
-    synthon_end = "</SYNTHON>" # 151688
-    synthetic_equivalent_start = "<SYNTHETIC_EQUIVALENT>" # 151689
-    synthetic_equivalent_end = "</SYNTHETIC_EQUIVALENT>" # 151690
-    reactant_removed_start = "<REACTANT_REMOVED_FUNCGROUP>" # 151691
-    reactant_removed_end = "</REACTANT_REMOVED_FUNCGROUP>"# 151692
-    product_added_start = "<PRODUCT_ADDED_FUNCGROUP>" # 151693
-    product_added_end = "</PRODUCT_ADDED_FUNCGROUP>" # 151694
+    # Forward
+    molecule_info_start = "<MOLECULE_INFO>" # 151669
+    molecule_info_end = "</MOLECULE_INFO>" # 151670
+    main_funcgroup_info_start = "<MAIN_FUNCGROUP_INFO>" # 151671
+    main_funcgroup_info_end = "</MAIN_FUNCGROUP_INFO>" # 151672
+    template_start = "<TEMPLATE>" # 151673
+    template_end = "</TEMPLATE>" # 151674
+    reaction_start = "<REACTION>" # 151675
+    reaction_end = "</REACTION>" # 151676
+    # Retro
+    product_info_start = "<PRODUCT_INFO>" # 151677
+    product_info_end = "</PRODUCT_INFO>" # 151678
+    candidate_structure_start = "<CANDIDATE_STRUCTURE>" # 151679
+    candidate_structure_end = "</CANDIDATE_STRUCTURE>" # 151680
+    strategic_bond_disconnect_start = "<STRATEGIC_BOND_DISCONNECTION>" # 151681
+    strategic_bond_disconnect_end = "</STRATEGIC_BOND_DISCONNECTION>" # 151682
+    synthetic_equivalent_start = "<SYNTHETIC_EQUIVALENT>" # 151683
+    synthetic_equivalent_end = "</SYNTHETIC_EQUIVALENT>" # 151684
+
     special_tokens = [
-        reactant_funcgroup_start, reactant_funcgroup_end,
-        product_funcgroup_start, product_funcgroup_end,
-        molecular_role_start, molecular_role_end,
-        condition_start, condition_end,
-        precursor_stat_start, precursor_stat_end,
-        reactant_stat_start, reactant_stat_end,
-        product_stat_start, product_stat_end,
+        molecule_info_start, molecule_info_end,
+        main_funcgroup_info_start, main_funcgroup_info_end,
         template_start, template_end,
-        bond_disconnect_start, bond_disconnect_end,
-        synthon_start, synthon_end,
+        reaction_start, reaction_end,
+        product_info_start, product_info_end,
+        candidate_structure_start, candidate_structure_end,
+        strategic_bond_disconnect_start, strategic_bond_disconnect_end,
         synthetic_equivalent_start, synthetic_equivalent_end,
-        reactant_removed_start, reactant_removed_end,
-        product_added_start, product_added_end,
     ]
     added = tokenizer.add_special_tokens(
         {

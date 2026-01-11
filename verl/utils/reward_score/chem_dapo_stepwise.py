@@ -1432,13 +1432,13 @@ class StepEvaluator():
 
     def calcualte_retro_rationale_metrics(self, info, GT_rationale, predicted_rationale): ## EDITED ##
         product_info_dict = self.extract_json_in_tags(predicted_rationale, "PRODUCT_INFO")
-        candidate_atoms_list = self.extract_json_in_tags(predicted_rationale, "CANDIDATE_ATOMS")
+        candidate_structure_list = self.extract_json_in_tags(predicted_rationale, "CANDIDATE_STRUCTURE")
         stratetic_bond_disconnection_dict = self.extract_json_in_tags(predicted_rationale, "STRATEGIC_BOND_DISCONNECTION")
         synthetic_equivalents_list = self.extract_json_in_tags(predicted_rationale, "SYNTHETIC_EQUIVALENT")
         if product_info_dict is None:
             product_info_dict = {}
-        if candidate_atoms_list is None:
-            candidate_atoms_list = []
+        if candidate_structure_list is None:
+            candidate_structure_list = []
         if stratetic_bond_disconnection_dict is None:
             stratetic_bond_disconnection_dict = {}
         if synthetic_equivalents_list is None:
@@ -1476,13 +1476,13 @@ class StepEvaluator():
             correct_product_smiles_stat,
         ])
 
-        # Metric 2: Candidate atoms
+        # Metric 2: Candidate structure
         try:
-            gt_candidate_atoms = info["template"]["atoms_to_use_product"][0]
-            predicted_candidate_atoms = [int(c)-1 for c in candidate_atoms_list]
-            correct_candidate_atoms = set(predicted_candidate_atoms) == set(gt_candidate_atoms)
-        except Exception:
-            correct_candidate_atoms = False
+            gt_candidate_pair = [info["bond_list"][0][0], info["bond_list"][0][1]]
+            predicted_candidate_atoms = candidate_structure_list[0].split("|")[-1].strip()
+            correct_candidate_structure = all(str(g) in predicted_candidate_atoms for g in gt_candidate_pair)
+        except:
+            correct_candidate_structure = False
         
         # Metric 3: Strategic bond disconnection
         try:
@@ -1513,7 +1513,7 @@ class StepEvaluator():
             "retro/correct_product_funcgroup": int(correct_product_funcgroup),
             "retro/correct_product_smiles_stat": int(correct_product_smiles_stat),
             "retro/correct_product_info": int(correct_product_info),
-            "retro/correct_candidate_atoms": int(correct_candidate_atoms),
+            "retro/correct_candidate_structure": int(correct_candidate_structure),
             "retro/correct_disconnect_bonds": int(correct_disconnect_bonds),
             "retro/correct_synthons": int(correct_synthons),
             "retro/correct_synthetic_equivalents": int(correct_synthetic_equivalents),
@@ -1825,7 +1825,7 @@ class ChemistryEvaluator:
             info['bond_list'] = ast.literal_eval(info['bond_list'])
             info['product_mapping'] = info['product_mapping']
             info['product_minimal_funcgroup_info'] = ast.literal_eval(info['product_minimal_funcgroup_info'])
-            info['product_reactive_atoms'] = ast.literal_eval(info['product_reactive_atoms'])
+            # info['product_reactive_atoms'] = ast.literal_eval(info['product_reactive_atoms'])
             info['product_smiles_stat'] = ast.literal_eval(info['product_smiles_stat'])
             info['reactant_str'] = info['reactant_str']
             info['product_str'] = info['product_str']
