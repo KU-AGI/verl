@@ -547,9 +547,13 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             f.write("=" * 100 + "\n")
             f.write(f"📝 [PROMPT]\n{prompt[i]}\n")
             f.write("=" * 100 + "\n\n")
+            f.write(f"🧾 [SUMMARY]\n{summarizes[i] if summarizes else 'N/A'}\n")
+            f.write("=" * 100 + "\n\n")
 
             # Task 1
             f.write(f"🖼️ [TASK 1] INITIAL GEN\n")
+            f.write(f"[VQA Questions] \n{gts_vqas[i] if gts_vqas else 'N/A'}\n")
+            f.write("=" * 100 + "\n\n")
             f.write(f"  - Total Score: {self._get_safe_val(scores, 'task1_scores', i)}\n")
             f.write(f"  - VLM Reward: {self._get_safe_val(reward_extra_infos_dict, 'task1_vlm_reward', i)}\n")
             f.write(f"  - Detector Reward: {self._get_safe_val(reward_extra_infos_dict, 'task1_detector_reward', i)}\n")
@@ -569,6 +573,8 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             f.write(f"  - Hallucination Check Score: {self._get_safe_val(reward_extra_infos_dict, 'task2_hallucination_check_score', i)}\n")
             f.write(f"  - Edit Instruction Score: {self._get_safe_val(reward_extra_infos_dict, 'task2_edit_instruction_score', i)}\n")
             f.write(f"  - Model Feedback:\n{feedback_texts[i] if feedback_texts else 'N/A'}\n")
+            f.write(f"  - Reference (GT):\n  SUMMARY: {summarizes[i] if summarizes else 'N/A'}\n  TUPLE: {gts_tuples[i] if gts_tuples else 'N/A'}\n\n")
+            f.write("=" * 100 + "\n\n")
             f.write(f"  - VLM Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task2_reward_response', i)}\n")
             f.write(f"  - Comparison Summarize Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task2_comparison_summarize_response', i)}\n")
             f.write(f"  - Comparison Tuple Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task2_comparison_tuple_response', i)}\n")
@@ -613,9 +619,9 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             feedback_texts = batch.non_tensor_batch['task2_feedback_texts'].tolist()
             regen_imgs_pil_list = batch.non_tensor_batch['task3_regen_imgs_pil_list']
             gts_imgs = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
-            summarizes = [item.non_tensor_batch.get("reward_model", {}).get("summary", None) for item in batch]
-            gts_tuples = [item.non_tensor_batch.get("reward_model", {}).get("tuple", None) for item in batch]
-            gts_vqas = [item.non_tensor_batch.get("reward_model", {}).get("vqa_question", None) for item in batch]
+            summarizes = [item.non_tensor_batch.get("reward_model", {}).get("summary", None) or item.non_tensor_batch.get("reward_model.summary", None) for item in batch]
+            gts_tuples = [item.non_tensor_batch.get("reward_model", {}).get("tuple", None) or item.non_tensor_batch.get("reward_model.tuple", None) for item in batch]
+            gts_vqas = [item.non_tensor_batch.get("reward_model", {}).get("vqa_question", None) or item.non_tensor_batch.get("reward_model.vqa_question", None) for item in batch]
 
             batch_size = len(prompt)
             current_v = getattr(self, "current_param_version", self.global_steps)

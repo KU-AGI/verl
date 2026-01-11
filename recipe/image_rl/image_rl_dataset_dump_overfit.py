@@ -180,12 +180,20 @@ class ImageRLDataset(Dataset):
             logger.error(f"Path is not a directory: {data_path}")
             return chunks
 
-        chunk_pattern = re.compile(r"^chunk_\d+$")
+        chunk_pattern = re.compile(r"^chunk_(\d+)$")
         chunk_dirs: List[Path] = []
         try:
+            all_chunks = []
             for item in data_path.iterdir():
-                if item.is_dir() and chunk_pattern.match(item.name):
-                    chunk_dirs.append(item)
+                if item.is_dir():
+                    match = chunk_pattern.match(item.name)
+                    if match:
+                        chunk_num = int(match.group(1))
+                        all_chunks.append((chunk_num, item))
+            
+            all_chunks.sort(key=lambda x: x[0])
+            
+            chunk_dirs = [path for _, path in all_chunks[:8]] # 8 chunk: HARD-CODING
         except PermissionError:
             logger.error(f"Permission denied: {data_path}")
             return chunks

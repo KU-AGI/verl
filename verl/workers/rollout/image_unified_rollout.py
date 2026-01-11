@@ -484,6 +484,8 @@ class ImageUnifiedRollout(BaseRollout):
         generated_tokens = self.generate_img(gen_final_cfg_embeds, gen_final_cfg_attention_mask)
         # For reproducing generated images
 
+        data_proto.batch["task1_gen_img_tokens"] = generated_tokens
+
         decoded_images = self._decode_image_tokens(generated_tokens)
         gen_imgs_pil_list = [PIL.Image.fromarray(img_array) for img_array in decoded_images]
         data_proto.non_tensor_batch["task1_gen_imgs_pil_list"] = np.array(gen_imgs_pil_list, dtype=object)
@@ -503,7 +505,6 @@ class ImageUnifiedRollout(BaseRollout):
 
             image_embeds = self.module.gen_aligner(self.module.gen_embed(image_ids))
 
-        data_proto.batch["task1_gen_img_tokens"] = image_ids
         data_proto.batch["task1_response_mask"] = torch.ones((B, image_embeds.size(1)), dtype=torch.long, device=image_embeds.device)
         if dist.get_rank() == 0:
             print(f"[IMG_GEN] Created DataProto with batch_size: {batch_size}")
@@ -736,6 +737,8 @@ class ImageUnifiedRollout(BaseRollout):
         regen_final_cfg_embeds, regen_final_cfg_attention_mask = self._prepare_regen_cfg_embeds(data_proto)
         regenerated_tokens = self.generate_img(regen_final_cfg_embeds, regen_final_cfg_attention_mask)
 
+        data_proto.batch["task3_regen_img_tokens"] = regenerated_tokens
+
         regen_decoded_images = self._decode_image_tokens(regenerated_tokens)
         regen_imgs_pil_list = [PIL.Image.fromarray(img_array) for img_array in regen_decoded_images]
         data_proto.non_tensor_batch["task3_regen_imgs_pil_list"] = np.array(regen_imgs_pil_list, dtype=object)
@@ -754,9 +757,6 @@ class ImageUnifiedRollout(BaseRollout):
             image_ids = image_ids.view(B, -1)
 
             image_embeds = self.module.gen_aligner(self.module.gen_embed(image_ids))
-
-        # For reproducing regen images
-        data_proto.batch["task3_regen_img_tokens"] = image_ids
 
         data_proto.batch["task3_response_mask"] = torch.ones((B, image_embeds.size(1)), dtype=torch.long, device=image_embeds.device)
         if dist.get_rank() == 0:

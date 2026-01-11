@@ -52,25 +52,61 @@ class ImageGenerationRewardManager:
     def verify(self, data: DataProto, task_id: int) -> List[dict]:
         """Verify and compute scores for batch."""
         # Get lists from non_tensor_batch
-        prompt = data.non_tensor_batch.get('prompt', [])
-        gen_imgs_pil_list = data.non_tensor_batch.get('task1_gen_imgs_pil_list', [])
-        feedback_texts = data.non_tensor_batch.get('task2_feedback_texts', [])
-        regen_imgs_pil_list = data.non_tensor_batch.get('task3_regen_imgs_pil_list', [])
-        reward_model = data.non_tensor_batch.get('reward_model', {})
+        ntb = data.non_tensor_batch
+        n = len(data)
+
+        # Get lists from non_tensor_batch
+        prompt = ntb.get('prompt', [])
+        gen_imgs_pil_list = ntb.get('task1_gen_imgs_pil_list', [])
+        feedback_texts = ntb.get('task2_feedback_texts', [])
+        regen_imgs_pil_list = ntb.get('task3_regen_imgs_pil_list', [])
+        reward_model = ntb.get('reward_model', None)
 
         print(f"[VERIFY] Processing batch of {len(prompt)} samples")
 
-        # Prepare batch data
-        prompts = prompt
-        gen_imgs = [gen_imgs_pil_list[i] if i < len(gen_imgs_pil_list) else None for i in range(len(data))]
-        feedback_texts_padded = [feedback_texts[i] if i < len(feedback_texts) else "" for i in range(len(data))]
-        regen_imgs = [regen_imgs_pil_list[i] if i < len(regen_imgs_pil_list) else None for i in range(len(data))]
-        ground_truth_imgs = [reward_model[i].get("ground_truth", None) if i < len(reward_model) else None for i in range(len(data))]
-        summarizes = [reward_model[i].get("summary", None) if i < len(reward_model) else "" for i in range(len(data))]
-        feedback_tuples = [reward_model[i].get("tuple", None) if i < len(reward_model) else None for i in range(len(data))]
-        vqa_questions = [reward_model[i].get("vqa_question", None) if i < len(reward_model) else None for i in range(len(data))]
-        extra_infos = [data.meta_info.get("extra_info", {})] * len(data)
-        task_ids = [task_id] * len(data)
+        # Prepare batch data (길이 n으로 안전하게 패딩)
+        prompts = [prompt[i] if i < len(prompt) else "" for i in range(n)]
+        gen_imgs = [gen_imgs_pil_list[i] if i < len(gen_imgs_pil_list) else None for i in range(n)]
+        feedback_texts_padded = [feedback_texts[i] if i < len(feedback_texts) else "" for i in range(n)]
+        regen_imgs = [regen_imgs_pil_list[i] if i < len(regen_imgs_pil_list) else None for i in range(n)]
+
+        # --- 핵심: reward_model 내부(nested) 또는 flat key 둘 다 지원 ---
+        def _get_reward(field: str, i: int, default=None):
+            v = None
+
+            # (A) nested: ntb["reward_model"]이 list[dict] 인 경우 (원 코드 호환)
+            if isinstance(reward_model, (list, tuple, np.ndarray, torch.Tensor)):
+                if i < len(reward_model) and isinstance(reward_model[i], dict):
+                    v = reward_model[i].get(field, None)
+
+            # (B) nested: ntb["reward_model"]이 dict이고 field가 list인 경우 (dict-of-lists)
+            elif isinstance(reward_model, dict):
+                vv = reward_model.get(field, None)
+                if isinstance(vv, (list, tuple)):
+                    v = vv[i] if i < len(vv) else None
+                else:
+                    v = vv  # scalar면 그대로(있다면)
+
+            # nested에서 찾았으면 반환
+            if v is not None:
+                return v
+
+            # (C) flat: ntb["reward_model.<field>"] (예: reward_model.summary)
+            flat = ntb.get(f"reward_model.{field}", None)
+            if isinstance(flat, (list, tuple, np.ndarray, torch.Tensor)):
+                return flat[i] if i < len(flat) else default
+            if flat is not None:
+                return flat  # scalar flat
+
+            return default
+
+        ground_truth_imgs = [_get_reward("ground_truth", i, None) for i in range(n)]
+        summarizes        = [_get_reward("summary", i, "") for i in range(n)]
+        feedback_tuples   = [_get_reward("tuple", i, None) for i in range(n)]
+        vqa_questions     = [_get_reward("vqa_question", i, None) for i in range(n)]
+
+        extra_infos = [data.meta_info.get("extra_info", {})] * n
+        task_ids = [task_id] * n
 
         # Call batch processing function
         # Check if compute_score is async (coroutine function)
