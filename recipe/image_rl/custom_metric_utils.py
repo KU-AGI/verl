@@ -598,23 +598,27 @@ def process_validation_metrics(
                 if isinstance(var_vals[0], str):
                     continue
 
+                # Filter out -100 values (invalid/masked values)
+                valid_indices = [i for i, val in enumerate(var_vals) if val != -100]
+                if len(valid_indices) == 0:
+                    continue  # Skip if all values are -100
+                
+                filtered_var_vals = [var_vals[i] for i in valid_indices]
+
                 metric = {}
-                n_resps = len(var_vals)
-                metric[f"mean@{n_resps}"] = np.mean(var_vals)
+                n_resps = len(filtered_var_vals)
+                metric[f"mean@{n_resps}"] = np.mean(filtered_var_vals)
 
                 if n_resps > 1:
-                    metric[f"std@{n_resps}"] = np.std(var_vals)
-
-                if n_resps > 1:
-                    metric[f"std@{n_resps}"] = np.std(var_vals)
+                    metric[f"std@{n_resps}"] = np.std(filtered_var_vals)
 
                     # Collapse detection
-                    unique_vals = np.unique(var_vals)
+                    unique_vals = np.unique(filtered_var_vals)
                     all_same = len(unique_vals) == 1
                     metric["advantage_collapse/all_same_ratio"] = float(all_same)
                     
-                    val_std = np.std(var_vals)
-                    val_mean = np.mean(var_vals)
+                    val_std = np.std(filtered_var_vals)
+                    val_mean = np.mean(filtered_var_vals)
                     cv = val_std / (abs(val_mean) + 1e-8)
                     
                     cv_threshold = 0.01 # under 1%: regard as collapse
@@ -629,13 +633,15 @@ def process_validation_metrics(
 
                     for n in ns:
                         [(bon_mean, bon_std), (won_mean, won_std)] = bootstrap_metric(
-                            data=var_vals, subset_size=n, reduce_fns=[np.max, np.min], seed=seed
+                            data=filtered_var_vals, subset_size=n, reduce_fns=[np.max, np.min], seed=seed
                         )
                         metric[f"best@{n}/mean"], metric[f"best@{n}/std"] = bon_mean, bon_std
                         metric[f"worst@{n}/mean"], metric[f"worst@{n}/std"] = won_mean, won_std
                         if var2vals.get("pred", None) is not None:
+                            # Also filter pred values based on valid_indices
+                            filtered_pred_vals = [var2vals["pred"][i] for i in valid_indices]
                             vote_data = [
-                                {"val": val, "pred": pred} for val, pred in zip(var_vals, var2vals["pred"], strict=True)
+                                {"val": val, "pred": pred} for val, pred in zip(filtered_var_vals, filtered_pred_vals, strict=True)
                             ]
                             [(maj_n_mean, maj_n_std)] = bootstrap_metric(
                                 data=vote_data,
