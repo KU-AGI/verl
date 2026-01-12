@@ -364,7 +364,7 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
         data_source_lst = []
         sample_uids = []
         
-        # ✅ reward_extra_infos를 batch별로 수집
+        # reward_extra_infos를 batch별로 수집
         all_reward_extra_infos_batches = []
 
         # Sample data for logging
@@ -546,7 +546,7 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                     for task_id in [2]:
                         task_reward_tensors[task_id].append(reward_tensor_dict[task_id])
                         
-                        # ✅ Store reward_extra_infos as batch
+                        # Store reward_extra_infos as batch
                         all_reward_extra_infos_batches.append(reward_extra_infos[task_id])
 
                 finally:
@@ -594,7 +594,7 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                 dump_path=val_data_dir,
             )
 
-        # ✅ Flatten batched reward_extra_infos
+        # Flatten batched reward_extra_infos
         reward_extra_infos_dict = {}
         if all_reward_extra_infos_batches:
             # Get all keys from first batch

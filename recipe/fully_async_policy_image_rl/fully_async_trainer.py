@@ -29,7 +29,7 @@ from recipe.fully_async_policy_image_rl.detach_utils import (
     ValidateMetrics,
     assemble_batch_from_rollout_samples,
 )
-from verl.trainer.ppo.reward import load_reward_manager
+from recipe.image_rl.reward import load_reward_manager
 from recipe.fully_async_policy_image_rl.message_queue import MessageQueueClient
 from recipe.fully_async_policy_image_rl.ray_trainer import FullyAsyncRayPPOTrainer
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
@@ -67,10 +67,10 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         self.processor = processor
         self.config = config
         self.reward_fn = load_reward_manager(
-            config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {})
+            config, tokenizer, processor, num_examine=0, **config.reward_model.get("reward_kwargs", {})
         )
         self.val_reward_fn = load_reward_manager(
-            config, tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {})
+            config, tokenizer, processor, num_examine=1, **config.reward_model.get("reward_kwargs", {})
         )
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
 
@@ -109,6 +109,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         self.trigger_parameter_sync_step = config.async_training.trigger_parameter_sync_step
         self.last_ckpt_version = 0
 
+        self.staleness_threshold: float = config.async_training.get("staleness_threshold", 1)
         # required_samples use ppo_mini_batch_size*require_batches as the minimum number of samples.
         self.require_batches = config.async_training.require_batches
         self.required_samples = config.actor_rollout_ref.actor.ppo_mini_batch_size * self.require_batches
@@ -161,8 +162,6 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             flush=True,
         )
 
-        staleness_threshold = self.config.async_training.get("staleness_threshold", 1)
-
         consumer_start = time.time()
         queue_samples = []
         current_rows = 0
@@ -188,7 +187,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
 
             # version_gap > 0이면 on_plolicy
             # default는 verison_gap > staleness_threshold
-            if version_gap > 0:
+            if version_gap > self.staleness_threshold:
                 num_rows = len(deserialized_sample.full_batch)
                 dropped_rows += num_rows
                 continue
@@ -330,7 +329,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                             self.actor_rollout_wg.save_model_to_cpu(local_trigger)
                             self.actor_rollout_wg.restore_model_from_cpu(1)
 
-                    for task_id in [2]:
+                    for task_id in [1, 2, 3]:
                         batch.batch["task_id"] = torch.tensor([task_id for _ in range(len(batch))], dtype=int)
 
                         batch = self._process_batch_common(
@@ -358,7 +357,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                         metrics.update(actor_output_metrics)
 
                     reward_extra_infos_dict: dict[str, list] = {}
-                    for task_id in [2]:
+                    for task_id in [1, 2, 3]:
                         # Get pre-computed reward_extra_infos_dict from meta_info
                         reward_extra_infos_dict.update({k: v for k, v in batch.meta_info.items()})
 

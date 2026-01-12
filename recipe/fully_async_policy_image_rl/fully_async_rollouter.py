@@ -578,12 +578,14 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         while True:
             # 0) Pause gate ONLY here (loop head)
             if self.paused or await self._should_pause_generation():
-                print(
-                    "[FullyAsyncRollouter][Processor] Received pause signal, waiting for remaining tasks to return..."
-                )
-                async with self.lock:
-                    self.paused = True
+                if not self.paused:
+                    print(
+                        "[FullyAsyncRollouter][Processor] Received pause signal, waiting for remaining tasks to return..."
+                    )
+                self.paused = True
+                if self.idle_start_time is None:
                     self.idle_start_time = time.time()
+                async with self.condition:
                     while self.paused:
                         await self.condition.wait()
                 continue
@@ -972,19 +974,12 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                     print("[FullAsyncRollouter] status check failed:", e, flush=True)
 
             # Trigger rollout recovery
-            # if self.monitor_loop_trigger and not self.paused:
-            #     if not await self._should_pause_generation():
-            #         async with self.lock:
-            #             self.paused = False
-            #             self.condition.notify_all()
-
-            if self.paused:
-                should_pause = await self._should_pause_generation()
-                print(f"[MonitorLoop] paused=True, should_pause={should_pause}", flush=True)
-                if not should_pause:
-                    print(f"[MonitorLoop] Triggering resume!", flush=True)
-                    self.paused = False
+            if self.monitor_loop_trigger:
+                if not await self._should_pause_generation():
                     async with self.condition:
+                        if self.paused:
+                            print("[FullyAsyncRollouter][MonitorLoop] Triggering auto-resume")
+                        self.paused = False
                         self.condition.notify_all()
 
     async def _should_pause_generation(self) -> bool:
@@ -1039,16 +1034,14 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         if dependency_ref is not None:
             ray.get(dependency_ref)
         print("[FullyAsyncRollouter][Public][Resume]")
-        async with self.lock:
+
+        async with self.condition:
             self.paused = False
             self.monitor_loop_trigger = True
             self.condition.notify_all()
 
-        async with self.condition:
-            self.condition.notify_all()
-
-            if self.config.async_training.partial_rollout:
-                await self.async_rollout_manager.resume()
+        if self.config.async_training.partial_rollout:
+            await self.async_rollout_manager.resume()
 
     async def get_statistics(self) -> dict:
         queue_stats = self.message_queue_client.get_statistics_sync()
