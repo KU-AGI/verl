@@ -986,7 +986,7 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
             with marked_timer("dump_rollout_generations", timing_raw, color="green"):
                 inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
                 outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
-                scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
+                scores = batch.batch["task2_token_level_scores"].sum(-1).cpu().tolist()
                 sample_gts = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
 
                 if "request_id" in batch.non_tensor_batch:

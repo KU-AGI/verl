@@ -29,7 +29,7 @@ from recipe.fully_async_policy_image_rl.detach_utils import (
     ValidateMetrics,
     assemble_batch_from_rollout_samples,
 )
-from recipe.image_rl.reward import load_reward_manager
+from verl.trainer.ppo.reward import load_reward_manager
 from recipe.fully_async_policy_image_rl.message_queue import MessageQueueClient
 from recipe.fully_async_policy_image_rl.ray_trainer import FullyAsyncRayPPOTrainer
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
@@ -67,10 +67,10 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         self.processor = processor
         self.config = config
         self.reward_fn = load_reward_manager(
-            config, tokenizer, processor, num_examine=0, **config.reward_model.get("reward_kwargs", {})
+            config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {})
         )
         self.val_reward_fn = load_reward_manager(
-            config, tokenizer, processor, num_examine=1, **config.reward_model.get("reward_kwargs", {})
+            config, tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {})
         )
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
 
@@ -329,7 +329,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                             self.actor_rollout_wg.save_model_to_cpu(local_trigger)
                             self.actor_rollout_wg.restore_model_from_cpu(1)
 
-                    for task_id in [1, 2, 3]:
+                    for task_id in [2]:
                         batch.batch["task_id"] = torch.tensor([task_id for _ in range(len(batch))], dtype=int)
 
                         batch = self._process_batch_common(
@@ -357,7 +357,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                         metrics.update(actor_output_metrics)
 
                     reward_extra_infos_dict: dict[str, list] = {}
-                    for task_id in [1, 2, 3]:
+                    for task_id in [2]:
                         # Get pre-computed reward_extra_infos_dict from meta_info
                         reward_extra_infos_dict.update({k: v for k, v in batch.meta_info.items()})
 
@@ -366,7 +366,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                     if self.config.trainer.rollout_freq > 0 and (
                         self.global_steps % self.config.trainer.rollout_freq == 0 and rollout_data_dir
                     ):
-                        self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
+                        self._log_rollout(batch, reward_extra_infos_dict, timing_raw)
 
             self._collect_metrics(batch, 0, metrics, timing_raw)
             self.metrics_aggregator.add_step_metrics(

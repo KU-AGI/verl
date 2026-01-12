@@ -2,7 +2,7 @@
 set -xeuo pipefail
 
 project_name='dapo-fully-async-policy-image-rl'
-exp_name='DAPO-Qwen2.5-7b-MATH-0527a1-fsdp2-fully-async-4-4-ours'
+exp_name='DAPO-Qwen2.5-7b-MATH-0527a1-fsdp2-fully-async-staleness-fresh'
 
 # Ray
 RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
@@ -74,15 +74,16 @@ gen_prompt_bsz=1
 val_prompt_bsz=8
 n_resp_per_prompt=16
 rollout_prompt_size=4 # set to number of prompts per actor per batch, used in async mode
-val_rollout_prompt_size=16
+val_rollout_prompt_size=8
 train_prompt_mini_bsz=32
 train_prompt_micro_bsz=1
 total_rollout_steps=$(((512*100)))
 test_freq=10
-staleness_threshold=0.1
+staleness_threshold=0.0
 trigger_parameter_sync_step=4
-require_batches=6
+require_batches=3
 partial_rollout=True
+rollout_freq=10
 log_prob_micro_batch_size_per_gpu=1
 
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -180,6 +181,8 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     rollout.total_rollout_steps="${total_rollout_steps}" \
     rollout.total_epochs=10 \
     rollout.test_freq="${test_freq}" \
+    trainer.test_freq="${test_freq}" \
+    trainer.validation_data_dir="${CKPTS_DIR}/validation" \
     async_training.rollout_prompt_size="${rollout_prompt_size}" \
     async_training.val_rollout_prompt_size="${val_rollout_prompt_size}" \
     async_training.staleness_threshold="${staleness_threshold}" \
