@@ -151,10 +151,58 @@ class DataParallelImageGenerationActor(BasePPOActor):
             # For FSDP wrapped models
             self.actor_module.module.set_processor(processor)
 
+    def _extract_valid_input_tokens(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        pad_token_id: int = 0
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Extract valid input tokens by removing left padding"""
+        batch_size = input_ids.size(0)
+        valid_tokens_list = []
+        max_valid_len = 0
+        
+        for i in range(batch_size):
+            valid_mask = attention_mask[i] == 1
+            if valid_mask.any():
+                # Find first and last valid positions
+                valid_indices = valid_mask.nonzero(as_tuple=False).squeeze(-1)
+                first_valid = valid_indices[0].item()
+                last_valid = valid_indices[-1].item()
+                valid_tokens = input_ids[i, first_valid:last_valid + 1]
+            else:
+                valid_tokens = torch.tensor([], dtype=input_ids.dtype, device=input_ids.device)
+            valid_tokens_list.append(valid_tokens)
+            max_valid_len = max(max_valid_len, len(valid_tokens))
+        
+        if max_valid_len == 0:
+            empty_tensor = torch.zeros((batch_size, 0), dtype=input_ids.dtype, device=input_ids.device)
+            return empty_tensor, empty_tensor, empty_tensor
+        
+        # Right pad to max valid length
+        padded_input_ids = torch.full((batch_size, max_valid_len), pad_token_id,
+                                      dtype=input_ids.dtype, device=input_ids.device)
+        new_attention_mask = torch.zeros((batch_size, max_valid_len),
+                                         dtype=attention_mask.dtype, device=attention_mask.device)
+        new_position_ids = torch.zeros((batch_size, max_valid_len),
+                                       dtype=position_ids.dtype, device=position_ids.device)
+        
+        for i, valid_tokens in enumerate(valid_tokens_list):
+            if len(valid_tokens) > 0:
+                padded_input_ids[i, :len(valid_tokens)] = valid_tokens
+                new_attention_mask[i, :len(valid_tokens)] = 1
+                new_position_ids[i, :len(valid_tokens)] = torch.arange(
+                    len(valid_tokens), device=position_ids.device
+                )
+        
+        return padded_input_ids, new_attention_mask, new_position_ids
+
     def _extract_valid_output_tokens(
         self,
         output_tokens: torch.Tensor,
-        response_mask: torch.Tensor
+        response_mask: torch.Tensor,
+        pad_token_id: int = 0
     ) -> torch.Tensor:
         """Extract valid output tokens by removing right padding"""
         batch_size = output_tokens.size(0)
@@ -176,8 +224,9 @@ class DataParallelImageGenerationActor(BasePPOActor):
         # Right pad to max valid length
         if max_valid_len == 0:
             return torch.zeros((batch_size, 0), dtype=output_tokens.dtype, device=output_tokens.device)
-
-        padded_tokens = torch.zeros((batch_size, max_valid_len),
+        
+        # Pad with pad_token_id
+        padded_tokens = torch.full((batch_size, max_valid_len), pad_token_id, 
                                    dtype=output_tokens.dtype, device=output_tokens.device)
 
         for i, valid_tokens in enumerate(valid_tokens_list):
@@ -248,10 +297,15 @@ class DataParallelImageGenerationActor(BasePPOActor):
         attention_mask = micro_batch[f"task{task_id}_attention_mask"]
         position_ids = micro_batch[f"task{task_id}_position_ids"]
 
+        # Extract valid input tokens (remove left padding)
+        input_ids, attention_mask, position_ids = self._extract_valid_input_tokens(
+            input_ids, attention_mask, position_ids, pad_token_id=self.tokenizer.pad_token_id
+        )
+
         # Get original response mask for length restoration
         original_response_mask = micro_batch[f"task{task_id}_response_mask"]
 
-        # Extract valid output tokens (remove right padding)
+        # Extract output tokens
         if task_id == 1:
             output_tokens = micro_batch["task1_gen_img_tokens"]
         elif task_id == 2:
@@ -261,26 +315,35 @@ class DataParallelImageGenerationActor(BasePPOActor):
         else:
             raise ValueError(f"Invalid task_id: {task_id}")
 
-        valid_output_tokens = self._extract_valid_output_tokens(output_tokens, original_response_mask)
+        # Extract valid output tokens (remove right padding)
+        valid_output_tokens = self._extract_valid_output_tokens(
+            output_tokens, original_response_mask, pad_token_id=self.tokenizer.pad_token_id
+        )
 
-        input_lengths = [attention_mask[i].sum().item() for i in range(attention_mask.size(0))]
+        # Calculate lengths (이제 left/right padding이 모두 제거됨)
+        input_lengths = attention_mask.sum(dim=-1).tolist()  # 더 간단하게
         output_lengths = [original_response_mask[i].sum().item() for i in range(original_response_mask.size(0))]
 
+        # Concatenate input and output
         concat_ids = torch.cat([input_ids, valid_output_tokens], dim=-1)
 
-        # Extend attention_mask
+        # Extend attention_mask (각 샘플의 실제 output length 반영)
         bs, output_len = valid_output_tokens.shape
-        output_attention = torch.ones(bs, output_len, dtype=attention_mask.dtype, device=attention_mask.device)
+        output_attention = torch.zeros(bs, output_len, dtype=attention_mask.dtype, device=attention_mask.device)
+        for i in range(bs):
+            output_attention[i, :output_lengths[i]] = 1
         extended_attention_mask = torch.cat([attention_mask, output_attention], dim=-1)
-        
-        # Extend position_ids
-        # Assume position_ids continues from where input ends
+
+        # Extend position_ids (input position은 이제 0부터 시작)
         batch_size = position_ids.size(0)
-        input_lengths_tensor = torch.tensor(input_lengths, device=position_ids.device)
-        output_position_ids = torch.arange(output_len, device=position_ids.device).unsqueeze(0).expand(batch_size, -1)
-        output_position_ids = output_position_ids + input_lengths_tensor.unsqueeze(-1)
+        output_position_ids = torch.zeros(batch_size, output_len, dtype=position_ids.dtype, device=position_ids.device)
+        for i in range(batch_size):
+            valid_len = output_lengths[i]
+            if valid_len > 0:
+                # input_lengths[i]는 이제 left padding 제거 후의 실제 길이
+                output_position_ids[i, :valid_len] = torch.arange(valid_len, device=position_ids.device) + input_lengths[i]
         extended_position_ids = torch.cat([position_ids, output_position_ids], dim=-1)
-        
+
         extra_args = {}
         if self.use_fused_kernels:
             extra_args["temperature"] = temperature
