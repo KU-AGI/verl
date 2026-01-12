@@ -423,11 +423,13 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         """
         while True:
             if self.paused or await self._should_pause_generation():
-                print(
-                    "[FullyAsyncRollouter][Processor] Received pause signal, waiting for remaining tasks to return..."
-                )
-                async with self.lock:
-                    self.paused = True
+                if not self.paused:
+                    print(
+                        "[FullyAsyncRollouter][Processor] Received pause signal, waiting for remaining tasks to return..."
+                    )
+                self.paused = True
+                if self.idle_start_time is None:
+                    self.idle_start_time = time.time()
                 while self.active_tasks:
                     async with self.lock:
                         # After acquiring the lock, the number of active_tasks may change, need to be verified again
@@ -438,9 +440,8 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                         for task in done_tasks:
                             await task
 
-                async with self.lock:
+                async with self.condition:
                     while self.paused:
-                        self.idle_start_time = time.time()
                         await self.condition.wait()
                 continue
 
@@ -638,7 +639,9 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             # Trigger rollout recovery
             if self.monitor_loop_trigger:
                 if not await self._should_pause_generation():
-                    async with self.lock:
+                    async with self.condition:
+                        if self.paused:
+                            print("[FullyAsyncRollouter][MonitorLoop] Triggering auto-resume")
                         self.paused = False
                         self.condition.notify_all()
 
@@ -685,9 +688,11 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         if dependency_ref is not None:
             ray.get(dependency_ref)
         print("[FullyAsyncRollouter][Public][Resume]")
-        async with self.lock:
-            if self.config.async_training.partial_rollout:
-                await self.async_rollout_manager.resume()
+
+        if self.config.async_training.partial_rollout:
+            await self.async_rollout_manager.resume()
+
+        async with self.condition:
             self.paused = False
             self.monitor_loop_trigger = True
             self.condition.notify_all()
