@@ -16,7 +16,7 @@ def collate_fn(data_list: list[dict]) -> dict:
     grouped_meta = defaultdict(list)
     other = defaultdict(list)
     
-    # ✨ 첫 번째 샘플의 meta_info 키들을 미리 수집
+    # 첫 번째 샘플의 meta_info 키들을 미리 수집
     meta_info_keys = set()
     if data_list and isinstance(data_list[0].get("meta_info"), dict):
         meta_info_keys = set(data_list[0]["meta_info"].keys())
@@ -40,7 +40,7 @@ def collate_fn(data_list: list[dict]) -> dict:
         for k, v in sample.items():
             if k in ("batch", "non_tensor_batch", "meta_info"):
                 continue
-            # ✨ meta_info에서 온 키는 other에 넣지 않음
+            # meta_info에서 온 키는 other에 넣지 않음
             if k in meta_info_keys:
                 continue
             other[k].append(v)
@@ -62,13 +62,10 @@ def collate_fn(data_list: list[dict]) -> dict:
     for k, vs in grouped_non.items():
         out[k] = _to_object_array(vs)
     
-    # C) ✨ meta_info: 리스트로 유지
+    # C) meta_info: 리스트로 유지
     meta_info = {}
     for k, vs in grouped_meta.items():
-        if all(v == vs[0] for v in vs):
-            meta_info[k] = vs[0]
-        else:
-            meta_info[k] = vs  # 리스트 유지
+        meta_info[k] = vs  # 리스트 유지
     
     out.update(meta_info)
     

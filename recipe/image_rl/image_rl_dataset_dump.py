@@ -375,7 +375,7 @@ class ImageRLDataset(Dataset):
                 continue
 
             arr = self._as_array(gt[colname])
-            # ✨ 핵심: to_pylist()를 컬럼당 1번만 실행
+            #  핵심: to_pylist()를 컬럼당 1번만 실행
             out[field] = arr.to_pylist()
 
         return out
@@ -432,7 +432,7 @@ class ImageRLDataset(Dataset):
             "batch": {},
             "non_tensor_batch": {},
             "meta_info": {},
-            "is_flat": False  # ✨ flat 구조 여부 추적
+            "is_flat": False  #  flat 구조 여부 추적
         }
 
         # top-level 컬럼들
@@ -441,7 +441,7 @@ class ImageRLDataset(Dataset):
                 arr = self._as_array(table[k])
                 chunk_data["top_level"][k] = arr.to_pylist()
 
-        # ✨ nested structure 시도 (arrow와 parquet 공통)
+        #  nested structure 시도 (arrow와 parquet 공통)
         batch_cols = self._extract_group_columns_fast(table, "batch")
         non_tensor_cols = self._extract_group_columns_fast(table, "non_tensor_batch")
         meta_cols = self._extract_group_columns_fast(table, "meta_info")
@@ -464,7 +464,7 @@ class ImageRLDataset(Dataset):
                 arr = self._as_array(table[col_name])
                 values = arr.to_pylist()
                 
-                # ✨ 컬럼 이름으로 분류 (개선된 휴리스틱)
+                #  컬럼 이름으로 분류 (개선된 휴리스틱)
                 # 1. prompt와 메타데이터
                 if col_name in [self.prompt_key, "uid", "index"]:
                     chunk_data["non_tensor_batch"][col_name] = values
@@ -636,7 +636,7 @@ class ImageRLDataset(Dataset):
             try:
                 value = values[local_idx]
                 
-                # ✨ 이미지 경로 변환 (PIL 변환 전에)
+                #  이미지 경로 변환 (PIL 변환 전에)
                 if isinstance(value, str) and ("image" in field.lower() or "pil" in field.lower()):
                     value = self._resolve_image_path(value, chunk_dir)
                 
@@ -670,14 +670,14 @@ class ImageRLDataset(Dataset):
                 logger.warning(f"Failed to process meta field {field} at item {item}: {e}")
                 continue
 
-        # ✨ 이미지 경로 변환 적용
+        #  이미지 경로 변환 적용
         try:
             batch_dict = self._resolve_image_paths_in_dict(batch_dict, chunk_dir, "batch")
             non_tensor_dict = self._resolve_image_paths_in_dict(non_tensor_dict, chunk_dir, "non_tensor_batch")
         except Exception as e:
             logger.warning(f"Failed to resolve image paths at item {item}: {e}")
         
-        # ✨ row_dict 구성 - 빈 딕셔너리도 명시적으로 생성
+        #  row_dict 구성 - 빈 딕셔너리도 명시적으로 생성
         row_dict["batch"] = batch_dict if batch_dict else {}
         row_dict["non_tensor_batch"] = non_tensor_dict if non_tensor_dict else {}
         row_dict["meta_info"] = meta_dict if meta_dict else {}
