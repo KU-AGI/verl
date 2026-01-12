@@ -7,7 +7,7 @@ export WANDB_PROJECT="verl-dapo"
 export NCCL_DEBUG="WARN"
 
 project_name='verl-dapo'
-exp_name='retro_fullset_v13_wo_steprwd'
+exp_name='retro_fullset_v13_wo_steprwd_w_rndtrp'
 
 # Ray
 RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
@@ -52,7 +52,7 @@ balance_task=False
 use_response_mask_to_reflection_step=False
 
 # Reward related parameters
-use_roundtrip_reward=False
+use_roundtrip_reward=True
 use_content_reward=False
 use_decision_reward=False
 use_reflection_bonus=False

@@ -23,6 +23,7 @@ from rdkit.Chem import MACCSkeys, AllChem, Fragments
 from collections import defaultdict
 from pprint import pprint
 from nltk.translate.bleu_score import corpus_bleu
+from openai import OpenAI
 
 RDLogger.DisableLog('rdApp.*')
 
@@ -1671,6 +1672,9 @@ class ChemistryEvaluator:
         self.validator = SMILESValidator()
         self.parser = StepParser()
         self.step_evaluator = StepEvaluator()
+        self.roundtrip_base_url = "http://localhost:18000/v1"
+        self.roundtrip_client_model_name = "/models/roundtrip"
+        self.roundtrip_client = OpenAI(base_url=self.roundtrip_base_url, api_key="EMPTY")
     
     def is_correct_strict_tag(self, pred: str, gt: str) -> Tuple[int, Optional[str]]:
         """Check prediction correctness using strict ANSWER tag criteria."""
@@ -1793,10 +1797,38 @@ class ChemistryEvaluator:
             metric=DataStructs.TanimotoSimilarity
         )
 
+    def roundtrip_acc(self, reactant: str, product: str):
+        system_prompt = "You are a chemist."
+        user_prompt = f"{reactant} Considering the given starting materials, what might be the resulting product in a chemical reaction?"
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        response = self.roundtrip_client.chat.completions.create(
+            model=self.roundtrip_client_model_name,
+            messages=messages,
+            max_tokens=500,
+            temperature=0.0,
+            n=1,
+        )
+        raw_response = response.choices[0].message.content.strip()
+        reasoning_pattern = r"<think>(.*?)</think>"
+        smiles_pattern = r"<ANSWER>(.*?)</ANSWER>"
+
+        reasoning_match = re.search(reasoning_pattern, raw_response, re.DOTALL)
+        smiles_match = re.search(smiles_pattern, raw_response, re.DOTALL)
+
+        reasoning_steps = reasoning_match.group(1).strip() if reasoning_match else ""
+        roundtrip_product = smiles_match.group(1).strip() if smiles_match else ""
+        is_correct = self.validator.exact_match(roundtrip_product, product)
+        
+        return is_correct
+
     def compute_score(self,
                       solution_str: str,
                       ground_truth: str,
                       extra_info: Optional[Dict] = None,
+                      use_roundtrip_reward=False,
                       use_content_reward=False,
                       use_decision_reward=False,
                       use_reflection_bonus=False,
@@ -1841,7 +1873,11 @@ class ChemistryEvaluator:
             # info['synthons_list_new'] = ast.literal_eval(info['synthons_list_new'])
             # info['synthetic_equivalents_list'] = ast.literal_eval(info['synthetic_equivalents_list'])
             step_eval_results = self.step_evaluator.calcualte_retro_rationale_metrics(info, gt_rationale, pred_rationale)
-            answer_correct = self.step_evaluator._exact_match(pred_smiles, gt_smiles)
+            if use_roundtrip_reward:
+                is_roundtrip_correct = self.roundtrip_acc(reactant=pred_smiles, product=info['product_str'])
+                answer_correct = int(is_roundtrip_correct)
+            else:
+                answer_correct = self.step_evaluator._exact_match(pred_smiles, gt_smiles)
         elif task == "condition":
             step_eval_results = self.step_evaluator.calcualte_condition_rationale_metrics(info, gt_rationale, pred_rationale)
         else:
@@ -1915,80 +1951,6 @@ class ChemistryEvaluator:
             content_reward = sum(step_eval_results.values()) / len(step_eval_results)
             reward += content_reward
             reward_metric_dict[f"{task}/reward/content_reward"] = content_reward
-            # for step_key in content_reward_dict:
-            #     if "step1" in step_key:
-            #         step_rewards["step1"] += content_reward_dict[step_key] / len(content_reward_dict)
-            #     elif "step2" in step_key:
-            #         step_rewards["step2"] += content_reward_dict[step_key] / len(content_reward_dict)
-            #     elif "step3" in step_key:
-            #         step_rewards["step3"] += content_reward_dict[step_key] / len(content_reward_dict)
-            #     elif "step4" in step_key:
-            #         step_rewards["step4"] += content_reward_dict[step_key] / len(content_reward_dict)
-            #     elif "step5" in step_key:
-            #         step_rewards["step5"] += content_reward_dict[step_key] / len(content_reward_dict)
-            #     elif "step6" in step_key:
-            #         step_rewards["step6"] += content_reward_dict[step_key] / len(content_reward_dict)
-            #     elif "step7" in step_key:
-            #         step_rewards["step7"] += content_reward_dict[step_key] / len(content_reward_dict)
-        """
-        if use_decision_reward:
-            decision_reward = sum(reflection_decision_reward_dict.values()) / len(reflection_decision_reward_dict)
-            reward += decision_reward
-            reward_metric_dict[f"{task}/reward/decision_reward"] = decision_reward
-            for step_key in reflection_decision_reward_dict:
-                if "step1" in step_key:
-                    step_rewards["step1"] += reflection_decision_reward_dict[step_key] / len(reflection_decision_reward_dict)
-                elif "step2" in step_key:
-                    step_rewards["step2"] += reflection_decision_reward_dict[step_key] / len(reflection_decision_reward_dict)
-                elif "step3" in step_key:
-                    step_rewards["step3"] += reflection_decision_reward_dict[step_key] / len(reflection_decision_reward_dict)
-                elif "step4" in step_key:
-                    step_rewards["step4"] += reflection_decision_reward_dict[step_key] / len(reflection_decision_reward_dict)
-                elif "step5" in step_key:
-                    step_rewards["step5"] += reflection_decision_reward_dict[step_key] / len(reflection_decision_reward_dict)
-                elif "step6" in step_key:
-                    step_rewards["step6"] += reflection_decision_reward_dict[step_key] / len(reflection_decision_reward_dict)
-                elif "step7" in step_key:
-                    step_rewards["step7"] += reflection_decision_reward_dict[step_key] / len(reflection_decision_reward_dict)
-        if use_reflection_bonus:
-            if len(reflection_bonus_dict) > 0:
-                reflection_bonus_reward = (sum(reflection_bonus_dict.values()) / len(reflection_bonus_dict)) * reflection_bonus_weight
-                for step_key in reflection_bonus_dict:
-                    if "step1" in step_key:
-                        step_rewards["step1"] += reflection_bonus_dict[step_key] * reflection_bonus_weight / len(reflection_bonus_dict)
-                    elif "step2" in step_key:
-                        step_rewards["step2"] += reflection_bonus_dict[step_key] * reflection_bonus_weight / len(reflection_bonus_dict)
-                    elif "step3" in step_key:
-                        step_rewards["step3"] += reflection_bonus_dict[step_key] * reflection_bonus_weight / len(reflection_bonus_dict)
-                    elif "step4" in step_key:
-                        step_rewards["step4"] += reflection_bonus_dict[step_key] * reflection_bonus_weight / len(reflection_bonus_dict)
-                    elif "step5" in step_key:
-                        step_rewards["step5"] += reflection_bonus_dict[step_key] * reflection_bonus_weight / len(reflection_bonus_dict)
-                    elif "step6" in step_key:
-                        step_rewards["step6"] += reflection_bonus_dict[step_key] * reflection_bonus_weight / len(reflection_bonus_dict)
-                    elif "step7" in step_key:
-                        step_rewards["step7"] += reflection_bonus_dict[step_key] * reflection_bonus_weight / len(reflection_bonus_dict)
-            else:
-                reflection_bonus_reward = 0.0
-            reward += reflection_bonus_reward
-            reward_metric_dict[f"{task}/reward/reflection_bonus_reward"] = reflection_bonus_reward
-        """
-        # print("="*100)
-        # print("=== predicted_rational ===\n", solution_str)
-        # print("-"*100)
-        # pprint(step_eval_results)
-        # print("-"*100)
-        # pprint(reflection_bonus_dict)
-        # print("-"*100)
-        # pprint(content_reward_dict)
-        # print("-"*100)
-        # pprint(reflection_decision_reward_dict)
-        # print("-"*100)
-        # pprint(step_rewards)
-        # print("-"*100)
-        # pprint(extra_info['reagents'])
-        # print("="*100)
-
         
         step_eval_results.update(reward_metric_dict)
 
@@ -2009,6 +1971,7 @@ class ChemistryEvaluator:
 def compute_score(solution_str: str,
                   ground_truth: str,
                   extra_info: Optional[dict] = None,
+                  use_roundtrip_reward=False,
                   use_content_reward=False,
                   use_decision_reward=False,
                   use_reflection_bonus=False,
@@ -2019,6 +1982,7 @@ def compute_score(solution_str: str,
         solution_str,
         ground_truth,
         extra_info,
+        use_roundtrip_reward,
         use_content_reward,
         use_decision_reward,
         use_reflection_bonus,
@@ -2108,6 +2072,7 @@ The reagent 3 is the most suitable reagent for the reaction, since it provides b
         solution_str,
         ground_truth,
         extra_info,
+        use_roundtrip_reward=True,
         use_content_reward=True,
         use_decision_reward=True,
         use_reflection_bonus=True,

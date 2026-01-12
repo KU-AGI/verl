@@ -34,6 +34,7 @@ class DAPORewardManager(AbstractRewardManager):
         reward_fn_key="data_source",
         max_resp_len=None,
         overlong_buffer_cfg=None,
+        use_roundtrip_reward=False,
         use_content_reward=False,
         use_decision_reward=False,
         use_reflection_bonus=False,
@@ -45,6 +46,7 @@ class DAPORewardManager(AbstractRewardManager):
         self.reward_fn_key = reward_fn_key
         self.overlong_buffer_cfg = overlong_buffer_cfg
         self.max_resp_len = max_resp_len
+        self.use_roundtrip_reward = use_roundtrip_reward
         self.use_content_reward = use_content_reward
         self.use_decision_reward = use_decision_reward
         self.use_reflection_bonus = use_reflection_bonus
@@ -116,6 +118,7 @@ class DAPORewardManager(AbstractRewardManager):
                 solution_str=response_str_special,
                 ground_truth=ground_truth,
                 extra_info=extra_info,
+                use_roundtrip_reward=self.use_roundtrip_reward,
                 use_content_reward=self.use_content_reward,
                 use_decision_reward=self.use_decision_reward,
                 use_reflection_bonus=self.use_reflection_bonus,

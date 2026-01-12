@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
 
+export NCCL_SOCKET_IFNAME=bond-srv.1506
 export WANDB_ENTITY="llm-reaction-reasoning"
 export WANDB_PROJECT="verl-dapo"
 export NCCL_DEBUG="WARN"
@@ -51,6 +52,7 @@ balance_task=False
 use_response_mask_to_reflection_step=False
 
 # Reward related parameters
+use_roundtrip_reward=False
 use_content_reward=True
 use_decision_reward=False
 use_reflection_bonus=False
@@ -189,6 +191,7 @@ python -m recipe.fully_async_policy.fully_async_main \
     +reward_model.reward_kwargs.overlong_buffer_cfg.penalty_factor=${overlong_penalty_factor} \
     +reward_model.reward_kwargs.overlong_buffer_cfg.log=False \
     +reward_model.reward_kwargs.max_resp_len=${max_response_length} \
+    +reward_model.reward_kwargs.use_roundtrip_reward=${use_roundtrip_reward} \
     +reward_model.reward_kwargs.use_content_reward=${use_content_reward} \
     +reward_model.reward_kwargs.use_decision_reward=${use_decision_reward} \
     +reward_model.reward_kwargs.use_reflection_bonus=${use_reflection_bonus} \
