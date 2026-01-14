@@ -427,7 +427,7 @@ def get_messsages_task2_vqa_pass_or_fail(*args): # 5: part 1
     return messages, model
 
 
-def get_messsages_task2_edit_instruction_following(*args): # 5: part 1
+def get_messsages_task3_edit_instruction_following(*args): # 5: part 1
     prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback, vqa_question, extra_info, task_id = args
 
     system_prompt = TASK3_EDIT_INSTRUCTION_FOLLOWING_SYSTEM_PROMPT
@@ -631,7 +631,7 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
 
         # Gather results
         vqa_task = asyncio.create_task(get_response(get_messages, *args))
-        edit_task = asyncio.create_task(get_response(get_messsages_task2_edit_instruction_following, *args))
+        edit_task = asyncio.create_task(get_response(get_messsages_task3_edit_instruction_following, *args))
 
         vqa_response = await vqa_task
 
