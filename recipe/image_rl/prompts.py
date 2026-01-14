@@ -1,19 +1,21 @@
 # Prompt templates
 TASK1_TASK3_IMAGE_GENERATOR_SYSTEM_PROMPT_TEMPLATE = """
-You are an AI assistant that answers a batch of yes/no questions.
+You are a VQA assistant. The user provides multiple questions as:
+<id> | <question>
 
-Protocol:
-1) For each question, output EXACTLY two lines, in order, both starting with "<index> |".
-2) Line 1 (justification): one or two concise sentences; no lists, no newlines, do NOT include "Answer:".
-3) Line 2 (final): exactly "<index> | Answer: Yes" or "<index> | Answer: No".
-4) Preserve the original question order and indices. Do not skip or renumber.
-5) If evidence is insufficient or the question is malformed/ambiguous, include the phrase "Insufficient evidence." in the justification and set the final line to "Answer: No".
-6) Do NOT reveal chain-of-thought; provide only brief conclusions based on observable evidence.
-7) Do not add any extra text before, between, or after answers.
+For EACH question, output exactly TWO lines:
+<id> | Reason: <ONE sentence based only on visible cues in the image>.
+<id> | Answer: Yes  OR  <id> | Answer: No
 
-Output template per question (two lines per question):
-<index> | <one or two concise sentences for justification>
-<index> | Answer: Yes or Answer: No""".strip()
+Rules:
+1) Visual-only: decide from what is visible. No typicality/context inference and no external verification.
+2) YES gate: answer "Yes" only if the Reason cites at least one specific visible part/structure AND its location (e.g., "wheels under the fuselage"). If you cannot cite this, answer "No".
+3) Visibility gating: for attributes, the entity must be visible; for relations, BOTH entities must be visible; otherwise Answer must be "No" and the Reason must mention what is not visible.
+4) Scope: do not add attributes/states not asked.
+5) Consistency: the Answer must be forced by the Reason.
+
+Output only the required lines, in order, with no extra text or blank lines.
+""".strip()
 
 TASK1_TASK3_IMAGE_GENERATOR_USER_PROMPT_TEMPLATE = """
 You will receive multiple questions, one per line, in the format "<index> | <question>".
@@ -25,65 +27,89 @@ For each question, follow the protocol and produce EXACTLY two lines using the t
 Questions:
 {questions}""".strip()
 
-TASK2_FEEDBACK_GENERATOR_SYSTEM_PROMPT_TEMPLATE_NAIVE = """
-You are a data consistency auditor.
+TASK2_VQA_PASS_OR_FAIL_SYSTEM_PROMPT_TEMPLATE = """
+## Role
+You are a strategic evaluation agent for Vision-Language Models (VLM). Your task is to verify if the model's self-feedback (`predicted_answer`) accurately captures the discrepancies identified in the Ground Truth (`task1_vlm_reward_response`).
 
-### Goal
-Given a PROMPT describing an image, an IMAGE showing what was actually generated, and a FEEDBACK text describing requested edits, your job is to determine whether the feedback focuses strictly on fixing discrepancies between the prompt and the image.
+## Evaluation Logic
 
-If the image already perfectly matches the prompt (meaning the feedback is redundant):
+### 1. The "Strict No" Rule (High Priority)
+If the Ground Truth (GT) contains any **"Answer: No"** items, you must be extremely rigorous. 
+- A "No" in GT indicates a specific error or missing element in the generated image.
+- The model's `predicted_answer` MUST correctly recognize these failures. 
+- Mark as **FAIL** if the model claims "Yes" (hallucination) for an element that GT explicitly marked as "No". 
+- The model must not overlook or gloss over the negative constraints provided in the GT.
+
+### 2. The "Flexible Yes" Rule (Contextual Nuance)
+If the Ground Truth consists mostly or entirely of **"Answer: Yes"** items, it means the image is largely successful. 
+- In this case, you may be more flexible with the evaluation.
+- Do NOT penalize the model for minor descriptive differences, overstatements, or synonyms.
+- As long as the core entities and their primary attributes align with the GT's intent, mark it as **PASS**.
+
+## Decision Criteria
+- **PASS**: 
+    - The model correctly identifies all "No" items from the GT as failures.
+    - For "Yes" items, the model's description matches the general essence and attributes of the objects, even if the phrasing is more detailed than the GT.
+- **FAIL**: 
+    - The model hallucinates an object/attribute that GT denies (Direct contradiction of a "No" item).
+    - The model fails to recognize a major structural or spatial error pointed out by a "No" answer in the GT.
+
+## Output Format (JSON only)
 {
-  "targeted_entities": [],
-  "reason": "All attributes are in this image, meaning no edits are required.",
-  "label": "no_feedback_needed"
-}
-
-### Labels
-- "targeted_only" : Feedback only addresses objects/attributes that failed to match the original prompt.
-- "non_target_touched" : Feedback modifies objects/attributes that were already correct, or introduces new elements not in the original prompt.
-- "global_or_irrelevant" : Feedback changes unrelated global properties (background, lighting, style) that weren't part of the original prompt's constraints.
-
-### Guidelines
-1. Compare the ORIGINAL PROMPT with the IMAGE. Identify "No-labeled" targets (elements that failed to generate correctly).
-2. Analyze the FEEDBACK:
-   - Identify which entities and attributes the feedback proposes to change.
-   - Match these changes against the identified discrepancies.
-3. Assign the Label:
-   - If the feedback ONLY fixes the discrepancies → "targeted_only".
-   - If the feedback fixes a discrepancy BUT ALSO changes a correctly generated element → "non_target_touched".
-   - If the feedback focuses on aesthetic style or environment not mentioned in the prompt → "global_or_irrelevant".
-
-### Output Format
-Output a single JSON object (no markdown, no fences):
-{
-  "targeted_entities": ["entity1", "entity2"],
-  "reason": "Short explanation of why this label was chosen.",
-  "label": "targeted_only | non_target_touched | global_or_irrelevant | no_feedback_needed"
-}
-
-### Example
-PROMPT:
-"A green banana and a blue cup"
-
-IMAGE (DESCRIPTION):
-"A yellow banana next to a blue cup on a green table."
-
-FEEDBACK:
-"Change the banana's color from yellow to green, and change the table to light blue."
-
-EXPECTED OUTPUT:
-{
-  "targeted_entities": ["banana", "table"],
-  "reason": "Feedback correctly targets the banana's color, but unnecessarily modifies the table/background which wasn't specified in the prompt.",
-  "label": "non_target_touched"
+  "judge": "Pass" or "Fail",
+  "reason": "Provide a concise explanation of why it passed or failed, highlighting the specific contradictions (e.g., 'The model hallucinated a shelf that does not exist according to the GT')."
 }
 """
 
-TASK2_FEEDBACK_GENERATOR_USER_PROMPT_TEMPLATE_NAIVE = """PROMPT:
+TASK2_VQA_PASS_OR_FAIL_USER_PROMPT_TEMPLATE = """
+### [ORIGINAL IMAGE GENERATION PROMPT]
 {prompt}
 
+### [GROUND TRUTH VQA: task1_vlm_reward_response]
+{task1_vlm_reward_response}
+
+### [MODEL SELF-FEEDBACK: predicted_answer]
+{predicted_answer}
+""".strip()
+
+
+TASK2_FEEDBACK_GENERATOR_SYSTEM_PROMPT_TEMPLATE_NAIVE = """
+You are an image-edit feasibility judge.
+
+You will be given:
+- ORIGINAL_PROMPT: the target description the final edited image must match.
+- CURRENT_IMAGE: the pre-edit image (provided as the attached image).
+- FEEDBACK: step-by-step edit instructions to apply to CURRENT_IMAGE.
+
+Task:
+(1) Caption the CURRENT_IMAGE in natural language.
+(2) Describe, in natural language, what the edited result would look like if FEEDBACK were applied exactly as written.
+(3) Decide whether that edited result would align with ORIGINAL_PROMPT.
+
+Rules:
+- Evidence-only for captioning: describe only what is visible in CURRENT_IMAGE. Do not guess.
+- Edit simulation: apply only the changes explicitly stated in FEEDBACK; do not add extra edits.
+- Alignment: the edited result aligns only if it satisfies ALL required elements in ORIGINAL_PROMPT (entities + key attributes + key relations). If any required element would be missing or contradicted, it does NOT align.
+
+Return EXACTLY ONE valid JSON object and nothing else (no markdown, no code fences, no extra text).
+The JSON must have exactly these keys:
+{
+  "caption": string (brief description of CURRENT_IMAGE),
+  "edited_result": string (brief description after applying FEEDBACK),
+  "reason": (one concise sentence explaining alignment or misalignment),
+  "answer": string ("Yes" or "No")
+}
+""".strip()
+
+
+TASK2_FEEDBACK_GENERATOR_USER_PROMPT_TEMPLATE_NAIVE = """
+ORIGINAL_PROMPT: 
+{prompt}
+
+CURRENT_IMAGE: (provided as an image input)
+
 FEEDBACK:
-{part4_feedback}
+{predicted_feedback}
 """.strip()
 
 
@@ -165,6 +191,69 @@ ANSWERS:
 
 FEEDBACK:
 {part4_feedback}
+""".strip()
+
+
+TASK3_EDIT_INSTRUCTION_FOLLOWING_SYSTEM_PROMPT = """
+You are an evaluator for an image-editing result.
+
+### Goal
+Given an ORIGINAL_IMAGE (first image), an EDITED_IMAGE (second image), and an FEEDBACK, decide whether the EDITED_IMAGE follows the FEEDBACK compared to the ORIGINAL_IMAGE.
+
+### Evaluation Rule
+For each step i in FEEDBACK, compare EDITED_IMAGE to ORIGINAL_IMAGE and decide whether step i is satisfied.
+
+IMPORTANT: Interpret FEEDBACK holistically to infer the final intended image.
+If two steps conflict on the same element, the later step overrides the earlier one for the final state; mark the earlier requirement as superseded.
+
+- Mark step i as YES if:
+    (a) step i is satisfied as written in the edited image, OR
+	(b) step i is superseded by a later step (overridden requirement).
+	
+- Mark step i as NO only if:
+    (a) the edited image clearly violates or misses at least one requirement of step i, OR
+    (b) there are clearly unrequested changes (i.e., changes not requested anywhere in FEEDBACK).
+  	
+### Output Format
+Output a single JSON object with keys exactly: "step 1", "step 2", ... in order:
+{
+  "step <index i>": "<reason> <Answer: YES or Answer: NO>"
+}
+
+### Example
+FEEDBACK:
+"Step 1: Add a classic-style bicycle in the background, positioned to the right of the horse and slightly behind it.  
+Step 2: Ensure the bicycle is placed at a slight distance from the horse, not obstructing the main subject.  
+Step 3: Match the bicycle’s lighting and shadows to the existing outdoor scene for natural blending.  
+Step 4: Adjust the bicycle’s size to appear proportionally small compared to the horse, maintaining visual balance."
+
+ORIGINAL IMAGE (DESCRIPTION):
+"An image that describes a brown horse with a red saddle and blue bags in the yard."
+
+EDITED IMAGE (DESCRIPTION):
+"An image that describes a brown horse with a red saddle and blue bags, and a metal bicycle behind the horse in the yard."
+  
+EXPECTED OUTPUT:
+{
+  "step 1": "A bicycle is present in the edited image. Answer: YES",
+  "step 2": "The bicycle is placed at a slight distance and does not obstruct or overlap the horse, keeping the horse as the main subject. Answer: YES",
+  "step 3": "The bicycle’s lighting matches the sunny scene and its shadow direction is consistent with the horse’s shadow for natural blending. Answer: YES",
+  "step 4": "The bicycle is proportionally small relative to the horse, maintaining overall visual balance. Answer: YES"
+}
+""".strip()
+
+
+TASK3_EDIT_INSTRUCTION_FOLLOWING_USER_PROMPT = """
+You will receive an original image (first image), edited image (second image) and a feedback text containing the edit instruction.
+For each feedback step i, evaluate the edited image correctly and output JSON:
+
+{{
+  "step 1": "<reason> Answer: YES or Answer: NO",
+  "step 2": "<reason> Answer: YES or Answer: NO"
+}}
+
+FEEDBACK: 
+{predicted_feedback}
 """.strip()
 
 
