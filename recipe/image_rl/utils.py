@@ -209,7 +209,7 @@ class FormattingEvaluatorV2:
         metrics['part1_accuracy'] = f1_score
         
         # Part 2: Pred Part 2와 Pred Part 3의 항목 개수 일치 여부 (내부 일관성)
-        metrics['internal_consistency_ok'] = 1 if len(pred_part2) == len(pred_paragraphs) else 0
+        metrics['internal_consistency_ok'] = 1 if (len(pred_part2) == len(pred_paragraphs)) and (len(pred_part2) != 0) and (len(pred_paragraphs) != 0) else 0
 
         final_metrics = {k: v.item() if isinstance(v, torch.Tensor) else v for k, v in metrics.items()}
         
