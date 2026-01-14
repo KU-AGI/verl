@@ -155,6 +155,12 @@ class FormattingEvaluatorV2:
         match = re.search(r'Answer: (Yes|No)$', paragraph)
         return match.group(1) if match else None
 
+    def check_all_answers_positive(self, paragraphs: list[str]) -> bool:
+        """모든 답변이 Yes인지 확인"""
+        answers = [self._get_answer_from_paragraph(para) for para in paragraphs]
+        answers_int = [1 if ans.lower() == "yes" else 0 for ans in answers if ans is not None]
+        return all(ans == 1 for ans in answers_int) if len(answers_int) > 0 else False
+
     def _calculate_metrics(self, gt_part2, pred_part2, gt_answers, pred_paragraphs):
         """
         핵심 메트릭 계산 로직 (변경 없음)

@@ -555,37 +555,45 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
         # Launch all API requests in parallel
         args = (prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback, vqa_question, extra_info, task_id)
 
-        # Gather results
-        vqa_pass_or_fail_task = asyncio.create_task(get_response(get_messsages_task2_vqa_pass_or_fail, *args)) # pass or fail
-        feedback_task = asyncio.create_task(get_response(get_messages, *args)) # +1
+        # Now call VQA pass or fail check
+        predicted_judge = formatting_evaluator.check_all_answers_positive(predict_decomposed_ans)
+        vqa_judge = bool(extra_info.get("task1_vqa_reward", 1.0))
+        
+        need_to_get_feedback_reward = False
+        if vqa_judge and predicted_judge: # VLM yes & policy yes
+            reward_extra_info[f"task{task_id}_vqa_pass_or_fail_reward"] = 1.0
+            reward_extra_info[f"task{task_id}_vqa_pass_or_fail_reward_response"] = "No need to get feedback reward. Both VQA alignment and predicted answer judge are positive(+)."
+            reward_extra_info[f"task{task_id}_feedback_reward"] = 1.0
+            reward_extra_info[f"task{task_id}_feedback_reward_response"] = "No need to get feedback response. Both VQA alignment and predicted answer judge are positive(+)."
+            need_to_get_feedback_reward = False 
 
-        # Await VQA response
-        vqa_pass_or_fail_response = await vqa_pass_or_fail_task
-
-        task2_vqa_reward = 0.0
-        vqa_judge = False
-        if not isinstance(vqa_pass_or_fail_response, Exception) and vqa_pass_or_fail_response is not None:
-            try:
-                vqa_pass_or_fail = safe_json_loads(vqa_pass_or_fail_response)
-                if vqa_pass_or_fail and vqa_pass_or_fail.get("judge", "").lower() == "pass":
-                    task2_vqa_reward = 1.0
-                    vqa_judge = True
-                else:
-                    task2_vqa_reward = 0.0
-            except:
-                task2_vqa_reward = 0.0
-
-        # Always add VQA reward info
-        reward_extra_info["task2_vqa_pass_or_fail_reward"] = task2_vqa_reward
-        reward_extra_info["task2_vqa_pass_or_fail_reward_response"] = vqa_pass_or_fail
-
-        if not vqa_judge:
+        elif vqa_judge and not predicted_judge: # VLM yes & policy no
             reward_extra_info[f"task{task_id}_vqa_pass_or_fail_reward"] = 0.0
-            reward_extra_info[f"task{task_id}_vqa_pass_or_fail_reward_response"] = "N/A due to VQA alignment fail"
+            reward_extra_info[f"task{task_id}_vqa_pass_or_fail_reward_response"] = "Fail due to mismatch between VQA alignment and predicted answer judge. VQA alignment is positive(+) but predicted answer judge is negative(-)."
+            reward_extra_info[f"task{task_id}_feedback_reward"] = 0.0
+            reward_extra_info[f"task{task_id}_feedback_reward_response"] = "Fail to get feedback reward due to mismatch between VQA alignment and predicted answer judge."
+            need_to_get_feedback_reward = False
+
+        elif not vqa_judge and predicted_judge: # VLM no & policy yes
+            reward_extra_info[f"task{task_id}_vqa_pass_or_fail_reward"] = 0.0
+            reward_extra_info[f"task{task_id}_vqa_pass_or_fail_reward_response"] = "Fail due to mismatch between VQA alignment and predicted answer judge. VQA alignment is negative(-) but predicted answer judge is positive(+)."
+            reward_extra_info[f"task{task_id}_feedback_reward"] = 0.0
+            reward_extra_info[f"task{task_id}_feedback_reward_response"] = "Fail to get feedback reward due to mismatch between VQA alignment and predicted answer judge."
+            need_to_get_feedback_reward = False
+
+        elif not vqa_judge and not predicted_judge: # VLM no & policy no
+            reward_extra_info[f"task{task_id}_vqa_pass_or_fail_reward"] = 1.0
+            reward_extra_info[f"task{task_id}_vqa_pass_or_fail_reward_response"] = "Both VQA alignment and predicted answer judge are negative(-). Proceed to get feedback reward."
+            need_to_get_feedback_reward = True # Need to get feedback reward
+
+        if not need_to_get_feedback_reward: # Early return
             return {
                 "score": task2_reward_score,
                 "reward_extra_info": reward_extra_info,
             }
+
+        # Gather results
+        feedback_task = asyncio.create_task(get_response(get_messages, *args)) # +1
 
         # Await feedback response
         feedback_response = await feedback_task
