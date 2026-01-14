@@ -820,26 +820,26 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
             )
 
         # Gather results
-        response = await vlm_task
+        response = await vqa_task
         detector_response = await detector_task if detector_task else {"results": {}, "details": [], "errors": ["No valid detection items"]}
 
         # Process VLM response
-        task1_vlm_reward_score = 0.0
+        task1_vqa_reward_score = 0.0
         if not isinstance(response, Exception) and response is not None:
             try:
                 task1_idx_to_ans: dict = image_evaluator_parser(response)
-                task1_vlm_reward_score_sum = sum(task1_idx_to_ans.values())
+                task1_vqa_reward_score_sum = sum(task1_idx_to_ans.values())
                 task1_ans_count = len(task1_idx_to_ans)
-                task1_vlm_reward_score = 1.0 if task1_vlm_reward_score_sum == task1_ans_count else 0.0
-                reward_score += task1_vlm_reward_score
-                reward_extra_info[f"task{task_id}_vlm_reward"] = task1_vlm_reward_score
+                task1_vqa_reward_score = 1.0 if task1_vqa_reward_score_sum == task1_ans_count else 0.0
+                reward_score += task1_vqa_reward_score
+                reward_extra_info[f"task{task_id}_vqa_reward"] = task1_vqa_reward_score
             except Exception as e:
-                task1_vlm_reward_score = 0.0
+                task1_vqa_reward_score = 0.0
                 reward_score += 0.0
-                reward_extra_info[f"task{task_id}_vlm_reward"] = 0.0
+                reward_extra_info[f"task{task_id}_vqa_reward"] = 0.0
         else:
             reward_score += 0.0
-            reward_extra_info[f"task{task_id}_vlm_reward"] = 0.0
+            reward_extra_info[f"task{task_id}_vqa_reward"] = 0.0
 
         reward_extra_info[f"task{task_id}_reward_response"] = response if not isinstance(response, Exception) else str(response)
 
@@ -862,12 +862,12 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
         reward_extra_info[f"task{task_id}_detector_response"] = detector_response
 
         # Bonus if both perfect
-        if task1_vlm_reward_score == 1 and detector_reward == 1:
+        if task1_vqa_reward_score == 1 and detector_reward == 1:
             reward_score += 1.0
-            reward_extra_info[f"task{task_id}_vlm_detector_bonus"] = 1.0
+            reward_extra_info[f"task{task_id}_vqa_detector_bonus"] = 1.0
         else:
             reward_score += 0.0
-            reward_extra_info[f"task{task_id}_vlm_detector_bonus"] = 0.0
+            reward_extra_info[f"task{task_id}_vqa_detector_bonus"] = 0.0
 
     elif task_id == 2:
         task2_reward_score = 0.0
@@ -916,29 +916,29 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
         )
 
         # Process feedback response
-        task2_vlm_reward_score = 0.0
+        task2_feedback_reward_score = 0.0
         if not isinstance(response, Exception) and response is not None:
             try:
                 raw_json = safe_json_loads(response)
                 label_response = raw_json.get("label", "").lower()
                 if label_response in ["targeted_only", "no_feedback_needed"]:
-                    task2_vlm_reward_score = 1.0
+                    task2_feedback_reward_score = 1.0
                 elif label_response in ["non_target_touched", "global_or_irrelevant"]:
-                    task2_vlm_reward_score = 0.0
+                    task2_feedback_reward_score = 0.0
                 else:
-                    task2_vlm_reward_score = 0.0
+                    task2_feedback_reward_score = 0.0
 
-                task2_reward_score += task2_vlm_reward_score
+                task2_reward_score += task2_feedback_reward_score
                 # task2_ans_count += 1
             except:
-                task2_vlm_reward_score = 0.0
+                task2_feedback_reward_score = 0.0
                 task2_reward_score += 0.0
         else:
-            task2_vlm_reward_score = 0.0
+            task2_feedback_reward_score = 0.0
             task2_reward_score += 0.0
 
         # reward_score += (task2_reward_score / task2_ans_count) if task2_ans_count > 0 else 0.0
-        reward_extra_info[f"task{task_id}_vlm_reward"] = task2_vlm_reward_score
+        reward_extra_info[f"task{task_id}_feedback_reward"] = task2_feedback_reward_score
         reward_extra_info[f"task{task_id}_reward_response"] = response
 
         # Process comparison_summarize response
@@ -1020,12 +1020,12 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
         last = predicted_feedback
         if last is not None and "No need to generate feedback.".lower() in last.lower():
             reward_score = -100
-            reward_extra_info[f"task{task_id}_vlm_reward"] = reward_score
+            reward_extra_info[f"task{task_id}_vqa_reward"] = reward_score
             reward_extra_info[f"task{task_id}_reward_response"] = "None"
             reward_extra_info[f"task{task_id}_detector_reward"] = reward_score
             reward_extra_info[f"task{task_id}_detector_response"] = {"results": {}, "details": [], "errors": []}
             reward_extra_info[f"task{task_id}_detector_details"] = []
-            reward_extra_info[f"task{task_id}_vlm_detector_bonus"] = reward_score
+            reward_extra_info[f"task{task_id}_vqa_detector_bonus"] = reward_score
             reward_extra_info[f"task{task_id}_regeneration_followed_by_editing_reward"] = reward_score
             reward_extra_info[f"task{task_id}_regeneration_followed_by_editing_response"] = "No need to respond reward."
             return {
@@ -1037,7 +1037,7 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
         detection_results = verify_detection_single(feedback_tuple)
         args = (prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback, vqa_question, extra_info, task_id)
 
-        vlm_task = asyncio.create_task(get_response(get_messages, *args))
+        vqa_task = asyncio.create_task(get_response(get_messages, *args))
         regeneration_task = asyncio.create_task(get_response(get_messages_task3_regeneration_followed_by_editing, *args))
 
         detector_task = None
@@ -1047,26 +1047,26 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
         # Gather results
         if detector_task:
             response, regeneration_followed_by_editing_response, detector_response = await asyncio.gather(
-                vlm_task, regeneration_task, detector_task, return_exceptions=True
+                vqa_task, regeneration_task, detector_task, return_exceptions=True
             )
         else:
             response, regeneration_followed_by_editing_response = await asyncio.gather(
-                vlm_task, regeneration_task, return_exceptions=True
+                vqa_task, regeneration_task, return_exceptions=True
             )
             detector_response = {"results": {}, "details": [], "errors": ["No valid detection items"]}
 
         # Process VLM response
-        task3_vlm_reward_score = 0.0
+        task3_vqa_reward_score = 0.0
         if not isinstance(response, Exception) and response is not None:
             task3_idx_to_ans: dict = image_evaluator_parser(response)
-            task3_vlm_reward_score_sum = sum(task3_idx_to_ans.values())
+            task3_vqa_reward_score_sum = sum(task3_idx_to_ans.values())
             task3_ans_count = len(task3_idx_to_ans)
-            task3_vlm_reward_score = 1.0 if task3_vlm_reward_score_sum == task3_ans_count else 0.0
-            reward_score += task3_vlm_reward_score
-            reward_extra_info[f"task{task_id}_vlm_reward"] = task3_vlm_reward_score
+            task3_vqa_reward_score = 1.0 if task3_vqa_reward_score_sum == task3_ans_count else 0.0
+            reward_score += task3_vqa_reward_score
+            reward_extra_info[f"task{task_id}_vqa_reward"] = task3_vqa_reward_score
         else:
             reward_score += 0.0
-            reward_extra_info[f"task{task_id}_vlm_reward"] = 0.0
+            reward_extra_info[f"task{task_id}_vqa_reward"] = 0.0
         
         reward_extra_info[f"task{task_id}_reward_response"] = response if isinstance(response, Exception) else str(response)
 
@@ -1106,12 +1106,12 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
         reward_extra_info[f"task{task_id}_detector_response"] = detector_response if not isinstance(detector_response, Exception) else str(detector_response)
 
         # Bonus if both perfect
-        if task3_vlm_reward_score == 1 and detector_reward == 1:
+        if task3_vqa_reward_score == 1 and detector_reward == 1:
             reward_score += 1.0
-            reward_extra_info[f"task{task_id}_vlm_detector_bonus"] = 1.0
+            reward_extra_info[f"task{task_id}_vqa_detector_bonus"] = 1.0
         else:
             reward_score += 0.0
-            reward_extra_info[f"task{task_id}_vlm_detector_bonus"] = 0.0
+            reward_extra_info[f"task{task_id}_vqa_detector_bonus"] = 0.0
 
     return {
         "score": reward_score,

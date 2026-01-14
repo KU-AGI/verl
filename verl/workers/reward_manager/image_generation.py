@@ -69,7 +69,7 @@ class ImageGenerationRewardManager:
         summarizes = [reward_model[i].get("summary", None) if i < len(reward_model) else "" for i in range(len(data))]
         feedback_tuples = [reward_model[i].get("tuple", None) if i < len(reward_model) else None for i in range(len(data))]
         vqa_questions = [reward_model[i].get("vqa_question", None) if i < len(reward_model) else None for i in range(len(data))]
-        extra_infos = [data.meta_info.get("extra_info", {})] * len(data)
+        extra_infos = [{k: v[i] for k, v in (data.meta_info.get("extra_info", None) or {}).items() if isinstance(v, list) and i < len(v)} for i in range(len(data))]
         task_ids = [task_id] * len(data)
 
         # Call batch processing function
@@ -95,6 +95,7 @@ class ImageGenerationRewardManager:
         # Initialize reward tensor
         reward_tensor = torch.zeros_like(response_mask, dtype=torch.float32)
         reward_extra_info = defaultdict(list)
+        accumulate_extra_info = defaultdict(list)
         
         prompt = data.non_tensor_batch.get('prompt', [])
 
@@ -128,6 +129,8 @@ class ImageGenerationRewardManager:
             for key in all_extra_info_keys:
                 # Use None as placeholder if this sample doesn't have this key
                 reward_extra_info[key].append(sample_extra_info.get(key, None))
+                # Accumulate all task evaluation in meta_info?
+                accumulate_extra_info[key].append(sample_extra_info.get(key, None))
 
             rewards.append(reward)
             reward_tensor[i, valid_response_length - 1] = reward
@@ -152,6 +155,8 @@ class ImageGenerationRewardManager:
 
         # Store accuracy
         data.batch[f"task{task_id}_acc"] = torch.tensor(rewards, dtype=torch.float32)
+        # Store reward extra info
+        data.meta_info["extra_info"] = accumulate_extra_info
 
         # Compute mean excluding -100 rewards
         valid_rewards = [reward for reward in rewards if reward != -100]
