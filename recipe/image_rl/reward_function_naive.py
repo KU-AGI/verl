@@ -26,15 +26,9 @@ from recipe.image_rl.gdino_regex import _CONNECTORS, SKIP_KEYWORDS, _COMPILED_RE
 # Configuration
 VLM_BASE_URLS = [
     # "http://10.100.44.4:8006/v1", # main1
-    # "http://10.100.44.8:8006/v1", # sub1
-    # "http://10.100.44.8:8007/v1",
-    "http://10.100.44.2:8000/v1", # sub2
-    "http://10.100.44.2:8001/v1",
-    "http://10.100.44.2:8002/v1",
-    "http://10.100.44.2:8003/v1",
-    "http://10.100.44.2:8004/v1", # sub2
-    "http://10.100.44.2:8005/v1",
-    "http://10.100.44.2:8006/v1",
+    "http://10.100.44.8:8006/v1", # sub1
+    "http://10.100.44.8:8007/v1",
+    "http://10.100.44.2:8006/v1", # sub2
     "http://10.100.44.2:8007/v1",
     
 ]
@@ -57,10 +51,10 @@ RECOVERY_CHECK_INTERVAL = 60  # seconds to wait before checking if unhealthy ser
 
 # Detector configuration
 DETECTOR_URLS = [
-    "http://10.100.44.2:8084",
-    "http://10.100.44.2:8085",
-    "http://10.100.44.2:8086",
-    "http://10.100.44.2:8087",
+    # "http://10.100.44.2:8084",
+    # "http://10.100.44.2:8085",
+    # "http://10.100.44.2:8086",
+    # "http://10.100.44.2:8087",
 ]
 DETECTOR_TIMEOUT = 300000.0
 
@@ -372,7 +366,7 @@ def get_messages(*args):
 
     if task_id == 1:
         system_prompt = TASK1_TASK3_IMAGE_GENERATOR_SYSTEM_PROMPT_TEMPLATE
-        user_prompt = TASK1_TASK3_IMAGE_GENERATOR_USER_PROMPT_TEMPLATE.format(questions=vqa_question)
+        user_prompt = vqa_question #TASK1_TASK3_IMAGE_GENERATOR_USER_PROMPT_TEMPLATE.format(questions=vqa_question)
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": [
@@ -394,7 +388,7 @@ def get_messages(*args):
         model = RM_VLM_MODEL_PATH
     elif task_id == 3:
         system_prompt = TASK1_TASK3_IMAGE_GENERATOR_SYSTEM_PROMPT_TEMPLATE
-        user_prompt = TASK1_TASK3_IMAGE_GENERATOR_USER_PROMPT_TEMPLATE.format(questions=vqa_question)
+        user_prompt = vqa_question #TASK1_TASK3_IMAGE_GENERATOR_USER_PROMPT_TEMPLATE.format(questions=vqa_question)
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": [
@@ -409,25 +403,7 @@ def get_messages(*args):
     return messages, model
 
 
-# Additional message constructors for task 2 subtasks
-def get_messsages_task2_vqa_pass_or_fail(*args): # 5: part 1
-    prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback, vqa_question, extra_info, task_id = args
-
-    system_prompt = TASK2_VQA_PASS_OR_FAIL_SYSTEM_PROMPT_TEMPLATE
-    task1_vlm_reward_response = extra_info.get("task1_reward_response", "")
-    user_prompt = TASK2_VQA_PASS_OR_FAIL_USER_PROMPT_TEMPLATE.format(prompt=prompt, task1_vlm_reward_response=task1_vlm_reward_response, predicted_answer=predicted_answer)
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": [
-            {"type": "text", "text": user_prompt},
-        ]}
-    ]
-    model = RM_VLM_MODEL_PATH
-
-    return messages, model
-
-
-def get_messsages_task3_edit_instruction_following(*args): # 5: part 1
+def get_messsages_task3_edit_instruction_following(*args): # 5: part 4
     prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback, vqa_question, extra_info, task_id = args
 
     system_prompt = TASK3_EDIT_INSTRUCTION_FOLLOWING_SYSTEM_PROMPT
@@ -561,29 +537,29 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
         
         need_to_get_feedback_reward = False
         if vqa_judge and predicted_judge: # VLM yes & policy yes
-            reward_extra_info[f"task{task_id}_vqa_pass_or_fail_reward"] = 1.0
-            reward_extra_info[f"task{task_id}_vqa_pass_or_fail_reward_response"] = "No need to get feedback reward. Both VQA alignment and predicted answer judge are positive(+)."
+            reward_extra_info[f"task{task_id}_judge_alignment_reward"] = 1.0
+            reward_extra_info[f"task{task_id}_judge_alignment_response"] = "No need to get feedback reward. Both VQA alignment and predicted answer judge are positive(+)."
             reward_extra_info[f"task{task_id}_feedback_reward"] = 1.0
             reward_extra_info[f"task{task_id}_feedback_reward_response"] = "No need to get feedback response. Both VQA alignment and predicted answer judge are positive(+)."
             need_to_get_feedback_reward = False 
 
         elif vqa_judge and not predicted_judge: # VLM yes & policy no
-            reward_extra_info[f"task{task_id}_vqa_pass_or_fail_reward"] = 0.0
-            reward_extra_info[f"task{task_id}_vqa_pass_or_fail_reward_response"] = "Fail due to mismatch between VQA alignment and predicted answer judge. VQA alignment is positive(+) but predicted answer judge is negative(-)."
+            reward_extra_info[f"task{task_id}_judge_alignment_reward"] = 0.0
+            reward_extra_info[f"task{task_id}_judge_alignment_reward_response"] = "Fail due to mismatch between VQA alignment and predicted answer judge. VQA alignment is positive(+) but predicted answer judge is negative(-)."
             reward_extra_info[f"task{task_id}_feedback_reward"] = 0.0
             reward_extra_info[f"task{task_id}_feedback_reward_response"] = "Fail to get feedback reward due to mismatch between VQA alignment and predicted answer judge."
             need_to_get_feedback_reward = False
 
         elif not vqa_judge and predicted_judge: # VLM no & policy yes
-            reward_extra_info[f"task{task_id}_vqa_pass_or_fail_reward"] = 0.0
-            reward_extra_info[f"task{task_id}_vqa_pass_or_fail_reward_response"] = "Fail due to mismatch between VQA alignment and predicted answer judge. VQA alignment is negative(-) but predicted answer judge is positive(+)."
+            reward_extra_info[f"task{task_id}_judge_alignment_reward"] = 0.0
+            reward_extra_info[f"task{task_id}_judge_alignment_reward_response"] = "Fail due to mismatch between VQA alignment and predicted answer judge. VQA alignment is negative(-) but predicted answer judge is positive(+)."
             reward_extra_info[f"task{task_id}_feedback_reward"] = 0.0
             reward_extra_info[f"task{task_id}_feedback_reward_response"] = "Fail to get feedback reward due to mismatch between VQA alignment and predicted answer judge."
             need_to_get_feedback_reward = False
 
         elif not vqa_judge and not predicted_judge: # VLM no & policy no
-            reward_extra_info[f"task{task_id}_vqa_pass_or_fail_reward"] = 1.0
-            reward_extra_info[f"task{task_id}_vqa_pass_or_fail_reward_response"] = "Both VQA alignment and predicted answer judge are negative(-). Proceed to get feedback reward."
+            reward_extra_info[f"task{task_id}_judge_alignment_reward"] = 1.0
+            reward_extra_info[f"task{task_id}_judge_alignment_reward_response"] = "Both VQA alignment and predicted answer judge are negative(-). Proceed to get feedback reward."
             need_to_get_feedback_reward = True # Need to get feedback reward
 
         if not need_to_get_feedback_reward: # Early return
