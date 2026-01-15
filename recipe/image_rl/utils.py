@@ -1,5 +1,6 @@
 import re
 import torch
+import spacy
 
 class FormattingEvaluator:
     def __init__(self):
@@ -83,8 +84,8 @@ class FormattingEvaluator:
         metrics = {}
         
         # Part 1: F1 score
-        gt_contents = {content for _, content in gt_part1}
-        pred_contents = {content for _, content in pred_part1}
+        gt_contents = {content.lower() for _, content in gt_part1}
+        pred_contents = {content.lower() for _, content in pred_part1}
         correct_matches = len(gt_contents.intersection(pred_contents))
         total_gt = len(gt_part1)
 
@@ -105,6 +106,7 @@ class FormattingEvaluatorV2:
         self.SECOND_PATTERN = "Second, Decompose summarize"
         self.THIRD_PATTERN = "Third, Verify that the decomposed elements align with the image."
         self.FOURTH_PATTERN = "Fourth, Generate corrective feedback."
+        self.nlp = spacy.load("en_core_web_sm", disable=["parser", "ner"])
 
     def _split_text_into_parts(self, text):
         """
@@ -159,7 +161,7 @@ class FormattingEvaluatorV2:
         """모든 답변이 Yes인지 확인"""
         answers = [self._get_answer_from_paragraph(para) for para in paragraphs]
         answers_int = [1 if ans.lower() == "yes" else 0 for ans in answers if ans is not None]
-        return all(ans == 1 for ans in answers_int) if len(answers_int) > 0 else False
+        return 1.0 if all(ans == 1 for ans in answers_int) and len(answers_int) > 0 else 0.0
 
     def _calculate_metrics(self, gt_part2, pred_part2, gt_answers, pred_paragraphs):
         """
@@ -170,8 +172,8 @@ class FormattingEvaluatorV2:
         metrics = {}
 
         # 1. Part 1(Decompose) 내용 정확도
-        gt_contents = {content for _, content in gt_part2}
-        pred_contents = {content for _, content in pred_part2}
+        gt_contents = {self._normalize_content(self.nlp, content) for _, content in gt_part2}
+        pred_contents = {self._normalize_content(self.nlp, content) for _, content in pred_part2}
         correct_matches = len(gt_contents.intersection(pred_contents))
         total_gt = len(gt_part2)
         metrics['part1_accuracy'] = correct_matches / total_gt if total_gt > 0 else 0.0
@@ -204,8 +206,8 @@ class FormattingEvaluatorV2:
         metrics = {}
         
         # Part 1: F1 score
-        gt_contents = {content for _, content in gt_part2}
-        pred_contents = {content for _, content in pred_part2}
+        gt_contents = {self._normalize_content(self.nlp, content) for _, content in gt_part2}
+        pred_contents = {self._normalize_content(self.nlp, content) for _, content in pred_part2}
         correct_matches = len(gt_contents.intersection(pred_contents))
         total_gt = len(gt_part2)
 
@@ -220,3 +222,12 @@ class FormattingEvaluatorV2:
         final_metrics = {k: v.item() if isinstance(v, torch.Tensor) else v for k, v in metrics.items()}
         
         return final_metrics
+
+    def _normalize_content(self, nlp, text):
+        if not text:
+            return ""
+        
+        doc = nlp(text.lower())
+        # 각 토큰의 기본형(lemma)을 추출하여 공백 없이 결합
+        normalized = "".join([token.lemma_.strip() for token in doc if not token.is_space])
+        return normalized

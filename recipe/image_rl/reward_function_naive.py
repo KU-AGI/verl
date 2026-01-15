@@ -350,7 +350,7 @@ def convert_gen_img_to_base64(gen_img) -> Optional[str]:
     
 
 def image_evaluator_parser(text):
-    ans_line_re = re.compile(r'^\s*(\d+)\s*\|\s*Answer:\s*(Yes|No)\s*$', re.IGNORECASE | re.MULTILINE)
+    ans_line_re = re.compile(r'(?:step\s+)?(\d+)\s*\|\s*Answer:\s*(Yes|No)', re.IGNORECASE) # whether step <index> or <index>
     
     idx_to_ans = {} # 1 | ... Answer: Yes or No -> {1: True or False}
     for idx_str, yn in ans_line_re.findall(text):
@@ -411,8 +411,9 @@ def get_messsages_task3_edit_instruction_following(*args): # 5: part 4
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": [
-            {"type": "image_url", "image_url": {"url": convert_gen_img_to_base64(gen_img)}},
             {"type": "text", "text": user_prompt},
+            {"type": "image_url", "image_url": {"url": convert_gen_img_to_base64(gen_img)}},
+            {"type": "image_url", "image_url": {"url": convert_gen_img_to_base64(regen_img)}},
         ]}
     ]
     model = RM_VLM_MODEL_PATH
@@ -426,7 +427,12 @@ async def get_response_with_client(client, messages, model):
         model=model,
         messages=messages,
         max_tokens=4096,
-        extra_body={"repetition_penalty": 1.2},
+        extra_body={
+            "repetition_penalty": 1.2,
+            # "top_p": 1.0,
+            # "top_k": 40,
+            "temperature": 0.0,
+        },
         timeout=300000.0,
     )
     return response.choices[0].message.content
@@ -478,7 +484,7 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
     reward_score = 0.0
     reward_extra_info = {}
 
-    if task_id == 1: # Total score: 3.0
+    if task_id == 1: # Total score: 1.0
         # Create tasks
         vqa_task = asyncio.create_task(
             get_response(get_messages, prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback, vqa_question, extra_info, task_id)
@@ -487,7 +493,7 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
         # Gather results
         vqa_response = await vqa_task
 
-        # Process VLM response
+        # Process VQA response
         task1_vqa_reward_score = 0.0
         if not isinstance(vqa_response, Exception) and vqa_response is not None:
             try:
@@ -507,7 +513,7 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
 
         reward_extra_info[f"task{task_id}_vqa_reward_response"] = vqa_response if not isinstance(vqa_response, Exception) else str(vqa_response)
 
-    elif task_id == 2:
+    elif task_id == 2: # Total score: 4.0
         task2_reward_score = 0.0
 
         # Call FormattingEvaluator
@@ -531,44 +537,7 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
         # Launch all API requests in parallel
         args = (prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback, vqa_question, extra_info, task_id)
 
-        # Now call VQA pass or fail check
-        predicted_judge = formatting_evaluator.check_all_answers_positive(predict_decomposed_ans)
-        vqa_judge = bool(extra_info.get("task1_vqa_reward", 1.0))
-        
-        need_to_get_feedback_reward = False
-        if vqa_judge and predicted_judge: # VLM yes & policy yes
-            reward_extra_info[f"task{task_id}_judge_alignment_reward"] = 1.0
-            reward_extra_info[f"task{task_id}_judge_alignment_response"] = "No need to get feedback reward. Both VQA alignment and predicted answer judge are positive(+)."
-            reward_extra_info[f"task{task_id}_feedback_reward"] = 1.0
-            reward_extra_info[f"task{task_id}_feedback_reward_response"] = "No need to get feedback response. Both VQA alignment and predicted answer judge are positive(+)."
-            need_to_get_feedback_reward = False 
-
-        elif vqa_judge and not predicted_judge: # VLM yes & policy no
-            reward_extra_info[f"task{task_id}_judge_alignment_reward"] = 0.0
-            reward_extra_info[f"task{task_id}_judge_alignment_reward_response"] = "Fail due to mismatch between VQA alignment and predicted answer judge. VQA alignment is positive(+) but predicted answer judge is negative(-)."
-            reward_extra_info[f"task{task_id}_feedback_reward"] = 0.0
-            reward_extra_info[f"task{task_id}_feedback_reward_response"] = "Fail to get feedback reward due to mismatch between VQA alignment and predicted answer judge."
-            need_to_get_feedback_reward = False
-
-        elif not vqa_judge and predicted_judge: # VLM no & policy yes
-            reward_extra_info[f"task{task_id}_judge_alignment_reward"] = 0.0
-            reward_extra_info[f"task{task_id}_judge_alignment_reward_response"] = "Fail due to mismatch between VQA alignment and predicted answer judge. VQA alignment is negative(-) but predicted answer judge is positive(+)."
-            reward_extra_info[f"task{task_id}_feedback_reward"] = 0.0
-            reward_extra_info[f"task{task_id}_feedback_reward_response"] = "Fail to get feedback reward due to mismatch between VQA alignment and predicted answer judge."
-            need_to_get_feedback_reward = False
-
-        elif not vqa_judge and not predicted_judge: # VLM no & policy no
-            reward_extra_info[f"task{task_id}_judge_alignment_reward"] = 1.0
-            reward_extra_info[f"task{task_id}_judge_alignment_reward_response"] = "Both VQA alignment and predicted answer judge are negative(-). Proceed to get feedback reward."
-            need_to_get_feedback_reward = True # Need to get feedback reward
-
-        if not need_to_get_feedback_reward: # Early return
-            return {
-                "score": task2_reward_score,
-                "reward_extra_info": reward_extra_info,
-            }
-
-        # Gather results
+        # Get reward from API
         feedback_task = asyncio.create_task(get_response(get_messages, *args)) # +1
 
         # Await feedback response
@@ -581,31 +550,26 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
                 feedback_success = safe_json_loads(feedback_response)
                 if feedback_success and feedback_success.get("answer", "").lower() == "yes":
                     task2_feedback_reward_score = 1.0
-                else:
-                    task2_feedback_reward_score = 0.0
-
-                task2_reward_score += task2_feedback_reward_score
-                # task2_ans_count += 1
             except:
                 task2_feedback_reward_score = 0.0
-                task2_reward_score += 0.0
         else:
             task2_feedback_reward_score = 0.0
-            task2_reward_score += 0.0
 
-        # reward_score += (task2_reward_score / task2_ans_count) if task2_ans_count > 0 else 0.0
+        # DO NOT record feedback reward in score right now
         reward_extra_info[f"task{task_id}_feedback_reward"] = task2_feedback_reward_score
-        reward_extra_info[f"task{task_id}_feedback_reward_response"] = feedback_response if not isinstance(feedback_response, Exception) else str(feedback_response)
+        reward_extra_info[f"task{task_id}_feedback_reward_response"] = feedback_response if not isinstance(feedback_response, Exception) else None # for postprocessing
 
-        # reward_score += (task2_reward_score / task2_ans_count) if task2_ans_count > 0 else 0.0
         reward_score += task2_reward_score # not normalizing
 
-    elif task_id == 3: # Total score: 4.0
+    elif task_id == 3: # Total score: 2.0
         last = predicted_feedback
         if last is not None and "No need to generate feedback.".lower() in last.lower():
             reward_score = -100
             reward_extra_info[f"task{task_id}_vqa_reward"] = reward_score
-            reward_extra_info[f"task{task_id}_vqa_reward_response"] = "None"
+            reward_extra_info[f"task{task_id}_vqa_reward_response"] = "No need to get VQA reward."
+            reward_extra_info[f"task{task_id}_edit_reward"] = reward_score
+            reward_extra_info[f"task{task_id}_edit_reward_response"] = "No need to get Edit reward."
+
             return {
                 "score": reward_score,
                 "reward_extra_info": reward_extra_info,
@@ -619,7 +583,7 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
 
         vqa_response = await vqa_task
 
-        # Process VLM response
+        # Process VQA response
         task3_vqa_reward_score = 0.0
         if not isinstance(vqa_response, Exception) and vqa_response is not None:
             task3_vqa_idx_to_ans: dict = image_evaluator_parser(vqa_response)
@@ -636,7 +600,7 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
 
         edit_response = await edit_task
 
-        # Process VLM response
+        # Process Edit response
         task3_edit_reward_score = 0.0
         if not isinstance(edit_response, Exception) and edit_response is not None:
             task3_edit_idx_to_ans: dict = image_evaluator_parser(edit_response)
@@ -655,6 +619,93 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
         "score": reward_score,
         "reward_extra_info": reward_extra_info,
     }
+
+
+def postprocess_task2_rewards(results: List[Dict], extra_infos: List[Dict], task_ids: List[int]) -> List[Dict]:
+    """
+    Post-process task2 rewards by comparing VQA judge (from task1) with predicted judge.
+    
+    This function should be called after compute_score_batch_async when task1 results
+    are available in extra_infos.
+    
+    Args:
+        results: List of result dicts from compute_score_batch_async
+        extra_infos: List of extra_info dicts containing task1_vqa_reward
+        task_ids: List of task IDs corresponding to each result
+    
+    Returns:
+        Updated results list with task2 rewards properly calculated
+    """
+    formatting_evaluator = FormattingEvaluatorV2()
+    
+    for idx, (result, extra_info, task_id) in enumerate(zip(results, extra_infos, task_ids)):
+        if result is None:
+            continue
+            
+        if task_id != 2:
+            continue
+        
+        reward_extra_info = result.get("reward_extra_info", {})
+        current_score = result.get("score", 0.0)
+        
+        # Get predicted_answer from extra_info (should be stored during compute_score)
+        predicted_answer = extra_info.get("predicted_answer", None)
+        if predicted_answer is None:
+            # Try to reconstruct from feedback_text if available
+            feedback_text = extra_info.get("feedback_text", "")
+            if feedback_text:
+                _, _, predicted_answer, _ = formatting_evaluator._split_text_into_parts(feedback_text.strip())
+        
+        if predicted_answer is None:
+            # Cannot evaluate without predicted_answer
+            reward_extra_info["task2_judge_alignment_reward"] = 0.0
+            reward_extra_info["task2_judge_alignment_reward_response"] = "Cannot evaluate: predicted_answer not available"
+            reward_extra_info["task2_feedback_reward"] = 0.0
+            continue
+        
+        # Get VQA judge from task1 result (should be in extra_info)
+        vqa_judge = bool(extra_info.get("task1_vqa_reward", None))
+        
+        # Get predicted judge
+        predict_decomposed_ans = formatting_evaluator._extract_answer_paragraphs(predicted_answer)
+        predicted_judge = formatting_evaluator.check_all_answers_positive(predict_decomposed_ans)
+        
+        # Calculate final feedback reward based on judge alignment
+        task2_feedback_reward_score = 0.0
+        
+        if vqa_judge and predicted_judge:
+            # VLM yes & Policy yes -> Direct reward without API
+            task2_feedback_reward_score = 1.0
+            reward_extra_info["task2_judge_alignment_reward"] = 1.0
+            reward_extra_info["task2_judge_alignment_reward_response"] = (
+                "No need to get feedback reward. Both VQA alignment and predicted answer judge are positive(+)."
+            )
+            reward_extra_info["task2_feedback_reward"] = task2_feedback_reward_score
+            
+        elif not vqa_judge and not predicted_judge:
+            # VLM no & Policy no -> Use the API feedback reward already computed
+            task2_feedback_reward_score = reward_extra_info.get("task2_feedback_reward", 0.0)
+            reward_extra_info["task2_judge_alignment_reward"] = 1.0
+            reward_extra_info["task2_judge_alignment_reward_response"] = (
+                "Both VQA alignment and predicted answer judge are negative(-). Using API feedback reward."
+            )
+            reward_extra_info["task2_feedback_reward"] = task2_feedback_reward_score
+            
+        else:
+            # Mismatch case: VLM yes & Policy no / VLM no & Policy yes
+            task2_feedback_reward_score = 0.0
+            reward_extra_info["task2_judge_alignment_reward"] = 0.0
+            reward_extra_info["task2_judge_alignment_reward_response"] = (
+                f"Fail due to mismatch between VQA alignment ({vqa_judge}) and predicted answer judge ({predicted_judge})."
+            )
+            reward_extra_info["task2_feedback_reward"] = 0.0
+        
+        # Update the score with feedback reward
+        result["score"] = current_score + task2_feedback_reward_score
+        result["reward_extra_info"] = reward_extra_info
+        results[idx] = result
+    
+    return results
 
 
 async def compute_score_batch_async(prompts, gen_imgs, feedback_texts, regen_imgs, ground_truth_imgs, summarizes, feedback_tuples, vqa_questions, extra_infos, task_ids):
@@ -753,3 +804,52 @@ def safe_json_loads(text):
         return json.loads(text)
     except:
         return None
+
+
+# Make this async to work with the async reward loop
+async def compute_score_batch_with_postprocess(prompts, gen_imgs, feedback_texts, regen_imgs, ground_truth_imgs, summarizes, feedback_tuples, vqa_questions, extra_infos, task_ids):
+    """Async batch processing - directly calls the async implementation"""
+    # First, compute all scores
+    results = await compute_score_batch_async(
+        prompts, gen_imgs, feedback_texts, regen_imgs, ground_truth_imgs, summarizes, feedback_tuples, vqa_questions, extra_infos, task_ids
+    )
+    
+    # Build a mapping from prompt to task1 vqa_reward for cross-task reference
+    prompt_to_task1_vqa = {}
+    for idx, (prompt, task_id, result) in enumerate(zip(prompts, task_ids, results)):
+        if result is None:
+            continue
+        if task_id == 1:
+            vqa_reward = result.get("reward_extra_info", {}).get("task1_vqa_reward", 0.0)
+            prompt_to_task1_vqa[prompt] = vqa_reward
+    
+    # Update extra_infos with task1 vqa rewards and feedback_text for task2
+    updated_extra_infos = []
+    for idx, (prompt, feedback_text, extra_info, task_id) in enumerate(zip(prompts, feedback_texts, extra_infos, task_ids)):
+        updated_info = dict(extra_info) if extra_info else {}
+        
+        if task_id == 2:
+            # Add task1 vqa reward if available
+            if prompt in prompt_to_task1_vqa:
+                updated_info["task1_vqa_reward"] = prompt_to_task1_vqa[prompt]
+            # Store feedback_text for post-processing
+            updated_info["feedback_text"] = feedback_text
+            
+        updated_extra_infos.append(updated_info)
+    
+    # Run post-processing for task2
+    results = postprocess_task2_rewards(results, updated_extra_infos, task_ids)
+    
+    return results
+
+
+def compute_score_batch_with_postprocess_sync(
+    prompts, gen_imgs, feedback_texts, regen_imgs, ground_truth_imgs,
+    summarizes, feedback_tuples, vqa_questions, extra_infos, task_ids
+):
+    """Synchronous wrapper for compute_score_batch_with_postprocess"""
+    return asyncio.run(
+        compute_score_batch_with_postprocess(
+            prompts, gen_imgs, feedback_texts, regen_imgs, ground_truth_imgs, summarizes, feedback_tuples, vqa_questions, extra_infos, task_ids
+        )
+    )
