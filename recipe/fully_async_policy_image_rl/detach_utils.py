@@ -15,6 +15,8 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Optional, Union
+import re
+import json
 
 import numpy as np
 import torch
@@ -25,9 +27,19 @@ from recipe.fully_async_policy_image_rl.agent_loop.agent_loop import AgentLoopOu
 from verl.trainer.ppo.ray_trainer import compute_response_mask
 from verl.utils.model import compute_position_id_with_mask
 import PIL
-
+from recipe.image_rl.utils import FormattingEvaluatorV2
 
 import PIL.Image
+
+def safe_json_loads(text):
+    try:
+        # Markdown 블록 제거 및 순수 JSON 추출
+        match = re.search(r'\{.*\}', text, re.DOTALL)
+        if match:
+            return json.loads(match.group())
+        return json.loads(text)
+    except:
+        return None
 
 def postprocess_agent_loop_outputs(rs_or_list: Union["RolloutSample", list], tokenizer, config, processor) -> DataProto:
     """Optimized postprocessing of AgentLoopOutput list into DataProto with dynamic task_id handling"""
@@ -244,8 +256,84 @@ def merge_rollout_sample(config, tokenizer, rs: RolloutSample, processor):
     
     # Step 3: Clear agent_loop_output_list
     rs.agent_loop_output_list = []
+
+    # Step 4: Calculate ramained reward
+    # Extract task 1 VQA judge
+    vqa_judges: list = rs.full_batch.meta_info.get("task1_vqa_reward", [None] * batch_size)
+
+    # Extract task 2 predicted judge
+    formatting_evaluator = FormattingEvaluatorV2()
+    feedback_texts = rs.full_batch.non_tensor_batch.get('task2_feedback_texts', [None] * batch_size)
+
+    predicted_judges: list = []
+    for feedback_text in feedback_texts:
+        par1, part2, part3, part4 = formatting_evaluator._split_text_into_parts(feedback_text.strip())
+        predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback = par1, part2, part3, part4
+        predict_decomposed_ans = formatting_evaluator._extract_answer_paragraphs(predicted_answer)
+        predicted_judge = formatting_evaluator.check_all_answers_positive(predict_decomposed_ans)
+        predicted_judges.append(predicted_judge)
+
+    task2_token_level_scores = rs.full_batch.batch["task2_token_level_scores"]
+    task2_response_mask = rs.full_batch.batch["task2_response_mask"]
+
+    extra_info = rs.full_batch.meta_info
+    extra_info["task2_judge_alignment_reward"] = [-100] * batch_size 
+    extra_info["task2_judge_alignment_reward_response"] = [None] * batch_size
+
+    task2_feedback_reward_score: list = [-100] * batch_size
+    for i, (vqa_judge, predicted_judge) in enumerate(zip(vqa_judges, predicted_judges)):
+
+        vqa_judge = bool(vqa_judge) # 1.0 or 0.0
+        
+        if vqa_judge is None or predicted_judge is None: # Invalid case
+            task2_feedback_reward_score[i] = 0.0
+            extra_info["task2_judge_alignment_reward"][i] = -100
+            extra_info["task2_feedback_reward"][i] = -100
+            extra_info["task2_judge_alignment_reward_response"][i] = "Judge value is None."
+            extra_info["task2_feedback_reward_response"][i] = "Judge value is None."
+            
+        elif vqa_judge and predicted_judge:  # VLM yes & Policy yes
+            task2_feedback_reward_score[i] = 1.0
+            extra_info["task2_judge_alignment_reward"][i] = 1.0
+            extra_info["task2_feedback_reward"][i] = 1.0
+            extra_info["task2_judge_alignment_reward_response"][i] = "No need to get feedback reward. Both VQA alignment and predicted answer judge are positive(+)."
+            extra_info["task2_feedback_reward_response"][i] = "No need to get feedback response. Both VQA alignment and predicted answer judge are positive(+)."
+            
+        elif not vqa_judge and not predicted_judge:  # VLM no & Policy no
+            # Get reward from API
+            # feedback_response = await feedback_task
+            feedback_reward = 0.0
+            
+            task2_feedback_reward_response = extra_info["task2_feedback_reward_response"][i]
+            if task2_feedback_reward_response is not None:
+                try:
+                    feedback_success = safe_json_loads(task2_feedback_reward_response)
+                    if feedback_success and feedback_success.get("answer", "").lower() == "yes":
+                        feedback_reward = 1.0
+                except:
+                    feedback_reward = 0.0
+            
+            task2_feedback_reward_score[i] = feedback_reward
+            extra_info["task2_judge_alignment_reward"][i] = 1.0
+            extra_info["task2_judge_alignment_reward_response"][i] = "Both VQA alignment and predicted answer judge are negative(-). Proceed to get feedback reward."
+            extra_info["task2_feedback_reward"][i] = feedback_reward
+            extra_info["task2_feedback_reward_response"][i] = task2_feedback_reward_response if task2_feedback_reward_response is not None else str(task2_feedback_reward_response)
+            
+        else:  # VLM yes & Policy no / VLM no & Policy yes (Mismatch)
+            task2_feedback_reward_score[i] = 0.0
+            extra_info["task2_judge_alignment_reward"][i] = 0.0
+            extra_info["task2_feedback_reward"][i] = 0.0
+            extra_info["task2_judge_alignment_reward_response"][i] = "Fail due to mismatch between VQA alignment and predicted answer judge."
+            extra_info["task2_feedback_reward_response"][i] = "Fail to get feedback reward due to mismatch between VQA alignment and predicted answer judge."
+        
+        # task2_token_level_scores update
+        valid_response_length = task2_response_mask[i].sum().int()
+        task2_token_level_scores[i, valid_response_length - 1] += task2_feedback_reward_score[i]
     
-    # Step 4: Mask invalid rewards (-100) for each task
+    rs.full_batch.batch["task2_token_level_scores"] = task2_token_level_scores
+    rs.full_batch.meta_info.update(extra_info)
+
+    # Step 5: Mask invalid rewards (-100) for each task
     for task_id in [1, 2, 3]:  # task1, task2, task3
         scores_key = f"task{task_id}_token_level_scores"
         response_mask_key = f"task{task_id}_response_mask"
