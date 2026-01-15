@@ -36,6 +36,7 @@ import json
 from pathlib import Path
 from torch.distributed.device_mesh import DeviceMesh
 from verl.workers.config import HFModelConfig, RolloutConfig
+import verl.utils.torch_functional as verl_F
 from recipe.image_rl.config import ImageGenerationHFModelConfig
 from recipe.image_rl.utils import FormattingEvaluatorV2
 import asyncio
@@ -241,7 +242,7 @@ class ImageUnifiedRollout(BaseRollout):
     def apply_rollout_weights_from_path(self, version: int, file_path: str):
         return self.inference_engine.worker.model_runner.model.load_weights_from_path(file_path)
 
-    def _pad_tensor_left(self, tensor: torch.Tensor, target_length: int, pad_value: int) -> torch.Tensor:
+    def _pad_tensor_left(self, tensor: torch.Tensor, target_length: int, pad_value: float | int = 0) -> torch.Tensor:
         """Left padding for input tensors"""
         if tensor.dim() == 2:  # [batch_size, seq_len]
             current_length = tensor.size(1)
@@ -264,7 +265,7 @@ class ImageUnifiedRollout(BaseRollout):
         else:
             return tensor
 
-    def _pad_tensor_right(self, tensor: torch.Tensor, target_length: int, pad_value: int) -> torch.Tensor:
+    def _pad_tensor_right(self, tensor: torch.Tensor, target_length: int, pad_value: float | int = 0) -> torch.Tensor:
         """Right padding for output tensors"""
         if tensor.dim() == 2:  # [batch_size, seq_len]
             current_length = tensor.size(1)
@@ -304,7 +305,7 @@ class ImageUnifiedRollout(BaseRollout):
                     data_proto.batch[key], self.prompt_length, pad_value
                 )
         
-        # Skip Task 1 - Image Generation (outputs) tokens are always same length (576)
+        # Skip Task 1 - Image Generation (outputs) tokens and log probs are always same length (576)
 
         # Task 2 - Text Generation (inputs)
         input_tensors_task2 = [
@@ -322,11 +323,11 @@ class ImageUnifiedRollout(BaseRollout):
 
         # Task 2 - Text Generation (outputs)
         output_tensors_task2 = [
-            "task2_feedback_ids", "task2_response_mask"
+            "task2_feedback_ids", "task2_response_mask", "task2_rollout_log_probs"
         ]
         for key in output_tensors_task2:
             if key in data_proto.batch:
-                if "mask" in key:
+                if ("mask" in key) or ("log_probs" in key):
                     pad_value = 0  # attention masks and embeddings use 0 padding
                 else:
                     pad_value = self.processor.tokenizer.eos_token_id
@@ -348,7 +349,7 @@ class ImageUnifiedRollout(BaseRollout):
                     data_proto.batch[key], self.prompt_length, pad_value
                 )
 
-        # Skip Task 3 - Regen Image Generation (outputs) tokens are always same length (576)
+        # Skip Task 3 - Regen Image Generation (outputs) tokens and log probs are always same length (576)
 
         return data_proto
 
@@ -481,10 +482,10 @@ class ImageUnifiedRollout(BaseRollout):
         data_proto.batch["task1_input_embeds"] = input_embeds
 
         gen_final_cfg_embeds, gen_final_cfg_attention_mask = self._prepare_cfg_embeds(data_proto)
-        generated_tokens = self.generate_img(gen_final_cfg_embeds, gen_final_cfg_attention_mask)
+        generated_tokens, generated_logprobs = self.generate_img(gen_final_cfg_embeds, gen_final_cfg_attention_mask)
         # For reproducing generated images
 
-        data_proto.batch["task1_gen_img_tokens"] = generated_tokens
+        data_proto.batch['task1_rollout_log_probs'] = generated_logprobs.detach().float().cpu()
 
         decoded_images = self._decode_image_tokens(generated_tokens)
         gen_imgs_pil_list = [PIL.Image.fromarray(img_array) for img_array in decoded_images]
@@ -637,23 +638,30 @@ class ImageUnifiedRollout(BaseRollout):
         data_proto.batch["task2_attention_mask"] = batched_attention_mask
         data_proto.batch["task2_input_embeds"] = merged_embeds
 
-        feedback_texts = self.generate_text(merged_embeds, batched_attention_mask)
+        feedback_texts, gen_sequences, log_probs = self.generate_text(merged_embeds, batched_attention_mask)
 
+        pad_token_id = self.processor.tokenizer.eos_token_id
+        response_mask = (gen_sequences != pad_token_id).long()
+
+        first_pad_indices = (gen_sequences == pad_token_id).long().argmax(dim=-1)
+        has_pad = (gen_sequences == pad_token_id).any(dim=-1)
+        batch_indices = torch.arange(gen_sequences.size(0), device=gen_sequences.device)
+        response_mask[batch_indices, first_pad_indices] = torch.where(
+            has_pad, 
+            torch.ones_like(first_pad_indices), 
+            response_mask[batch_indices, first_pad_indices]
+        )
+        log_probs = log_probs.masked_fill(response_mask == 0, 0.0)
+        
         # For computing logits: output
         data_proto.non_tensor_batch["task2_feedback_texts"] = np.array(feedback_texts, dtype=object)
-        self.processor.tokenizer.pad_token_id = self.processor.tokenizer.eos_token_id # Right padding w/ eos_token_id
-        outputs = self.processor.tokenizer(feedback_texts, padding=True, padding_side='right', return_tensors="pt", add_special_tokens=False)
-        data_proto.batch["task2_feedback_ids"] = outputs["input_ids"]
+        data_proto.batch["task2_feedback_ids"] = gen_sequences.detach().cpu()
+        data_proto.batch['task2_rollout_log_probs'] = log_probs.detach().cpu()
+        data_proto.batch["task2_response_mask"] = response_mask.detach().cpu()
 
         feedback_ids = data_proto.batch["task2_feedback_ids"]
         feedback_ids = feedback_ids.to(self.device)
 
-        # Postprocessing output embeds
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-            text_embeds = self.module.language_model.get_input_embeddings()(feedback_ids)
-            text_embeds = text_embeds.to(dtype=torch.bfloat16)
-
-        data_proto.batch["task2_response_mask"] = outputs["attention_mask"]
         if dist.get_rank() == 0:
             print(f"[TEXT_GEN] Completed feedback generation")
 
@@ -735,9 +743,9 @@ class ImageUnifiedRollout(BaseRollout):
         data_proto.batch["task3_input_embeds"] = merged_embeds
 
         regen_final_cfg_embeds, regen_final_cfg_attention_mask = self._prepare_regen_cfg_embeds(data_proto)
-        regenerated_tokens = self.generate_img(regen_final_cfg_embeds, regen_final_cfg_attention_mask)
+        regenerated_tokens, regenerated_logprobs = self.generate_img(regen_final_cfg_embeds, regen_final_cfg_attention_mask)
 
-        data_proto.batch["task3_regen_img_tokens"] = regenerated_tokens
+        data_proto.batch['task3_rollout_log_probs'] = regenerated_logprobs.detach().float().cpu()
 
         regen_decoded_images = self._decode_image_tokens(regenerated_tokens)
         regen_imgs_pil_list = [PIL.Image.fromarray(img_array) for img_array in regen_decoded_images]
@@ -859,6 +867,7 @@ class ImageUnifiedRollout(BaseRollout):
     def generate_img(self, inputs_embeds: torch.Tensor, attention_masks: torch.Tensor, generator: torch.Generator = None) -> torch.Tensor:
         batch_size = inputs_embeds.shape[0] // 2
         generated_tokens = torch.zeros((batch_size, self.image_token_num_per_image), dtype=torch.int, device=self.device)
+        generated_logprobs = torch.zeros((batch_size, self.image_token_num_per_image), dtype=torch.float32, device=self.device)
 
         attention_mask = attention_masks
 
@@ -887,8 +896,14 @@ class ImageUnifiedRollout(BaseRollout):
                 logit_uncond = logits[1::2, :]
                 
                 logits = logit_uncond + self.cfg_weight * (logit_cond-logit_uncond)
+
+                all_logprobs = torch.log_softmax(logits, dim = -1)
+
                 next_token = self._sample_from_logits(logits, is_text=False, generator=generator)
                 generated_tokens[:, i] = next_token.squeeze(-1)
+
+                token_logprobs = all_logprobs.gather(dim=-1, index=next_token)
+                generated_logprobs[:, i] = token_logprobs.squeeze(-1)
 
                 next_token_pair = next_token.repeat(1, 2).view(-1)
                 inputs_embeds = self.module.prepare_gen_img_embeds(next_token_pair).unsqueeze(1)
@@ -899,7 +914,7 @@ class ImageUnifiedRollout(BaseRollout):
                 position_ids = past_len.clone()
                 past_len += 1
 
-        return generated_tokens
+        return generated_tokens, generated_logprobs
 
     @torch.no_grad()
     def generate_text(self, inputs_embeds: torch.Tensor, attention_masks: torch.Tensor) -> torch.Tensor:
@@ -913,11 +928,20 @@ class ImageUnifiedRollout(BaseRollout):
                 pad_token_id=self.processor.tokenizer.eos_token_id,
                 eos_token_id=self.processor.tokenizer.eos_token_id,
                 bos_token_id=self.processor.tokenizer.bos_token_id,
+                return_dict_in_generate=True,
+                output_scores=True
             )
+        
+        gen_sequences = outputs.sequences
 
-        answer = self.processor.tokenizer.batch_decode(outputs, skip_special_tokens=True)
+        stacked_logits = torch.stack(outputs.scores, dim=1)
 
-        return answer
+        all_logprobs = verl_F.log_probs_from_logits_with_chunking_for_2D(stacked_logits.to(torch.float32), chunk_size=2048) # torch.log_softmax(stacked_logits.to(torch.float32), dim=-1)
+        token_logprobs = all_logprobs.gather(dim=-1, index=gen_sequences.unsqueeze(-1)).squeeze(-1)
+
+        answer = self.processor.tokenizer.batch_decode(gen_sequences, skip_special_tokens=True)
+
+        return answer, gen_sequences, token_logprobs
 
     def _prepare_regen_cfg_embeds(self, data_proto: DataProto) -> Tuple[torch.Tensor, torch.Tensor]:
         input_ids = data_proto.batch['task3_input_ids']
