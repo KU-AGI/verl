@@ -293,9 +293,9 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     for metric_name, metric_values in batch.meta_info.items():
         if metric_name.endswith("_reward") or metric_name.endswith("_score"):
             if len(metric_values) > 0:
-                metrics[f"critic/task{task_id}/{metric_name}/mean"] = np.mean(metric_values)
-                metrics[f"critic/task{task_id}/{metric_name}/max"] = np.max(metric_values)
-                metrics[f"critic/task{task_id}/{metric_name}/min"] = np.min(metric_values)
+                metrics[f"critic/{metric_name}/mean"] = np.mean(metric_values)
+                metrics[f"critic/{metric_name}/max"] = np.max(metric_values)
+                metrics[f"critic/{metric_name}/min"] = np.min(metric_values)
     
     # 3. Compute statistics for _reward & _score metrics by data_source
     if "data_source" in batch.non_tensor_batch:
@@ -312,9 +312,9 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
                 # Compute statistics for each data_source
                 for data_source, vals in data_src2metric_vals.items():
                     if len(vals) > 0:
-                        metrics[f"critic/task{task_id}/{metric_name}/{data_source}/mean"] = np.mean(vals)
-                        metrics[f"critic/task{task_id}/{metric_name}/{data_source}/max"] = np.max(vals)
-                        metrics[f"critic/task{task_id}/{metric_name}/{data_source}/min"] = np.min(vals)
+                        metrics[f"critic/{metric_name}/{data_source}/mean"] = np.mean(vals)
+                        metrics[f"critic/{metric_name}/{data_source}/max"] = np.max(vals)
+                        metrics[f"critic/{metric_name}/{data_source}/min"] = np.min(vals)
     return metrics
 
 
@@ -598,10 +598,10 @@ def process_validation_metrics(
                 if isinstance(var_vals[0], str):
                     continue
 
-                # Filter out -100 values (invalid/masked values)
-                valid_indices = [i for i, val in enumerate(var_vals) if val != -100]
+                # Filter out -100 and None values (invalid/masked values)
+                valid_indices = [i for i, val in enumerate(var_vals) if val != -100 and val is not None]
                 if len(valid_indices) == 0:
-                    continue  # Skip if all values are -100
+                    continue  # Skip if all values are invalid
                 
                 filtered_var_vals = [var_vals[i] for i in valid_indices]
 
