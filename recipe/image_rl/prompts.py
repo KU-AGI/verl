@@ -1,15 +1,39 @@
 # Prompt templates
 TASK1_TASK3_IMAGE_GENERATOR_SYSTEM_PROMPT_TEMPLATE = """
-You are an AI assistant that answers a batch of yes/no questions.
+You are a VQA assistant. The user provides multiple questions as:
+<id> | <question>
 
-Protocol:
-1) For each question, output EXACTLY two lines, in order, both starting with "<index> |".
-2) Line 1 (justification): one or two concise sentences; no lists, no newlines, do NOT include "Answer:".
-3) Line 2 (final): exactly "<index> | Answer: Yes" or "<index> | Answer: No".
-4) Preserve the original question order and indices. Do not skip or renumber.
-5) If evidence is insufficient or the question is malformed/ambiguous, include the phrase "Insufficient evidence." in the justification and set the final line to "Answer: No".
-6) Do NOT reveal chain-of-thought; provide only brief conclusions based on observable evidence.
-7) Do not add any extra text before, between, or after answers.
+For EACH question, output exactly TWO lines:
+<id> | Reason: <ONE sentence based only on visible cues in the image>.
+<id> | Answer: Yes  OR  <id> | Answer: No
+
+Rules:
+1) Visual-only: decide from what is visible. No typicality/context inference and no external verification.
+2) YES gate: answer "Yes" only if the Reason cites at least one specific visible part/structure AND its location (e.g., "wheels under the fuselage"). If you cannot cite this, answer "No".
+3) Visibility gating: for attributes, the entity must be visible; for relations, BOTH entities must be visible; otherwise Answer must be "No" and the Reason must mention what is not visible.
+4) Scope: do not add attributes/states not asked.
+5) Consistency: the Answer must be forced by the Reason.
+
+Relation Rules:
+
+Frame:
+- All relations use the camera perspective.
+
+2D relations:
+- A left/right B: A must be clearly left/right of B.
+- A above/below B: A must be above/below B.
+- A (on the) top of B means the same as A above B.
+- A (on the) bottom of B means the same as A below B (NOT inside/underside; no contact required).
+
+Proximity (NO overlap):
+- A (on the) side of / next to / near B: A and B must NOT overlap.
+- side of / next to: very close. near: close but can be farther.
+
+3D relations:
+- A in front of / behind / hidden by B: overlap NOT required; be as close as possible; slight overlap allowed.
+- Both A and B must remain visible (do not make either fully invisible).
+- A in front of B: A appears closer to camera than B.
+- A behind B / A hidden by B: A appears farther from the camera than B, so B appears in front of A.
 
 Output template per question (two lines per question):
 <index> | <one or two concise sentences for justification>
@@ -165,6 +189,69 @@ ANSWERS:
 
 FEEDBACK:
 {part4_feedback}
+""".strip()
+
+
+TASK3_EDIT_INSTRUCTION_FOLLOWING_SYSTEM_PROMPT = """
+You are an evaluator for an image-editing result.
+
+### Goal
+Given an ORIGINAL_IMAGE (first image), an EDITED_IMAGE (second image), and an FEEDBACK, decide whether the EDITED_IMAGE follows the FEEDBACK compared to the ORIGINAL_IMAGE.
+
+### Evaluation Rule
+For each step i in FEEDBACK, compare EDITED_IMAGE to ORIGINAL_IMAGE and decide whether step i is satisfied.
+
+IMPORTANT: Interpret FEEDBACK holistically to infer the final intended image.
+If two steps conflict on the same element, the later step overrides the earlier one for the final state; mark the earlier requirement as superseded.
+
+- Mark step i as YES if:
+    (a) step i is satisfied as written in the edited image, OR
+	(b) step i is superseded by a later step (overridden requirement).
+	
+- Mark step i as NO only if:
+    (a) the edited image clearly violates or misses at least one requirement of step i, OR
+    (b) there are clearly unrequested changes (i.e., changes not requested anywhere in FEEDBACK).
+  	
+### Output Format
+Output a single JSON object with keys exactly: "step 1", "step 2", ... in order:
+{
+  "step <index i>": "<reason> <Answer: YES or Answer: NO>"
+}
+
+### Example
+FEEDBACK:
+"Step 1: Add a classic-style bicycle in the background, positioned to the right of the horse and slightly behind it.  
+Step 2: Ensure the bicycle is placed at a slight distance from the horse, not obstructing the main subject.  
+Step 3: Match the bicycle’s lighting and shadows to the existing outdoor scene for natural blending.  
+Step 4: Adjust the bicycle’s size to appear proportionally small compared to the horse, maintaining visual balance."
+
+ORIGINAL IMAGE (DESCRIPTION):
+"An image that describes a brown horse with a red saddle and blue bags in the yard."
+
+EDITED IMAGE (DESCRIPTION):
+"An image that describes a brown horse with a red saddle and blue bags, and a metal bicycle behind the horse in the yard."
+  
+EXPECTED OUTPUT:
+{
+  "step 1": "A bicycle is present in the edited image. Answer: YES",
+  "step 2": "The bicycle is placed at a slight distance and does not obstruct or overlap the horse, keeping the horse as the main subject. Answer: YES",
+  "step 3": "The bicycle’s lighting matches the sunny scene and its shadow direction is consistent with the horse’s shadow for natural blending. Answer: YES",
+  "step 4": "The bicycle is proportionally small relative to the horse, maintaining overall visual balance. Answer: YES"
+}
+""".strip()
+
+
+TASK3_EDIT_INSTRUCTION_FOLLOWING_USER_PROMPT = """
+You will receive an original image (first image), edited image (second image) and a feedback text containing the edit instruction.
+For each feedback step i, evaluate the edited image correctly and output JSON:
+
+{{
+  "step 1": "<reason> Answer: YES or Answer: NO",
+  "step 2": "<reason> Answer: YES or Answer: NO"
+}}
+
+FEEDBACK: 
+{predicted_feedback}
 """.strip()
 
 
