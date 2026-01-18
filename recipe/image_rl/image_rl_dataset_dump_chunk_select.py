@@ -32,6 +32,8 @@ import io as _io
 
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer, ProcessorMixin
+import time
+import sys
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +85,9 @@ class ImageRLDataset(Dataset):
         self.use_sample_cache = config.get("use_sample_cache", False)
         self.cache_size = config.get("sample_cache_size", 1000)
         self._sample_cache = {} if self.use_sample_cache else None
+
+        self.chunk_start_idx = config.get("chunk_start_idx", None)
+        self.chunk_end_idx = config.get("chunk_end_idx", None)
 
         self.decode_tensors = config.get("decode_tensors", True)
         self.decode_images = config.get("decode_images", True)
@@ -180,20 +185,12 @@ class ImageRLDataset(Dataset):
             logger.error(f"Path is not a directory: {data_path}")
             return chunks
 
-        chunk_pattern = re.compile(r"^chunk_(\d+)$")
+        chunk_pattern = re.compile(r"^chunk_\d+$")
         chunk_dirs: List[Path] = []
         try:
-            all_chunks = []
             for item in data_path.iterdir():
-                if item.is_dir():
-                    match = chunk_pattern.match(item.name)
-                    if match:
-                        chunk_num = int(match.group(1))
-                        all_chunks.append((chunk_num, item))
-            
-            all_chunks.sort(key=lambda x: x[0])
-            
-            chunk_dirs = [path for _, path in all_chunks[:8]] # 8 chunk: HARD-CODING
+                if item.is_dir() and chunk_pattern.match(item.name):
+                    chunk_dirs.append(item)
         except PermissionError:
             logger.error(f"Permission denied: {data_path}")
             return chunks
@@ -289,6 +286,26 @@ class ImageRLDataset(Dataset):
                     if self.schema_metadata is not None:
                         break
 
+        total_chunks_before_filter = len(all_chunks)
+        
+        if self.chunk_start_idx is not None or self.chunk_end_idx is not None:
+            start_idx = self.chunk_start_idx if self.chunk_start_idx is not None else 0
+            end_idx = self.chunk_end_idx if self.chunk_end_idx is not None else len(all_chunks)
+            
+            # Clamp to valid range
+            start_idx = max(0, min(start_idx, len(all_chunks)))
+            end_idx = max(0, min(end_idx, len(all_chunks)))
+            
+            if start_idx >= end_idx:
+                raise ValueError(
+                    f"Invalid chunk range: chunk_start_idx={self.chunk_start_idx}, "
+                    f"chunk_end_idx={self.chunk_end_idx}, total_chunks={len(all_chunks)}"
+                )
+            
+            all_chunks = all_chunks[start_idx:end_idx]
+            print(f"[ImageRLDataset] Chunk range filter: [{start_idx}, {end_idx}) "
+                  f"-> {len(all_chunks)}/{total_chunks_before_filter} chunks selected")
+
         self.chunk_files = [c[0] for c in all_chunks]
         self.chunk_types = [c[1] for c in all_chunks]
         self.chunk_dirs = [c[2] for c in all_chunks]
@@ -314,7 +331,7 @@ class ImageRLDataset(Dataset):
                 continue
 
         self.total_length = int(total_length)
-        print(f"[ImageRLDataset] Total samples: {self.total_length}")
+        print(f"[ImageRLDataset] Total samples (before sample range filter): {self.total_length}")
 
         if self.total_length == 0:
             preview = "\n".join([f"  - {p} ({t}) -> {err}" for p, t, err in failed[:80]])
@@ -322,10 +339,6 @@ class ImageRLDataset(Dataset):
                 "All chunks failed to load or had zero length; dataset would be empty.\n"
                 "First failures:\n" + preview
             )
-
-        if self.max_samples > 0 and self.max_samples < self.total_length:
-            self.total_length = int(self.max_samples)
-            print(f"[ImageRLDataset] Limited to {self.max_samples} samples")
 
     # ------------------------------ chunk cache ------------------------------
 
@@ -383,13 +396,17 @@ class ImageRLDataset(Dataset):
                 continue
 
             arr = self._as_array(gt[colname])
-            # ✨ 핵심: to_pylist()를 컬럼당 1번만 실행
-            out[field] = arr.to_pylist()
+            #  핵심: to_pylist()를 컬럼당 1번만 실행
+            # out[field] = arr.to_pylist()
+            out[field] = arr
 
         return out
 
     def _load_chunk(self, chunk_idx: int) -> tuple:
         """청크를 로드하고 컬럼 단위로 전처리"""
+        t0 = time.time()
+        os.write(2, f"[DEBUG] _load_chunk enter {chunk_idx}\n".encode())
+
         if chunk_idx in self._chunk_cache:
             self._chunk_cache.move_to_end(chunk_idx)
             return self._chunk_cache[chunk_idx]
@@ -398,6 +415,7 @@ class ImageRLDataset(Dataset):
         chunk_type = self.chunk_types[chunk_idx]
         chunk_dir = self.chunk_dirs[chunk_idx]
 
+        tA = time.time()
         # 1. 데이터셋 로드
         if chunk_type == "arrow":
             try:
@@ -427,33 +445,39 @@ class ImageRLDataset(Dataset):
             ds = load_dataset("parquet", data_files=str(chunk_path), split="train")
         else:
             raise ValueError(f"Unknown chunk type: {chunk_type}")
+        os.write(2, f"[DEBUG] dataset load dt={time.time()-tA:.3f}s\n".encode())
 
         ds.reset_format()
         table = ds.data
 
         # 2. 컬럼 단위로 전체 데이터 추출 (한 번에!)
         chunk_data = {
-            "table": table,
+            # "table": table,
             "chunk_type": chunk_type,
             "chunk_dir": chunk_dir,
             "top_level": {},
             "batch": {},
             "non_tensor_batch": {},
             "meta_info": {},
-            "is_flat": False  # ✨ flat 구조 여부 추적
+            "is_flat": False  #  flat 구조 여부 추적
         }
 
+        tB = time.time()
         # top-level 컬럼들
         for k in ["global_step", "param_version", "local_trigger_step", "images_dir"]:
             if k in table.column_names:
                 arr = self._as_array(table[k])
-                chunk_data["top_level"][k] = arr.to_pylist()
+                # chunk_data["top_level"][k] = arr.to_pylist()
+                chunk_data["top_level"][k] = arr
+        os.write(2, f"[DEBUG] top-level to_pylist dt={time.time()-tB:.3f}s\n".encode())
 
-        # ✨ nested structure 시도 (arrow와 parquet 공통)
+        tC = time.time()
+        #  nested structure 시도 (arrow와 parquet 공통)
         batch_cols = self._extract_group_columns_fast(table, "batch")
         non_tensor_cols = self._extract_group_columns_fast(table, "non_tensor_batch")
         meta_cols = self._extract_group_columns_fast(table, "meta_info")
-        
+        os.write(2, f"[DEBUG] group to_pylist dt={time.time()-tC:.3f}s\n".encode())
+
         if batch_cols or non_tensor_cols or meta_cols:
             # nested structure 존재
             chunk_data["batch"] = batch_cols
@@ -472,27 +496,27 @@ class ImageRLDataset(Dataset):
                 arr = self._as_array(table[col_name])
                 values = arr.to_pylist()
                 
-                # ✨ 컬럼 이름으로 분류 (개선된 휴리스틱)
+                #  컬럼 이름으로 분류 (개선된 휴리스틱)
                 # 1. prompt와 메타데이터
                 if col_name in [self.prompt_key, "uid", "index"]:
-                    chunk_data["non_tensor_batch"][col_name] = values
+                    chunk_data["non_tensor_batch"][col_name] = arr 
                 # 2. 딕셔너리 타입 (extra_info, tools_kwargs 등)
                 elif col_name in ["extra_info", "tools_kwargs", "interaction_kwargs"]:
-                    chunk_data["non_tensor_batch"][col_name] = values
+                    chunk_data["non_tensor_batch"][col_name] = arr
                 # 3. 이미지 관련
                 elif col_name.endswith(("_pil", "_pil_list", "_image", "_images")):
-                    chunk_data["non_tensor_batch"][col_name] = values
+                    chunk_data["non_tensor_batch"][col_name] = arr
                 elif "image" in col_name.lower() or "pil" in col_name.lower():
-                    chunk_data["non_tensor_batch"][col_name] = values
+                    chunk_data["non_tensor_batch"][col_name] = arr
                 # 4. tensor 관련
-                elif col_name.endswith(("_ids", "_mask", "_tokens", "_pixel_values", "_scores")):
-                    chunk_data["batch"][col_name] = values
+                elif col_name.endswith(("_ids", "_mask", "_tokens", "_log_probs", "_pixel_values", "_scores")):
+                    chunk_data["batch"][col_name] = arr
                 # 5. 메타 정보 (step, version 등)
                 elif col_name.endswith(("_step", "_version", "_dir")):
-                    chunk_data["meta_info"][col_name] = values
+                    chunk_data["meta_info"][col_name] = arr
                 # 6. 기타는 non_tensor_batch에
                 else:
-                    chunk_data["non_tensor_batch"][col_name] = values
+                    chunk_data["non_tensor_batch"][col_name] = arr
             
             logger.info(
                 f"[Flat parquet] {chunk_path}: "
@@ -500,7 +524,9 @@ class ImageRLDataset(Dataset):
                 f"non_tensor={len(chunk_data['non_tensor_batch'])}, "
                 f"meta={len(chunk_data['meta_info'])}"
             )
-        
+
+        os.write(2, f"[DEBUG] _load_chunk total dt={time.time()-t0:.3f}s\n".encode())
+
         # 3. 캐시에 저장
         result = chunk_data
         self._chunk_cache[chunk_idx] = result
@@ -595,6 +621,8 @@ class ImageRLDataset(Dataset):
 
     def __getitem__(self, item: int):
         """최적화된 샘플 추출: 캐시된 컬럼 리스트에서 인덱싱만"""
+        t0 = time.perf_counter()
+
         if self._sample_cache is not None and item in self._sample_cache:
             return copy.deepcopy(self._sample_cache[item])
 
@@ -610,8 +638,8 @@ class ImageRLDataset(Dataset):
         row_dict: dict[str, Any] = {}
 
         # top-level fields
-        for k, values in chunk_data["top_level"].items():
-            row_dict[k] = values[local_idx]
+        for k, arr in chunk_data["top_level"].items():
+            row_dict[k] = arr[local_idx].as_py()
 
         # batch 그룹 (tensor로 변환)
         batch_dict = {}
@@ -619,13 +647,13 @@ class ImageRLDataset(Dataset):
         if not isinstance(batch_data, dict):
             logger.error(f"batch is not dict: type={type(batch_data)}, item={item}")
             batch_data = {}
-        
+
         for field, arr in batch_data.items():
             try:
                 value = arr[local_idx].as_py()
                 
                 # tensor 변환
-                if field.endswith(("_ids", "_mask", "_tokens", "_pixel_values", "_scores")):
+                if field.endswith(("_ids", "_mask", "_tokens", "_log_probs", "_pixel_values", "_scores")):
                     value = self._convert_list_to_tensor(value)
                 
                 batch_dict[field] = value
@@ -644,7 +672,7 @@ class ImageRLDataset(Dataset):
             try:
                 value = arr[local_idx].as_py()
                 
-                # ✨ 이미지 경로 변환 (PIL 변환 전에)
+                #  이미지 경로 변환 (PIL 변환 전에)
                 if isinstance(value, str) and ("image" in field.lower() or "pil" in field.lower()):
                     value = self._resolve_image_path(value, chunk_dir)
                 
@@ -678,14 +706,14 @@ class ImageRLDataset(Dataset):
                 logger.warning(f"Failed to process meta field {field} at item {item}: {e}")
                 continue
 
-        # ✨ 이미지 경로 변환 적용
+        #  이미지 경로 변환 적용
         try:
             batch_dict = self._resolve_image_paths_in_dict(batch_dict, chunk_dir, "batch")
             non_tensor_dict = self._resolve_image_paths_in_dict(non_tensor_dict, chunk_dir, "non_tensor_batch")
         except Exception as e:
             logger.warning(f"Failed to resolve image paths at item {item}: {e}")
         
-        # ✨ row_dict 구성 - 빈 딕셔너리도 명시적으로 생성
+        #  row_dict 구성 - 빈 딕셔너리도 명시적으로 생성
         row_dict["batch"] = batch_dict if batch_dict else {}
         row_dict["non_tensor_batch"] = non_tensor_dict if non_tensor_dict else {}
         row_dict["meta_info"] = meta_dict if meta_dict else {}
@@ -726,4 +754,11 @@ class ImageRLDataset(Dataset):
         if self._sample_cache is not None and len(self._sample_cache) < self.cache_size:
             self._sample_cache[item] = copy.deepcopy(row_dict)
 
+        os.write(
+            2,
+            (f"[DEBUG] getitem item={item} chunk={chunk_idx}:{local_idx} "
+            f"is_flat={is_flat} batch_n={len(batch_dict)} non_n={len(non_tensor_dict)} meta_n={len(meta_dict)} "
+            f"dt={time.perf_counter()-t0:.4f}s\n").encode()
+        )
+        
         return row_dict

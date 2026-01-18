@@ -612,9 +612,9 @@ class ImageRLDataset(Dataset):
             logger.error(f"batch is not dict: type={type(batch_data)}, item={item}")
             batch_data = {}
         
-        for field, values in batch_data.items():
+        for field, arr in batch_data.items():
             try:
-                value = values[local_idx]
+                value = arr[local_idx].as_py()
                 
                 # tensor 변환
                 if field.endswith(("_ids", "_mask", "_tokens", "_pixel_values", "_scores")):
@@ -632,9 +632,9 @@ class ImageRLDataset(Dataset):
             logger.error(f"non_tensor_batch is not dict: type={type(non_tensor_data)}, item={item}")
             non_tensor_data = {}
         
-        for field, values in non_tensor_data.items():
+        for field, arr in non_tensor_data.items():
             try:
-                value = values[local_idx]
+                value = arr[local_idx].as_py()
                 
                 #  이미지 경로 변환 (PIL 변환 전에)
                 if isinstance(value, str) and ("image" in field.lower() or "pil" in field.lower()):
@@ -662,9 +662,9 @@ class ImageRLDataset(Dataset):
             logger.error(f"meta_info is not dict: type={type(meta_data)}, item={item}")
             meta_data = {}
         
-        for field, values in meta_data.items():
+        for field, arr in meta_data.items():
             try:
-                value = values[local_idx]
+                value = arr[local_idx].as_py()
                 meta_dict[field] = value
             except Exception as e:
                 logger.warning(f"Failed to process meta field {field} at item {item}: {e}")
