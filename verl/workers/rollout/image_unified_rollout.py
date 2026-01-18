@@ -365,38 +365,24 @@ class ImageUnifiedRollout(BaseRollout):
         return stats
 
     def set_generation_config(self, prompt: DataProto):
-        do_sample = prompt.meta_info.get("do_sample", self.config.do_sample)
         is_validate = prompt.meta_info.get("validate", False)
 
-        temperature = prompt.meta_info.get("temperature", self.config.temperature)
-        response_length = prompt.meta_info.get("response_length", self.config.response_length)
-        top_p = prompt.meta_info.get("top_p", self.config.get("top_p", 1.0))
-        top_k = max(0, prompt.meta_info.get("top_k", self.config.get("top_k", 0)))
-        
-        if not do_sample:
-            kwargs = {
-                "do_sample": False,
-                "num_beams": 1,
-                "num_return_sequences": 1,  # Set to 1 for for-loop processing
-            }
-        elif is_validate:
-            kwargs = {
-                "do_sample": True,
-                "num_beams": 1,
-                "top_k": max(0, self.config.val_kwargs.top_k),
-                "top_p": self.config.val_kwargs.top_p,
-                "temperature": self.config.val_kwargs.temperature,
-                "num_return_sequences": 1,  # Set to 1 for for-loop processing
-            }
+        if is_validate:
+            # Validation mode: use val_kwargs
+            self.cfg_weight = getattr(self.config.val_kwargs, 'val_cfg_weight', 5.0)
+            self.temperature = getattr(self.config.val_kwargs, 'val_temperature', 1.0)
+            self.txt_top_k = getattr(self.config.val_kwargs, 'val_txt_top_k', 50)
+            self.txt_top_p = getattr(self.config.val_kwargs, 'val_txt_top_p', 1.0)
+            self.img_top_k = getattr(self.config.val_kwargs, 'val_img_top_k', 4096)
+            self.img_top_p = getattr(self.config.val_kwargs, 'val_img_top_p', 1.0)
         else:
-            kwargs = {
-                "do_sample": True,
-                "num_beams": 1,
-                "top_p": top_p,
-                "top_k": top_k,
-                "temperature": temperature,
-                "num_return_sequences": 1,  # Set to 1 for for-loop processing
-            }
+            # Training mode: use config values (already set in __init__)
+            self.cfg_weight = getattr(self.config, "cfg_weight", 5.0)
+            self.temperature = getattr(self.config, "temperature", 1.0)
+            self.txt_top_k = getattr(self.config, "txt_top_k", 50)
+            self.txt_top_p = getattr(self.config, "txt_top_p", 1.0)
+            self.img_top_k = getattr(self.config, "img_top_k", 4096)
+            self.img_top_p = getattr(self.config, "img_top_p", 1.0)
 
         # Additional settings
         self.image_start_tag = self.processor.image_start_tag
@@ -420,23 +406,6 @@ class ImageUnifiedRollout(BaseRollout):
         batch_size = prompts.batch.batch_size[0]
 
         self.set_generation_config(prompts[0])
-
-        input_format = [self.get_sft_format(prompt) for prompt in prompts.non_tensor_batch["prompt"]]
-
-        self.processor.tokenizer.pad_token_id = self.processor.pad_id
-
-        inputs = self.processor.tokenizer(
-            input_format,
-            padding=True,
-            padding_side='left',
-            return_tensors="pt"
-        )
-
-        input_ids = inputs["input_ids"].to(self.device)
-        attention_mask = inputs["attention_mask"].to(self.device)
-
-        prompts.batch["task1_input_ids"] = input_ids
-        prompts.batch["task1_attention_mask"] = attention_mask
 
         task_funcs = {
             1: self._generate_minibatch_image_generation,
@@ -468,6 +437,23 @@ class ImageUnifiedRollout(BaseRollout):
 
     @torch.no_grad()
     def _generate_minibatch_image_generation(self, data_proto: DataProto) -> DataProto:
+        input_format = [self.get_sft_format(prompt) for prompt in data_proto.non_tensor_batch["prompt"]]
+
+        self.processor.tokenizer.pad_token_id = self.processor.pad_id
+
+        inputs = self.processor.tokenizer(
+            input_format,
+            padding=True,
+            padding_side='left',
+            return_tensors="pt"
+        )
+
+        input_ids = inputs["input_ids"].to(self.device)
+        attention_mask = inputs["attention_mask"].to(self.device)
+
+        data_proto.batch["task1_input_ids"] = input_ids
+        data_proto.batch["task1_attention_mask"] = attention_mask
+
         batch_size = data_proto.batch.batch_size[0]
         
         input_ids = data_proto.batch["task1_input_ids"]
@@ -506,9 +492,21 @@ class ImageUnifiedRollout(BaseRollout):
 
             image_embeds = self.module.gen_aligner(self.module.gen_embed(image_ids))
 
-        data_proto.batch["task1_response_mask"] = torch.ones((B, image_embeds.size(1)), dtype=torch.long, device=image_embeds.device)
+        data_proto.batch["task1_gen_img_tokens"] = image_ids.cpu()
+        data_proto.batch["task1_response_mask"] = torch.ones((B, image_embeds.size(1)), dtype=torch.long).cpu()
         if dist.get_rank() == 0:
             print(f"[IMG_GEN] Created DataProto with batch_size: {batch_size}")
+
+        # Move task1 tensors to CPU and cleanup GPU memory
+        data_proto.batch["task1_input_ids"] = data_proto.batch["task1_input_ids"].cpu()
+        data_proto.batch["task1_attention_mask"] = data_proto.batch["task1_attention_mask"].cpu()
+
+        # Delete local GPU tensors
+        del input_ids, attention_mask, input_embeds
+        del gen_final_cfg_embeds, gen_final_cfg_attention_mask
+        del generated_tokens, generated_logprobs
+        del gen_imgs_pixel_values, image_ids, image_embeds
+        del all_image_ids, gen_imgs_tensor, decoded_images
 
         torch.cuda.empty_cache()
         return data_proto
@@ -659,11 +657,19 @@ class ImageUnifiedRollout(BaseRollout):
         data_proto.batch['task2_rollout_log_probs'] = log_probs.detach().cpu()
         data_proto.batch["task2_response_mask"] = response_mask.detach().cpu()
 
-        feedback_ids = data_proto.batch["task2_feedback_ids"]
-        feedback_ids = feedback_ids.to(self.device)
-
         if dist.get_rank() == 0:
             print(f"[TEXT_GEN] Completed feedback generation")
+
+        # Move task2 tensors to CPU and cleanup GPU memory
+        data_proto.batch["task2_input_ids"] = data_proto.batch["task2_input_ids"].cpu()
+        data_proto.batch["task2_attention_mask"] = data_proto.batch["task2_attention_mask"].cpu()
+        
+        # Delete local GPU tensors
+        del input_ids, attention_mask
+        del batched_total_ids, batched_attention_mask
+        del gen_imgs_pixel_values, text_embeds, image_embeds
+        del merged_embeds, gen_sequences, log_probs, response_mask
+        del first_pad_indices, has_pad, batch_indices
 
         torch.cuda.empty_cache()
         return data_proto
@@ -727,12 +733,13 @@ class ImageUnifiedRollout(BaseRollout):
 
         # embedding
         image_ids = data_proto.batch.get('task1_gen_img_tokens', [])
-        image_ids.to(self.device, dtype=torch.bfloat16)
+        image_ids = image_ids.to(self.device)
 
-        image_embeds = self.module.gen_aligner(self.module.gen_embed(image_ids))
-        text_embeds = self.module.language_model.get_input_embeddings()(batched_total_ids)
-        image_embeds = image_embeds.to(dtype=torch.bfloat16)
-        text_embeds = text_embeds.to(dtype=torch.bfloat16)
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            image_embeds = self.module.gen_aligner(self.module.gen_embed(image_ids))
+            text_embeds = self.module.language_model.get_input_embeddings()(batched_total_ids)
+            image_embeds = image_embeds.to(dtype=torch.bfloat16)
+            text_embeds = text_embeds.to(dtype=torch.bfloat16)
 
         # merge text and image embeds
         merged_embeds = self.merge_text_and_image_embeds(text_embeds, image_embeds, all_image_start_indices)
@@ -761,14 +768,30 @@ class ImageUnifiedRollout(BaseRollout):
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
             _, _, all_image_ids = self.module.gen_vision_model.encode(regen_imgs_pixel_values)
     
-            image_ids = all_image_ids[2]
-            image_ids = image_ids.view(B, -1)
+            regen_image_ids = all_image_ids[2]
+            regen_image_ids = regen_image_ids.view(B, -1)
 
-            image_embeds = self.module.gen_aligner(self.module.gen_embed(image_ids))
+            regen_image_embeds = self.module.gen_aligner(self.module.gen_embed(regen_image_ids))
 
-        data_proto.batch["task3_response_mask"] = torch.ones((B, image_embeds.size(1)), dtype=torch.long, device=image_embeds.device)
+        # For reproducing regen images
+        data_proto.batch["task3_regen_img_tokens"] = regen_image_ids.cpu()
+        data_proto.batch["task3_response_mask"] = torch.ones((B, regen_image_embeds.size(1)), dtype=torch.long).cpu()
         if dist.get_rank() == 0:
-            print(f"[IMG_GEN] Created DataProto with batch_size: {batch_size}")
+            print(f"[REGEN] Created DataProto with batch_size: {batch_size}")
+
+        # Move task3 tensors to CPU and cleanup GPU memory
+        data_proto.batch["task3_input_ids"] = data_proto.batch["task3_input_ids"].cpu()
+        data_proto.batch["task3_attention_mask"] = data_proto.batch["task3_attention_mask"].cpu()
+
+        # Delete local GPU tensors
+        del input_ids, attention_mask
+        del batched_total_ids, batched_attention_mask
+        del image_ids, image_embeds, text_embeds
+        del merged_embeds
+        del regen_final_cfg_embeds, regen_final_cfg_attention_mask
+        del regenerated_tokens, regenerated_logprobs
+        del regen_imgs_pixel_values, regen_image_ids, regen_image_embeds
+        del all_image_ids, regen_imgs_tensor, regen_decoded_images
 
         torch.cuda.empty_cache()
         return data_proto

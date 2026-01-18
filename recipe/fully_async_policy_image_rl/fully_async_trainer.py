@@ -128,7 +128,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         self.arrow_buffer = []
         self.arrow_buffer_size = self.config.trainer.get("arrow_buffer_size", 1000)
         self.arrow_output_dir = None
-        self.arrow_file_counter = 21 # 0
+        self.arrow_file_counter = 0
         self.schema_metadata = {}
 
     def _run_prefetch(self):
