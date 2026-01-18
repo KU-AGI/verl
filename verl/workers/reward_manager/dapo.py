@@ -20,6 +20,7 @@ from verl import DataProto
 from verl.utils.reward_score import default_compute_score
 from verl.workers.reward_manager import register
 from verl.workers.reward_manager.abstract import AbstractRewardManager
+from openai import OpenAI
 
 
 @register("dapo")
@@ -51,6 +52,9 @@ class DAPORewardManager(AbstractRewardManager):
         self.use_decision_reward = use_decision_reward
         self.use_reflection_bonus = use_reflection_bonus
         self.reflection_bonus_weight = reflection_bonus_weight
+        
+        self.roundtrip_base_url = "http://localhost:18000/v1"
+        self.roundtrip_client_model_name = "/models/roundtrip"
 
         if self.overlong_buffer_cfg is not None:
             assert self.max_resp_len is not None, (
@@ -75,6 +79,7 @@ class DAPORewardManager(AbstractRewardManager):
 
         reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
         reward_extra_info = defaultdict(list)
+        self.roundtrip_client = OpenAI(base_url=self.roundtrip_base_url, api_key="EMPTY")
 
         already_print_data_sources = {}
 
@@ -122,7 +127,8 @@ class DAPORewardManager(AbstractRewardManager):
                 use_content_reward=self.use_content_reward,
                 use_decision_reward=self.use_decision_reward,
                 use_reflection_bonus=self.use_reflection_bonus,
-                reflection_bonus_weight=self.reflection_bonus_weight
+                reflection_bonus_weight=self.reflection_bonus_weight,
+                roundtrip_client=self.roundtrip_client
             )
 
             score: float

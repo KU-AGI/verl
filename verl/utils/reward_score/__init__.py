@@ -64,7 +64,17 @@ def default_compute_score(
         # from . import chem_dapo
         from . import chem_dapo_stepwise
         # res = chem_dapo.compute_score(solution_str, ground_truth)
-        res = chem_dapo_stepwise.compute_score(solution_str, ground_truth, extra_info, kwargs['use_roundtrip_reward'], kwargs['use_content_reward'], kwargs['use_decision_reward'], kwargs['use_reflection_bonus'], kwargs['reflection_bonus_weight'])
+        res = chem_dapo_stepwise.compute_score(
+            solution_str,
+            ground_truth,
+            extra_info,
+            kwargs['use_roundtrip_reward'],
+            kwargs['use_content_reward'],
+            kwargs['use_decision_reward'],
+            kwargs['use_reflection_bonus'],
+            kwargs['reflection_bonus_weight'],
+            kwargs['roundtrip_client']
+        )
     elif data_source in [
         "numina_aops_forum",
         "numina_synthetic_math",

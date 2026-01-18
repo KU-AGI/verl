@@ -256,8 +256,8 @@ if __name__ == "__main__":
                 elif args.train and task == "retro":
                     if d['rxn_str'] in excluded_rxns:
                         continue
-                    if convert_to_canonical_smiles(".".join(d['products'])) in multiple_product_set:
-                        continue
+                    # if convert_to_canonical_smiles(".".join(d['products'])) in multiple_product_set:
+                    #     continue
                     rxn_str = d['rxn_str']
                     products_in_rxn = rxn_str.split(">>")[-1].split(".")
                     products_in_orderly = d['products']
