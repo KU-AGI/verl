@@ -431,7 +431,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             
             summary_path = os.path.join(sample_dir, "comparison_summary.txt")
             summary_header = [
-                f"📋 GRPO COMPARISON SUMMARY | STEP: {trainer_ver}",
+                f"📋 GRPO COMPARISON SUMMARY | STEP: {self.global_steps}",
                 f"Sample Path: {sample_dir}",
                 "=" * 170,
                 f"{'Rollout':<10} | {'T1':<5} | {'T2':<5} | {'T3':<5} | {'Total':<6} | {'Gen Path (Initial)':<65} | {'Regen Path (Edited)'}",
@@ -452,7 +452,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                 t1 = self._get_safe_val(scores, 'task1_scores', i, 0.0)
                 t2 = self._get_safe_val(scores, 'task2_scores', i, 0.0)
                 t3 = self._get_safe_val(scores, 'task3_scores', i, 0.0)
-                total = t1 + t2 + (t3 > 0) # exclude -100
+                total = t1 + t2 + t3 > 0 # exclude -100
                 
                 summary_rows.append(f"rollout_{r_idx:<3} | {t1:<5.2f} | {t2:<5.2f} | {t3:<5.2f} | {total:<6.2f} | {paths['gen']:<65} | {paths['regen']}")
 
@@ -489,50 +489,31 @@ class RayImageGenerationTrainer(RayPPOTrainer):
         # Task 1 Gen Image
         if gen_imgs is not None and len(gen_imgs) > i:
             p = os.path.join(rollout_dir, "gen.png")
+            # numpy array 대응
             img_data = gen_imgs[i]
-            
-            if isinstance(img_data, str):
-                if os.path.exists(img_data):
-                    PIL.Image.open(img_data).convert("RGB").save(p)
-                else:
-                    print(f"Warning: Image path does not exist: {img_data}")
-            elif isinstance(img_data, np.ndarray):
+            if isinstance(img_data, np.ndarray):
                 PIL.Image.fromarray(img_data.astype(np.uint8)).save(p)
             else:
                 img_data.save(p)
             paths["gen"] = os.path.abspath(p)
-        
+
         # Task 3 Regen Image
         if regen_imgs is not None and len(regen_imgs) > i:
             p = os.path.join(rollout_dir, "regen.png")
             img_data = regen_imgs[i]
-            
-            if isinstance(img_data, str):
-                if os.path.exists(img_data):
-                    PIL.Image.open(img_data).convert("RGB").save(p)
-                else:
-                    print(f"Warning: Image path does not exist: {img_data}")
-            elif isinstance(img_data, np.ndarray):
+            if isinstance(img_data, np.ndarray):
                 PIL.Image.fromarray(img_data.astype(np.uint8)).save(p)
             else:
                 img_data.save(p)
             paths["regen"] = os.path.abspath(p)
-        
+
         # Ground Truth Image
         if gts_imgs is not None and len(gts_imgs) > i and gts_imgs[i]:
             p = os.path.join(rollout_dir, "ground_truth.png")
             if not os.path.exists(p):
                 try:
-                    gt_data = gts_imgs[i]
-                    if isinstance(gt_data, str):
-                        if os.path.exists(gt_data):
-                            PIL.Image.open(gt_data).convert("RGB").save(p)
-                    elif isinstance(gt_data, np.ndarray):
-                        PIL.Image.fromarray(gt_data.astype(np.uint8)).save(p)
-                    else:
-                        gt_data.save(p)
-                except Exception as e:
-                    print(f"Warning: Failed to save ground truth: {e}")
+                    PIL.Image.open(gts_imgs[i]).convert("RGB").save(p)
+                except: pass
             paths["gt"] = os.path.abspath(p)
             
         return paths
@@ -547,17 +528,13 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             f.write("=" * 100 + "\n")
             f.write(f"📝 [PROMPT]\n{prompt[i]}\n")
             f.write("=" * 100 + "\n\n")
-            f.write(f"🧾 [SUMMARY]\n{summarizes[i] if summarizes else 'N/A'}\n")
-            f.write("=" * 100 + "\n\n")
 
             # Task 1
             f.write(f"🖼️ [TASK 1] INITIAL GEN\n")
-            f.write(f"[VQA Questions] \n{gts_vqas[i] if gts_vqas else 'N/A'}\n")
-            f.write("=" * 100 + "\n\n")
             f.write(f"  - Total Score: {self._get_safe_val(scores, 'task1_scores', i)}\n")
-            f.write(f"  - VLM Reward: {self._get_safe_val(reward_extra_infos_dict, 'task1_vlm_reward', i)}\n")
-            f.write(f"  - Detector Reward: {self._get_safe_val(reward_extra_infos_dict, 'task1_detector_reward', i)}\n")
-            f.write(f"  - VLM+Detector Bonus: {self._get_safe_val(reward_extra_infos_dict, 'task1_vlm_detector_bonus', i)}\n")
+            f.write(f"  - VQA Reward: {self._get_safe_val(reward_extra_infos_dict, 'task1_vqa_reward', i)}\n")
+            # f.write(f"  - Detector Reward: {self._get_safe_val(reward_extra_infos_dict, 'task1_detector_reward', i)}\n")
+            # f.write(f"  - VQA+Detector Bonus: {self._get_safe_val(reward_extra_infos_dict, 'task1_vqa_detector_bonus', i)}\n")
             f.write(f"  - Path: {paths['gen']}\n")
             f.write(f"  - VQA Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task1_vqa_reward_response', i)}\n")
             # f.write(f"  - Detector Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task1_detector_response', i)}\n")
@@ -568,11 +545,12 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             f.write(f"  - Total Score: {self._get_safe_val(scores, 'task2_scores', i)}\n")
             f.write(f"  - Format Reward: {self._get_safe_val(reward_extra_infos_dict, 'task2_format_reward', i)}\n")
             f.write(f"  - Part1 Reward (F1 + Consistency): {self._get_safe_val(reward_extra_infos_dict, 'task2_part1_reward', i)}\n")
-            f.write(f"  - VLM Reward: {self._get_safe_val(reward_extra_infos_dict, 'task2_vlm_reward', i)}\n")
-            f.write(f"  - Comparison Summarize Score: {self._get_safe_val(reward_extra_infos_dict, 'task2_comparison_summarize_score', i)}\n")
-            f.write(f"  - Comparison Tuple Score: {self._get_safe_val(reward_extra_infos_dict, 'task2_comparison_tuple_score', i)}\n")
-            f.write(f"  - Hallucination Check Score: {self._get_safe_val(reward_extra_infos_dict, 'task2_hallucination_check_score', i)}\n")
-            f.write(f"  - Edit Instruction Score: {self._get_safe_val(reward_extra_infos_dict, 'task2_edit_instruction_score', i)}\n")
+            f.write(f"  - Judge Alignment Gate (does not contribute to reward): {self._get_safe_val(reward_extra_infos_dict, 'task2_judge_alignment_reward', i)}\n")
+            f.write(f"  - Feedback Reward: {self._get_safe_val(reward_extra_infos_dict, 'task2_feedback_reward', i)}\n")
+            # f.write(f"  - Comparison Summarize Score: {self._get_safe_val(reward_extra_infos_dict, 'task2_comparison_summarize_score', i)}\n")
+            # f.write(f"  - Comparison Tuple Score: {self._get_safe_val(reward_extra_infos_dict, 'task2_comparison_tuple_score', i)}\n")
+            # f.write(f"  - Hallucination Check Score: {self._get_safe_val(reward_extra_infos_dict, 'task2_hallucination_check_score', i)}\n")
+            # f.write(f"  - Edit Instruction Score: {self._get_safe_val(reward_extra_infos_dict, 'task2_edit_instruction_score', i)}\n")
             f.write(f"  - Model Feedback:\n{feedback_texts[i] if feedback_texts else 'N/A'}\n")
             f.write(f"  - Judge Alignment Gate Response (does not contribute to reward): {self._get_safe_response(reward_extra_infos_dict, 'task2_judge_alignment_reward_response', i)}\n")
             f.write(f"  - Feedback Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task2_feedback_reward_response', i)}\n")
@@ -585,10 +563,11 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             # Task 3
             f.write(f"🔄 [TASK 3] RE-GENERATION\n")
             f.write(f"  - Total Score: {self._get_safe_val(scores, 'task3_scores', i)}\n")
-            f.write(f"  - VLM Reward: {self._get_safe_val(reward_extra_infos_dict, 'task3_vlm_reward', i)}\n")
-            f.write(f"  - Detector Reward: {self._get_safe_val(reward_extra_infos_dict, 'task3_detector_reward', i)}\n")
-            f.write(f"  - VLM+Detector Bonus: {self._get_safe_val(reward_extra_infos_dict, 'task3_vlm_detector_bonus', i)}\n")
-            f.write(f"  - Regeneration Followed by Editing Reward: {self._get_safe_val(reward_extra_infos_dict, 'task3_regeneration_followed_by_editing_reward', i)}\n")
+            f.write(f"  - VQA Reward: {self._get_safe_val(reward_extra_infos_dict, 'task3_vqa_reward', i)}\n")
+            f.write(f"  - Edit Instruction Following Reward: {self._get_safe_val(reward_extra_infos_dict, 'task3_edit_reward', i)}\n")
+            # f.write(f"  - Detector Reward: {self._get_safe_val(reward_extra_infos_dict, 'task3_detector_reward', i)}\n")
+            # f.write(f"  - VQA+Detector Bonus: {self._get_safe_val(reward_extra_infos_dict, 'task3_vqa_detector_bonus', i)}\n")
+            # f.write(f"  - Regeneration Followed by Editing Reward: {self._get_safe_val(reward_extra_infos_dict, 'task3_regeneration_followed_by_editing_reward', i)}\n")
             f.write(f"  - Path: {paths['regen']}\n")
             f.write(f"  - VQA Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task3_vqa_reward_response', i)}\n")
             f.write(f"  - Edit Instruction Following Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task3_edit_reward_response', i)}\n")
@@ -622,13 +601,15 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             feedback_texts = batch.non_tensor_batch['task2_feedback_texts'].tolist()
             regen_imgs_pil_list = batch.non_tensor_batch['task3_regen_imgs_pil_list']
             gts_imgs = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
-            summarizes = [item.non_tensor_batch.get("reward_model", {}).get("summary", None) or item.non_tensor_batch.get("reward_model.summary", None) for item in batch]
-            gts_tuples = [item.non_tensor_batch.get("reward_model", {}).get("tuple", None) or item.non_tensor_batch.get("reward_model.tuple", None) for item in batch]
-            gts_vqas = [item.non_tensor_batch.get("reward_model", {}).get("vqa_question", None) or item.non_tensor_batch.get("reward_model.vqa_question", None) for item in batch]
+            summarizes = [item.non_tensor_batch.get("reward_model", {}).get("summary", None) for item in batch]
+            gts_tuples = [item.non_tensor_batch.get("reward_model", {}).get("tuple", None) for item in batch]
+            gts_vqas = [item.non_tensor_batch.get("reward_model", {}).get("vqa_question", None) for item in batch]
 
-            batch_size = len(prompt)
-            current_v = getattr(self, "current_param_version", self.global_steps)
-            v_list = [current_v] * batch_size
+            sample_versions = batch.non_tensor_batch.get('param_version')
+            if sample_versions is not None:
+                sample_versions = sample_versions.tolist()
+            else:
+                sample_versions = [self.global_steps] * len(batch)
 
             scores = {}
             # Add all task scores
@@ -655,7 +636,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                 gts_vqas=gts_vqas,
                 scores=scores,
                 reward_extra_infos_dict=reward_extra_infos_to_dump,
-                sample_versions=v_list,
+                sample_versions=sample_versions,
                 dump_path=dump_path,
             )
 
