@@ -1794,7 +1794,7 @@ class ChemistryEvaluator:
             metric=DataStructs.TanimotoSimilarity
         )
 
-    def roundtrip_acc(self, reactant: str, product: str, roundtrip_client):
+    def roundtrip(self, reactant: str, product: str, roundtrip_client):
         system_prompt = "You are a chemist."
         user_prompt = f"{reactant} Considering the given starting materials, what might be the resulting product in a chemical reaction?"
         messages = [
@@ -1802,7 +1802,7 @@ class ChemistryEvaluator:
             {"role": "user", "content": user_prompt},
         ]
         response = roundtrip_client.chat.completions.create(
-            model=self.roundtrip_client_model_name,
+            model="/models/roundtrip",
             messages=messages,
             max_tokens=500,
             temperature=0.0,
@@ -1819,7 +1819,7 @@ class ChemistryEvaluator:
         roundtrip_product = smiles_match.group(1).strip() if smiles_match else ""
         is_correct = self.validator.exact_match(roundtrip_product, product)
         
-        return is_correct
+        return roundtrip_product
 
     def compute_score(self,
                       solution_str: str,
@@ -1831,6 +1831,7 @@ class ChemistryEvaluator:
                       use_reflection_bonus=False,
                       reflection_bonus_weight=0.0,
                       roundtrip_client=None,
+                      roundtrip_cache=None,
                       ) -> Union[EvaluationResult, Dict[str, Any]]:
         """Compute comprehensive evaluation score."""
         task = extra_info['task']
@@ -1872,8 +1873,16 @@ class ChemistryEvaluator:
             # info['synthetic_equivalents_list'] = ast.literal_eval(info['synthetic_equivalents_list'])
             step_eval_results = self.step_evaluator.calcualte_retro_rationale_metrics(info, gt_rationale, pred_rationale)
             if use_roundtrip_reward:
-                is_roundtrip_correct = self.roundtrip_acc(reactant=pred_smiles, product=info['product_str'], roundtrip_client=roundtrip_client)
-                print(f"Roundtrip prediction correct: {is_roundtrip_correct}")
+                cached_product = roundtrip_cache.get(pred_smiles)
+                if cached_product is not None:
+                    roundtrip_product = cached_product
+                    # print(f"Using cached roundtrip product")
+                else:
+                    roundtrip_product = self.roundtrip(reactant=pred_smiles, product=info['product_str'], roundtrip_client=roundtrip_client)
+                    roundtrip_cache.set(pred_smiles, roundtrip_product)
+                    # print(f"Caching roundtrip product")
+                is_roundtrip_correct = self.validator.exact_match(roundtrip_product, info['product_str'])
+                # print(f"Roundtrip prediction correct: {is_roundtrip_correct}")
                 answer_correct = int(is_roundtrip_correct)
             else:
                 answer_correct = self.step_evaluator._exact_match(pred_smiles, gt_smiles)
@@ -1975,9 +1984,11 @@ def compute_score(solution_str: str,
                   use_decision_reward=False,
                   use_reflection_bonus=False,
                   reflection_bonus_weight=0.0,
-                  roundtrip_client=None
+                  roundtrip_client=None,
+                  roundtrip_cache=None,
                  ) -> Dict[str, Any]:
     evaluator = ChemistryEvaluator()
+    assert roundtrip_client is not None, "Roundtrip client must be provided if use_roundtrip_reward is True."
     result = evaluator.compute_score(
         solution_str,
         ground_truth,
@@ -1987,7 +1998,8 @@ def compute_score(solution_str: str,
         use_decision_reward,
         use_reflection_bonus,
         reflection_bonus_weight,
-        roundtrip_client=roundtrip_client
+        roundtrip_client=roundtrip_client,
+        roundtrip_cache=roundtrip_cache,
     )
     # result is already a dict from compute_score method
     return result

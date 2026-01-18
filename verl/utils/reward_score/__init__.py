@@ -73,7 +73,8 @@ def default_compute_score(
             kwargs['use_decision_reward'],
             kwargs['use_reflection_bonus'],
             kwargs['reflection_bonus_weight'],
-            kwargs['roundtrip_client']
+            kwargs['roundtrip_client'],
+            kwargs['roundtrip_cache'],
         )
     elif data_source in [
         "numina_aops_forum",

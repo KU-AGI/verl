@@ -39,7 +39,8 @@ class DAPORewardManager(AbstractRewardManager):
         use_content_reward=False,
         use_decision_reward=False,
         use_reflection_bonus=False,
-        reflection_bonus_weight=0.0
+        reflection_bonus_weight=0.0,
+        roundtrip_cache=None,
     ) -> None:
         self.tokenizer = tokenizer
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
@@ -53,8 +54,8 @@ class DAPORewardManager(AbstractRewardManager):
         self.use_reflection_bonus = use_reflection_bonus
         self.reflection_bonus_weight = reflection_bonus_weight
         
-        self.roundtrip_base_url = "http://localhost:18000/v1"
-        self.roundtrip_client_model_name = "/models/roundtrip"
+        # self.roundtrip_client = roundtrip_client
+        self.roundtrip_cache = roundtrip_cache
 
         if self.overlong_buffer_cfg is not None:
             assert self.max_resp_len is not None, (
@@ -79,7 +80,10 @@ class DAPORewardManager(AbstractRewardManager):
 
         reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
         reward_extra_info = defaultdict(list)
-        self.roundtrip_client = OpenAI(base_url=self.roundtrip_base_url, api_key="EMPTY")
+        self.roundtrip_client = OpenAI(base_url="http://localhost:8007/v1", api_key="EMPTY")
+        print("Using DAPORewardManager")
+        print(f"client: {self.roundtrip_client}")
+        print(f"cache: {self.roundtrip_cache}")
 
         already_print_data_sources = {}
 
@@ -128,7 +132,8 @@ class DAPORewardManager(AbstractRewardManager):
                 use_decision_reward=self.use_decision_reward,
                 use_reflection_bonus=self.use_reflection_bonus,
                 reflection_bonus_weight=self.reflection_bonus_weight,
-                roundtrip_client=self.roundtrip_client
+                roundtrip_client=self.roundtrip_client,
+                roundtrip_cache=self.roundtrip_cache
             )
 
             score: float

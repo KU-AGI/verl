@@ -18,6 +18,18 @@ from verl import DataProto
 from verl.experimental.reward.reward_loop import register
 from verl.experimental.reward.reward_loop.base import RewardLoopManagerBase
 from verl.utils.reward_score import default_compute_score
+from openai import OpenAI
+from collections import defaultdict
+
+class roundtrip_cache:
+    def __init__(self):
+        self.cache = defaultdict(str)
+
+    def get(self, key):
+        return self.cache.get(key, None)
+
+    def set(self, key, value):
+        self.cache[key] = value
 
 
 @register("dapo")
@@ -44,7 +56,15 @@ class DAPORewardLoopManager(RewardLoopManagerBase):
                 "max_resp_len must be larger than overlong_buffer.len"
             )
 
+        self.roundtrip_base_url = "http://localhost:8007/v1"
+        self.roundtrip_client_model_name = "/models/roundtrip"
+        self.roundtrip_client = OpenAI(base_url=self.roundtrip_base_url, api_key="EMPTY")
+        self.roundtrip_cache = roundtrip_cache()
+
     async def run_single(self, data: DataProto) -> dict:
+        print("Using DAPORewardLoopManager")
+        print(f"client: {self.roundtrip_client}")
+        print(f"cache: {self.roundtrip_cache}")
         assert len(data) == 1, "Only support single data item"
         data_item = data[0]
         response_ids = data_item.batch["responses"]
@@ -71,7 +91,9 @@ class DAPORewardLoopManager(RewardLoopManagerBase):
                 use_content_reward=self.config.reward_model.reward_kwargs.use_content_reward,
                 use_decision_reward=self.config.reward_model.reward_kwargs.use_decision_reward,
                 use_reflection_bonus=self.config.reward_model.reward_kwargs.use_reflection_bonus,
-                reflection_bonus_weight=self.config.reward_model.reward_kwargs.reflection_bonus_weight
+                reflection_bonus_weight=self.config.reward_model.reward_kwargs.reflection_bonus_weight,
+                roundtrip_client=self.roundtrip_client,
+                roundtrip_cache=self.roundtrip_cache
             )
         else:
             result = await self.loop.run_in_executor(
@@ -87,7 +109,9 @@ class DAPORewardLoopManager(RewardLoopManagerBase):
                     use_content_reward=self.config.reward_model.reward_kwargs.use_content_reward,
                     use_decision_reward=self.config.reward_model.reward_kwargs.use_decision_reward,
                     use_reflection_bonus=self.config.reward_model.reward_kwargs.use_reflection_bonus,
-                    reflection_bonus_weight=self.config.reward_model.reward_kwargs.reflection_bonus_weight
+                    reflection_bonus_weight=self.config.reward_model.reward_kwargs.reflection_bonus_weight,
+                    roundtrip_client=self.roundtrip_client,
+                    roundtrip_cache=self.roundtrip_cache
                 ),
             )
 

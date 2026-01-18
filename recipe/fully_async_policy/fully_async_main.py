@@ -29,6 +29,9 @@ from verl.trainer.ppo.reward import load_reward_manager
 from verl.trainer.ppo.utils import Role
 from verl.utils.fs import copy_to_local
 
+from openai import OpenAI
+from collections import defaultdict
+
 
 def create_resource_pool_manager(config, roles: list) -> ResourcePoolManager:
     """
@@ -122,6 +125,17 @@ def create_role_worker_mapping(config):
     return role_worker_mapping, ray_worker_group_cls
 
 
+class roundtrip_cache:
+    def __init__(self):
+        self.cache = defaultdict(str)
+
+    def get(self, key):
+        return self.cache.get(key, None)
+
+    def set(self, key, value):
+        self.cache[key] = value
+
+
 @ray.remote(num_cpus=1)
 class FullyAsyncTaskRunner:
     """
@@ -165,11 +179,15 @@ class FullyAsyncTaskRunner:
         self.components["ray_worker_group_cls"] = ray_worker_group_cls
 
         print("[ASYNC MAIN] Loading reward functions...")
+        self.roundtrip_base_url = "http://localhost:8007/v1"
+        self.roundtrip_client_model_name = "/models/roundtrip"
+        self.roundtrip_client = OpenAI(base_url=self.roundtrip_base_url, api_key="EMPTY")
+        self.roundtrip_cache = roundtrip_cache()
         reward_fn = load_reward_manager(
-            config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {})
+            config, tokenizer, num_examine=0, roundtrip_cache=self.roundtrip_cache, **config.reward_model.get("reward_kwargs", {})
         )
         val_reward_fn = load_reward_manager(
-            config, tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {})
+            config, tokenizer, num_examine=1, roundtrip_cache=self.roundtrip_cache, **config.reward_model.get("reward_kwargs", {})
         )
         self.components["reward_fn"] = reward_fn
         self.components["val_reward_fn"] = val_reward_fn
