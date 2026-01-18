@@ -25,11 +25,24 @@ from recipe.image_rl.gdino_regex import _CONNECTORS, SKIP_KEYWORDS, _COMPILED_RE
 
 # Configuration
 VLM_BASE_URLS = [
-    "http://192.169.0.3:8004/v1",
-    "http://192.169.0.3:8005/v1",
+    # "http://10.100.44.4:8006/v1", # main1
+    # "http://10.100.44.8:8006/v1", # sub1
+    # "http://10.100.44.8:8007/v1",
+    # "http://10.100.44.2:8000/v1", # sub2
+    # "http://10.100.44.2:8001/v1",
+    # "http://10.100.44.2:8002/v1", # sub2
+    # "http://10.100.44.2:8003/v1",
+    "http://10.100.44.6:8004/v1", # sub3
+    "http://10.100.44.6:8005/v1",
+    "http://10.100.44.6:8006/v1", # sub3
+    "http://10.100.44.6:8007/v1",
+    
 ]
 LLM_BASE_URLS = [
-    # "http://192.169.0.3:8005/v1",
+    # "http://10.100.44.2:8004/v1", # sub2
+    # "http://10.100.44.2:8005/v1",
+    # "http://10.100.44.2:8006/v1",
+    # "http://10.100.44.2:8007/v1",
 ]
 API_KEY = "EMPTY"
 MAX_RETRIES = 3
@@ -44,8 +57,10 @@ RECOVERY_CHECK_INTERVAL = 60  # seconds to wait before checking if unhealthy ser
 
 # Detector configuration
 DETECTOR_URLS = [
-    "http://192.169.0.3:8084",
-    "http://192.169.0.3:8085",
+    # "http://10.100.44.2:8084",
+    # "http://10.100.44.2:8085",
+    # "http://10.100.44.2:8086",
+    # "http://10.100.44.2:8087",
 ]
 DETECTOR_TIMEOUT = 300000.0
 
@@ -357,7 +372,7 @@ def get_messages(*args):
 
     if task_id == 1:
         system_prompt = TASK1_TASK3_IMAGE_GENERATOR_SYSTEM_PROMPT_TEMPLATE
-        user_prompt = TASK1_TASK3_IMAGE_GENERATOR_USER_PROMPT_TEMPLATE.format(questions=vqa_question)
+        user_prompt = vqa_question #TASK1_TASK3_IMAGE_GENERATOR_USER_PROMPT_TEMPLATE.format(questions=vqa_question)
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": [
@@ -368,7 +383,7 @@ def get_messages(*args):
         model = RM_VLM_MODEL_PATH
     elif task_id == 2:
         system_prompt = TASK2_FEEDBACK_GENERATOR_SYSTEM_PROMPT_TEMPLATE_NAIVE
-        user_prompt = TASK2_FEEDBACK_GENERATOR_USER_PROMPT_TEMPLATE_NAIVE.format(prompt=prompt, part4_feedback=predicted_feedback)
+        user_prompt = TASK2_FEEDBACK_GENERATOR_USER_PROMPT_TEMPLATE_NAIVE.format(prompt=prompt, predicted_feedback=predicted_feedback)
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": [
@@ -379,7 +394,7 @@ def get_messages(*args):
         model = RM_VLM_MODEL_PATH
     elif task_id == 3:
         system_prompt = TASK1_TASK3_IMAGE_GENERATOR_SYSTEM_PROMPT_TEMPLATE
-        user_prompt = TASK1_TASK3_IMAGE_GENERATOR_USER_PROMPT_TEMPLATE.format(questions=vqa_question)
+        user_prompt = vqa_question #TASK1_TASK3_IMAGE_GENERATOR_USER_PROMPT_TEMPLATE.format(questions=vqa_question)
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": [
@@ -477,32 +492,32 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
 
     if task_id == 1: # Total score: 1.0
         # Create tasks
-        vlm_task = asyncio.create_task(
+        vqa_task = asyncio.create_task(
             get_response(get_messages, prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback, vqa_question, extra_info, task_id)
         )
 
         # Gather results
-        response = await vlm_task
+        vqa_response = await vqa_task
 
         # Process VQA response
         task1_vqa_reward_score = 0.0
         if not isinstance(vqa_response, Exception) and vqa_response is not None:
             try:
-                task1_idx_to_ans: dict = image_evaluator_parser(response)
-                task1_vlm_reward_score_sum = sum(task1_idx_to_ans.values())
+                task1_idx_to_ans: dict = image_evaluator_parser(vqa_response)
+                task1_vqa_reward_score_sum = sum(task1_idx_to_ans.values())
                 task1_ans_count = len(task1_idx_to_ans)
-                task1_vlm_reward_score = 1.0 if task1_vlm_reward_score_sum == task1_ans_count else 0.0
-                reward_score += task1_vlm_reward_score
-                reward_extra_info[f"task{task_id}_vlm_reward"] = task1_vlm_reward_score
+                task1_vqa_reward_score = 1.0 if task1_vqa_reward_score_sum == task1_ans_count else 0.0
+                reward_score += task1_vqa_reward_score
+                reward_extra_info[f"task{task_id}_vqa_reward"] = task1_vqa_reward_score
             except Exception as e:
-                task1_vlm_reward_score = 0.0
+                task1_vqa_reward_score = 0.0
                 reward_score += 0.0
-                reward_extra_info[f"task{task_id}_vlm_reward"] = 0.0
+                reward_extra_info[f"task{task_id}_vqa_reward"] = 0.0
         else:
             reward_score += 0.0
-            reward_extra_info[f"task{task_id}_vlm_reward"] = 0.0
+            reward_extra_info[f"task{task_id}_vqa_reward"] = 0.0
 
-        reward_extra_info[f"task{task_id}_reward_response"] = response if not isinstance(response, Exception) else str(response)
+        reward_extra_info[f"task{task_id}_vqa_reward_response"] = vqa_response if not isinstance(vqa_response, Exception) else str(vqa_response)
 
     elif task_id == 2: # Total score: 4.0
         task2_reward_score = 0.0
@@ -531,12 +546,12 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
         # Get reward from API
         feedback_task = asyncio.create_task(get_response(get_messages, *args)) # +1
 
-        # Gather all results at once
-        response = await feedback_task
+        # Await feedback response
+        feedback_response = await feedback_task
 
         # Process feedback response
-        task2_vlm_reward_score = 0.0
-        if not isinstance(response, Exception) and response is not None:
+        task2_feedback_reward_score = 0.0
+        if not isinstance(feedback_response, Exception) and feedback_response is not None:
             try:
                 feedback_success = safe_json_loads(feedback_response)
                 if feedback_success and feedback_success.get("answer", "").lower() == "yes":
@@ -568,7 +583,9 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
 
         args = (prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback, vqa_question, extra_info, task_id)
 
-        vlm_task = asyncio.create_task(get_response(get_messages, *args))
+        # Gather results
+        vqa_task = asyncio.create_task(get_response(get_messages, *args))
+        edit_task = asyncio.create_task(get_response(get_messsages_task3_edit_instruction_following, *args))
 
         vqa_response = await vqa_task
 
@@ -600,9 +617,9 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
             reward_extra_info[f"task{task_id}_edit_reward"] = task3_edit_reward_score
         else:
             reward_score += 0.0
-            reward_extra_info[f"task{task_id}_vlm_reward"] = 0.0
+            reward_extra_info[f"task{task_id}_edit_reward"] = 0.0
         
-        reward_extra_info[f"task{task_id}_reward_response"] = response if isinstance(response, Exception) else str(response)
+        reward_extra_info[f"task{task_id}_edit_reward_response"] = edit_response if not isinstance(edit_response, Exception) else str(edit_response)
 
     return {
         "score": reward_score,
