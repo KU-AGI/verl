@@ -38,7 +38,7 @@ norm_adv_by_std_in_grpo=True # False for Dr.GRPO, True for standard GRPO
 use_kl_in_reward=False
 kl_coef=0.0
 use_kl_loss=True
-kl_loss_coef=0.005
+kl_loss_coef=0.001
 entropy_coeff=0.001
 
 clip_ratio_low=0.2
