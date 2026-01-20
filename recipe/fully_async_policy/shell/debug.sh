@@ -17,7 +17,7 @@ RUNTIME_ENV=${RUNTIME_ENV:-"/verl/recipe/fully_async_policy/shell/runtime_env.ya
 HOME="/data"
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
 # very important! please modify the max_position_embeddings in config.json to 32768 after downloading from huggingface
-MODEL_PATH="'/data/llm-reaction-reasoning/all_checkpoints/main_full_8b_v14_retro_cont/epoch=17-step=143997-exact_match_sum=0.574.ckpt/hf_model'"
+MODEL_PATH="'/data/llm-reaction-reasoning/all_checkpoints/main_full_8b_v14_retro_cont/epoch=26-step=219996-exact_match_sum=0.598.ckpt/hf_model'"
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
 DUMP_DIR=${DUMP_DIR:-"${RAY_DATA_HOME}/dumps/${project_name}/${exp_name}"}
 TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/chem_dapo/syntheticreact_train.parquet"}

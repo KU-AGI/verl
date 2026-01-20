@@ -353,16 +353,20 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         Trigger parameter synchronization after training step
         This ensures rollouter always uses the latest trained parameters
         """
+        self.logger.log(
+            data=self.metrics_aggregator.get_aggregated_metrics(),
+            step=global_steps,
+        )
+        # self.logger.log(
+        #     data=self.metrics_aggregator.get_aggregated_metrics(),
+        #     step=self.current_param_version,
+        # )
         if self.local_trigger_step < self.trigger_parameter_sync_step and not validate:
             self.local_trigger_step += 1
             return
 
         self.current_param_version += 1
         self.local_trigger_step = 1
-        self.logger.log(
-            data=self.metrics_aggregator.get_aggregated_metrics(),
-            step=self.current_param_version,
-        )
         self.progress_bar.update(1)
         self.metrics_aggregator.reset()
         timing_param_sync = {}
