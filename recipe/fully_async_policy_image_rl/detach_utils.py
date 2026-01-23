@@ -283,7 +283,7 @@ def merge_rollout_sample(config, tokenizer, rs: RolloutSample, processor):
     task2_feedback_reward_score: list = [-100] * batch_size
     for i, (vqa_judge, predicted_judge) in enumerate(zip(vqa_judges, predicted_judges)):
 
-        vqa_judge = bool(vqa_judge) # 1.0 or 0.0
+        vqa_judge = (vqa_judge == 1) # if all
         
         if vqa_judge is None or predicted_judge is None: # Invalid case
             task2_feedback_reward_score[i] = 0.0
@@ -349,6 +349,78 @@ def merge_rollout_sample(config, tokenizer, rs: RolloutSample, processor):
             for i in range(batch_size):
                 if has_invalid[i]:
                     rs.full_batch.batch[response_mask_key][i] = torch.zeros_like(response_mask[i])
+
+    # Step 6: Filtering logic
+    if not config.algorithm.filter_groups.enable:
+        return rs
+    else:
+        metric_name = config.algorithm.filter_groups.metric
+
+        # Compute per-task metrics
+        for task_id in [1, 2, 3]:
+            task_scores = rs.full_batch.batch[f"task{task_id}_token_level_scores"]
+            rs.full_batch.non_tensor_batch[f"task{task_id}_{metric_name}"] = (
+                torch.where(task_scores >= 0, task_scores, torch.zeros_like(task_scores))
+                .sum(dim=-1).cpu().numpy()
+            )
+    
+        # Collect metric values per uid for each task
+        task_prompt_uid2metric_vals = {1: defaultdict(list), 2: defaultdict(list), 3: defaultdict(list)}
+        for task_id in [1, 2, 3]:
+            task_metric_key = f"task{task_id}_{metric_name}"
+            for uid, metric_val in zip(
+                rs.full_batch.non_tensor_batch["uid"],
+                rs.full_batch.non_tensor_batch[task_metric_key],
+                strict=True
+            ):
+                task_prompt_uid2metric_vals[task_id][uid].append(metric_val)
+        
+        # Compute std per uid for each task
+        task_prompt_uid2metric_std = {1: {}, 2: {}, 3: {}}
+        for task_id in [1, 2, 3]:
+            for prompt_uid, metric_vals in task_prompt_uid2metric_vals[task_id].items():
+                task_prompt_uid2metric_std[task_id][prompt_uid] = np.std(metric_vals)
+        
+        # Keep uid only if ALL tasks have std > 0 (or single trajectory)
+        all_uids = set(rs.full_batch.non_tensor_batch["uid"])
+        kept_prompt_uids = set()
+        
+        for uid in all_uids:
+            # Skip filtering if only one trajectory (no variance possible)
+            n_trajs = len(task_prompt_uid2metric_vals[1][uid])
+            if n_trajs == 1:
+                kept_prompt_uids.add(uid)
+                continue
+            
+            # Require std > 0 for ALL tasks to keep this prompt
+            all_tasks_have_variance = all(
+                task_prompt_uid2metric_std[task_id].get(uid, 0) > 0
+                for task_id in [1, 2, 3]
+            )
+            if all_tasks_have_variance:
+                kept_prompt_uids.add(uid)
+        
+        # Apply filtering
+        kept_traj_idxs = [
+            idx for idx, uid in enumerate(rs.full_batch.non_tensor_batch["uid"])
+            if uid in kept_prompt_uids
+        ]
+        rs.full_batch = rs.full_batch[kept_traj_idxs]
+
+        # Apply detail reward logging
+        kept_meta_info = {}
+        for metric_name, metric_value in rs.full_batch.meta_info.items():
+            if isinstance(metric_value, list):
+                kept_meta_info[metric_name] = [metric_value[idx] for idx in kept_traj_idxs]
+            elif metric_name == "metrics":
+                for sub_metric_name, sub_metric_value in rs.full_batch.meta_info["metrics"].items():
+                    if metric_name not in kept_meta_info:
+                        kept_meta_info[metric_name] = {}
+                    kept_meta_info[metric_name][sub_metric_name] = [sub_metric_value[idx] for idx in kept_traj_idxs]
+            else:
+                kept_meta_info[metric_name] = metric_value
+
+        rs.full_batch.meta_info = kept_meta_info
 
     return rs
 
