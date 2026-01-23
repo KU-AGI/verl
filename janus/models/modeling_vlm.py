@@ -395,23 +395,67 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
         return concat_embeds_padded, concat_mask_padded, position_ids, output_starts
 
     def _process_task1_data(self, batch: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[int]]:
-        """Process Task 1 (Image Generation) data"""
-        # Input processing
-        task1_input_ids = batch["task1_input_ids"]
-        task1_attention_mask = batch["task1_attention_mask"]
-        task1_input_embeds = self.language_model.get_input_embeddings()(task1_input_ids)
+        """Process Task 1 (Image Generation) data with CFG logic applied"""
+        # 1. 원본 데이터 로드
+        task1_input_ids = batch["task1_input_ids"].long() # [B, L_in]
+        task1_attention_mask = batch["task1_attention_mask"] # [B, L_in]
+        
+        # 2. Conditional Embeddings 생성
+        task1_input_embeds = self.language_model.get_input_embeddings()(task1_input_ids) # [B, L_in, D]
+        
+        # 3. Unconditional Embeddings 생성 (Masking 로직 적용)
+        uncond_input_embeds = task1_input_embeds.clone()
+        pad_id = torch.tensor(self.processor.pad_id, device=task1_input_ids.device)
+        
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            # [주의] 할당 시 차원 불일치 방지를 위해 squeeze() 처리
+            pad_embed = self.language_model.get_input_embeddings()(pad_id).squeeze() # [D]
+            
+        start_marker = torch.tensor([100601], device=task1_input_ids.device) # <|User|>
+        end_marker = torch.tensor([100602], device=task1_input_ids.device)   # <|Assistant|>
 
-        # Output processing
-        gen_imgs_pixel_values = batch["task1_gen_imgs_pixel_values"]
-        task1_image_ids = batch["task1_gen_img_tokens"]
-        task1_gen_img_embeds = self.gen_aligner(self.gen_embed(task1_image_ids))
+        def find_sequence(inp_id, marker):
+            len_needle = marker.shape[0]
+            for i in range(inp_id.shape[0] - len_needle + 1):
+                if torch.equal(inp_id[i:i+len_needle], marker):
+                    return i
+            return -1
 
-        # Response mask
-        task1_response_mask = batch["task1_response_mask"]
+        for i, row in enumerate(task1_input_ids):
+            start_pos = find_sequence(row, start_marker)
+            end_pos = find_sequence(row, end_marker)
+            
+            if start_pos != -1 and end_pos != -1 and start_pos < end_pos:
+                # User 프롬프트 구간을 pad_embed로 치환 (Uncond)
+                uncond_input_embeds[i, start_pos : end_pos + 2] = pad_embed
 
-        # Remove padding and concatenate
+        # 4. Batch Interleaving (B -> B*2)
+        # Cond와 Uncond를 [C, U, C, U...] 순서로 섞습니다.
+        batch_size, seq_len, embed_dim = task1_input_embeds.shape
+        
+        final_input_embeds = torch.zeros((batch_size * 2, seq_len, embed_dim), 
+                                        dtype=task1_input_embeds.dtype, device=task1_input_embeds.device)
+        final_input_embeds[0::2] = task1_input_embeds
+        final_input_embeds[1::2] = uncond_input_embeds
+        
+        final_attention_mask = task1_attention_mask.repeat_interleave(2, dim=0) # [B*2, L_in]
+
+        # 5. Output (Generated Image) 데이터 처리 및 2배 확장
+        # 생성된 이미지는 Cond/Uncond 패스 모두에 동일하게 대응되도록 2배 확장합니다.
+        task1_image_ids = batch["task1_gen_img_tokens"].long() # [B, L_out]
+        task1_gen_img_embeds = self.gen_aligner(self.gen_embed(task1_image_ids)) # [B, L_out, D]
+        
+        # Interleave Output Embeds
+        final_gen_img_embeds = task1_gen_img_embeds.repeat_interleave(2, dim=0) # [B*2, L_out, D]
+        
+        # Response mask 확장
+        task1_response_mask = batch["task1_response_mask"] # [B, L_out]
+        final_response_mask = task1_response_mask.repeat_interleave(2, dim=0) # [B*2, L_out]
+
+        # 6. Padding 제거 및 Concatenate (최종 시퀀스 구성)
+        # 
         concat_embeds, concat_mask, position_ids, output_starts = self._remove_padding_and_concat_with_embeds(
-            task1_input_embeds, task1_attention_mask, task1_gen_img_embeds, task1_response_mask
+            final_input_embeds, final_attention_mask, final_gen_img_embeds, final_response_mask
         )
 
         return concat_embeds, concat_mask, position_ids, output_starts
@@ -466,51 +510,85 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
         return concat_embeds, concat_mask, position_ids, output_starts
 
     def _process_task3_data(self, batch: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[int]]:
-        """Process Task 3 (Regen Image Generation) data"""
-        # Input processing
-        task3_input_ids = batch["task3_input_ids"]
+        """Process Task 3 (Regen Image Generation) data with CFG logic applied"""
+        # 1. 원본 데이터 로드 (정수형 캐스팅 필수)
+        task3_input_ids = batch["task3_input_ids"].long()
         task3_attention_mask = batch["task3_attention_mask"]
-        gen_imgs_pixel_values = batch["task1_gen_imgs_pixel_values"]
-        task3_image_ids = batch["task1_gen_img_tokens"]
+        task3_image_ids = batch["task1_gen_img_tokens"].long() # 이전 단계에서 생성된 이미지 토큰
 
-        task3_image_embeds = self.gen_aligner(self.gen_embed(task3_image_ids))
+        # 2. 텍스트 임베딩 및 CFG 마스킹 (Uncond 생성)
         task3_text_embeds = self.language_model.get_input_embeddings()(task3_input_ids)
+        uncond_text_embeds = task3_text_embeds.clone()
 
-        # Find image token positions
+        pad_id = torch.tensor(self.processor.pad_id, device=task3_input_ids.device)
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            pad_embed = self.language_model.get_input_embeddings()(pad_id).squeeze() # [D]
+
+        # Task 3용 마커: <end_of_image>\n 부터 <|Assistant|> 직전까지 마스킹
+        start_marker = torch.tensor([100593, 185], device=task3_input_ids.device) 
+        end_marker = torch.tensor([100602], device=task3_input_ids.device)
+
+        def find_sequence(inp_id, marker):
+            len_needle = marker.shape[0]
+            for i in range(inp_id.shape[0] - len_needle + 1):
+                if torch.equal(inp_id[i:i+len_needle], marker):
+                    return i
+            return -1
+
+        for i, row in enumerate(task3_input_ids):
+            start_pos = find_sequence(row, start_marker)
+            end_pos = find_sequence(row, end_marker)
+            if start_pos != -1 and end_pos != -1 and start_pos < end_pos:
+                # 피드백 텍스트 구간을 마스킹
+                uncond_text_embeds[i, start_pos + 1 : end_pos + 2] = pad_embed
+
+        # 3. 이미지 임베딩 준비
+        task3_image_embeds = self.gen_aligner(self.gen_embed(task3_image_ids))
+
+        # 4. 이미지 토큰 위치 찾기 (Cond/Uncond 공통 사용)
         pos_list = []
         invalid_mask = []
         for i, ids in enumerate(task3_input_ids):
             pos_tensor = (ids == self.processor.image_id).nonzero(as_tuple=False)
             if pos_tensor.numel() == 0:
-                # No image placeholder found, mark this sample as invalid
-                print(f"[WARNING] No image placeholder token (id={self.processor.image_id}) found in task3_input_ids[{i}]. Excluding from training.")
-                pos_list.append([0])  # Use dummy position
                 invalid_mask.append(i)
+                pos_list.append([0])
             else:
                 pos = pos_tensor[0].item()
                 pos_list.append([pos])
-        task3_image_start_indices = pos_list
-
-        # Zero out response_mask for invalid samples to exclude from loss calculation
-        if len(invalid_mask) > 0 and "task3_response_mask" in batch:
-            for idx in invalid_mask:
-                batch["task3_response_mask"][idx] = 0
-
-        task3_merged_embeds = self._merge_text_and_image_embeds(
-            task3_text_embeds, task3_image_embeds, task3_image_start_indices
+        
+        # 5. Merge (Cond/Uncond 각각 수행)
+        cond_merged_embeds = self._merge_text_and_image_embeds(
+            task3_text_embeds, task3_image_embeds, pos_list
+        )
+        uncond_merged_embeds = self._merge_text_and_image_embeds(
+            uncond_text_embeds, task3_image_embeds, pos_list
         )
 
-        # Output processing
-        regen_imgs_pixel_values = batch["task3_regen_imgs_pixel_values"]
-        task3_image_ids = batch["task3_regen_img_tokens"]
-        task3_regen_img_embeds = self.gen_aligner(self.gen_embed(task3_image_ids))
+        # 6. Batch Interleaving (B -> B*2)
+        batch_size, seq_len, embed_dim = cond_merged_embeds.shape
+        final_merged_embeds = torch.zeros((batch_size * 2, seq_len, embed_dim), 
+                                         dtype=cond_merged_embeds.dtype, device=cond_merged_embeds.device)
+        final_merged_embeds[0::2] = cond_merged_embeds
+        final_merged_embeds[1::2] = uncond_merged_embeds
+        
+        final_attention_mask = task3_attention_mask.repeat_interleave(2, dim=0)
 
-        # Response mask
-        task3_response_mask = batch["task3_response_mask"]
+        # 7. Output (Regenerated Image) 데이터 처리 및 2배 확장
+        task3_regen_image_ids = batch["task3_regen_img_tokens"].long()
+        task3_regen_img_embeds = self.gen_aligner(self.gen_embed(task3_regen_image_ids))
+        final_regen_img_embeds = task3_regen_img_embeds.repeat_interleave(2, dim=0)
 
-        # Remove padding and concatenate
+        # 8. Response Mask 처리
+        task3_response_mask = batch["task3_response_mask"].clone()
+        if len(invalid_mask) > 0:
+            for idx in invalid_mask:
+                task3_response_mask[idx] = 0
+        final_response_mask = task3_response_mask.repeat_interleave(2, dim=0)
+
+        # 9. 최종 시퀀스 구성
         concat_embeds, concat_mask, position_ids, output_starts = self._remove_padding_and_concat_with_embeds(
-            task3_merged_embeds, task3_attention_mask, task3_regen_img_embeds, task3_response_mask
+            final_merged_embeds, final_attention_mask, final_regen_img_embeds, final_response_mask
         )
 
         return concat_embeds, concat_mask, position_ids, output_starts
@@ -541,19 +619,24 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
         """
         from transformers.modeling_outputs import CausalLMOutputWithPast
 
+        self.guidance_scale = 5
+
         # If batch is provided, process data internally
         if batch is not None:
             if task_id == 1:
                 inputs_embeds, attention_mask, position_ids, output_starts = self._process_task1_data(batch)
+                # Store output_starts in instance variable for retrieval
+                self._output_starts = output_starts[0::2] if output_starts is not None else None
             elif task_id == 2:
                 inputs_embeds, attention_mask, position_ids, output_starts = self._process_task2_data(batch)
+                # Store output_starts in instance variable for retrieval
+                self._output_starts = output_starts
             elif task_id == 3:
                 inputs_embeds, attention_mask, position_ids, output_starts = self._process_task3_data(batch)
+                # Store output_starts in instance variable for retrieval
+                self._output_starts = output_starts[0::2] if output_starts is not None else None
             else:
                 raise ValueError(f"Invalid task_id: {task_id}. Must be 1, 2, or 3.")
-
-        # Store output_starts in instance variable for retrieval
-        self._output_starts = output_starts
 
         # Forward pass based on task_id
         if task_id == 1:
@@ -564,6 +647,10 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
                 position_ids=position_ids,
             )
             logits = self.gen_head(output.last_hidden_state)
+
+            logit_cond = logits[0::2, :]
+            logit_uncond = logits[1::2, :]
+            logits = logit_uncond + self.guidance_scale * (logit_cond-logit_uncond)
 
             return CausalLMOutputWithPast(
                 logits=logits,
@@ -588,6 +675,10 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
                 position_ids=position_ids,
             )
             logits = self.gen_head(output.last_hidden_state)
+
+            logit_cond = logits[0::2, :]
+            logit_uncond = logits[1::2, :]
+            logits = logit_uncond + self.guidance_scale * (logit_cond-logit_uncond)
 
             return CausalLMOutputWithPast(
                 logits=logits,

@@ -11,17 +11,21 @@ exec > >(tee -a "${SCRIPT_LOG}")
 exec 2>&1
 
 project_name='mllm_reasoning'
-exp_name='fully_async_kt'
+exp_name='0123_online_grpo_prompt_filter_kl0.001_real_final'
 
 # export NCCL_IB_GID_INDEX=0
 # export NCCL_CUDA_DEVICE_MAX_CONNECTIONS=8
 # export CUDA_DEVICE_MAX_CONNECTIONS=8
 # export NCCL_P2P_LEVEL="NVL"
 # export NCCL_NET_GDR_LEVEL=2
+export NCCL_SOCKET_IFNAME="eth0"
+export NCCL_IB_DISABLE=1
+export GLOO_SOCKET_IFNAME="eth0"
 export NCCL_SOCKET_TIMEOUT=300000
 export NCCL_IB_TIMEOUT=300000
-export export NCCL_IB_HCA=mlx5_0
+# export NCCL_IB_HCA=mlx5_0
 
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # export VLLM_ATTENTION_BACKEND=XFORMERS
 export HYDRA_FULL_ERROR=1
 # export TORCH_DISTRIBUTED_DEBUG=DETAIL
@@ -32,14 +36,13 @@ WORKING_DIR=${WORKING_DIR:-"${PWD}"}
 RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/recipe/fully_async_policy_image_rl/shell/runtime_env_kt.yaml"}
 
 # Paths
-HOME="/home/work/AGILAB"
+HOME="/home/work/AGILAB/mllm_reasoning/pimang62"
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
 # very important! please modify the max_position_embeddings in config.json to 32768 after downloading from huggingface
-MODEL_PATH=/home/work/AGILAB/mllm_reasoning/data/experiments/ckpt/janus_sft/1204_v9_sft_constant_sch/version_0/step=012000.ckpt/hf_model # /data/mllm/checkpoints/Janus-Pro-7B
-RM_MODEL_PATH=/home/work/AGILAB/mllm_reasoning/data/checkpoints/Qwen3-VL-30B-A3B-Instruct # OpenGVLab/InternVL3_5-38B
+MODEL_PATH=/home/work/AGILAB/mllm_reasoning/data/experiments/ckpt/janus_sft/1223_v10_sft_warmup_constant_long_prompt/version_1/step=014000.ckpt/hf_model # /data/mllm/checkpoints/Janus-Pro-7B
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
-TRAIN_FILES=/home/work/AGILAB/mllm_reasoning/pimang62/data/train.parquet
-VAL_FILES=/home/work/AGILAB/mllm_reasoning/pimang62/data/val.parquet
+TRAIN_FILES=/home/work/AGILAB/mllm_reasoning/pimang62/data/train_wo_focusdiff_v2.parquet
+VAL_FILES=/home/work/AGILAB/mllm_reasoning/pimang62/data/val_wo_focusdiff_v2.parquet
 
 rollout_name=image_unified
 rollout_mode=async
@@ -48,16 +51,17 @@ rollout_mode=async
 adv_estimator=grpo_task_skip
 
 use_kl_in_reward=False
-kl_coef=0.0
+kl_coef=0.00
 use_kl_loss=True
 kl_loss_coef=0.001
+entropy_coeff=0.00
 
 clip_ratio_low=0.2
 clip_ratio_high=0.2
 
-enable_filter_groups=False
+enable_filter_groups=True
 filter_groups_metric=acc
-max_num_gen_batches=10
+# max_num_gen_batches=10
 
 norm_adv_by_std_in_grpo=True
 
@@ -107,21 +111,22 @@ train_prompt_bsz=0 # not used in async mode
 gen_prompt_bsz=1 # streaming generation, set to 1
 n_resp_per_prompt=8
 rollout_prompt_size=2 # set to number of prompts per actor per batch, used in async mode
-val_rollout_prompt_size=16
+val_rollout_prompt_size=16 # 16 prompt per batch
 train_prompt_mini_bsz=128
-train_prompt_micro_bsz=16
+train_prompt_micro_bsz=128
 total_rollout_steps=$(((512*100*3*10)))
-staleness_threshold=1.0
-trigger_parameter_sync_step=4
+staleness_threshold=4.0
+trigger_parameter_sync_step=1
 require_batches=1
 partial_rollout=False
 log_prob_micro_batch_size_per_gpu=16
 
-test_freq=5
-save_freq=$((test_freq * trigger_parameter_sync_step * 1))
-total_epochs=1
+test_freq=50
+save_freq=10 # $((test_freq * trigger_parameter_sync_step * 1))
+total_epochs=10
+# total_training_steps=3000
 rollout_freq=1
-log_val_generations=20
+# log_val_generations=20
 
 ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     --working-dir "${WORKING_DIR}" \
@@ -129,18 +134,18 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     --config-name="fully_async_ppo_trainer.yaml" \
     data.train_files="${TRAIN_FILES}" \
     data.val_files="${VAL_FILES}" \
-    data.shuffle=False \
+    data.shuffle=True \
     data.prompt_key=prompt \
     data.train_batch_size=${train_prompt_bsz} \
     data.gen_batch_size=${gen_prompt_bsz} \
     data.val_batch_size=${gen_prompt_bsz} \
     data.max_prompt_length=${max_prompt_length} \
     data.max_response_length=${max_response_length} \
-    data.custom_cls.path=recipe/image_rl/image_rl_dataset.py \
+    data.custom_cls.path=${RAY_DATA_HOME}/recipe/image_rl/image_rl_dataset.py \
     data.custom_cls.name=ImageRLDataset \
     actor_rollout_ref.nccl_timeout=120000000 \
     actor_rollout_ref.model.path=\"${MODEL_PATH}\" \
-    actor_rollout_ref.actor.optim.lr=1e-6 \
+    actor_rollout_ref.actor.optim.lr=2e-5 \
     actor_rollout_ref.actor.optim.lr_scheduler_type=constant \
     actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
     actor_rollout_ref.actor.optim.weight_decay=0.1 \
@@ -152,7 +157,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     actor_rollout_ref.actor.use_kl_loss=${use_kl_loss} \
     actor_rollout_ref.actor.kl_loss_coef=${kl_loss_coef} \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
-    actor_rollout_ref.actor.entropy_coeff=-0.00 \
+    actor_rollout_ref.actor.entropy_coeff=${entropy_coeff} \
     actor_rollout_ref.actor.grad_clip=1.0 \
     actor_rollout_ref.actor.clip_ratio_low=${clip_ratio_low} \
     actor_rollout_ref.actor.clip_ratio_high=${clip_ratio_high} \
@@ -161,6 +166,8 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     algorithm.adv_estimator=${adv_estimator} \
     algorithm.use_kl_in_reward=${use_kl_in_reward} \
     algorithm.kl_ctrl.kl_coef=${kl_coef} \
+    algorithm.filter_groups.enable=${enable_filter_groups} \
+    algorithm.filter_groups.metric=${filter_groups_metric} \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.hybrid_engine=False \
     actor_rollout_ref.actor.use_dynamic_bsz=${use_dynamic_bsz} \
@@ -214,7 +221,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     algorithm.norm_adv_by_std_in_grpo=${norm_adv_by_std_in_grpo} \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
-    trainer.val_before_train=False \
+    trainer.val_before_train=True \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
     trainer.save_freq="${save_freq}" \
@@ -227,7 +234,8 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     trainer.nnodes=1 \
     trainer.n_gpus_per_node=8 \
     rollout.nnodes=2 \
-    rollout.n_gpus_per_node=8 \
+    rollout.n_gpus_per_node=6 \
+    actor_rollout_ref.rollout.agent.num_workers=12 \
     rollout.total_rollout_steps="${total_rollout_steps}" \
     rollout.total_epochs=${total_epochs} \
     trainer.test_freq="${test_freq}" \
@@ -238,24 +246,13 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     async_training.trigger_parameter_sync_step="${trigger_parameter_sync_step}" \
     async_training.require_batches="${require_batches}" \
     async_training.partial_rollout="${partial_rollout}" \
-    async_training.use_rollout_log_probs=False \
+    async_training.use_rollout_log_probs=True \
+    async_training.compute_prox_log_prob=False \
     reward_model.reward_manager=image_generation \
-    reward_model.enable=True \
-    reward_model.strategy=vllm \
-    reward_model.micro_batch_size=${train_prompt_mini_bsz} \
-    reward_model.ppo_micro_batch_size_per_gpu=1 \
-    reward_model.model.path=\"${RM_MODEL_PATH}\" \
-    reward_model.model.trust_remote_code=True \
-    reward_model.rollout.tensor_model_parallel_size=${rm_gen_tp} \
-    reward_model.rollout.gpu_memory_utilization=0.6 \
-    reward_model.rollout.max_length=2048 \
-    reward_model.reward_manager=image_generation \
-    custom_reward_function.path=recipe/image_rl/reward_function.py \
+    custom_reward_function.path=${RAY_DATA_HOME}/recipe/image_rl/reward_function_naive.py \
     custom_reward_function.name=compute_score_batch \
-    # reward_model.reward_kwargs.img_saving.num=8 \
-    # algorithm.rollout_correction.rollout_is=${rollout_is} \
-    # algorithm.rollout_correction.rollout_is_threshold=${rollout_is_threshold} \
-    # algorithm.rollout_correction.rollout_rs=${rollout_rs} \
-    # algorithm.rollout_correction.rollout_rs_threshold=${rollout_rs_threshold} \
-    # algorithm.rollout_correction.rollout_rs_threshold_lower=${rollout_rs_threshold_lower} \
-    # algorithm.rollout_correction.rollout_token_veto_threshold=${rollout_token_veto_threshold} \
+    +reward_model.reward_kwargs.overlong_buffer_cfg.enable=${enable_overlong_buffer} \
+    +reward_model.reward_kwargs.overlong_buffer_cfg.len=${overlong_buffer_len} \
+    +reward_model.reward_kwargs.overlong_buffer_cfg.penalty_factor=${overlong_penalty_factor} \
+    +reward_model.reward_kwargs.overlong_buffer_cfg.log=False \
+    +reward_model.reward_kwargs.max_resp_len=${max_response_length} \
