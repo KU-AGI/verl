@@ -173,13 +173,45 @@ class WeightRelayActor:
 
                 for c in children:
                     collective.send(buf, dst_rank=c, group_name=group)
+                    
             t_net = time.time() - t_net0
+            t_save0 = time.time()
+
+            # 1. Rank 0의 메모리에 있는 w0를 활용해 .pt 파일 저장
+            # w0는 위에서 이미 numpy array로 준비되어 있습니다.
+            weights_tensor = torch.from_numpy(w0).view(torch.bfloat16)
+            
+            # 2. 원자적(Atomic) 저장을 위해 임시 파일 사용
+            tmp_pt = f"/dev/shm/.wtmp_v{version}_rank0.pt"
+            torch.save(weights_tensor, tmp_pt)
+            os.replace(tmp_pt, file_path)
+
+            # 3. 이전 버전 파일 정리 (Rank 0 노드 관리용)
+            try:
+                for f in glob.glob("/dev/shm/weights_v*.pt"):
+                    base = os.path.basename(f)
+                    if (base.startswith("weights_v")
+                        and base.endswith(".pt")
+                        and base.count(".") == 1 
+                        and os.path.abspath(f) != os.path.abspath(file_path)):
+                        try:
+                            os.remove(f)
+                        except:
+                            pass
+            except:
+                pass
+
+            t_save = time.time() - t_save0
             t_total = time.time() - t_total0
-            # Root version marker (no early-return optimization; just bookkeeping)
             self.latest_version = version
+
             return {
-                "node": self.node_id, "rank": rank, "file": None,
-                "t_net": t_net, "t_save_pt": 0.0, "t_total": t_total,
+                "node": self.node_id, 
+                "rank": rank, 
+                "file": file_path,  # 기존 None에서 file_path로 변경
+                "t_net": t_net, 
+                "t_save_pt": t_save, 
+                "t_total": t_total,
                 "skip_write": False,
             }
 
