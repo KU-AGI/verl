@@ -73,7 +73,12 @@ class ParameterSynchronizer:
         self.keep_last_n = getattr(config.async_training, "keep_last_n_weights", 1)
         self._weights_refs = {}
 
+        self._actor_rank0_idx = self._setup_rank_info()
+
         self.relays = self._setup_node_relays()
+
+        self._init_relay_gloo_group()
+        self._configure_relays_for_tree()
 
         # Statistics
         self.current_version = 0
@@ -83,10 +88,12 @@ class ParameterSynchronizer:
 
         self._export_method_name = None
         self._rank_method_name = None
-        self._actor_rank0_idx = self._setup_rank_info()
 
         self._init_weights_info()
         self._init_sync_group()
+
+        # Prevent overlapping weight distribution (vN and vN+1 race)
+        self._dist_lock = asyncio.Lock()
 
     def _setup_rank_info(self):
     
@@ -111,17 +118,28 @@ class ParameterSynchronizer:
             getattr(w, method_name).remote() for w in self.rollout_wg.workers
         ])
         
-        unique_nodes = list(set(node_ids))
+        rollout_nodes = sorted(set(node_ids))
+
+        trainer_node_id = ray.get(
+        self.actor_wg.workers[self._actor_rank0_idx].__ray_call__.remote(
+            lambda self: __import__("ray").get_runtime_context().get_node_id()
+            )
+        )
         
+        self._trainer_node_id = trainer_node_id
+
+        ordered_nodes = [trainer_node_id] + [n for n in rollout_nodes if n != trainer_node_id]
+        self._relay_nodes_ordered = ordered_nodes
+
         relays = {}
-        for node_id in unique_nodes:
+        for node_id in ordered_nodes:
             relays[node_id] = WeightRelayActor.options(
                 scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
                     node_id=node_id, soft=False
                 )
             ).remote(node_id)
         
-        print(f"[ParamSync] Initialized {len(relays)} RelayActors on nodes: {unique_nodes}")
+        print(f"[ParamSync] Initialized {len(relays)} RelayActors on nodes: {ordered_nodes}")
         return relays
 
     def get_latest_published(self):
@@ -150,6 +168,40 @@ class ParameterSynchronizer:
             group_name=self.sync_group_name,
         )
 
+    def _init_relay_gloo_group(self):
+        job_id = ray.get_runtime_context().get_job_id()
+        self._weight_group_name = f"weight_gloo_relays_{job_id}"
+
+        actors = [self.relays[n] for n in self._relay_nodes_ordered]
+        world_size = len(actors)
+
+        collective.create_collective_group(
+            actors,
+            world_size,
+            list(range(world_size)),
+            backend="GLOO",
+            group_name=self._weight_group_name,
+        )
+
+    def _configure_relays_for_tree(self):
+        # fanout은 확장성/속도 밸런스: 기본 2 추천
+        world_size = len(self._relay_nodes_ordered)
+        fanout = 1
+        chunk_bytes = 128 << 20
+
+        cfg_tasks = []
+        for rank, node_id in enumerate(self._relay_nodes_ordered):
+            cfg_tasks.append(
+                self.relays[node_id].configure_stream.remote(
+                    rank=rank,
+                    world_size=world_size,
+                    group_name=self._weight_group_name,
+                    fanout=fanout,
+                    chunk_bytes=chunk_bytes,
+                )
+            )
+        ray.get(cfg_tasks)
+
     def set_self_handle(self, handle):
         """Store the actor handle for this ParameterSynchronizer"""
         self.self_handle = handle
@@ -170,22 +222,55 @@ class ParameterSynchronizer:
         weights_ref = export_refs[self._actor_rank0_idx]
         self.latest_weights_ref = weights_ref
         self.latest_version = version
+
+        w0 = self.actor_wg.workers[self._actor_rank0_idx]
+        owner_node = ray.get(w0.__ray_call__.remote(lambda self: __import__("ray").get_runtime_context().get_node_id()))
+        print(f"[ParamSync] weights owner node_id = {owner_node}", flush=True)
+        print(f"[ParamSync] trainer_node_id     = {self._trainer_node_id}", flush=True)
         return weights_ref
 
     async def sync_weights(self, version, validate=False, global_steps=0):
 
-        start_time = time.time()
+        t_total0 = time.time()
+
+        t_pub0 = time.time()
+
         self.current_version = version
         
         self.mq_client.update_param_version_sync(version)
 
         weights_ref = await self._publish_weights(version)
 
-        prefetch_tasks = [r.prefetch_to_shm.remote(version, weights_ref) for r in self.relays.values()]
-        
-        t0 = time.time()
-        await asyncio.gather(*prefetch_tasks)
-        print(f"[ParameterSynchronizer] v{version} Prefetch to all nodes SHM done. Time: {time.time()-start_time:.2f}s")
+        t_pub = time.time() - t_pub0
+
+        t_stream0 = time.time()
+        async with self._dist_lock:
+            tasks = []
+            for node_id in self._relay_nodes_ordered:
+                relay = self.relays[node_id]
+                if node_id == self._trainer_node_id:
+                    tasks.append(relay.stream_to_shm_gloo.remote(version, weights_ref))
+                else:
+                    tasks.append(relay.stream_to_shm_gloo.remote(version, None))
+
+            results = await asyncio.gather(*tasks)
+        t_stream = time.time() - t_stream0
+
+        # relay 결과에서 net/save를 집계
+        # root(rank0) 결과 포함, non-root 여러 개 중 “critical path”는 보통 max로 봅니다.
+        t_net_max = max(r.get("t_net", 0.0) for r in results)
+        t_save_max = max(r.get("t_save_pt", 0.0) for r in results)
+        t_relay_total_max = max(r.get("t_total", 0.0) for r in results)
+
+        t_total = time.time() - t_total0
+
+        print(
+            f"[ParameterSynchronizer][GLOO] v{version} "
+            f"publish={t_pub:.2f}s | stream_total={t_stream:.2f}s | "
+            f"relay_net_max={t_net_max:.2f}s | relay_ptsave_max={t_save_max:.2f}s | "
+            f"relay_total_max={t_relay_total_max:.2f}s | total={t_total:.2f}s",
+            flush=True
+        )
 
         # Update rollout version metadata & trigger validation asynchronously
         self.wait_last_update = self.rollouter.update_param_version.remote(version, validate, global_steps)
@@ -200,16 +285,22 @@ class ParameterSynchronizer:
 
     async def distribute_weights(self, version, weights_ref, validate=False, global_steps=0):
         start_time = time.time()
-        
-        prefetch_tasks = [r.prefetch_to_shm.remote(version, weights_ref) for r in self.relays.values()]
-        
-        t0 = time.time()
-        await asyncio.gather(*prefetch_tasks)
-        print(f"[ParameterSynchronizer] v{version} Prefetch to all nodes SHM done. Time: {time.time()-start_time:.2f}s")
+        self.current_version = version
 
-        # Update rollout version metadata & trigger validation asynchronously
+        async with self._dist_lock:
+            tasks = []
+            for node_id in self._relay_nodes_ordered:
+                relay = self.relays[node_id]
+                if node_id == self._trainer_node_id:
+                    tasks.append(relay.stream_to_shm_gloo.remote(version, weights_ref))
+                else:
+                    tasks.append(relay.stream_to_shm_gloo.remote(version, None))
+
+            await asyncio.gather(*tasks)
+
+        print(f"[ParameterSynchronizer][GLOO] v{version} Gloo stream done. Time: {time.time()-start_time:.2f}s")
+
         self.wait_last_update = self.rollouter.update_param_version.remote(version, validate, global_steps)
-        # No need to pause/resume - generation continues with old weights until async update completes
         self.wait_last_resume = None
 
     def apply_nccl_weight_sync(self, version: int):
