@@ -641,11 +641,22 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             return
 
         val_metrics: ValidateMetrics = ray.cloudpickle.loads(val_data)
+
+        # Use max of val_metrics.param_version and current_param_version to avoid wandb step ordering warnings
+        # This ensures monotonically increasing steps while still logging all validation results
+        log_step = max(val_metrics.param_version, self.current_param_version)
+
+        if val_metrics.param_version < self.current_param_version:
+            print(
+                f"[FullyAsyncTrainer] Logging stale validation result from param_version {val_metrics.param_version} "
+                f"at step {log_step} (current: {self.current_param_version})"
+            )
+
         if val_metrics.metrics:
             # Extract validation generation samples if present (image RL specific)
             validation_samples = val_metrics.metrics.pop('validation_samples', None)
 
-            self.logger.log(data=val_metrics.metrics, step=val_metrics.param_version)
+            self.logger.log(data=val_metrics.metrics, step=log_step)
             pprint(
                 f"[FullyAsyncTrainer] parameter version: {val_metrics.param_version} "
                 f"Validation metrics: {val_metrics.metrics}"
@@ -660,6 +671,6 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                     project_name=self.config.trainer.project_name,
                     experiment_name=self.config.trainer.experiment_name,
                 )
-                val_gen_logger._log_generations_to_wandb(validation_samples, val_metrics.param_version, wandb)
+                val_gen_logger._log_generations_to_wandb(validation_samples, log_step, wandb)
 
-        self.logger.log(data=val_metrics.timing_raw, step=val_metrics.param_version)
+        self.logger.log(data=val_metrics.timing_raw, step=log_step)
