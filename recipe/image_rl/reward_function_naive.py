@@ -26,10 +26,10 @@ from recipe.image_rl.gdino_regex import _CONNECTORS, SKIP_KEYWORDS, _COMPILED_RE
 # Configuration
 VLM_BASE_URLS = [
     # "http://10.100.44.4:8006/v1", # main1
-    "http://10.100.44.8:8006/v1", # sub1
-    "http://10.100.44.8:8007/v1",
-    "http://10.100.44.2:8006/v1", # sub2
-    "http://10.100.44.2:8007/v1",
+    "http://10.100.44.4:8006/v1", # sub2
+    "http://10.100.44.4:8007/v1",
+    "http://10.100.44.6:8006/v1",
+    "http://10.100.44.6:8007/v1",
     
 ]
 LLM_BASE_URLS = [
@@ -41,7 +41,7 @@ LLM_BASE_URLS = [
 API_KEY = "EMPTY"
 MAX_RETRIES = 3
 BASE_DELAY = 2
-RM_VLM_MODEL_PATH = os.environ.get("RM_VLM_MODEL_PATH", "Qwen/Qwen3-VL-30B-A3B-Instruct")
+RM_VLM_MODEL_PATH = os.environ.get("RM_VLM_MODEL_PATH", "Qwen/Qwen3-VL-32B-Instruct")
 RM_LLM_MODEL_PATH = os.environ.get("RM_LLM_MODEL_PATH", "Qwen/Qwen3-30B-A3B-Instruct-2507")
 
 # Health checking configuration
@@ -366,9 +366,9 @@ def get_messages(*args):
 
     if task_id == 1:
         system_prompt = TASK1_TASK3_IMAGE_GENERATOR_SYSTEM_PROMPT_TEMPLATE
-        user_prompt = vqa_question #TASK1_TASK3_IMAGE_GENERATOR_USER_PROMPT_TEMPLATE.format(questions=vqa_question)
+        user_prompt = TASK1_TASK3_IMAGE_GENERATOR_USER_PROMPT_TEMPLATE.format(questions=vqa_question)
         messages = [
-            {"role": "system", "content": system_prompt},
+            # {"role": "system", "content": system_prompt},
             {"role": "user", "content": [
                 {"type": "image_url", "image_url": {"url": convert_gen_img_to_base64(gen_img)}},
                 {"type": "text", "text": user_prompt}
@@ -379,7 +379,7 @@ def get_messages(*args):
         system_prompt = TASK2_FEEDBACK_GENERATOR_SYSTEM_PROMPT_TEMPLATE_NAIVE
         user_prompt = TASK2_FEEDBACK_GENERATOR_USER_PROMPT_TEMPLATE_NAIVE.format(prompt=prompt, predicted_feedback=predicted_feedback)
         messages = [
-            {"role": "system", "content": system_prompt},
+            # {"role": "system", "content": system_prompt},
             {"role": "user", "content": [
                 {"type": "image_url", "image_url": {"url": convert_gen_img_to_base64(gen_img)}},
                 {"type": "text", "text": user_prompt},
@@ -388,9 +388,9 @@ def get_messages(*args):
         model = RM_VLM_MODEL_PATH
     elif task_id == 3:
         system_prompt = TASK1_TASK3_IMAGE_GENERATOR_SYSTEM_PROMPT_TEMPLATE
-        user_prompt = vqa_question #TASK1_TASK3_IMAGE_GENERATOR_USER_PROMPT_TEMPLATE.format(questions=vqa_question)
+        user_prompt = TASK1_TASK3_IMAGE_GENERATOR_USER_PROMPT_TEMPLATE.format(questions=vqa_question)
         messages = [
-            {"role": "system", "content": system_prompt},
+            # {"role": "system", "content": system_prompt},
             {"role": "user", "content": [
                 {"type": "image_url", "image_url": {"url": convert_gen_img_to_base64(regen_img)}},
                 {"type": "text", "text": user_prompt}
@@ -409,7 +409,7 @@ def get_messsages_task3_edit_instruction_following(*args): # 5: part 4
     system_prompt = TASK3_EDIT_INSTRUCTION_FOLLOWING_SYSTEM_PROMPT
     user_prompt = TASK3_EDIT_INSTRUCTION_FOLLOWING_USER_PROMPT.format(predicted_feedback=predicted_feedback)
     messages = [
-        {"role": "system", "content": system_prompt},
+        # {"role": "system", "content": system_prompt},
         {"role": "user", "content": [
             {"type": "text", "text": user_prompt},
             {"type": "image_url", "image_url": {"url": convert_gen_img_to_base64(gen_img)}},
@@ -500,7 +500,7 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
                 task1_idx_to_ans: dict = image_evaluator_parser(vqa_response)
                 task1_vqa_reward_score_sum = sum(task1_idx_to_ans.values())
                 task1_ans_count = len(task1_idx_to_ans)
-                task1_vqa_reward_score = 1.0 if task1_vqa_reward_score_sum == task1_ans_count else 0.0
+                task1_vqa_reward_score = (task1_vqa_reward_score_sum / task1_ans_count) if task1_ans_count > 0 else 0.0 # 1.0 if task1_vqa_reward_score_sum == task1_ans_count else 0.0
                 reward_score += task1_vqa_reward_score
                 reward_extra_info[f"task{task_id}_vqa_reward"] = task1_vqa_reward_score
             except Exception as e:
@@ -589,7 +589,7 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
             task3_vqa_idx_to_ans: dict = image_evaluator_parser(vqa_response)
             task3_vqa_reward_score_sum = sum(task3_vqa_idx_to_ans.values())
             task3_vqa_ans_count = len(task3_vqa_idx_to_ans)
-            task3_vqa_reward_score = 1.0 if task3_vqa_reward_score_sum == task3_vqa_ans_count else 0.0
+            task3_vqa_reward_score = (task3_vqa_reward_score_sum / task3_vqa_ans_count) if task3_vqa_ans_count > 0 else 0.0 # 1.0 if task3_vqa_reward_score_sum == task3_vqa_ans_count else 0.0
             reward_score += task3_vqa_reward_score
             reward_extra_info[f"task{task_id}_vqa_reward"] = task3_vqa_reward_score
         else:
