@@ -944,27 +944,28 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                 metrics.update(old_log_prob_metrics)
                 old_log_prob.batch.pop(f"task{task_id}_entropys")
                 batch = batch.union(old_log_prob)
-                if f"task{task_id}_rollout_log_probs" in batch.batch.keys(): ### Not use
+                if f"task{task_id}_rollout_log_probs" in batch.batch.keys():
                     # TODO: we may want to add diff of probs too.
-                    from verl.utils.debug.metrics import calculate_debug_metrics
+                    from recipe.image_rl.debug_metrics import calculate_debug_metrics
 
-                    metrics.update(calculate_debug_metrics(batch))
+                    metrics.update(calculate_debug_metrics(batch, task_id=task_id))
                 return batch
 
             async_training = self.config.get("async_training", None)
-            if async_training and async_training.use_rollout_log_probs:  ### Not use
-                # If local_triger_step == 1, load the training engine's parameters to the CPU
-                #  and save a copy for subsequent MIS use.
-                # If local_trigger_step == 2, 3, ..., restore the parameters of version 1 to calculate the old_log_prob,
-                # then restore the parameters of the current version.
+            if async_training and async_training.use_rollout_log_probs:  
                 if local_trigger_step is not None:
                     batch = compute_old_log_prob(batch)
                 else:
+                    print("[FullyAsyncRayPPOTrainer] Use rollout log probs in async mode.")
                     batch.batch[f"task{task_id}_old_log_probs"] = batch.batch[f"task{task_id}_rollout_log_probs"]
                     batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
-                print("[FullyAsyncRayPPOTrainer] restore model from cpu done.")
             else:
-                batch = compute_old_log_prob(batch)
+                if self.config.actor_rollout_ref.actor.use_rollout_log_probs:
+                    print("[FullyAsyncRayPPOTrainer] Use rollout log probs in sync mode.")
+                    batch.batch[f"task{task_id}_old_log_probs"] = batch.batch[f"task{task_id}_rollout_log_probs"]
+                    batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+                else:
+                    batch = compute_old_log_prob(batch)
 
         if self.use_reference_policy:
             # compute reference log_prob

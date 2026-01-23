@@ -43,6 +43,29 @@ from recipe.image_rl.custom_metric_utils import reduce_metrics # custom metric
 from recipe.image_rl.reward import compute_reward, compute_reward_async
 import asyncio
 
+def log_prob_metrics(metrics):
+    import numpy as np 
+
+    log_prob_info = {}
+
+    for task_id in [1, 2, 3]:
+        task_pos_log_prob = f"actor/task{task_id}_pos_log_prob"
+        task_neg_log_prob = f"actor/task{task_id}_neg_log_prob"
+        task_pos_log_prob_cnt = f"actor/task{task_id}_pos_log_prob_cnt"
+        task_neg_log_prob_cnt = f"actor/task{task_id}_neg_log_prob_cnt"
+
+        pos_log_prob_sum = np.array(metrics.pop(task_pos_log_prob)).sum()
+        pos_log_prob_cnt = np.array(metrics.pop(task_pos_log_prob_cnt)).sum()
+        neg_log_prob_sum = np.array(metrics.pop(task_neg_log_prob)).sum()
+        neg_log_prob_cnt = np.array(metrics.pop(task_neg_log_prob_cnt)).sum()
+
+        log_prob_info[f"actor/task{task_id}_pos_log_prob_mean"] = pos_log_prob_sum / pos_log_prob_cnt if pos_log_prob_cnt > 0 else 0.0
+        log_prob_info[f"actor/task{task_id}_neg_log_prob_mean"] = neg_log_prob_sum / neg_log_prob_cnt if neg_log_prob_cnt > 0 else 0.0
+
+        log_prob_info[f"actor/task{task_id}_log_probs_diff"] = log_prob_info[f"actor/task{task_id}_pos_log_prob_mean"] - log_prob_info[f"actor/task{task_id}_neg_log_prob_mean"]
+    
+    return log_prob_info
+
 @ray.remote(num_cpus=10)
 class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
     """
@@ -188,7 +211,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
 
             # version_gap > 0이면 on_plolicy
             # default는 verison_gap > staleness_threshold
-            if version_gap > 0:
+            if version_gap > staleness_threshold:
                 num_rows = len(deserialized_sample.full_batch)
                 dropped_rows += num_rows
                 continue
@@ -198,7 +221,6 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             queue_samples.append(deserialized_sample)
             current_rows += num_rows_in_sample
 
-            
             print(
                 f"[FullyAsyncTrainer] Progress: {current_rows}/{self.required_samples} rows "
                 f"({len(queue_samples)} groups collected). mq_len: {queue_len}"
@@ -215,6 +237,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         print(
             f"[FullyAsyncTrainer] Collection completed: {current_rows} rows from {len(queue_samples)} groups. "
             f"Wait time: {total_wait_time:.2f}s."
+            f"Dropped sample: {dropped_rows}"
         )
 
         if self.config.trainer.balance_batch:
@@ -295,8 +318,8 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             config=OmegaConf.to_container(self.config, resolve=True),
         )
 
-        self.prefetch_thread = threading.Thread(target=self._run_prefetch, daemon=True)
-        self.prefetch_thread.start()
+        #self.prefetch_thread = threading.Thread(target=self._run_prefetch, daemon=True)
+        #self.prefetch_thread.start()
         self.max_steps_duration = 0
 
         # get validate data before training
@@ -310,7 +333,8 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
 
             with marked_timer("step", timing_raw):
                 with marked_timer("gen", timing_raw, color="red"):
-                    epoch, batch = self.batch_buffer.get()
+                    epoch, batch = self._get_samples_from_queue()
+                    training_start_time = time.time()
                     if batch is None: break
                     self._collect_metrics_from_samples(batch, metrics)
 
@@ -318,17 +342,17 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                     if hasattr(batch, 'meta_info') and 'reward' in batch.meta_info:
                         timing_raw['reward'] = batch.meta_info['reward']
 
-                    async_training = self.config.get("async_training", None)
-                    use_mis = async_training and async_training.use_rollout_log_probs
-                    local_trigger = self.local_trigger_step if self.compute_prox_log_prob else None
-                    should_swap = use_mis and local_trigger is not None and local_trigger > 1
+                    # async_training = self.config.get("async_training", None)
+                    # use_mis = async_training and async_training.use_rollout_log_probs
+                    # local_trigger = self.local_trigger_step if self.compute_prox_log_prob else None
+                    # should_swap = use_mis and local_trigger is not None and local_trigger > 1
                     
-                    if use_mis:
-                        if local_trigger == 1:
-                            self.actor_rollout_wg.save_model_to_cpu(1)
-                        elif should_swap:
-                            self.actor_rollout_wg.save_model_to_cpu(local_trigger)
-                            self.actor_rollout_wg.restore_model_from_cpu(1)
+                    # if use_mis:
+                    #     if local_trigger == 1:
+                    #         self.actor_rollout_wg.save_model_to_cpu(1)
+                    #     elif should_swap:
+                    #         self.actor_rollout_wg.save_model_to_cpu(local_trigger)
+                    #         self.actor_rollout_wg.restore_model_from_cpu(1)
 
                     for task_id in [1, 2, 3]:
                         batch.batch["task_id"] = torch.tensor([task_id for _ in range(len(batch))], dtype=int)
@@ -337,9 +361,9 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                             batch, metrics, timing_raw, self.local_trigger_step if self.compute_prox_log_prob else None, task_id
                         )
 
-                    if should_swap:
-                        self.actor_rollout_wg.restore_model_from_cpu(local_trigger)
-                        self.actor_rollout_wg.clear_cpu_model(local_trigger)
+                    # if should_swap:
+                    #     self.actor_rollout_wg.restore_model_from_cpu(local_trigger)
+                    #     self.actor_rollout_wg.clear_cpu_model(local_trigger)
                 
                     # update critic
                     if self.use_critic:
@@ -354,7 +378,9 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                         with marked_timer("update_actor", timing_raw, color="red"):
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
                             actor_output = self.actor_rollout_wg.update_actor(batch)
+                        log_prob_info = log_prob_metrics(actor_output.meta_info["metrics"])
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                        metrics.update(log_prob_info)
                         metrics.update(actor_output_metrics)
 
                     reward_extra_infos_dict: dict[str, list] = {}
@@ -386,6 +412,9 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             self._check_save_checkpoint(timing_raw)
             self.global_steps += 1
 
+            training_end_time = time.time()
+            print(f"[FullyAsyncTrainer] One Step Training Finish Time: {training_end_time - training_start_time}s")
+
         # final parameter sync and validate
         # 1. waiting remaining validate task
         ray.get(self.param_synchronizer.wait_last_valid.remote())
@@ -397,7 +426,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             self._log_validation_data()
             
         self.progress_bar.close()
-        self.stop_prefetch = True
+        #self.stop_prefetch = True
 
         self._check_save_checkpoint(timing_raw)
 

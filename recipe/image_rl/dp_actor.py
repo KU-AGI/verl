@@ -599,8 +599,8 @@ class DataParallelImageGenerationActor(BasePPOActor):
                         )
 
                         if entropy_coeff != 0:
-                            entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask,
-                                                loss_agg_mode=loss_agg_mode)
+                            entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                            micro_batch_metrics[f"actor/task{task_id}_entropy"] = entropy_loss.detach().item()
                             policy_loss = pg_loss - entropy_loss * entropy_coeff
                         else:
                             policy_loss = pg_loss
@@ -633,6 +633,23 @@ class DataParallelImageGenerationActor(BasePPOActor):
                             f"actor/task{task_id}_weight": task_weight,
                             f"actor/task{task_id}_loss": weighted_loss.detach().item(),
                         })
+
+                        adv = model_inputs[f"task{task_id}_advantages"]      # (B, 576)
+                        mask = model_inputs[f"task{task_id}_response_mask"]  # (B, 576)
+                        lp = log_prob.detach()
+
+                        seq_adv_sum = adv[:, 0].view(-1, 1)
+                        is_pos_seq = (seq_adv_sum > 0) # (B, 1)
+                        is_neg_seq = (seq_adv_sum < 0)
+
+                        pos_mask = is_pos_seq & mask.bool() # (B, 576)
+                        neg_mask = is_neg_seq & mask.bool() # (B, 576)
+
+                        micro_batch_metrics[f"actor/task{task_id}_pos_log_prob"] = lp[pos_mask].sum().item()
+                        micro_batch_metrics[f"actor/task{task_id}_pos_log_prob_cnt"] = pos_mask.sum().item()
+                        
+                        micro_batch_metrics[f"actor/task{task_id}_neg_log_prob"] = lp[neg_mask].sum().item()
+                        micro_batch_metrics[f"actor/task{task_id}_neg_log_prob_cnt"] = neg_mask.sum().item()
 
                     # Add aggregated metrics across tasks
                     if enable_multi_task and len(task_ids) > 1:

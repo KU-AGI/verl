@@ -26,6 +26,8 @@ from verl.workers.config import HFModelConfig, RewardModelConfig, RolloutConfig
 from recipe.image_rl.config import ImageGenerationHFModelConfig, ImageGenerationRolloutConfig
 from verl.workers.rollout.replica import RolloutMode
 from verl import DataProto
+import glob
+import pathlib
 
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
@@ -113,6 +115,14 @@ class HuggingFaceAsyncServerForImageRollout:
 
         # Start background weight update worker
         self.weight_update_worker_task = asyncio.create_task(self._weight_update_worker())
+
+        # Start background SHM semaphore cleanup worker (best-effort)
+        self._shm_cleanup_task = asyncio.create_task(
+            self._shm_semaphore_cleanup_worker(
+                interval_s=int(os.getenv("SHM_SEM_CLEAN_INTERVAL_S", "300")),
+                ttl_s=int(os.getenv("SHM_SEM_CLEAN_TTL_S", "1800")),
+            )
+        )
 
         logger.info(f"HF async server initialized on replica {self.replica_rank}")
 
@@ -407,3 +417,92 @@ class HuggingFaceAsyncServerForImageRollout:
         print(f"[Replica {self.replica_rank}] v={version} worker_results={results[:1]}", flush=True)
 
         return version
+
+    def _is_path_open_by_any_process(self, path: str) -> bool:
+        """
+        /proc/*/fd 를 훑어서, 어떤 프로세스든 해당 path를 열고 있으면 True.
+        권한 문제/레이스가 있으니 예외는 무시하고 best-effort로 동작.
+        """
+        target = os.path.realpath(path)
+        proc_dir = pathlib.Path("/proc")
+
+        for p in proc_dir.iterdir():
+            if not p.name.isdigit():
+                continue
+            fd_dir = p / "fd"
+            try:
+                for fd in fd_dir.iterdir():
+                    try:
+                        link = os.path.realpath(os.readlink(fd))
+                    except OSError:
+                        continue
+                    if link == target:
+                        return True
+            except (PermissionError, FileNotFoundError, NotADirectoryError):
+                # 다른 유저 프로세스/짧게 생성됐다 사라진 프로세스 등
+                continue
+        return False
+
+    async def _shm_semaphore_cleanup_worker(
+        self,
+        interval_s: int = 300,   # 5분마다
+        ttl_s: int = 1800,       # 30분 이상 된 것만
+        pattern: str = "/dev/shm/sem.mp-*",
+        max_delete_per_round: int = 200,
+    ):
+        """
+        /dev/shm/sem.mp-* 중 '오래되고' + '어떤 프로세스도 열고있지 않은' 파일만 삭제.
+        """
+        logger.info(
+            f"[Server {self.replica_rank}] SHM semaphore cleanup worker started: "
+            f"interval={interval_s}s ttl={ttl_s}s pattern={pattern}"
+        )
+
+        while True:
+            try:
+                now = time.time()
+                candidates = glob.glob(pattern)
+
+                deleted = 0
+                skipped_inuse = 0
+                skipped_young = 0
+                errors = 0
+
+                # 오래된 것부터 보자(가장 오래된 파일 우선)
+                candidates.sort(key=lambda p: os.path.getmtime(p) if os.path.exists(p) else now)
+
+                for p in candidates:
+                    if deleted >= max_delete_per_round:
+                        break
+
+                    try:
+                        st = os.stat(p)
+                        age = now - st.st_mtime
+                        if age < ttl_s:
+                            skipped_young += 1
+                            continue
+
+                        # 누가 열고 있으면 스킵
+                        if self._is_path_open_by_any_process(p):
+                            skipped_inuse += 1
+                            continue
+
+                        os.remove(p)
+                        deleted += 1
+
+                    except FileNotFoundError:
+                        continue
+                    except Exception:
+                        errors += 1
+
+                if deleted or skipped_inuse or errors:
+                    logger.info(
+                        f"[Server {self.replica_rank}] SHM cleanup: deleted={deleted} "
+                        f"skipped_inuse={skipped_inuse} skipped_young={skipped_young} errors={errors} "
+                        f"(total_seen={len(candidates)})"
+                    )
+
+            except Exception as e:
+                logger.warning(f"[Server {self.replica_rank}] SHM cleanup worker error: {e}", exc_info=True)
+
+            await asyncio.sleep(interval_s)

@@ -295,6 +295,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
 
             self.version_start_time = time.time()
             
+        print("[FullyAsyncRollouter] rollouter sync start")
         if self.async_rollout_manager is not None:
             await self.set_latest_available_version(version)
 
@@ -464,7 +465,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         await asyncio.gather(
             *[server.set_latest_available_version.remote(version) for server in server_handles]
         )
-        print(f"[Rollouter] Notified {len(server_handles)} servers about v{version} ready in SHM.")
+        print(f"[FullyAsyncRollouter] Notified {len(server_handles)} servers about v{version} ready in SHM.")
 
     async def _acquire_finalize_budget(self, n: int):
         async with self._finalize_cond:
@@ -744,6 +745,8 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         active_released = False
         enqueued_to_finalize = False
         token_released = False
+
+        rollout_start_time = time.perf_counter()
         try:
             used_version = await self._maybe_update_server_weights(server_index)
             rollout_sample.full_batch.non_tensor_batch["param_version"] = np.full(
@@ -767,6 +770,11 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 on_task_complete=on_task_complete,
             )
             await self._wait_server_idle(server_index)
+
+            rollout_duration = time.perf_counter() - rollout_start_time
+            if self.processed_sample_count % 100 == 0: # 10번째 샘플에 대해서만 출력 (Warm-up 고려)
+                print(f"[FullyAsyncRollouter][Rollout] Sample ID: {rollout_sample.sample_id}")
+                print(f"[FullyAsyncRollouter][Rollout] 1. Rollout (Generation) Time: {rollout_duration:.4f}s (Batch size: {batch_size})")
 
             self.server_token_q.put_nowait(server_index)
             token_released = True
@@ -855,6 +863,8 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 if item == "DONE":
                     break
 
+                finalize_start_time = time.perf_counter()
+
                 rollout_sample, sample_reward_tasks, reward_results, used_version, finalize_budget = item
                 batch_size = len(rollout_sample.full_batch)
 
@@ -887,6 +897,10 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
 
                 rollout_sample = merge_rollout_sample(self.config, self.tokenizer, rollout_sample, self.processor)
                 individual_samples = expand_rollout_sample(rollout_sample)
+
+                finalize_duration = time.perf_counter() - finalize_start_time
+                if self.processed_sample_count % 100 == 0: # Rollout 로그와 동일한 시점에 출력
+                    print(f"[FullyAsyncRollouter][Finalize] 2. Finalize (Reward + Merge) Time: {finalize_duration:.4f}s")
 
                 success_count = 0
                 for individual_sample in individual_samples:
