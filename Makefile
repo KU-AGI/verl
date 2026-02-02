@@ -50,42 +50,22 @@ init-container-with-infiniband:
 		$(IMAGE_NAME_TAG) \
 		tail -f /dev/null
 
-start-predictiononly-servers:
-	for GPU in 0 ; do \
+start-roundtrip-servers:
+	for GPU in 7 ; do \
 		PORT=$$((8000 + $$GPU)) ; \
-		docker run --rm -d --name predictiononly$$GPU \
+		docker run --rm -d --name roundtrip$$GPU \
 			--runtime nvidia \
 			--gpus "device=$$GPU" \
 			-v ${CACHE_PATH}:/root/.cache/huggingface \
-			-v /data/llm-reaction-reasoning/all_checkpoints/answeronly_fullft_8b/best.ckpt/hf_model:/models/predictiononly:ro \
+			-v /data/llm-reaction-reasoning/all_checkpoints/roundtrip_full_0.6b/epoch=06-step=099000-exact_match_sum=0.887.ckpt/hf_model:/models/roundtrip:ro \
 			-e HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN} \
 			-p $${PORT}:8000 \
 			--ipc=host \
-			vllm/vllm-openai:v0.10.0 \
-			--model /models/predictiononly ; \
+			vllm/vllm-openai:v0.10.1 \
+			--model /models/roundtrip ; \
 	done
 
-start-ReactionReasoner-servers:
+stop-roundtrip-servers:
 	for GPU in 0 1 2 3 4 5 6 7 ; do \
-		PORT=$$((8000 + $$GPU)) ; \
-		docker run --rm -d --name ReactionReasoner$$GPU \
-			--runtime nvidia \
-			--gpus "device=$$GPU" \
-			-v ${CACHE_PATH}:/root/.cache/huggingface \
-			-v /data/verl/ckpts/verl-dapo/refl_bonus_0.3_2node/global_step_10800/hf_model:/models/ReactionReasoner:ro \
-			-e HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN} \
-			-p $${PORT}:8000 \
-			--ipc=host \
-			vllm/vllm-openai:v0.10.0 \
-			--model /models/ReactionReasoner ; \
-	done
-
-stop-predictiononly-servers:
-	for GPU in 0 1 2 3 4 5 6 7 ; do \
-		docker stop predictiononly$$GPU || true ; \
-	done
-
-stop-ReactionReasoner-servers:
-	for GPU in 0 1 2 3 4 5 6 7 ; do \
-		docker stop ReactionReasoner$$GPU || true ; \
+		docker stop roundtrip$$GPU || true ; \
 	done

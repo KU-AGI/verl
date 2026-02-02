@@ -187,7 +187,7 @@ def append_info(data):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--train_dir", default="/data/llm-reaction-reasoning/data/orderly/main_training_v13")
+    parser.add_argument("--train_dir", default="/data/llm-reaction-reasoning/data/orderly/main_training_v14")
     parser.add_argument("--val_dir", default="/data/llm-reaction-reasoning/data/orderly/excluded_val_test")
     parser.add_argument("--test_dir", default="/data/llm-reaction-reasoning/data/orderly/excluded_val_test")
     parser.add_argument("--output_dir", default="/data/verl/data")
@@ -199,16 +199,12 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     concatenated = []
-    args.train = True
+    # args.train = True
 
-    # with open('/data/llm-reaction-reasoning/data/orderly/retro_related/precursor_with_solvent_to_multiple_products.json', 'r') as f:
-    #     precursor_with_solvent_to_multiple_products = json.load(f)
-    #     multiple_precursor_with_solvent_set = set(precursor_with_solvent_to_multiple_products.keys())
     with open('/data/llm-reaction-reasoning/data/orderly/retro_related/product_to_multiple_reactants.json', 'r') as f:
         product_to_multiple_reactants = json.load(f)
         multiple_product_set = set(product_to_multiple_reactants.keys())
 
-    # tasks = ["forward", "retro"]
     tasks = ["retro"]
     for task in tasks:
         with open(f"/data/llm-reaction-reasoning/data/orderly/excluded_val_test/{task}_val.json", "r") as f:
@@ -222,16 +218,12 @@ if __name__ == "__main__":
             dataset_paths = sorted(glob(os.path.join(f"{args.train_dir}/{task}", "*.json")), key=_sort_key)
             split = "train"
         elif args.val:
-            # dataset_paths = sorted(glob(os.path.join(f"{args.val_dir}", f"{task}*val.json")))
             dataset_paths = [
                 f"/data/llm-reaction-reasoning/data/orderly/excluded_val_test/{task}_val.json",
             ]
             split = "val"
         elif args.test:
-            # dataset_paths = sorted(glob(os.path.join(f"{args.test_dir}", f"{task}*test.json")))
             dataset_paths = [
-                # f"/data/llm-reaction-reasoning/data/orderly/excluded_val_test/{task}_ood_carbon_test.json",
-                # f"/data/llm-reaction-reasoning/data/orderly/excluded_val_test/{task}_ood_length_test.json",
                 f"/data/llm-reaction-reasoning/data/orderly/excluded_val_test/{task}_test.json",
             ]
             split = "test"
@@ -250,10 +242,7 @@ if __name__ == "__main__":
                 d['dataset_path'] = dataset_path.split("/")[-1].split(".json")[0]
                 if d['filtered'] == False:
                     continue
-                if args.train and task == "forward":
-                    if convert_to_canonical_smiles(".".join(d['reactants'] + d['reagents'] + d['solvents'])) in multiple_precursor_with_solvent_set:
-                        continue
-                elif args.train and task == "retro":
+                if args.train and task == "retro":
                     if d['rxn_str'] in excluded_rxns:
                         continue
                     # if convert_to_canonical_smiles(".".join(d['products'])) in multiple_product_set:
