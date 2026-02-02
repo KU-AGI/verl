@@ -7,7 +7,7 @@ export WANDB_PROJECT="verl-dapo"
 export NCCL_DEBUG="WARN"
 
 project_name='verl-dapo'
-exp_name='retro_fullset_v14_w_steprwd'
+exp_name='pdonly_retro_fullset_v14_wo_steprwd_w_rndtrp_kl0.05_en0.05'
 
 # Ray
 RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
@@ -17,7 +17,7 @@ RUNTIME_ENV=${RUNTIME_ENV:-"/verl/recipe/fully_async_policy/shell/runtime_env.ya
 HOME="/data"
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
 # very important! please modify the max_position_embeddings in config.json to 32768 after downloading from huggingface
-MODEL_PATH="'/data/llm-reaction-reasoning/all_checkpoints/main_full_8b_v14_retro_cont/epoch=26-step=219996-exact_match_sum=0.598.ckpt/hf_model'"
+MODEL_PATH="'/data/llm-reaction-reasoning/all_checkpoints/predictiononly_full_8b_v14_retro_cont/epoch=22-step=183997-exact_match_sum=0.590.ckpt/hf_model'"
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
 DUMP_DIR=${DUMP_DIR:-"${RAY_DATA_HOME}/dumps/${project_name}/${exp_name}"}
 TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/chem_dapo/syntheticreact_train.parquet"}
@@ -36,10 +36,10 @@ adv_estimator=grpo # stepwise_grpo, stepcumul_grpo, grpo
 loss_mode=vanilla # steplevel, stepcumul, vanilla
 norm_adv_by_std_in_grpo=True # False for Dr.GRPO, True for standard GRPO
 use_kl_in_reward=False
-kl_coef=0.0
+kl_coef=0.05
 use_kl_loss=True
-kl_loss_coef=0.001
-entropy_coeff=0.001
+kl_loss_coef=0.05
+entropy_coeff=0.05
 
 clip_ratio_low=0.2
 clip_ratio_high=0.2
@@ -53,8 +53,8 @@ balance_task=False
 use_response_mask_to_reflection_step=False
 
 # Reward related parameters
-use_roundtrip_reward=False
-use_content_reward=True
+use_roundtrip_reward=True
+use_content_reward=False
 use_decision_reward=False
 use_reflection_bonus=False
 reflection_bonus_weight=0.0
@@ -101,12 +101,12 @@ gen_prompt_bsz=1
 n_resp_per_prompt=16
 train_prompt_mini_bsz=16
 total_rollout_steps=$(((512*100000)))
-test_freq=30
+test_freq=6
 staleness_threshold=0.0
-trigger_parameter_sync_step=1
+trigger_parameter_sync_step=5
 require_batches=3
 partial_rollout=False
-save_freq=$((test_freq * trigger_parameter_sync_step * 10))
+save_freq=$((test_freq * trigger_parameter_sync_step * 5))
 
 
 # ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \

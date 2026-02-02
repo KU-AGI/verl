@@ -1793,10 +1793,20 @@ class ChemistryEvaluator:
             Chem.RDKFingerprint(ot_m), 
             metric=DataStructs.TanimotoSimilarity
         )
+    
+    def convert_to_canonical_smiles(self, smiles):
+        if not smiles:
+            return None
+        molecule = Chem.MolFromSmiles(smiles)
+        if molecule is not None:
+            canonical_smiles = Chem.MolToSmiles(molecule, isomericSmiles=True, canonical=True)
+            return canonical_smiles
+        else:
+            return None
 
     def roundtrip(self, reactant: str, product: str, roundtrip_client):
         system_prompt = "You are a chemist."
-        user_prompt = f"{reactant} Considering the given starting materials, what might be the resulting product in a chemical reaction?"
+        user_prompt = f"{self.convert_to_canonical_smiles(reactant)} Considering the given starting materials, what might be the resulting product in a chemical reaction?"
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},

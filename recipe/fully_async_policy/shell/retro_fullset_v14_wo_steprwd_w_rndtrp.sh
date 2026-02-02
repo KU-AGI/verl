@@ -7,7 +7,7 @@ export WANDB_PROJECT="verl-dapo"
 export NCCL_DEBUG="WARN"
 
 project_name='verl-dapo'
-exp_name='retro_fullset_v14_wo_steprwd_w_rndtrp_kl0.05_en0.07'
+exp_name='fix_retro_fullset_v14_wo_steprwd_w_rndtrp_kl0.05_en0.05'
 
 # Ray
 RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
@@ -39,7 +39,7 @@ use_kl_in_reward=False
 kl_coef=0.05
 use_kl_loss=True
 kl_loss_coef=0.05
-entropy_coeff=0.07
+entropy_coeff=0.05
 
 clip_ratio_low=0.2
 clip_ratio_high=0.2
@@ -67,7 +67,7 @@ overlong_buffer_len=0 # $((1024 * 4))
 overlong_penalty_factor=1.0
 
 # Training parameters
-loss_agg_mode="seq-mean-token-sum" # "seq-mean-token-sum" "seq-mean-token-sum-norm"
+loss_agg_mode="seq-mean-token-sum" # "seq-mean-token-mean" "seq-mean-token-sum" "seq-mean-token-sum-norm"
 
 # Algorithm
 temperature=1.2
@@ -106,7 +106,7 @@ staleness_threshold=0.0
 trigger_parameter_sync_step=5
 require_batches=3
 partial_rollout=False
-save_freq=$((test_freq * trigger_parameter_sync_step * 10))
+save_freq=$((test_freq * trigger_parameter_sync_step * 5))
 
 
 # ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
