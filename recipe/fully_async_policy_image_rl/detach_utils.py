@@ -283,23 +283,21 @@ def merge_rollout_sample(config, tokenizer, rs: RolloutSample, processor):
     task2_feedback_reward_score: list = [-100] * batch_size
     for i, (vqa_judge, predicted_judge) in enumerate(zip(vqa_judges, predicted_judges)):
 
-        vqa_judge = (vqa_judge == 1) # if all
-        
         if vqa_judge is None or predicted_judge is None: # Invalid case
             task2_feedback_reward_score[i] = 0.0
-            extra_info["task2_judge_alignment_reward"][i] = -100
-            extra_info["task2_feedback_reward"][i] = -100
+            extra_info["task2_judge_alignment_reward"][i] = 0.0 # -100
+            extra_info["task2_feedback_reward"][i] = 0.0 # -100
             extra_info["task2_judge_alignment_reward_response"][i] = "Judge value is None."
             extra_info["task2_feedback_reward_response"][i] = "Judge value is None."
             
-        elif vqa_judge and predicted_judge:  # VLM yes & Policy yes
+        elif (vqa_judge == 1.0) and (predicted_judge == 1.0):  # VLM yes & Policy yes
             task2_feedback_reward_score[i] = 1.0
             extra_info["task2_judge_alignment_reward"][i] = 1.0
             extra_info["task2_feedback_reward"][i] = 1.0
             extra_info["task2_judge_alignment_reward_response"][i] = "No need to get feedback reward. Both VQA alignment and predicted answer judge are positive(+)."
             extra_info["task2_feedback_reward_response"][i] = "No need to get feedback response. Both VQA alignment and predicted answer judge are positive(+)."
             
-        elif not vqa_judge and not predicted_judge:  # VLM no & Policy no
+        elif (vqa_judge < 1.0) and (predicted_judge < 1.0):  # VLM no & Policy no
             # Get reward from API
             # feedback_response = await feedback_task
             feedback_reward = 0.0

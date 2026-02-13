@@ -525,8 +525,12 @@ class DataParallelImageGenerationActor(BasePPOActor):
         all_select_batch_keys.append("task_id")
         if "rollout_is_weights" in data.batch.keys():
             all_select_batch_keys.append("rollout_is_weights")
-        
-        data = data.select(meta_info_keys=list(set(all_select_batch_keys)))
+
+        # GDPO: Add combined advantages key if present
+        if "advantages" in data.batch.keys():
+            all_select_batch_keys.append("advantages")
+
+        data = data.select(batch_keys=list(set(all_select_batch_keys)))
         
         mini_batches = data.split(self.config.ppo_mini_batch_size)
         on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1
@@ -552,12 +556,29 @@ class DataParallelImageGenerationActor(BasePPOActor):
 
                     micro_batch_metrics = {}
 
-                    # Process each task separately with backward
+                    # GDPO: Compute all task losses first, then backward once
+                    # GRPO: Backward for each task separately (gradient accumulation)
+                    use_gdpo = "advantages" in model_inputs and enable_multi_task and len(task_ids) > 1
+
+                    total_loss = 0.0
+
+                    # Process each task separately
                     for task_id in task_ids:
                         # Get task-specific data
                         old_log_prob = model_inputs[f"task{task_id}_old_log_probs"]
-                        advantages = model_inputs[f"task{task_id}_advantages"]
+
                         response_mask = model_inputs[f"task{task_id}_response_mask"]
+
+                        # Check if we have combined advantages (for GDPO) or task-specific advantages
+                        if use_gdpo:
+                            # GDPO: Use combined advantages (sum of all independently normalized task advantages)
+                            # Slice to match current task's response_mask length
+                            combined_advantages = model_inputs["advantages"]  # (batch, max_len)
+                            task_seq_len = response_mask.size(1)
+                            advantages = combined_advantages[:, :task_seq_len]  # Slice to (batch, task_seq_len)
+                        else:
+                            # GRPO or single-task: Use task-specific advantages
+                            advantages = model_inputs[f"task{task_id}_advantages"]
 
                         entropy_coeff = self.config.entropy_coeff
                         loss_agg_mode = self.config.loss_agg_mode
@@ -621,8 +642,12 @@ class DataParallelImageGenerationActor(BasePPOActor):
                         task_weight = task_weights[task_id - 1] if enable_multi_task else 1.0
                         weighted_loss = policy_loss * task_weight * loss_scale_factor
 
-                        # Backward for each task separately
-                        weighted_loss.backward()
+                        # GDPO: Accumulate losses, backward once at the end
+                        # GRPO: Backward for each task separately
+                        if use_gdpo:
+                            total_loss = total_loss + weighted_loss
+                        else:
+                            weighted_loss.backward()
 
                         # Store metrics per task
                         micro_batch_metrics.update({
@@ -634,8 +659,9 @@ class DataParallelImageGenerationActor(BasePPOActor):
                             f"actor/task{task_id}_loss": weighted_loss.detach().item(),
                         })
 
-                        adv = model_inputs[f"task{task_id}_advantages"]      # (B, 576)
-                        mask = model_inputs[f"task{task_id}_response_mask"]  # (B, 576)
+                        # Use the advantages computed above (already sliced for GDPO)
+                        adv = advantages  # (B, task_seq_len)
+                        mask = response_mask  # (B, task_seq_len)
                         lp = log_prob.detach()
 
                         seq_adv_sum = adv[:, 0].view(-1, 1)
@@ -647,9 +673,13 @@ class DataParallelImageGenerationActor(BasePPOActor):
 
                         micro_batch_metrics[f"actor/task{task_id}_pos_log_prob"] = lp[pos_mask].sum().item()
                         micro_batch_metrics[f"actor/task{task_id}_pos_log_prob_cnt"] = pos_mask.sum().item()
-                        
+
                         micro_batch_metrics[f"actor/task{task_id}_neg_log_prob"] = lp[neg_mask].sum().item()
                         micro_batch_metrics[f"actor/task{task_id}_neg_log_prob_cnt"] = neg_mask.sum().item()
+
+                    # GDPO: Backward once with total accumulated loss
+                    if use_gdpo:
+                        total_loss.backward()
 
                     # Add aggregated metrics across tasks
                     if enable_multi_task and len(task_ids) > 1:
@@ -659,14 +689,14 @@ class DataParallelImageGenerationActor(BasePPOActor):
                         avg_pg_clipfrac = sum([micro_batch_metrics.get(f"actor/task{tid}_pg_clipfrac", 0.0) for tid in task_ids]) / len(task_ids)
                         avg_ppo_kl = sum([micro_batch_metrics.get(f"actor/task{tid}_ppo_kl", 0.0) for tid in task_ids]) / len(task_ids)
                         avg_pg_clipfrac_lower = sum([micro_batch_metrics.get(f"actor/task{tid}_pg_clipfrac_lower", 0.0) for tid in task_ids]) / len(task_ids)
-                        total_loss = sum([micro_batch_metrics.get(f"actor/task{tid}_loss", 0.0) for tid in task_ids])
+                        total_loss_metric = sum([micro_batch_metrics.get(f"actor/task{tid}_loss", 0.0) for tid in task_ids])
 
                         aggregated_metrics.update({
                             "actor/avg_pg_loss": avg_pg_loss,
                             "actor/avg_pg_clipfrac": avg_pg_clipfrac,
                             "actor/avg_ppo_kl": avg_ppo_kl,
                             "actor/avg_pg_clipfrac_lower": avg_pg_clipfrac_lower,
-                            "actor/loss": total_loss,
+                            "actor/loss": total_loss_metric,
                         })
 
                         if any(f"actor/task{tid}_kl_loss" in micro_batch_metrics for tid in task_ids):

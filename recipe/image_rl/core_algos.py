@@ -106,6 +106,7 @@ class AdvantageEstimator(str, Enum):
     RLOO_VECTORIZED = "rloo_vectorized"
     GRPO_VECTORIZED = "grpo_vectorized"
     GRPO_TASK_SKIP = "grpo_task_skip"
+    GDPO_TASK_SKIP = "gdpo_task_skip"
 
 
 ADV_ESTIMATOR_REGISTRY: dict[str, Any] = {}
@@ -485,6 +486,100 @@ def compute_grpo_task_skip_outcome_advantage(
                 scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
             else:
                 scores[i] = scores[i] - id2mean[index[i]]
+        scores = scores.unsqueeze(-1) * response_mask
+
+    return scores, scores
+
+
+@register_adv_est(AdvantageEstimator.GDPO_TASK_SKIP)  # or simply: @register_adv_est("gdpo_task_skip")
+def compute_gdpo_task_skip_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional[AlgoConfig] = None,
+    task_id: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute advantage for GDPO (Group reward-Decoupled normalization Policy Optimization).
+
+    GDPO differs from GRPO by normalizing each reward group (task) independently,
+    preventing high-variance tasks from dominating the training signal.
+    This is based on the paper: "GDPO: Group reward-Decoupled Normalization Policy
+    Optimization for Multi-reward RL Optimization" (https://arxiv.org/abs/2601.05242)
+
+    Key difference from GRPO:
+    - GRPO: Normalizes all rewards together (global normalization)
+    - GDPO: Normalizes each task's rewards independently (task-wise normalization)
+
+    Args:
+        token_level_rewards: `(torch.Tensor)`
+            shape is (bs, response_length) - rewards for current task only
+        response_mask: `(torch.Tensor)`
+            shape is (bs, response_length)
+        index: `(np.ndarray)`
+            index array for grouping (typically uid for prompt grouping)
+        epsilon: `(float)`
+            small value to avoid division by zero
+        norm_adv_by_std_in_grpo: `(bool)`
+            whether to scale the advantage by std
+        config: `(Optional[AlgoConfig])`
+            algorithm configuration object
+        task_id: `(int)`
+            task identifier for logging purposes
+
+    Returns:
+        advantages: `(torch.Tensor)`
+            shape is (bs, response_length)
+        returns: `(torch.Tensor)`
+            shape is (bs, response_length)
+    """
+    scores = token_level_rewards.sum(dim=-1)
+
+    # Group-wise (task-wise) statistics
+    # In GDPO, each task maintains its own normalization statistics
+    id2score = defaultdict(list)
+    id2mean = {}
+    id2std = {}
+
+    with torch.no_grad():
+        bsz = scores.shape[0]
+
+        # Collect scores per group (excluding invalid scores marked as -100)
+        for i in range(bsz):
+            if scores[i] == -100:  # ignore invalid scores (e.g., skipped tasks)
+                continue
+            id2score[index[i]].append(scores[i])
+
+        # Compute per-group normalization statistics
+        # This is the key difference: each group gets independent normalization
+        for idx in id2score:
+            if len(id2score[idx]) == 1:
+                # Single sample in group: no normalization needed
+                id2mean[idx] = torch.tensor(0.0)
+                id2std[idx] = torch.tensor(1.0)
+            elif len(id2score[idx]) > 1:
+                # Multiple samples: compute group-specific mean and std
+                scores_tensor = torch.stack(id2score[idx])
+                id2mean[idx] = torch.mean(scores_tensor)
+                id2std[idx] = torch.std(scores_tensor)
+            else:
+                raise ValueError(f"no score in prompt index: {idx}")
+
+        # Apply group-wise normalization to each score
+        for i in range(bsz):
+            if index[i] not in id2score:
+                # Skip samples with invalid scores
+                continue
+            if norm_adv_by_std_in_grpo:
+                # Normalize by both mean and std (default GDPO behavior)
+                scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
+            else:
+                # Only center by mean (Dr.GDPO variant)
+                scores[i] = scores[i] - id2mean[index[i]]
+
+        # Broadcast scalar advantage across token dimension
         scores = scores.unsqueeze(-1) * response_mask
 
     return scores, scores

@@ -364,7 +364,81 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                     # if should_swap:
                     #     self.actor_rollout_wg.restore_model_from_cpu(local_trigger)
                     #     self.actor_rollout_wg.clear_cpu_model(local_trigger)
-                
+
+                    # Combine advantages from all tasks for GDPO
+                    # GDPO: Each task is normalized independently, then advantages are summed
+                    # GRPO: Would normalize the sum of rewards (causing high-variance tasks to dominate)
+                    from recipe.image_rl.core_algos import AdvantageEstimator
+
+                    import verl.utils.torch_functional as verl_F
+
+                    if self.config.algorithm.adv_estimator == AdvantageEstimator.GDPO_TASK_SKIP:
+                        # Get shapes of all task advantages
+                        task1_adv = batch.batch["task1_advantages"]
+                        task2_adv = batch.batch["task2_advantages"]
+                        task3_adv = batch.batch["task3_advantages"]
+
+                        task1_ret = batch.batch["task1_returns"]
+                        task2_ret = batch.batch["task2_returns"]
+                        task3_ret = batch.batch["task3_returns"]
+
+                        task1_mask = batch.batch["task1_response_mask"]
+                        task2_mask = batch.batch["task2_response_mask"]
+                        task3_mask = batch.batch["task3_response_mask"]
+
+                        # Find max sequence length
+                        max_len = max(task1_adv.size(1), task2_adv.size(1), task3_adv.size(1))
+                        batch_size = task1_adv.size(0)
+
+                        # Pad all advantages and masks to max_len
+                        def pad_to_length(tensor, target_len):
+                            current_len = tensor.size(1)
+                            if current_len < target_len:
+                                padding = torch.zeros(tensor.size(0), target_len - current_len,
+                                                     dtype=tensor.dtype, device=tensor.device)
+                                return torch.cat([tensor, padding], dim=1)
+                            return tensor
+
+                        task1_adv_padded = pad_to_length(task1_adv, max_len)
+                        task2_adv_padded = pad_to_length(task2_adv, max_len)
+                        task3_adv_padded = pad_to_length(task3_adv, max_len)
+
+                        task1_ret_padded = pad_to_length(task1_ret, max_len)
+                        task2_ret_padded = pad_to_length(task2_ret, max_len)
+                        task3_ret_padded = pad_to_length(task3_ret, max_len)
+
+                        task1_mask_padded = pad_to_length(task1_mask, max_len)
+                        task2_mask_padded = pad_to_length(task2_mask, max_len)
+                        task3_mask_padded = pad_to_length(task3_mask, max_len)
+
+                        # Sum the independently normalized advantages
+                        total_advantages = (
+                            task1_adv_padded +
+                            task2_adv_padded +
+                            task3_adv_padded
+                        )
+                        total_returns = (
+                            task1_ret_padded +
+                            task2_ret_padded +
+                            task3_ret_padded
+                        )
+
+                        # Apply batch-level whitening (normalize to mean=0, std=1)
+                        # This is the final normalization step in GDPO
+                        # Combine all response masks to create a global mask
+                        combined_response_mask = (
+                            task1_mask_padded +
+                            task2_mask_padded +
+                            task3_mask_padded
+                        ).bool().float()
+
+                        # Whiten combined advantages across the entire batch
+                        total_advantages = verl_F.masked_whiten(total_advantages, combined_response_mask)
+
+                        # Store combined advantages for actor update
+                        batch.batch["advantages"] = total_advantages
+                        batch.batch["returns"] = total_returns
+
                     # update critic
                     if self.use_critic:
                         with marked_timer("update_critic", timing_raw, color="pink"):

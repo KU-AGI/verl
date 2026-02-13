@@ -71,6 +71,7 @@ from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_
 from verl.utils.torch_functional import masked_mean
 from verl.utils.transferqueue_utils import tqbridge
 from verl.workers.reward_manager.abstract import AbstractRewardManager
+import verl.utils.torch_functional as verl_F
 
 from recipe.image_rl.reward import compute_reward, compute_reward_async
 from recipe.image_rl.tracking import ValidationGenerationsLogger
@@ -230,7 +231,33 @@ def compute_advantage(
         )
         data.batch[f"task{task_id}_advantages"] = advantages
         data.batch[f"task{task_id}_returns"] = returns
-    
+
+    elif adv_estimator == AdvantageEstimator.GDPO_TASK_SKIP:
+        # GDPO: Group reward-Decoupled normalization Policy Optimization
+        # Key innovation: Each task's rewards are normalized independently,
+        # preventing high-variance tasks from dominating the training signal.
+        #
+        # In multi-task RL (Task 1, 2, 3), GDPO ensures:
+        # - Task 1 advantages normalized using only Task 1 reward statistics
+        # - Task 2 advantages normalized using only Task 2 reward statistics
+        # - Task 3 advantages normalized using only Task 3 reward statistics
+        #
+        # This is more effective than GRPO which would normalize all tasks together,
+        # as described in: https://arxiv.org/abs/2601.05242
+
+        gdpo_calculation_mask = data.batch[f"task{task_id}_response_mask"]
+
+        # Call compute_gdpo_task_skip_outcome_advantage for task-wise normalization
+        advantages, returns = core_algos.compute_gdpo_task_skip_outcome_advantage(
+            token_level_rewards=data.batch[f"task{task_id}_token_level_rewards"],
+            response_mask=gdpo_calculation_mask,
+            index=data.non_tensor_batch["uid"],
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            task_id=task_id,
+        )
+        data.batch[f"task{task_id}_advantages"] = advantages
+        data.batch[f"task{task_id}_returns"] = returns
+
     return data
 
 class RayImageGenerationTrainer(RayPPOTrainer):
@@ -1018,6 +1045,82 @@ class RayImageGenerationTrainer(RayPPOTrainer):
 
                         # Remove task-specific attention_mask and task_id for next iteration
                         batch.pop(batch_keys=["attention_mask", "task_id"])
+
+                    # Combine advantages from all tasks for GDPO
+                    # GDPO: Each task is normalized independently, then advantages are summed
+                    # GRPO: Would normalize the sum of rewards (causing high-variance tasks to dominate)
+                    if self.config.algorithm.adv_estimator == AdvantageEstimator.GDPO_TASK_SKIP:
+                        # Get shapes of all task advantages
+                        task1_adv = batch.batch["task1_advantages"]
+                        task2_adv = batch.batch["task2_advantages"]
+                        task3_adv = batch.batch["task3_advantages"]
+
+                        task1_ret = batch.batch["task1_returns"]
+                        task2_ret = batch.batch["task2_returns"]
+                        task3_ret = batch.batch["task3_returns"]
+
+                        task1_mask = batch.batch["task1_response_mask"]
+                        task2_mask = batch.batch["task2_response_mask"]
+                        task3_mask = batch.batch["task3_response_mask"]
+
+                        # Find max sequence length
+                        max_len = max(task1_adv.size(1), task2_adv.size(1), task3_adv.size(1))
+                        batch_size = task1_adv.size(0)
+
+                        # Pad all advantages and masks to max_len
+                        import torch
+
+                        def pad_to_length(tensor, target_len):
+                            current_len = tensor.size(1)
+                            if current_len < target_len:
+                                padding = torch.zeros(tensor.size(0), target_len - current_len,
+                                                     dtype=tensor.dtype, device=tensor.device)
+                                return torch.cat([tensor, padding], dim=1)
+                            return tensor
+
+                        task1_adv_padded = pad_to_length(task1_adv, max_len)
+                        task2_adv_padded = pad_to_length(task2_adv, max_len)
+                        task3_adv_padded = pad_to_length(task3_adv, max_len)
+
+                        task1_ret_padded = pad_to_length(task1_ret, max_len)
+                        task2_ret_padded = pad_to_length(task2_ret, max_len)
+                        task3_ret_padded = pad_to_length(task3_ret, max_len)
+
+                        task1_mask_padded = pad_to_length(task1_mask, max_len)
+                        task2_mask_padded = pad_to_length(task2_mask, max_len)
+                        task3_mask_padded = pad_to_length(task3_mask, max_len)
+
+                        # Sum the independently normalized advantages
+                        total_advantages = (
+                            task1_adv_padded +
+                            task2_adv_padded +
+                            task3_adv_padded
+                        )
+                        total_returns = (
+                            task1_ret_padded +
+                            task2_ret_padded +
+                            task3_ret_padded
+                        )
+
+                        # Apply batch-level whitening (normalize to mean=0, std=1)
+                        # This is the final normalization step in GDPO
+                        # Combine all response masks to create a global mask
+                        combined_response_mask = (
+                            task1_mask_padded +
+                            task2_mask_padded +
+                            task3_mask_padded
+                        ).bool().float()
+
+                        # Whiten combined advantages across the entire batch
+                        total_advantages = verl_F.masked_whiten(total_advantages, combined_response_mask)
+
+                        # Store combined advantages for actor update
+                        batch.batch["advantages"] = total_advantages
+                        batch.batch["returns"] = total_returns
+                    else:
+                        # For GRPO or other methods, use task-specific advantages as-is
+                        # The actor update will handle multi-task advantages separately
+                        pass
 
                     # update critic (after all tasks prepared)
                     if self.use_critic:

@@ -11,7 +11,7 @@ exec > >(tee -a "${SCRIPT_LOG}")
 exec 2>&1
 
 project_name='mllm_reasoning'
-exp_name='0107_fully_on_policy_nipa'
+exp_name="0123_ablation_gdpo" # '0123_ablation_lr1e-6_kl0.05_encoeff0.05_task1_simple_vqa_drgrpo'
 
 export NCCL_IB_GID_INDEX=0
 export NCCL_CUDA_DEVICE_MAX_CONNECTIONS=8
@@ -34,19 +34,21 @@ RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/recipe/fully_async_policy_image_rl/sh
 # Paths
 HOME="/data"
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
-MODEL_PATH=/data/mllm/ckpt/step=014000.ckpt/hf_model # /data/mllm/checkpoints/Janus-Pro-7B
+MODEL_PATH=/data/mllm/ckpt/step=014000.ckpt/hf_model # CaraJ/T2I-R1 # Franklin0/ReasonGen-R1 # /data/mllm/ckpt/step=014000.ckpt/hf_model # /data/mllm/checkpoints/Janus-Pro-7B
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
-TRAIN_FILES=/data/mllm/data/train_v2.parquet
-VAL_FILES=/data/mllm/data/val_v2.parquet
+TRAIN_FILES=/data/mllm/data/train_wo_focusdiff_v2.parquet
+VAL_FILES=['/data/mllm/data/val_wo_focusdiff_v2.parquet','/data/mllm/data/train_subset_24_wo_focusdiff_v2.parquet']
 
-export RM_VLM_MODEL_PATH="Qwen/Qwen3-VL-30B-A3B-Instruct" # OpenGVLab/InternVL3_5-38B
-export RM_LLM_MODEL_PATH="Qwen/Qwen3-30B-A3B-Instruct-2507" # OpenGVLab/InternVL3_5-38B
+export RM_VLM_MODEL_PATH="Qwen/Qwen2.5-VL-7B-Instruct"
 
 rollout_name=image_unified
 rollout_mode=async
 
 # Algorithm parameters
-adv_estimator=grpo_task_skip
+# Options: grpo_task_skip, gdpo_task_skip
+# GRPO: Normalizes all tasks together (high-variance tasks dominate)
+# GDPO: Normalizes each task independently, then combines (balanced multi-task learning)
+adv_estimator=gdpo_task_skip # gdpo_task_skip
 
 use_kl_in_reward=False
 kl_coef=0.0
@@ -57,11 +59,13 @@ entropy_coeff=0.00
 clip_ratio_low=0.2
 clip_ratio_high=0.2
 
-enable_filter_groups=False
+enable_filter_groups=True # False
 filter_groups_metric=acc
-max_num_gen_batches=10
+# max_num_gen_batches=10
 
-norm_adv_by_std_in_grpo=True
+# GDPO: False to avoid double normalization (task-wise mean-centering only, then batch whitening)
+# GRPO: True for full task-wise normalization
+norm_adv_by_std_in_grpo=False
 
 # Response length parameters
 max_prompt_length=1000
@@ -99,7 +103,7 @@ sp_size=1
 NNODES=${NNODES:-1}
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
 
-n_gpus_rollout=6
+n_gpus_rollout=5
 n_gpus_training=2 # $((NGPUS_PER_NODE - n_gpus_rollout))
 
 fsdp_size=2 # Must be divisible by (n_gpus_training*n_nodes) and (n_gpus_rollout*n_nodes)
@@ -109,22 +113,22 @@ train_prompt_bsz=0 # not used in async mode
 gen_prompt_bsz=1 # streaming generation, set to 1
 n_resp_per_prompt=8
 rollout_prompt_size=2 # set to number of prompts per actor per batch, used in async mode
-val_rollout_prompt_size=16
+val_rollout_prompt_size=10
 train_prompt_mini_bsz=128
 train_prompt_micro_bsz=4
 total_rollout_steps=$(((512*100*3*10)))
-staleness_threshold=1.0
+staleness_threshold=2.0
 trigger_parameter_sync_step=1
 require_batches=1
 partial_rollout=False
 log_prob_micro_batch_size_per_gpu=1
 
 test_freq=10
-save_freq=$((test_freq * trigger_parameter_sync_step * 1))
+save_freq=10 # $((test_freq * trigger_parameter_sync_step * 1))
 total_epochs=10
 # total_training_steps=3000
 rollout_freq=1
-# log_val_generations=1
+# log_val_generations=20
 
 ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     --working-dir "${WORKING_DIR}" \
@@ -132,7 +136,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     --config-name="fully_async_ppo_trainer.yaml" \
     data.train_files="${TRAIN_FILES}" \
     data.val_files="${VAL_FILES}" \
-    data.shuffle=False \
+    data.shuffle=True \
     data.prompt_key=prompt \
     data.train_batch_size=${train_prompt_bsz} \
     data.gen_batch_size=${gen_prompt_bsz} \
@@ -143,8 +147,8 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     data.custom_cls.name=ImageRLDataset \
     actor_rollout_ref.nccl_timeout=120000000 \
     actor_rollout_ref.model.path=\"${MODEL_PATH}\" \
-    actor_rollout_ref.actor.optim.lr=2e-6 \
-    actor_rollout_ref.actor.optim.warmup_style=constant \
+    actor_rollout_ref.actor.optim.lr=2e-5 \
+    actor_rollout_ref.actor.optim.lr_scheduler_type=constant \
     actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
     actor_rollout_ref.actor.optim.weight_decay=0.1 \
     actor_rollout_ref.actor.strategy=fsdp \
@@ -164,6 +168,8 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     algorithm.adv_estimator=${adv_estimator} \
     algorithm.use_kl_in_reward=${use_kl_in_reward} \
     algorithm.kl_ctrl.kl_coef=${kl_coef} \
+    algorithm.filter_groups.enable=${enable_filter_groups} \
+    algorithm.filter_groups.metric=${filter_groups_metric} \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.hybrid_engine=False \
     actor_rollout_ref.actor.use_dynamic_bsz=${use_dynamic_bsz} \
@@ -233,8 +239,9 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     rollout.n_gpus_per_node="${n_gpus_rollout}" \
     actor_rollout_ref.rollout.agent.num_workers=$((NNODES * n_gpus_rollout)) \
     rollout.total_rollout_steps="${total_rollout_steps}" \
-    rollout.total_epochs="${total_epochs}" \
+    rollout.total_epochs=${total_epochs} \
     trainer.test_freq="${test_freq}" \
+    rollout.test_freq="${test_freq}" \
     async_training.rollout_prompt_size="${rollout_prompt_size}" \
     async_training.val_rollout_prompt_size="${val_rollout_prompt_size}" \
     async_training.staleness_threshold="${staleness_threshold}" \
@@ -242,12 +249,15 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     async_training.require_batches="${require_batches}" \
     async_training.partial_rollout="${partial_rollout}" \
     async_training.use_rollout_log_probs=True \
-    async_training.compute_prox_log_prob=True \
+    async_training.compute_prox_log_prob=False \
     reward_model.reward_manager=image_generation \
-    custom_reward_function.path=recipe/image_rl/reward_function.py \
+    custom_reward_function.path=recipe/image_rl/reward_function_naive.py \
     custom_reward_function.name=compute_score_batch \
     +reward_model.reward_kwargs.overlong_buffer_cfg.enable=${enable_overlong_buffer} \
     +reward_model.reward_kwargs.overlong_buffer_cfg.len=${overlong_buffer_len} \
     +reward_model.reward_kwargs.overlong_buffer_cfg.penalty_factor=${overlong_penalty_factor} \
     +reward_model.reward_kwargs.overlong_buffer_cfg.log=False \
     +reward_model.reward_kwargs.max_resp_len=${max_response_length} \
+    +actor_rollout_ref.actor.multi_task.enable=True \
+    +actor_rollout_ref.actor.multi_task.task_weights='[1.0,0.0,0.0]' \
+    +actor_rollout_ref.actor.multi_task.task_selection=weighted_sample \
