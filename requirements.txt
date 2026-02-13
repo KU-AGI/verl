@@ -29,3 +29,8 @@ timm
 numpy==1.26.4
 deepspeed==0.18.2
 tensordict==0.6.2
+attrdict
+timm
+ray[default]==2.52.1
+spacy
+# python -m spacy download en_core_web_sm
