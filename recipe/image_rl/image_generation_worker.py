@@ -375,6 +375,20 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
                 if self.rank == 0:
                     print("[actor model] No vision tower found.")
 
+        # Freeze image encoder modules before FSDP wrapping.
+        # requires_grad must be set before FSDP wrapping so that:
+        #   - FSDP1: flat parameter's requires_grad is correctly determined per unit
+        #   - FSDP2: each DTensor's requires_grad is set correctly from the start
+        # Only applies to actor; ref policy uses torch.no_grad() context for inference.
+        if role == "actor":
+            for module_name in ["gen_embed", "vision_model", "gen_vision_model"]:
+                module = getattr(actor_module, module_name, None)
+                if module is not None:
+                    module.requires_grad_(False)
+                    self.use_orig_params = True  # FSDP1: mixed requires_grad needs use_orig_params=True
+                    if self.rank == 0:
+                        print(f"[actor model] Froze {module_name}.")
+
         torch.distributed.barrier()
 
         if self.rank == 0:
@@ -427,7 +441,7 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
                 mixed_precision=mixed_precision,
                 sync_module_states=True,
                 device_mesh=self.device_mesh,
-                use_orig_params=False,#self.use_orig_params,
+                use_orig_params=self.use_orig_params,
                 forward_prefetch=fsdp_config.get("forward_prefetch", False),
             )
         elif fsdp_strategy == "fsdp2":
@@ -1109,7 +1123,14 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
                 ):
                     sd = self.actor_module_fsdp.state_dict()
             else:
+                # FSDP2: state_dict() returns DTensors (local shards).
+                # .full_tensor() is a collective op — all ranks must participate simultaneously.
                 sd = self.actor_module_fsdp.state_dict()
+                sd = {
+                    k: v.full_tensor().to(dtype=torch.bfloat16, device="cpu")
+                       if isinstance(v, DTensor) else v.cpu()
+                    for k, v in sd.items()
+                }
 
             sd = convert_weight_keys(sd, getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp))
 

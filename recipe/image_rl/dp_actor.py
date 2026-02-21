@@ -488,7 +488,7 @@ class DataParallelImageGenerationActor(BasePPOActor):
     def update_policy(self, data: DataProto):
         """Update policy with multi-task support"""
         self.actor_module.train()
-        #self.freeze_param()
+        self.freeze_param()
         loss_agg_mode = self.config.loss_agg_mode
         
         temperature = data.meta_info["temperature"]
