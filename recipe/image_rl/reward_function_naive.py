@@ -22,15 +22,15 @@ from enum import Enum
 import torch
 import aiohttp
 from recipe.image_rl.gdino_regex import _CONNECTORS, SKIP_KEYWORDS, _COMPILED_RELATIONS
+from mathruler.grader import extract_boxed_content
 
 # Configuration
 VLM_BASE_URLS = [
     # "http://10.100.44.4:8006/v1", # main1
-    "http://10.100.44.4:8006/v1", # sub2
-    "http://10.100.44.4:8007/v1",
-    "http://10.100.44.6:8006/v1",
-    "http://10.100.44.6:8007/v1",
-    
+    # "http://10.100.44.4:8006/v1", # sub2
+    # "http://10.100.44.4:8007/v1",
+    # "http://10.100.44.6:8006/v1",
+    "http://192.169.0.2:8007/v1",
 ]
 LLM_BASE_URLS = [
     # "http://10.100.44.2:8004/v1", # sub2
@@ -41,7 +41,7 @@ LLM_BASE_URLS = [
 API_KEY = "EMPTY"
 MAX_RETRIES = 3
 BASE_DELAY = 2
-RM_VLM_MODEL_PATH = os.environ.get("RM_VLM_MODEL_PATH", "Qwen/Qwen3-VL-32B-Instruct")
+RM_VLM_MODEL_PATH = os.environ.get("RM_VLM_MODEL_PATH", "Qwen/Qwen2.5-VL-7B-Instruct")
 RM_LLM_MODEL_PATH = os.environ.get("RM_LLM_MODEL_PATH", "Qwen/Qwen3-30B-A3B-Instruct-2507")
 
 # Health checking configuration
@@ -307,6 +307,18 @@ class ClientManager:
 vlm_client_manager = ClientManager(VLM_BASE_URLS, name="VLM")
 llm_client_manager = ClientManager(LLM_BASE_URLS, name="LLM")
 
+def content_from_prompt_with_images(prompt: str, image_urls: list[str]):
+    parts = prompt.split("<image>")
+    if len(parts) - 1 != len(image_urls):
+        raise ValueError(f"placeholder <image> cnt({len(parts)-1})and image_urls cnt({len(image_urls)}) different")
+
+    content = []
+    for i, part in enumerate(parts):
+        if part:
+            content.append({"type": "text", "text": part})
+        if i < len(image_urls):
+            content.append({"type": "image_url", "image_url": {"url": image_urls[i]}})
+    return content
 
 def convert_gen_img_to_base64(gen_img) -> Optional[str]:
     """Convert image to base64 data URL.
@@ -365,14 +377,13 @@ def get_messages(*args):
     prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback, vqa_question, extra_info, task_id = args
 
     if task_id == 1:
-        system_prompt = TASK1_TASK3_IMAGE_GENERATOR_SYSTEM_PROMPT_TEMPLATE
-        user_prompt = TASK1_TASK3_IMAGE_GENERATOR_USER_PROMPT_TEMPLATE.format(questions=vqa_question)
+        # system_prompt = TASK1_TASK3_IMAGE_GENERATOR_SYSTEM_PROMPT_TEMPLATE
+        # user_prompt = VQA_PROMPT_TEMPLATE.replace("{prompt}", prompt)  # TASK1_TASK3_IMAGE_GENERATOR_USER_PROMPT_TEMPLATE.format(questions=vqa_question)
+        user_prompt = REASONGEN_R1_TEMPLATE.format(prompt=prompt.replace("A photo of ",""))
+        # print("User Prompt:\n\n", user_prompt)
         messages = [
             # {"role": "system", "content": system_prompt},
-            {"role": "user", "content": [
-                {"type": "image_url", "image_url": {"url": convert_gen_img_to_base64(gen_img)}},
-                {"type": "text", "text": user_prompt}
-            ]}
+            {"role": "user", "content": content_from_prompt_with_images(user_prompt, [convert_gen_img_to_base64(gen_img)])}
         ]
         model = RM_VLM_MODEL_PATH
     elif task_id == 2:
@@ -426,13 +437,21 @@ async def get_response_with_client(client, messages, model):
     response = await client.chat.completions.create(
         model=model,
         messages=messages,
-        max_tokens=4096,
+
+        # 출력 길이
+        max_tokens=1024,
+
+        # ✅ greedy
+        temperature=0.0,
+        top_p=1.0,
+
         extra_body={
-            "repetition_penalty": 1.2,
-            # "top_p": 1.0,
-            # "top_k": 40,
-            "temperature": 0.0,
+            "top_k": -1,
+            "min_p": 0.0,
+            "best_of": 1,
+            "repetition_penalty": 1.05,
         },
+
         timeout=300000.0,
     )
     return response.choices[0].message.content
@@ -497,10 +516,19 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
         task1_vqa_reward_score = 0.0
         if not isinstance(vqa_response, Exception) and vqa_response is not None:
             try:
-                task1_idx_to_ans: dict = image_evaluator_parser(vqa_response)
-                task1_vqa_reward_score_sum = sum(task1_idx_to_ans.values())
-                task1_ans_count = len(task1_idx_to_ans)
-                task1_vqa_reward_score = (task1_vqa_reward_score_sum / task1_ans_count) if task1_ans_count > 0 else 0.0 # 1.0 if task1_vqa_reward_score_sum == task1_ans_count else 0.0
+                # task1_idx_to_ans: dict = image_evaluator_parser(vqa_response)
+                # task1_vqa_reward_score_sum = sum(task1_idx_to_ans.values())
+                # task1_ans_count = len(task1_idx_to_ans)
+                # task1_vqa_reward_score = (task1_vqa_reward_score_sum / task1_ans_count) if task1_ans_count > 0 else 0.0 # 1.0 if task1_vqa_reward_score_sum == task1_ans_count else 0.0
+                # ==================== Naive ====================
+                # vqa_json = safe_json_loads(vqa_response)
+                # task1_vqa_reward_score += vqa_json.get("label", 0.0)
+                # ==================== Reasongen_R1 ====================
+                task1_vqa_reward_score = extract_boxed_content(vqa_response)
+                if task1_vqa_reward_score.startswith("{"): task1_vqa_reward_score.replace("{", "")
+                if task1_vqa_reward_score.endswith("}"): task1_vqa_reward_score.replace("}", "")
+                task1_vqa_reward_score = int(task1_vqa_reward_score)
+                # print("Reward:\n\n", task1_vqa_reward_score)
                 reward_score += task1_vqa_reward_score
                 reward_extra_info[f"task{task_id}_vqa_reward"] = task1_vqa_reward_score
             except Exception as e:
@@ -779,19 +807,19 @@ def is_meaningful_response(text: str) -> bool:
     if not text or not text.strip():
         return False
 
-    start_idx = text.find('{')
-    end_idx = text.rfind('}')
+    # start_idx = text.find('{')
+    # end_idx = text.rfind('}')
     
-    if (start_idx == -1) != (end_idx == -1):
-        return False
+    # if (start_idx == -1) != (end_idx == -1):
+    #     return False
 
-    if start_idx != -1:
-        if end_idx <= start_idx: return False
-        try:
-            json.loads(text[start_idx : end_idx + 1])
-            return True
-        except:
-            return False
+    # if start_idx != -1:
+    #     if end_idx <= start_idx: return False
+    #     try:
+    #         json.loads(text[start_idx : end_idx + 1])
+    #         return True
+    #     except:
+    #         return False
             
     return True
 

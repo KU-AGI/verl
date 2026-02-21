@@ -48,7 +48,7 @@ def log_prob_metrics(metrics):
 
     log_prob_info = {}
 
-    for task_id in [1, 2, 3]:
+    for task_id in [1]:
         task_pos_log_prob = f"actor/task{task_id}_pos_log_prob"
         task_neg_log_prob = f"actor/task{task_id}_neg_log_prob"
         task_pos_log_prob_cnt = f"actor/task{task_id}_pos_log_prob_cnt"
@@ -134,7 +134,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
 
         # required_samples use ppo_mini_batch_size*require_batches as the minimum number of samples.
         self.require_batches = config.async_training.require_batches
-        self.required_samples = config.actor_rollout_ref.actor.ppo_mini_batch_size * self.require_batches
+        self.required_samples = config.actor_rollout_ref.actor.ppo_mini_batch_size * self.require_batches * config.actor_rollout_ref.rollout.n
         self.compute_prox_log_prob = self.config.async_training.compute_prox_log_prob
         total_gpus = (
             config.trainer.nnodes * config.trainer.n_gpus_per_node
@@ -239,7 +239,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             f"Wait time: {total_wait_time:.2f}s."
             f"Dropped sample: {dropped_rows}"
         )
-
+        print(f"[DEBUG] Balance Batch: {self.config.trainer.balance_batch}")
         if self.config.trainer.balance_batch:
             batch = assemble_batch_from_rollout_samples(queue_samples, self.tokenizer, self.config, self._balance_batch)
         else:
@@ -354,7 +354,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                     #         self.actor_rollout_wg.save_model_to_cpu(local_trigger)
                     #         self.actor_rollout_wg.restore_model_from_cpu(1)
 
-                    for task_id in [1, 2, 3]:
+                    for task_id in [1]:
                         batch.batch["task_id"] = torch.tensor([task_id for _ in range(len(batch))], dtype=int)
 
                         batch = self._process_batch_common(
@@ -384,7 +384,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                         metrics.update(actor_output_metrics)
 
                     reward_extra_infos_dict: dict[str, list] = {}
-                    for task_id in [1, 2, 3]:
+                    for task_id in [1]:
                         # Get pre-computed reward_extra_infos_dict from meta_info
                         reward_extra_infos_dict.update({k: v for k, v in batch.meta_info.items()})
 

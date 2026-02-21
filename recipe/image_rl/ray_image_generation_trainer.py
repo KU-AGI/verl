@@ -385,7 +385,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
         except Exception as e:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
-    def _dump_generations(self, uid, prompt_id, prompt, gen_imgs_pil_list, feedback_texts, regen_imgs_pil_list,
+    def _dump_generations(self, uid, prompt_id, prompt, gen_imgs_pil_list, detailed_prompts, feedback_texts, regen_imgs_pil_list,
                         gts_imgs, summarizes, gts_tuples, gts_vqas, scores, reward_extra_infos_dict, sample_versions, dump_path):
 
         trainer_ver = getattr(self, "current_param_version", self.global_steps)
@@ -456,7 +456,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
 
                 # 개별 리포트 생성
                 item = {'rollout_idx': r_idx, 'uid': uid[i]}
-                self._write_detailed_report(rollout_dir, i, item, paths, prompt, feedback_texts, scores, 
+                self._write_detailed_report(rollout_dir, i, item, paths, prompt, detailed_prompts, feedback_texts, scores, 
                                         summarizes, gts_tuples, gts_vqas, reward_extra_infos_dict)
 
             with open(summary_path, 'w', encoding='utf-8') as f:
@@ -516,7 +516,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             
         return paths
 
-    def _write_detailed_report(self, rollout_dir, i, item, paths, prompt, feedback_texts, scores, 
+    def _write_detailed_report(self, rollout_dir, i, item, paths, prompt, detailed_prompts, feedback_texts, scores, 
                             summarizes, gts_tuples, gts_vqas, reward_extra_infos_dict):
 
         txt_path = os.path.join(rollout_dir, "txt.txt")
@@ -525,6 +525,9 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             f.write(f"Location: {os.path.abspath(rollout_dir)}\n")
             f.write("=" * 100 + "\n")
             f.write(f"📝 [PROMPT]\n{prompt[i]}\n")
+            f.write("=" * 100 + "\n\n")
+
+            f.write(f"📝 [DETAILED PROMPT]\n{detailed_prompts[i]}\n")
             f.write("=" * 100 + "\n\n")
 
             # Task 1
@@ -538,48 +541,48 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             # f.write(f"  - Detector Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task1_detector_response', i)}\n")
             f.write("\n")
 
-            # Task 2
-            f.write(f"💬 [TASK 2] FEEDBACK GENERATION\n")
-            f.write(f"  - Total Score: {self._get_safe_val(scores, 'task2_scores', i)}\n")
-            f.write(f"  - Format Reward: {self._get_safe_val(reward_extra_infos_dict, 'task2_format_reward', i)}\n")
-            f.write(f"  - Part1 Reward (F1 + Consistency): {self._get_safe_val(reward_extra_infos_dict, 'task2_part1_reward', i)}\n")
-            f.write(f"  - Judge Alignment Gate (does not contribute to reward): {self._get_safe_val(reward_extra_infos_dict, 'task2_judge_alignment_reward', i)}\n")
-            f.write(f"  - Feedback Reward: {self._get_safe_val(reward_extra_infos_dict, 'task2_feedback_reward', i)}\n")
-            # f.write(f"  - Comparison Summarize Score: {self._get_safe_val(reward_extra_infos_dict, 'task2_comparison_summarize_score', i)}\n")
-            # f.write(f"  - Comparison Tuple Score: {self._get_safe_val(reward_extra_infos_dict, 'task2_comparison_tuple_score', i)}\n")
-            # f.write(f"  - Hallucination Check Score: {self._get_safe_val(reward_extra_infos_dict, 'task2_hallucination_check_score', i)}\n")
-            # f.write(f"  - Edit Instruction Score: {self._get_safe_val(reward_extra_infos_dict, 'task2_edit_instruction_score', i)}\n")
-            f.write(f"  - Model Feedback:\n{feedback_texts[i] if feedback_texts else 'N/A'}\n")
-            f.write(f"  - Judge Alignment Gate Response (does not contribute to reward): {self._get_safe_response(reward_extra_infos_dict, 'task2_judge_alignment_reward_response', i)}\n")
-            f.write(f"  - Feedback Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task2_feedback_reward_response', i)}\n")
-            # f.write(f"  - Comparison Summarize Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task2_comparison_summarize_response', i)}\n")
-            # f.write(f"  - Comparison Tuple Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task2_comparison_tuple_response', i)}\n")
-            # f.write(f"  - Hallucination Check Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task2_hallucination_check_response', i)}\n")
-            # f.write(f"  - Edit Instruction Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task2_edit_instruction_response', i)}\n")
-            f.write("\n")
+            # # Task 2
+            # f.write(f"💬 [TASK 2] FEEDBACK GENERATION\n")
+            # f.write(f"  - Total Score: {self._get_safe_val(scores, 'task2_scores', i)}\n")
+            # f.write(f"  - Format Reward: {self._get_safe_val(reward_extra_infos_dict, 'task2_format_reward', i)}\n")
+            # f.write(f"  - Part1 Reward (F1 + Consistency): {self._get_safe_val(reward_extra_infos_dict, 'task2_part1_reward', i)}\n")
+            # f.write(f"  - Judge Alignment Gate (does not contribute to reward): {self._get_safe_val(reward_extra_infos_dict, 'task2_judge_alignment_reward', i)}\n")
+            # f.write(f"  - Feedback Reward: {self._get_safe_val(reward_extra_infos_dict, 'task2_feedback_reward', i)}\n")
+            # # f.write(f"  - Comparison Summarize Score: {self._get_safe_val(reward_extra_infos_dict, 'task2_comparison_summarize_score', i)}\n")
+            # # f.write(f"  - Comparison Tuple Score: {self._get_safe_val(reward_extra_infos_dict, 'task2_comparison_tuple_score', i)}\n")
+            # # f.write(f"  - Hallucination Check Score: {self._get_safe_val(reward_extra_infos_dict, 'task2_hallucination_check_score', i)}\n")
+            # # f.write(f"  - Edit Instruction Score: {self._get_safe_val(reward_extra_infos_dict, 'task2_edit_instruction_score', i)}\n")
+            # f.write(f"  - Model Feedback:\n{feedback_texts[i] if feedback_texts else 'N/A'}\n")
+            # f.write(f"  - Judge Alignment Gate Response (does not contribute to reward): {self._get_safe_response(reward_extra_infos_dict, 'task2_judge_alignment_reward_response', i)}\n")
+            # f.write(f"  - Feedback Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task2_feedback_reward_response', i)}\n")
+            # # f.write(f"  - Comparison Summarize Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task2_comparison_summarize_response', i)}\n")
+            # # f.write(f"  - Comparison Tuple Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task2_comparison_tuple_response', i)}\n")
+            # # f.write(f"  - Hallucination Check Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task2_hallucination_check_response', i)}\n")
+            # # f.write(f"  - Edit Instruction Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task2_edit_instruction_response', i)}\n")
+            # f.write("\n")
 
-            # Task 3
-            f.write(f"🔄 [TASK 3] RE-GENERATION\n")
-            f.write(f"  - Total Score: {self._get_safe_val(scores, 'task3_scores', i)}\n")
-            f.write(f"  - VQA Reward: {self._get_safe_val(reward_extra_infos_dict, 'task3_vqa_reward', i)}\n")
-            f.write(f"  - Edit Instruction Following Reward: {self._get_safe_val(reward_extra_infos_dict, 'task3_edit_reward', i)}\n")
-            # f.write(f"  - Detector Reward: {self._get_safe_val(reward_extra_infos_dict, 'task3_detector_reward', i)}\n")
-            # f.write(f"  - VQA+Detector Bonus: {self._get_safe_val(reward_extra_infos_dict, 'task3_vqa_detector_bonus', i)}\n")
-            # f.write(f"  - Regeneration Followed by Editing Reward: {self._get_safe_val(reward_extra_infos_dict, 'task3_regeneration_followed_by_editing_reward', i)}\n")
-            f.write(f"  - Path: {paths['regen']}\n")
-            f.write(f"  - VQA Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task3_vqa_reward_response', i)}\n")
-            f.write(f"  - Edit Instruction Following Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task3_edit_reward_response', i)}\n")
-            # f.write(f"  - Detector Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task3_detector_response', i)}\n")
-            # f.write(f"  - Regeneration Followed by Editing Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task3_regeneration_followed_by_editing_response', i)}\n")
-            f.write("\n")
+            # # Task 3
+            # f.write(f"🔄 [TASK 3] RE-GENERATION\n")
+            # f.write(f"  - Total Score: {self._get_safe_val(scores, 'task3_scores', i)}\n")
+            # f.write(f"  - VQA Reward: {self._get_safe_val(reward_extra_infos_dict, 'task3_vqa_reward', i)}\n")
+            # f.write(f"  - Edit Instruction Following Reward: {self._get_safe_val(reward_extra_infos_dict, 'task3_edit_reward', i)}\n")
+            # # f.write(f"  - Detector Reward: {self._get_safe_val(reward_extra_infos_dict, 'task3_detector_reward', i)}\n")
+            # # f.write(f"  - VQA+Detector Bonus: {self._get_safe_val(reward_extra_infos_dict, 'task3_vqa_detector_bonus', i)}\n")
+            # # f.write(f"  - Regeneration Followed by Editing Reward: {self._get_safe_val(reward_extra_infos_dict, 'task3_regeneration_followed_by_editing_reward', i)}\n")
+            # f.write(f"  - Path: {paths['regen']}\n")
+            # f.write(f"  - VQA Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task3_vqa_reward_response', i)}\n")
+            # f.write(f"  - Edit Instruction Following Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task3_edit_reward_response', i)}\n")
+            # # f.write(f"  - Detector Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task3_detector_response', i)}\n")
+            # # f.write(f"  - Regeneration Followed by Editing Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task3_regeneration_followed_by_editing_response', i)}\n")
+            # f.write("\n")
 
-            # Ground Truth
-            f.write(f"📚 [GROUND TRUTH REFERENCE]\n")
-            f.write(f"  - GT Image:\n{paths['gt']}\n")
-            f.write(f"  - Summary:\n{summarizes[i] if summarizes else 'N/A'}\n")
-            f.write(f"  - Tuples:\n{gts_tuples[i] if gts_tuples else 'N/A'}\n")
-            f.write(f"  - VQA Questions:\n{gts_vqas[i] if gts_vqas else 'N/A'}\n")
-            f.write("=" * 100 + "\n")
+            # # Ground Truth
+            # f.write(f"📚 [GROUND TRUTH REFERENCE]\n")
+            # f.write(f"  - GT Image:\n{paths['gt']}\n")
+            # f.write(f"  - Summary:\n{summarizes[i] if summarizes else 'N/A'}\n")
+            # f.write(f"  - Tuples:\n{gts_tuples[i] if gts_tuples else 'N/A'}\n")
+            # f.write(f"  - VQA Questions:\n{gts_vqas[i] if gts_vqas else 'N/A'}\n")
+            # f.write("=" * 100 + "\n")
 
     def _log_rollout_data(
         self, batch: DataProto, reward_extra_infos_dict: dict, timing_raw: dict, rollout_data_dir: str
@@ -596,8 +599,9 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             uid = batch.non_tensor_batch["uid"].tolist()
             prompt = batch.non_tensor_batch['prompt'].tolist()
             gen_imgs_pil_list = batch.non_tensor_batch['task1_gen_imgs_pil_list']
-            feedback_texts = batch.non_tensor_batch['task2_feedback_texts'].tolist()
-            regen_imgs_pil_list = batch.non_tensor_batch['task3_regen_imgs_pil_list']
+            detailed_prompts = batch.non_tensor_batch["task1_detailed_prompts"]
+            # feedback_texts = batch.non_tensor_batch['task2_feedback_texts'].tolist()
+            # regen_imgs_pil_list = batch.non_tensor_batch['task3_regen_imgs_pil_list']
             gts_imgs = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
             summarizes = [item.non_tensor_batch.get("reward_model", {}).get("summary", None) for item in batch]
             gts_tuples = [item.non_tensor_batch.get("reward_model", {}).get("tuple", None) for item in batch]
@@ -611,7 +615,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
 
             scores = {}
             # Add all task scores
-            for tid in [1, 2, 3]:
+            for tid in [1]:
                 key = f"task{tid}_token_level_scores"
                 if key in batch.batch:
                     scores[f"task{tid}_scores"] = batch.batch[key].sum(-1).cpu().tolist()
@@ -626,8 +630,9 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                 uid=uid,
                 prompt=prompt,
                 gen_imgs_pil_list=gen_imgs_pil_list,
-                feedback_texts=feedback_texts,
-                regen_imgs_pil_list=regen_imgs_pil_list,
+                detailed_prompts=detailed_prompts,
+                feedback_texts=None,
+                regen_imgs_pil_list=None,
                 gts_imgs=gts_imgs,
                 summarizes=summarizes,
                 gts_tuples=gts_tuples,
@@ -721,7 +726,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                 test_output_gen_batch = test_output_gen_batch.union(reward_tensor)
 
             # evaluate using reward_function for each task
-            for task_id in [1, 2, 3]:
+            for task_id in [1]:
                 task_reward_dict = self.val_reward_fn(test_output_gen_batch, eval=True, task_id=task_id, return_dict=True)
                 task_reward_tensor = task_reward_dict[f"task{task_id}_reward_tensor"]
                 task_reward_tensors[task_id].append(task_reward_tensor)
@@ -787,7 +792,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
 
         # task metrics computation
         metric_dict = {}
-        for task_id in [1, 2, 3]:
+        for task_id in [1]:
             reward_tensor = torch.cat(task_reward_tensors[task_id], dim=0).sum(-1).cpu()
 
             # evaluate test_score based on data source
@@ -925,7 +930,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                                                         + batch.batch["task3_attention_mask"].sum(dim=-1) + batch.batch["task3_response_mask"].sum(dim=-1)
 
                     # Process all tasks to prepare data for multi-task training
-                    for task_id in [1, 2, 3]:
+                    for task_id in [1]:
 
                         batch.batch["attention_mask"] = torch.cat([batch.batch[f"task{task_id}_attention_mask"], batch.batch[f"task{task_id}_response_mask"]], dim=1)
 

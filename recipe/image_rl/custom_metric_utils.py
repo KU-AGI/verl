@@ -427,33 +427,47 @@ def compute_group_reward_metrics(batch: DataProto) -> dict[str, Any]:
             task_reward_section[f"group_rewards/{name}/min"] = np.min(value)
             task_reward_section[f"group_rewards/{name}/positive_ratio"] = np.mean(np.array(value) > 0)
 
-    # Advantage collapse
-    sequence_score = batch.batch[f"task{task_id}_token_level_scores"].sum(-1)
+    # Advantage collapse - computed per group (same uid = same prompt)
+    sequence_score = batch.batch[f"task{task_id}_token_level_scores"].sum(-1).cpu().numpy()
+    uids = batch.non_tensor_batch.get("uid", None)
 
-    # Filter out negative scores
-    positive_mask = sequence_score > 0
-    positive_sequence_score = sequence_score[positive_mask]
+    cv_threshold = 0.01  # under 1%: regard as collapse
 
-    if positive_sequence_score.numel() > 0:
-        # unique score ratio
-        unique_scores = torch.unique(positive_sequence_score)
-        all_same_ratio = float(len(unique_scores) == 1)
-        score_std = torch.std(positive_sequence_score).item()
-        score_mean = torch.mean(positive_sequence_score).item()
-        # coefficient of variation
-        cv_threshold = 0.01  # under 1%: regard as collapse
-        collapse_ratio = float(score_std / (abs(score_mean) + 1e-8) < cv_threshold)
+    if uids is not None and len(uids) > 0:
+        # Group scores by uid
+        uid2scores = defaultdict(list)
+        for uid, score in zip(uids, sequence_score):
+            uid2scores[uid].append(float(score))
+
+        group_all_same, group_collapse, group_stds, group_cvs = [], [], [], []
+        for scores in uid2scores.values():
+            if len(scores) < 2:
+                continue
+            scores_arr = np.array(scores)
+            std = np.std(scores_arr)
+            mean = np.mean(scores_arr)
+            cv = std / (abs(mean) + 1e-8)
+            group_all_same.append(float(len(np.unique(scores_arr)) == 1))
+            group_collapse.append(float(cv < cv_threshold))
+            group_stds.append(std)
+            group_cvs.append(cv)
+
+        if len(group_all_same) > 0:
+            all_same_ratio = float(np.mean(group_all_same))
+            collapse_ratio = float(np.mean(group_collapse))
+            score_std = float(np.mean(group_stds))
+            score_cv = float(np.mean(group_cvs))
+        else:
+            all_same_ratio = collapse_ratio = score_std = score_cv = 0.0
     else:
-        all_same_ratio = 0.0
-        collapse_ratio = 0.0
-        score_std = 0.0
-        score_mean = 0.0
+        # Fallback: no uid info, skip collapse metrics
+        all_same_ratio = collapse_ratio = score_std = score_cv = 0.0
 
     task_reward_section.update({
         f"group_rewards/task{task_id}/advantage_collapse/all_same_ratio": all_same_ratio,
         f"group_rewards/task{task_id}/advantage_collapse/collapse_ratio": collapse_ratio,
         f"group_rewards/task{task_id}/advantage_collapse/score_std": score_std,
-        f"group_rewards/task{task_id}/advantage_collapse/score_cv": score_std / (abs(score_mean) + 1e-8) if score_mean != 0.0 else 0.0,
+        f"group_rewards/task{task_id}/advantage_collapse/score_cv": score_cv,
     })
 
     return task_reward_section
@@ -660,6 +674,7 @@ def process_validation_metrics(
             for var_name, metric in var2metric.items():
                 for metric_name, metric_val in metric.items():
                     data_src2var2metric2uid_vals[data_source][var_name][metric_name].append(metric_val)
+                    data_src2var2metric2uid_vals["all"][var_name][metric_name].append(metric_val)
 
     data_src2var2metric2val = defaultdict(lambda: defaultdict(lambda: defaultdict(float)))
     for data_source, var2metric2uid_vals in data_src2var2metric2uid_vals.items():

@@ -21,6 +21,7 @@ from verl.workers.config import ActorConfig
 
 from recipe.image_rl.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
 from recipe.image_rl.utils import FormattingEvaluator
+from verl.utils.adaptive_entropy_coeff import AdaptiveEntropyCoefficient
 import torch.distributed as dist
 
 logger = logging.getLogger(__file__)
@@ -144,6 +145,39 @@ class DataParallelImageGenerationActor(BasePPOActor):
         )
         self.device_name = get_device_name()
 
+        # Adaptive entropy coefficient
+        adaptive_cfg = self.config.get('adaptive_entropy_coeff', {})
+        if adaptive_cfg.get('enable', False):
+            self.use_adaptive_entropy_coeff = True
+            
+            # 2. 'text'와 'image' 섹션을 가져옵니다 (없을 경우 빈 딕셔너리 기본값)
+            text_cfg = adaptive_cfg.get('text', {})
+            image_cfg = adaptive_cfg.get('image', {})
+
+            # 3. Text 설정 (typo였던 gettext 수정 및 딕셔너리 접근 방식 적용)
+            self.text_adaptive_entropy_coeff = AdaptiveEntropyCoefficient(
+                # YAML에 'init_alpha'로 적으셨을 수도 있으니 둘 다 체크하도록 처리했습니다.
+                initial_alpha=text_cfg.get('initial_alpha', text_cfg.get('init_alpha', 0.0)),
+                target_entropy=text_cfg.get('target_entropy', -1.0),
+                lr=text_cfg.get('lr', 1e-3),
+                max_coeff=text_cfg.get('max_coeff', 1e-3),
+                min_coeff=text_cfg.get('min_coeff', -1e-3),
+            )
+            
+            # 4. Image 설정
+            self.img_adaptive_entropy_coeff = AdaptiveEntropyCoefficient(
+                initial_alpha=image_cfg.get('initial_alpha', image_cfg.get('init_alpha', 0.0)),
+                target_entropy=image_cfg.get('target_entropy', -1.0),
+                lr=image_cfg.get('lr', 1e-3),
+                max_coeff=image_cfg.get('max_coeff', 1e-3),
+                min_coeff=image_cfg.get('min_coeff', -1e-3),
+            )
+        else:
+            self.use_adaptive_entropy_coeff = False
+
+        self.cfg_weight = self.config.get('cfg_weight', 1.0)
+        self.detach_uncond = self.config.get('detach_uncond', True)
+
         # Set processor in the model for unified forward pass
         if hasattr(self.actor_module, 'set_processor'):
             self.actor_module.set_processor(processor)
@@ -237,71 +271,88 @@ class DataParallelImageGenerationActor(BasePPOActor):
         task_id: int = 1
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Unified forward pass using model's internal processing.
-        FSDP will automatically unshard parameters during forward pass.
+        Forward pass following modeling_vlm.py forward pattern.
+        input_ids를 concat하고 model forward 후 logit slice하는 레퍼런스 방식.
 
         Returns:
-            entropy: (bs, response_len) or None
-            log_probs: (bs, response_len)
+            entropy: (bs, response_length) or None
+            log_probs: (bs, response_length)
         """
-        # Get original response mask for length restoration
-        original_response_mask = micro_batch[f"task{task_id}_response_mask"]
-
-        # Extract valid output tokens (remove right padding)
+        # ========== 1. task별 full sequence 구성 ==========
         if task_id == 1:
-            output_tokens = micro_batch["task1_gen_img_tokens"]
+            responses = micro_batch['task1_gen_img_tokens']
+            response_length = responses.size(1)
+
+            input_ids = torch.cat([micro_batch['task1_input_ids'], responses], dim=1)
+            attention_mask = torch.cat([
+                micro_batch['task1_attention_mask'],
+                micro_batch['task1_response_mask']
+            ], dim=1)
+
+            # seq_img_mask: prompt 부분은 False, response 부분은 task1_seq_img_mask
+            prompt_img_mask = torch.zeros_like(micro_batch['task1_attention_mask'], dtype=torch.bool)
+            seq_img_mask = torch.cat([prompt_img_mask, micro_batch['task1_seq_img_mask']], dim=1)
+
         elif task_id == 2:
-            output_tokens = micro_batch["task2_feedback_ids"]
+            responses = micro_batch['task2_feedback_ids']
+            response_length = responses.size(1)
+
+            input_ids = torch.cat([micro_batch['task2_input_ids'], responses], dim=1)
+            attention_mask = torch.cat([
+                micro_batch['task2_attention_mask'],
+                micro_batch['task2_response_mask']
+            ], dim=1)
+
+            # task2는 text generation이므로 seq_img_mask 전부 False
+            seq_img_mask = torch.zeros_like(attention_mask, dtype=torch.bool)
+
         elif task_id == 3:
-            output_tokens = micro_batch["task3_regen_img_tokens"]
+            responses = micro_batch['task3_regen_img_tokens']
+            response_length = responses.size(1)
+
+            input_ids = torch.cat([micro_batch['task3_input_ids'], responses], dim=1)
+            attention_mask = torch.cat([
+                micro_batch['task3_attention_mask'],
+                micro_batch['task3_response_mask']
+            ], dim=1)
+
+            prompt_img_mask = torch.zeros_like(micro_batch['task3_attention_mask'], dtype=torch.bool)
+            response_img_mask = micro_batch.get('task3_seq_img_mask', micro_batch['task3_response_mask'].bool())
+            seq_img_mask = torch.cat([prompt_img_mask, response_img_mask], dim=1)
         else:
             raise ValueError(f"Invalid task_id: {task_id}")
 
-        valid_output_tokens = self._extract_valid_output_tokens(output_tokens, original_response_mask)
+        # ========== 2. position_ids 계산 ==========
+        position_ids = attention_mask.long().cumsum(-1) - 1
+        position_ids = position_ids.masked_fill(attention_mask == 0, 0)
 
-        output_lengths = [original_response_mask[i].sum().item() for i in range(original_response_mask.size(0))]
-        local_has_output = 1 if max(output_lengths) > 0 else 0
+        # ========== 3. model forward (modeling_vlm.py forward 직접 호출) ==========
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            output = self.actor_module(
+                input_ids=input_ids,
+                input_img_mask=seq_img_mask,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                bos_token_id=self.tokenizer.bos_token_id,
+                pad_token_id=self.tokenizer.pad_token_id,
+                image_start_token_id=self.processor.image_start_id,
+                cfg_weight=self.cfg_weight,
+                detach_uncond=self.detach_uncond,
+                use_cache=False,
+            )
 
-        # IMPORTANT: Always do forward pass even if no valid output
-        # FSDP requires all ranks to participate in forward/backward for synchronization
+            logits = output['logits'] if isinstance(output, dict) else output.logits
+            logits.div_(temperature)
 
-        output = self.actor_module(
-            task_id=task_id,
-            batch=micro_batch,
-        )
-        
-        if local_has_output == 0:
-            # This rank has no output, but we still did the forward pass above
-            # Keep gradient connection to forward pass for FSDP synchronization
-            dummy_scalar = output.logits.flatten()[0] * 0.0
-            log_probs = torch.zeros_like(original_response_mask, dtype=output.logits.dtype, device=output.logits.device) + dummy_scalar
+            # 레퍼런스 패턴: response 부분 logit만 slice
+            logits = logits[:, -response_length - 1:-1, :]  # (bsz, response_length, vocab_size)
+            logits = torch.clamp(logits, min=-30.0, max=30.0)
+
+            log_probs = logprobs_from_logits(logits, responses)
+
             entropy = None
             if calculate_entropy:
-                entropy = torch.zeros_like(original_response_mask, dtype=output.logits.dtype, device=output.logits.device) + dummy_scalar
-            return entropy, log_probs
-
-        # Extract output_starts from model
-        output_starts = self.actor_module.get_output_starts()
-
-        logits = output.logits
-        task_logits = extract_output_logits(logits, output_starts, output_lengths)
-
-        del logits
-        del output
-
-        # Compute log probabilities
-        compact_log_probs = logprobs_from_logits(task_logits, valid_output_tokens)
-        log_probs = self._restore_log_probs_to_original_length(compact_log_probs, original_response_mask)
-
-        # Calculate entropy if needed
-        entropy = None
-        if calculate_entropy:
-            if not self.config.entropy_checkpointing:
-                compact_entropy = self.compute_entropy_from_logits(task_logits)
-            else:
-                compact_entropy = torch.utils.checkpoint.checkpoint(self.compute_entropy_from_logits, task_logits)
-        
-            entropy = self._restore_log_probs_to_original_length(compact_entropy, original_response_mask)
+                entropy = self.compute_entropy_from_logits(logits)  # (bsz, response_length)
 
         return entropy, log_probs
 
@@ -341,8 +392,8 @@ class DataParallelImageGenerationActor(BasePPOActor):
         # Selected batch keys based on task_id
         if task_id == 1:
             select_batch_keys = [
-                "task1_input_ids", "task1_attention_mask", "task1_gen_imgs_pixel_values", 
-                "task1_gen_img_tokens", "task1_response_mask", "task_id"
+                "task1_input_ids", "task1_attention_mask", "task1_gen_imgs_pixel_values",
+                "task1_gen_img_tokens", "task1_response_mask", "task1_seq_img_mask", "task_id"
             ]
             non_tensor_batch_keys = []
         elif task_id == 2:
@@ -376,53 +427,19 @@ class DataParallelImageGenerationActor(BasePPOActor):
 
         log_probs_lst = []
         entropy_lst = []
-        response_masks = []
-        
-        # Collect all response masks to determine global max length
+
         for micro_batch in micro_batches:
-            micro_batch_device = micro_batch.to(get_device_id())
-            response_mask = micro_batch_device.batch[f"task{task_id}_response_mask"]
-            response_masks.append(response_mask)
-        
-        # Find global max response length
-        all_response_masks = torch.cat(response_masks, dim=0)
-        global_max_len = all_response_masks.size(1)  # Use original response mask length for consistency
-        
-        # Process each micro batch
-        for i, micro_batch in enumerate(micro_batches):
             micro_batch = micro_batch.to(get_device_id())
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
-            
+
             with torch.no_grad():
                 entropy, log_probs = self._forward_micro_batch(
                     model_inputs, temperature=temperature, calculate_entropy=calculate_entropy, task_id=task_id
                 )
-            
-            need = torch.ones(log_probs.size(0), device=log_probs.device, dtype=torch.bool)
 
-            # Pad log_probs to global_max_len for consistent concatenation
-            current_len = log_probs.size(1)
-            if current_len < global_max_len:
-                padding = torch.zeros(log_probs.size(0), global_max_len - current_len, 
-                                      device=log_probs.device, dtype=log_probs.dtype)
-                log_probs = torch.cat([log_probs, padding], dim=1)
-            elif current_len > global_max_len:
-                # Truncate if somehow longer (shouldn't happen but safety check)
-                log_probs = log_probs[:, :global_max_len]
-            
-            # Apply need mask
-            log_probs = log_probs * need.unsqueeze(1)
             log_probs_lst.append(log_probs)
-            
+
             if calculate_entropy and entropy is not None:
-                # Pad entropy to global_max_len
-                current_len = entropy.size(1)
-                if current_len < global_max_len:
-                    padding = torch.zeros(entropy.size(0), global_max_len - current_len, 
-                                          device=entropy.device, dtype=entropy.dtype)
-                    entropy = torch.cat([entropy, padding], dim=1)
-                elif current_len > global_max_len:
-                    entropy = entropy[:, :global_max_len]
                 entropy_lst.append(entropy)
 
         log_probs = torch.concat(log_probs_lst, dim=0)
@@ -471,13 +488,14 @@ class DataParallelImageGenerationActor(BasePPOActor):
     def update_policy(self, data: DataProto):
         """Update policy with multi-task support"""
         self.actor_module.train()
-        self.freeze_param()
+        #self.freeze_param()
+        loss_agg_mode = self.config.loss_agg_mode
         
         temperature = data.meta_info["temperature"]
         
         # Multi-task configuration
         multi_task_config = self.config.get("multi_task", {})
-        enable_multi_task = multi_task_config.get("enable", True) # After remove "task_id" in batch
+        enable_multi_task = multi_task_config.get("enable", True)
         task_weights = multi_task_config.get("task_weights", [1.0, 1.0, 1.0])
         task_selection = multi_task_config.get("task_selection", "all")
         
@@ -486,108 +504,110 @@ class DataParallelImageGenerationActor(BasePPOActor):
             if task_selection == "all":
                 task_ids = [1, 2, 3]
             elif task_selection == "weighted_sample":
-                # Sample tasks based on weights
                 import random
                 task_ids = random.choices([1, 2, 3], weights=task_weights, k=1)
             else:
-                # Fallback to single task from batch
                 task_ids = [data.batch["task_id"].view(-1)[0].item()]
         else:
-            # Original behavior - single task
             task_ids = [data.batch["task_id"].view(-1)[0].item()]
         
-        # Prepare batch keys for all selected tasks
-        all_select_batch_keys = []
-        for task_id in task_ids:
-            task_keys = [
-                f"task{task_id}_input_ids", 
-                f"task{task_id}_attention_mask",
-                f"task{task_id}_response_mask",
-                f"task{task_id}_old_log_probs",
-                f"task{task_id}_advantages",
-            ]
-            # Add task-specific keys
-            if task_id == 1:
-                task_keys.extend([f"task{task_id}_gen_imgs_pixel_values", 
-                                f"task{task_id}_gen_img_tokens"])
-            elif task_id == 2:
-                task_keys.append(f"task{task_id}_feedback_ids")
-            elif task_id == 3:
-                task_keys.extend([f"task{task_id}_regen_imgs_pixel_values",
-                                f"task{task_id}_regen_img_tokens"])
-            
-            all_select_batch_keys.extend(task_keys)
-            
+        # ========== Select keys (레퍼런스 패턴) ==========
+        select_keys = ['task_id']
+        for tid in task_ids:
+            select_keys.extend([
+                f'task{tid}_input_ids', f'task{tid}_attention_mask',
+                f'task{tid}_response_mask', f'task{tid}_old_log_probs',
+                f'task{tid}_advantages',
+            ])
+            if tid == 1:
+                select_keys.extend([
+                    'task1_gen_imgs_pixel_values', 'task1_gen_img_tokens', 'task1_seq_img_mask'
+                ])
+            elif tid == 2:
+                select_keys.extend(['task2_feedback_ids'])
+            elif tid == 3:
+                select_keys.extend([
+                    'task3_regen_imgs_pixel_values', 'task3_regen_img_tokens'
+                ])
             if self.config.use_kl_loss:
-                all_select_batch_keys.append(f"task{task_id}_ref_log_prob")
-        
-        # Add common keys
-        all_select_batch_keys.append("task_id")
-        if "rollout_is_weights" in data.batch.keys():
-            all_select_batch_keys.append("rollout_is_weights")
-        
-        data = data.select(meta_info_keys=list(set(all_select_batch_keys)))
-        
-        mini_batches = data.split(self.config.ppo_mini_batch_size)
-        on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1
-        
+                select_keys.append(f'task{tid}_ref_log_prob')
+
+        select_keys = list(set(select_keys))
+
+        non_tensor_select_keys = ['uid']
+        has_multi_modal_inputs = 'multi_modal_inputs' in data.non_tensor_batch.keys()
+        if has_multi_modal_inputs:
+            non_tensor_select_keys.append('multi_modal_inputs')
+
+        # ========== 레퍼런스 패턴: chunk로 mini-batch 분할 ==========
+        num_mini_batches = data.batch.batch_size[0] // self.config.ppo_mini_batch_size
+        dataloader = data.select(select_keys, non_tensor_select_keys).chunk(num_mini_batches)
+
         metrics = {}
-        
-        for _ in range(self.config.ppo_epochs):
-            for batch_idx, mini_batch in enumerate(mini_batches):
-                if self.config.use_dynamic_bsz:
-                    max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
-                    micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
-                else:
-                    self.gradient_accumulation = (
-                        self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
-                    )
-                    micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
-                
+        for epoch in range(self.config.ppo_epochs):
+            for batch_idx, mini_batch in enumerate(dataloader):
+                self.gradient_accumulation = (
+                    self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
+                )
+                num_micro_batches = (
+                    mini_batch.batch.batch_size[0] // self.config.ppo_micro_batch_size_per_gpu
+                )
+                micro_batches = mini_batch.select(
+                    select_keys, non_tensor_select_keys
+                ).chunk(num_micro_batches)
+
                 self.actor_optimizer.zero_grad()
-                
-                for micro_batch in micro_batches:
-                    micro_batch = micro_batch.to(get_device_id())
-                    model_inputs = {**micro_batch.batch}
 
-                    micro_batch_metrics = {}
+                for micro_data in micro_batches:
+                    if isinstance(micro_data, DataProto):
+                        data_dict = {
+                            **micro_data.batch.to(torch.cuda.current_device()),
+                            **micro_data.non_tensor_batch
+                        }
+                    else:
+                        data_dict = micro_data.to(torch.cuda.current_device())
 
-                    # Process each task separately with backward
+                    micro_metrics = {}
+
                     for task_id in task_ids:
-                        # Get task-specific data
-                        old_log_prob = model_inputs[f"task{task_id}_old_log_probs"]
-                        advantages = model_inputs[f"task{task_id}_advantages"]
-                        response_mask = model_inputs[f"task{task_id}_response_mask"]
+                        responses_key = {
+                            1: 'task1_gen_img_tokens',
+                            2: 'task2_feedback_ids',
+                            3: 'task3_regen_img_tokens',
+                        }[task_id]
 
-                        entropy_coeff = self.config.entropy_coeff
-                        loss_agg_mode = self.config.loss_agg_mode
+                        responses = data_dict[responses_key]
+                        response_length = responses.size(1)
+                        attention_mask = data_dict[f'task{task_id}_attention_mask']
+                        response_mask = data_dict[f'task{task_id}_response_mask']
+                        old_log_prob = data_dict[f'task{task_id}_old_log_probs']
+                        advantages = data_dict[f'task{task_id}_advantages']
 
-                        if self.config.use_dynamic_bsz:
-                            loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
+                        if task_id == 1 and 'task1_seq_img_mask' in data_dict:
+                            seq_img_mask = data_dict['task1_seq_img_mask']
                         else:
-                            loss_scale_factor = 1 / self.gradient_accumulation
+                            seq_img_mask = None
 
-                        # Forward pass for this task
-                        calculate_entropy = entropy_coeff != 0
+                        if self.config.get('ignore_img_start', False) and task_id in [1, 3]:
+                            img_start_mask = responses == self.config.image_start_token_id
+                            response_mask = response_mask & (~img_start_mask)
+
+                        uids = data_dict.get('uid', None)
+                        clip_ratio = self.config.clip_ratio
+
+                        # ========== Forward pass ==========
                         entropy, log_prob = self._forward_micro_batch(
-                            model_inputs, temperature=temperature,
-                            calculate_entropy=calculate_entropy, task_id=task_id
+                            micro_batch=data_dict,
+                            temperature=temperature,
+                            calculate_entropy=True,
+                            task_id=task_id,
                         )
 
-                        # Handle old_log_prob
-                        if hasattr(self.config, "use_rollout_log_probs") and self.config.use_rollout_log_probs:
-                            old_log_prob = model_inputs[f"task{task_id}_old_log_probs"]
-                        else:
-                            if on_policy:
-                                old_log_prob = log_prob.detach()
-                            else:
-                                old_log_prob = model_inputs[f"task{task_id}_old_log_probs"]
-
                         loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
-                        rollout_is_weights = model_inputs.get("rollout_is_weights", None)
+                        rollout_is_weights = data_dict.get("rollout_is_weights", None)
                         policy_loss_fn = get_policy_loss_fn(loss_mode)
 
-                        # Compute policy loss
+                        # ========== Policy loss ==========
                         pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
                             old_log_prob=old_log_prob,
                             log_prob=log_prob,
@@ -598,68 +618,117 @@ class DataParallelImageGenerationActor(BasePPOActor):
                             rollout_is_weights=rollout_is_weights,
                         )
 
-                        if entropy_coeff != 0:
-                            entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-                            micro_batch_metrics[f"actor/task{task_id}_entropy"] = entropy_loss.detach().item()
+                        # ========== Entropy ==========
+                        entropy_loss = verl_F.masked_mean(entropy, response_mask)
+
+                        if seq_img_mask is not None:
+                            img_entropy_loss = verl_F.masked_mean(
+                                entropy, seq_img_mask & response_mask.bool()
+                            )
+                            text_entropy_loss = verl_F.masked_mean(
+                                entropy, (~seq_img_mask) & response_mask.bool()
+                            )
+                        else:
+                            img_entropy_loss = None
+                            text_entropy_loss = None
+
+                        # ========== Entropy coeff 적용 ==========
+                        if not self.use_adaptive_entropy_coeff:
+                            entropy_coeff = self.config.entropy_coeff
                             policy_loss = pg_loss - entropy_loss * entropy_coeff
                         else:
-                            policy_loss = pg_loss
+                            if img_entropy_loss is not None and text_entropy_loss is not None:
+                                text_entropy_coeff = -self.text_adaptive_entropy_coeff.alpha.detach().item()
+                                img_entropy_coeff = -self.img_adaptive_entropy_coeff.alpha.detach().item()
+                                self.text_adaptive_entropy_coeff.update(entropy=text_entropy_loss.detach())
+                                self.img_adaptive_entropy_coeff.update(entropy=img_entropy_loss.detach())
+                                policy_loss = (
+                                    pg_loss
+                                    - text_entropy_loss * text_entropy_coeff
+                                    - img_entropy_loss * img_entropy_coeff
+                                )
+                            else:
+                                entropy_coeff = self.config.entropy_coeff
+                                policy_loss = pg_loss - entropy_loss * entropy_coeff
 
+                        # ========== KL loss ==========
                         if self.config.use_kl_loss:
-                            ref_log_prob = model_inputs[f"task{task_id}_ref_log_prob"]
-                            kld = kl_penalty(
-                                logprob=log_prob, ref_logprob=ref_log_prob,
-                                kl_penalty=self.config.kl_loss_type
+                            ref_log_prob = data_dict[f'task{task_id}_ref_log_prob']
+                            kld = core_algos.kl_penalty(
+                                logprob=log_prob,
+                                ref_logprob=ref_log_prob,
+                                kl_penalty=self.config.kl_loss_type,
                             )
-                            kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask,
-                                            loss_agg_mode=loss_agg_mode)
+                            kl_loss = verl_F.masked_mean(kld, response_mask)
                             policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
-                            micro_batch_metrics[f"actor/task{task_id}_kl_loss"] = kl_loss.detach().item() * loss_scale_factor
-                            micro_batch_metrics[f"actor/task{task_id}_kl_coef"] = self.config.kl_loss_coef
 
-                        # Apply task weight and scale factor
+                        # ========== Scale & backward ==========
                         task_weight = task_weights[task_id - 1] if enable_multi_task else 1.0
-                        weighted_loss = policy_loss * task_weight * loss_scale_factor
 
-                        # Backward for each task separately
-                        weighted_loss.backward()
+                        if self.config.use_dynamic_bsz:
+                            loss = policy_loss * task_weight * (
+                                response_mask.size(0) / self.config.ppo_mini_batch_size
+                            )
+                        else:
+                            loss = policy_loss * task_weight / self.gradient_accumulation
 
-                        # Store metrics per task
-                        micro_batch_metrics.update({
-                            f"actor/task{task_id}_pg_loss": pg_loss.detach().item() * loss_scale_factor,
-                            f"actor/task{task_id}_pg_clipfrac": pg_clipfrac.detach().item(),
-                            f"actor/task{task_id}_ppo_kl": ppo_kl.detach().item(),
-                            f"actor/task{task_id}_pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
-                            f"actor/task{task_id}_weight": task_weight,
-                            f"actor/task{task_id}_loss": weighted_loss.detach().item(),
-                        })
+                        loss = torch.nan_to_num(loss, nan=0.0)
+                        loss.backward()
 
-                        adv = model_inputs[f"task{task_id}_advantages"]      # (B, 576)
-                        mask = model_inputs[f"task{task_id}_response_mask"]  # (B, 576)
+                        # ========== Metrics ==========
+                        task_metrics = {
+                            f'actor/task{task_id}_entropy_loss': entropy_loss.detach().item(),
+                            f'actor/task{task_id}_pg_loss': pg_loss.detach().item(),
+                            f'actor/task{task_id}_pg_clipfrac': pg_clipfrac.detach().item(),
+                            f'actor/task{task_id}_pg_clipfrac_lower': pg_clipfrac_lower.detach().item(),
+                            f'actor/task{task_id}_ppo_kl': ppo_kl.detach().item(),
+                            f'actor/task{task_id}_weight': task_weight,
+                            f'actor/task{task_id}_loss': loss.detach().item(),
+                        }
+
+                        if text_entropy_loss is not None:
+                            task_metrics[f'actor/task{task_id}_text_entropy_loss'] = (
+                                text_entropy_loss.detach().item()
+                            )
+                        if img_entropy_loss is not None:
+                            task_metrics[f'actor/task{task_id}_img_entropy_loss'] = (
+                                img_entropy_loss.detach().item()
+                            )
+                        if self.use_adaptive_entropy_coeff and text_entropy_loss is not None:
+                            task_metrics[f'actor/task{task_id}_text_entropy_coeff'] = text_entropy_coeff
+                            task_metrics[f'actor/task{task_id}_img_entropy_coeff'] = img_entropy_coeff
+                        if self.config.use_kl_loss:
+                            task_metrics[f'actor/task{task_id}_kl_loss'] = kl_loss.detach().item()
+                            task_metrics[f'actor/task{task_id}_kl_coef'] = self.config.kl_loss_coef
+
+                        # ========== Pos/Neg log prob ==========
                         lp = log_prob.detach()
+                        adv = advantages
+                        mask = response_mask
 
                         seq_adv_sum = adv[:, 0].view(-1, 1)
-                        is_pos_seq = (seq_adv_sum > 0) # (B, 1)
+                        is_pos_seq = (seq_adv_sum > 0)
                         is_neg_seq = (seq_adv_sum < 0)
 
-                        pos_mask = is_pos_seq & mask.bool() # (B, 576)
-                        neg_mask = is_neg_seq & mask.bool() # (B, 576)
+                        pos_mask = is_pos_seq & mask.bool()
+                        neg_mask = is_neg_seq & mask.bool()
 
-                        micro_batch_metrics[f"actor/task{task_id}_pos_log_prob"] = lp[pos_mask].sum().item()
-                        micro_batch_metrics[f"actor/task{task_id}_pos_log_prob_cnt"] = pos_mask.sum().item()
-                        
-                        micro_batch_metrics[f"actor/task{task_id}_neg_log_prob"] = lp[neg_mask].sum().item()
-                        micro_batch_metrics[f"actor/task{task_id}_neg_log_prob_cnt"] = neg_mask.sum().item()
+                        task_metrics[f'actor/task{task_id}_pos_log_prob'] = lp[pos_mask].sum().item()
+                        task_metrics[f'actor/task{task_id}_pos_log_prob_cnt'] = pos_mask.sum().item()
+                        task_metrics[f'actor/task{task_id}_neg_log_prob'] = lp[neg_mask].sum().item()
+                        task_metrics[f'actor/task{task_id}_neg_log_prob_cnt'] = neg_mask.sum().item()
 
-                    # Add aggregated metrics across tasks
+                        micro_metrics.update(task_metrics)
+
+                    # ========== Aggregated metrics across tasks ==========
                     if enable_multi_task and len(task_ids) > 1:
                         aggregated_metrics = {}
 
-                        avg_pg_loss = sum([micro_batch_metrics.get(f"actor/task{tid}_pg_loss", 0.0) for tid in task_ids]) / len(task_ids)
-                        avg_pg_clipfrac = sum([micro_batch_metrics.get(f"actor/task{tid}_pg_clipfrac", 0.0) for tid in task_ids]) / len(task_ids)
-                        avg_ppo_kl = sum([micro_batch_metrics.get(f"actor/task{tid}_ppo_kl", 0.0) for tid in task_ids]) / len(task_ids)
-                        avg_pg_clipfrac_lower = sum([micro_batch_metrics.get(f"actor/task{tid}_pg_clipfrac_lower", 0.0) for tid in task_ids]) / len(task_ids)
-                        total_loss = sum([micro_batch_metrics.get(f"actor/task{tid}_loss", 0.0) for tid in task_ids])
+                        avg_pg_loss = sum([micro_metrics.get(f"actor/task{tid}_pg_loss", 0.0) for tid in task_ids]) / len(task_ids)
+                        avg_pg_clipfrac = sum([micro_metrics.get(f"actor/task{tid}_pg_clipfrac", 0.0) for tid in task_ids]) / len(task_ids)
+                        avg_ppo_kl = sum([micro_metrics.get(f"actor/task{tid}_ppo_kl", 0.0) for tid in task_ids]) / len(task_ids)
+                        avg_pg_clipfrac_lower = sum([micro_metrics.get(f"actor/task{tid}_pg_clipfrac_lower", 0.0) for tid in task_ids]) / len(task_ids)
+                        total_loss = sum([micro_metrics.get(f"actor/task{tid}_loss", 0.0) for tid in task_ids])
 
                         aggregated_metrics.update({
                             "actor/avg_pg_loss": avg_pg_loss,
@@ -669,17 +738,16 @@ class DataParallelImageGenerationActor(BasePPOActor):
                             "actor/loss": total_loss,
                         })
 
-                        if any(f"actor/task{tid}_kl_loss" in micro_batch_metrics for tid in task_ids):
-                            avg_kl_loss = sum([micro_batch_metrics.get(f"actor/task{tid}_kl_loss", 0.0) for tid in task_ids]) / len(task_ids)
+                        if any(f"actor/task{tid}_kl_loss" in micro_metrics for tid in task_ids):
+                            avg_kl_loss = sum([micro_metrics.get(f"actor/task{tid}_kl_loss", 0.0) for tid in task_ids]) / len(task_ids)
                             aggregated_metrics["actor/avg_kl_loss"] = avg_kl_loss
 
-                        micro_batch_metrics.update(aggregated_metrics)
+                        micro_metrics.update(aggregated_metrics)
 
-                    append_to_dict(metrics, micro_batch_metrics)
+                    append_to_dict(metrics, micro_metrics)
 
                 grad_norm = self._optimizer_step()
-                mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
-                append_to_dict(metrics, mini_batch_metrics)
-        
+                append_to_dict(metrics, {'actor/grad_norm': grad_norm.detach().item()})
+
         self.actor_optimizer.zero_grad()
         return metrics

@@ -20,6 +20,7 @@ import torch.nn.functional as F
 
 from verl import DataProto
 from .base import BaseRollout
+from verl.utils.torch_functional import get_eos_mask
 from verl.single_controller.base.decorator import register, Dispatch
 
 from transformers import GenerationConfig
@@ -92,37 +93,42 @@ class _HFModelWrapper:
                     actual_module = self._module
                     if hasattr(actual_module, "_fsdp_wrapped_module"):
                         actual_module = actual_module._fsdp_wrapped_module
-                    
-                    # 가중치 순서 보장을 위해 state_dict 키 정렬
+
                     current_sd = actual_module.state_dict()
                     sorted_keys = sorted(current_sd.keys())
-                    
+
+                    import hashlib
+                    keys_blob = "\n".join(sorted_keys).encode("utf-8")
+                    key_fp = hashlib.sha256(keys_blob).hexdigest()
+                    print(f"[ROLLOUT][init_weight_map] key_fp={key_fp} nkeys={len(sorted_keys)}", flush=True)
+
                     param_dict = dict(actual_module.named_parameters())
                     buffer_dict = dict(actual_module.named_buffers())
-                    
+
                     self._weight_map = []
                     pointer = 0
-                    
+                    skipped = []
+                    mapped = 0
+
                     for name in sorted_keys:
                         target = param_dict.get(name)
                         if target is None:
                             target = buffer_dict.get(name)
-                        
+
                         if target is None:
-                            if name in current_sd and isinstance(current_sd[name], torch.Tensor):
-                                pointer += current_sd[name].numel()
+                            # ✅ 여기가 진짜 "copy 안 되는 키" (tied alias일 수도 있고, 진짜 mismatch일 수도)
+                            skipped.append(name)
+                            t = current_sd.get(name, None)
+                            if isinstance(t, torch.Tensor):
+                                pointer += t.numel()
                             continue
-                        
+
+                        mapped += 1  # ✅ 매핑 성공 카운트
                         numel = target.numel()
-                        self._weight_map.append({
-                            'target': target,
-                            'start': pointer,
-                            'end': pointer + numel
-                        })
+                        self._weight_map.append({"target": target, "start": pointer, "end": pointer + numel})
                         pointer += numel
-                        
-                    self._total_numel = pointer
-                    print(f"[ImageUnifiedRollout] Weight map initialized: {len(self._weight_map)} tensors, Total numel: {self._total_numel}")
+
+                    self._total_numel = pointer                    
 
                 @torch.no_grad()
                 def load_weights(self, weights, **kwargs):
@@ -132,6 +138,8 @@ class _HFModelWrapper:
                         flat_tensor = weights
                         if flat_tensor.numel() != self._total_numel:
                             raise ValueError(f"Size mismatch! Expected {self._total_numel}, got {flat_tensor.numel()}")
+
+                        print(f"[LOAD] flat_tensor checksum: {flat_tensor.float().sum()}")
 
                         actual_module = self._module
                         if hasattr(actual_module, "_fsdp_wrapped_module"):
@@ -162,7 +170,18 @@ class _HFModelWrapper:
                         # strict=False because we might only be loading a subset of weights
                         missing_keys, unexpected_keys = actual_module.load_state_dict(weights, strict=False)
 
-                        loaded_count = len(weights) - len(missing_keys)
+                        if unexpected_keys:
+                            raise RuntimeError(
+                                f"[ImageUnifiedRollout] Key mismatch: {len(unexpected_keys)} keys in weights "
+                                f"not found in model (silent skip). First 10: {unexpected_keys[:10]}"
+                            )
+
+                        loaded_count = len(weights)
+                        if missing_keys:
+                            print(
+                                f"[ImageUnifiedRollout] Warning: {len(missing_keys)} model keys not in weights "
+                                f"(partial load). First 10: {missing_keys[:10]}"
+                            )
 
                         return {"loaded_elements": loaded_count, "status": "success"}
                 
@@ -181,7 +200,7 @@ class _HFModelWrapper:
                     except Exception as e:
                         print(f"[ImageUnifiedRollout] Error loading binary weights from {file_path}: {e}")
                         raise e
-
+                        
                     result = self.load_weights(flat_tensor)
                     
                     dt = time.time() - t0
@@ -212,12 +231,12 @@ class ImageUnifiedRollout(BaseRollout):
 
         self.generation_config = None
 
-        self.cfg_weight = getattr(config, "cfg_weight", 5.0)
-        self.temperature = getattr(config, "temperature", 1.0)
-        self.txt_top_k = getattr(config, "txt_top_k", 50)
-        self.txt_top_p = getattr(config, "txt_top_p", 1.0)
-        self.img_top_k = getattr(config, "img_top_k", 4096)
-        self.img_top_p = getattr(config, "img_top_p", 1.0)
+        self.cfg_weight = getattr(self.config, "cfg_weight", 1.0)
+        self.temperature = getattr(self.config, "temperature", 1.0)
+        self.txt_top_k = getattr(self.config, "txt_top_k", 0)
+        self.txt_top_p = getattr(self.config, "txt_top_p", 1.0)
+        self.img_top_k = getattr(self.config, "img_top_k", 0)
+        self.img_top_p = getattr(self.config, "img_top_p", 1.0)
 
         self.img_size = 384
         self.patch_size = 16
@@ -233,6 +252,7 @@ class ImageUnifiedRollout(BaseRollout):
         self.image_token_num_per_image = getattr(config, "image_token_num_per_image", 576)
 
         self.is_validate = False
+        self.cot_generate = getattr(config, "cot_generate", False)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def get_node_id(self):
@@ -307,7 +327,50 @@ class ImageUnifiedRollout(BaseRollout):
                     data_proto.batch[key], self.prompt_length, pad_value
                 )
         
-        # Skip Task 1 - Image Generation (outputs) tokens and log probs are always same length (576)
+        # Task 1 - Image Generation (combined text + image outputs)
+        # Note: combined_output_tokens = [text_tokens | image_tokens]
+        # Need to pad to response_length for consistent batch processing
+        if "task1_gen_img_tokens" in data_proto.batch:
+            # Pad tokens with eos_token_id
+            data_proto.batch["task1_gen_img_tokens"] = self._pad_tensor_right(
+                data_proto.batch["task1_gen_img_tokens"],
+                self.response_length,
+                self.processor.tokenizer.eos_token_id
+            )
+
+        if "task1_response_mask" in data_proto.batch:
+            # Pad mask with 0
+            data_proto.batch["task1_response_mask"] = self._pad_tensor_right(
+                data_proto.batch["task1_response_mask"],
+                self.response_length,
+                0
+            )
+
+        if "task1_seq_img_mask" in data_proto.batch:
+            # Pad seq_img_mask with False (0 for bool)
+            data_proto.batch["task1_seq_img_mask"] = self._pad_tensor_right(
+                data_proto.batch["task1_seq_img_mask"],
+                self.response_length,
+                0  # False = 0
+            )
+
+        if "task1_rollout_log_probs" in data_proto.batch:
+            # Pad log_probs with 0
+            data_proto.batch["task1_rollout_log_probs"] = self._pad_tensor_right(
+                data_proto.batch["task1_rollout_log_probs"],
+                self.response_length,
+                0
+            )
+
+        if "task1_text_tokens" in data_proto.batch:
+            # task1_text_tokens shape: [B, prompt_length + response_length - image_token_num_per_image]
+            # right pad to normalize across batches with different prompt lengths
+            target_length = self.prompt_length + self.response_length - self.image_token_num_per_image
+            data_proto.batch["task1_text_tokens"] = self._pad_tensor_right(
+                data_proto.batch["task1_text_tokens"],
+                target_length,
+                self.processor.pad_id
+            )
 
         # Task 2 - Text Generation (inputs)
         input_tensors_task2 = [
@@ -372,19 +435,19 @@ class ImageUnifiedRollout(BaseRollout):
 
         if is_validate:
             # Validation mode: use val_kwargs
-            self.cfg_weight = getattr(self.config.val_kwargs, 'val_cfg_weight', 5.0)
+            self.cfg_weight = getattr(self.config.val_kwargs, 'val_cfg_weight', 1.0)
             self.temperature = getattr(self.config.val_kwargs, 'val_temperature', 1.0)
-            self.txt_top_k = getattr(self.config.val_kwargs, 'val_txt_top_k', 50)
+            self.txt_top_k = getattr(self.config.val_kwargs, 'val_txt_top_k', 0)
             self.txt_top_p = getattr(self.config.val_kwargs, 'val_txt_top_p', 1.0)
-            self.img_top_k = getattr(self.config.val_kwargs, 'val_img_top_k', 4096)
+            self.img_top_k = getattr(self.config.val_kwargs, 'val_img_top_k', 0)
             self.img_top_p = getattr(self.config.val_kwargs, 'val_img_top_p', 1.0)
         else:
             # Training mode: use config values (already set in __init__)
-            self.cfg_weight = getattr(self.config, "cfg_weight", 5.0)
+            self.cfg_weight = getattr(self.config, "cfg_weight", 1.0)
             self.temperature = getattr(self.config, "temperature", 1.0)
-            self.txt_top_k = getattr(self.config, "txt_top_k", 50)
+            self.txt_top_k = getattr(self.config, "txt_top_k", 0)
             self.txt_top_p = getattr(self.config, "txt_top_p", 1.0)
-            self.img_top_k = getattr(self.config, "img_top_k", 4096)
+            self.img_top_k = getattr(self.config, "img_top_k", 0)
             self.img_top_p = getattr(self.config, "img_top_p", 1.0)
 
         # Additional settings
@@ -401,6 +464,15 @@ class ImageUnifiedRollout(BaseRollout):
         sft_format = sft_format + self.image_start_tag
         return sft_format
 
+    def get_reasongen_format(self, prompt, system_prompt=""):
+        sft_format = self.processor.apply_sft_template_for_multi_turn_prompts(
+            conversations=[{"role": "<|User|>", "content": f"A photo of {prompt}. Output a richly detailed prompt: "}, {"role": "<|Assistant|>", "content": ""}],
+            sft_format=self.processor.sft_format,
+            system_prompt=system_prompt.format(image_start_tag=self.image_start_tag, image_end_tag=self.image_end_tag) if system_prompt else "",
+        )
+        sft_format = sft_format
+        return sft_format
+
     @torch.no_grad()
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         self.module.eval()
@@ -411,7 +483,7 @@ class ImageUnifiedRollout(BaseRollout):
         self.set_generation_config(prompts[0])
 
         task_funcs = {
-            1: self._generate_minibatch_image_generation,
+            1: self._generate_minibatch_reasongen_image_generation,
             2: self._generate_minibatch_text_generation,
             3: self._generate_minibatch_regen_image_generation,
         }
@@ -439,8 +511,204 @@ class ImageUnifiedRollout(BaseRollout):
         return DataProto(batch=_batch.batch, non_tensor_batch=prompts.non_tensor_batch, meta_info=prompts.meta_info)
 
     @torch.no_grad()
+    def _generate_minibatch_reasongen_image_generation(self, data_proto: DataProto) -> DataProto:
+        """
+        Task 1: Image Generation
+        - cot_generate=True:  Text generation → Image generation (text_img_generate)
+        - cot_generate=False: Direct image generation (generate)
+        """
+        self.module.eval()
+        batch_size = data_proto.batch.batch_size[0]
+
+        if dist.get_rank() == 0:
+            print(f"[TASK1] cot_generate={self.cot_generate}, batch_size={batch_size}")
+
+        # ========== 1. Prepare Input ==========
+        if self.cot_generate:
+            input_format = [self.get_reasongen_format(prompt) for prompt in data_proto.non_tensor_batch["prompt"]]
+        else:
+            # input_format = [self.get_reasongen_format(prompt) + self.image_start_tag for prompt in data_proto.non_tensor_batch["prompt"]]
+            input_format = [self.get_sft_format(prompt) + self.image_start_tag for prompt in data_proto.non_tensor_batch["prompt"]]
+
+        self.processor.tokenizer.pad_token_id = self.processor.pad_id
+
+        inputs = self.processor.tokenizer(
+            input_format,
+            padding=True,
+            padding_side='left',
+            return_tensors="pt"
+        )
+
+        input_ids = inputs["input_ids"].to(self.device)
+        attention_mask = inputs["attention_mask"].to(self.device)
+        prompt_length = input_ids.size(1)
+
+        eos_token_id = self.processor.tokenizer.eos_token_id
+        pad_token_id = self.processor.pad_id
+        image_start_token_id = self.processor.image_start_id
+
+        kwargs = {'top_p': self.img_top_p, 'top_k': self.img_top_k, 'temperature': self.temperature}
+        kwargs.update(cfg_weight=self.cfg_weight)
+        generation_config = GenerationConfig(do_sample=True)
+        generation_config = generation_config.update(**kwargs) 
+
+        # ========== 2. Generate ==========
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            if self.cot_generate:
+                output = self.module.text_img_generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    do_sample=True,
+                    max_new_tokens=self.response_length,
+                    eos_token_id=eos_token_id,
+                    pad_token_id=pad_token_id,
+                    image_start_token_id=image_start_token_id,
+                    generation_config=generation_config,
+                    output_scores=False,
+                    return_dict_in_generate=True,
+                    use_cache=True,
+                )
+            else:
+                output = self.module.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    do_sample=True,
+                    max_new_tokens=self.response_length,
+                    eos_token_id=eos_token_id,
+                    pad_token_id=pad_token_id,
+                    generation_config=generation_config,
+                    output_scores=False,
+                    return_dict_in_generate=True,
+                    use_cache=True,
+                )
+
+        # ========== 3. Extract Outputs ==========
+        if self.cot_generate:
+            text_tokens = output.text_tokens           # [B, text_input_len]
+            text_gen_tokens = output.text_gen_tokens    # [B, text_gen_len]
+            img_tokens = output.img_tokens             # [B, image_token_num_per_image]
+            sequences = output.sequences               # [B, total_len]
+            seq_img_mask = output.seq_img_mask         # [B, total_len]
+            gen_img = output.gen_img                   # numpy [B, H, W, 3]
+
+            # Decode detailed prompts
+            detailed_texts = self.processor.tokenizer.batch_decode(text_tokens, skip_special_tokens=True)
+            
+            data_proto.non_tensor_batch["task1_detailed_prompts"] = np.array(detailed_texts, dtype=object)
+
+            if dist.get_rank() == 0:
+                print(f"[TASK1-COT] Generated detailed prompts. Example: {detailed_texts[0][:100]}...")
+        else:
+            img_tokens = output.generated_tokens       # [B, image_token_num_per_image]
+            sequences = output.sequences               # [B, prompt_len + img_len]
+            seq_img_mask = output.seq_img_mask         # [B, prompt_len + img_len]
+            gen_img = output.gen_img                   # numpy [B, H, W, 3]
+            text_tokens = None
+
+            data_proto.non_tensor_batch["task1_detailed_prompts"] = np.array([""] * batch_size, dtype=object)
+
+        # ========== 4. Process Images ==========
+        gen_imgs_pil_list = [PIL.Image.fromarray(img_array) for img_array in gen_img]
+        data_proto.non_tensor_batch["task1_gen_imgs_pil_list"] = np.array(gen_imgs_pil_list, dtype=object)
+        gen_imgs_tensor = self.processor.image_processor(gen_imgs_pil_list).pixel_values
+        data_proto.batch["task1_gen_imgs_pixel_values"] = gen_imgs_tensor.cpu()
+
+        # ========== 5. Pad to Fixed Length ==========
+        sequence_length = prompt_length + self.response_length
+        delta_length = sequence_length - sequences.shape[1]
+
+        if delta_length > 0:
+            delta_tokens = torch.full(
+                (batch_size, delta_length), pad_token_id,
+                device=sequences.device, dtype=sequences.dtype
+            )
+            sequences = torch.cat((sequences, delta_tokens), dim=1)
+
+            delta_mask = torch.zeros(
+                (batch_size, delta_length),
+                device=seq_img_mask.device, dtype=seq_img_mask.dtype
+            )
+            seq_img_mask = torch.cat((seq_img_mask, delta_mask), dim=1)
+
+            if self.cot_generate and text_tokens is not None:
+                delta_text_tokens = torch.full(
+                    (batch_size, delta_length), pad_token_id,
+                    device=text_tokens.device, dtype=text_tokens.dtype
+                )
+                text_tokens = torch.cat((text_tokens, delta_text_tokens), dim=1)
+
+        elif delta_length < 0:
+            sequences = sequences[:, :sequence_length]
+            seq_img_mask = seq_img_mask[:, :sequence_length]
+            if self.cot_generate and text_tokens is not None:
+                text_tokens = text_tokens[:, :sequence_length]
+
+        assert sequences.shape[1] == sequence_length
+
+        # ========== 6. Split Prompt / Response ==========
+        response = sequences[:, prompt_length:]                    # [B, response_length]
+        response_seq_img_mask = seq_img_mask[:, prompt_length:]    # [B, response_length]
+
+        response_attention_mask = get_eos_mask(
+            response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype
+        )
+        if delta_length > 0:
+            response_attention_mask[..., -delta_length:] = 0
+
+        # ========== 7. Store in data_proto ==========
+        data_proto.batch["task1_input_ids"] = input_ids.cpu()
+        data_proto.batch["task1_attention_mask"] = attention_mask.cpu()
+        data_proto.batch["task1_gen_img_tokens"] = response.cpu()
+        data_proto.batch["task1_response_mask"] = response_attention_mask.cpu()
+        data_proto.batch["task1_seq_img_mask"] = response_seq_img_mask.bool().cpu()
+        data_proto.batch["task1_img_only_tokens"] = img_tokens.detach().cpu()
+
+        if self.cot_generate and text_tokens is not None:
+            data_proto.batch["task1_text_tokens"] = text_tokens.cpu()
+
+        # ========== 8. Compute Rollout Log-Probs ==========
+        if not self.is_validate:
+            full_attention_mask = torch.cat([
+                attention_mask,
+                response_attention_mask.to(self.device)
+            ], dim=1)
+
+            position_ids = full_attention_mask.long().cumsum(-1) - 1
+            position_ids = position_ids.masked_fill(full_attention_mask == 0, 0)
+
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                fwd_output = self.module(
+                    input_ids=sequences.to(self.device),
+                    input_img_mask=seq_img_mask.bool().to(self.device),
+                    attention_mask=full_attention_mask,
+                    position_ids=position_ids,
+                    cfg_weight=self.cfg_weight,
+                    pad_token_id=pad_token_id,
+                    image_start_token_id=image_start_token_id,
+                )
+
+            logits = fwd_output.logits  # [B, sequence_length, V]
+            response_logits = logits[:, prompt_length - 1:-1, :]  # [B, response_length, V]
+
+            log_probs = torch.log_softmax(response_logits.float(), dim=-1)
+            token_log_probs = log_probs.gather(
+                dim=-1,
+                index=response.unsqueeze(-1).long().to(self.device)
+            ).squeeze(-1)
+            token_log_probs = token_log_probs * response_attention_mask.float().to(self.device)
+
+            data_proto.batch['task1_rollout_log_probs'] = token_log_probs.cpu()
+            del logits, log_probs, fwd_output
+
+        if dist.get_rank() == 0:
+            print(f"[TASK1] Completed (cot={self.cot_generate}) for batch_size: {batch_size}")
+
+        torch.cuda.empty_cache()
+        return data_proto
+
+    @torch.no_grad()
     def _generate_minibatch_image_generation(self, data_proto: DataProto) -> DataProto:
-        input_format = [self.get_sft_format(prompt) for prompt in data_proto.non_tensor_batch["prompt"]]
+        input_format = [self.get_reasongen_format(prompt) + self.image_start_tag for prompt in data_proto.non_tensor_batch["prompt"]]
 
         self.processor.tokenizer.pad_token_id = self.processor.pad_id
 
@@ -489,9 +757,11 @@ class ImageUnifiedRollout(BaseRollout):
         B, C, H, W = gen_imgs_pixel_values.shape
         data_proto.batch["task1_gen_img_tokens"] = generated_tokens.detach().cpu()
         data_proto.batch["task1_response_mask"] = torch.ones((B, generated_tokens.size(1)), dtype=torch.long, device=generated_tokens.device)
+        data_proto.batch["task1_seq_img_mask"] = torch.ones((B, generated_tokens.size(1)), dtype=torch.bool, device=generated_tokens.device)
+        data_proto.non_tensor_batch["task1_detailed_prompts"] = np.array([""] * B, dtype=object)
         if dist.get_rank() == 0:
             print(f"[IMG_GEN] Created DataProto with batch_size: {batch_size}")
-
+        
         torch.cuda.empty_cache()
         return data_proto
 
@@ -885,11 +1155,13 @@ class ImageUnifiedRollout(BaseRollout):
                 
                 logits = logit_uncond + self.cfg_weight * (logit_cond-logit_uncond)
 
+                if not self.is_validate:
+                    all_logprobs = torch.log_softmax(logits, dim=-1)
+
                 next_token = self._sample_from_logits(logits, is_text=False, generator=generator)
                 generated_tokens[:, i] = next_token.squeeze(-1)
 
                 if not self.is_validate:
-                    all_logprobs = torch.log_softmax(logits, dim=-1)
                     token_logprobs = all_logprobs.gather(dim=-1, index=next_token)
                     generated_logprobs[:, i] = token_logprobs.squeeze(-1)
 
@@ -930,11 +1202,14 @@ class ImageUnifiedRollout(BaseRollout):
                 max_new_tokens=self.response_length,
                 use_cache=True,
                 do_sample=True,
+                temperature=self.temperature,
+                top_k=self.txt_top_k,
+                top_p=self.txt_top_p,    
                 pad_token_id=self.processor.tokenizer.eos_token_id,
-                eos_token_id=self.processor.tokenizer.eos_token_id,
+                eos_token_id=[self.processor.tokenizer.eos_token_id, self.processor.image_start_id],
                 bos_token_id=self.processor.tokenizer.bos_token_id,
                 return_dict_in_generate=True,
-                output_scores=not self.is_validate,
+                output_logits=not self.is_validate, 
             )
 
         gen_sequences = outputs.sequences
@@ -943,61 +1218,58 @@ class ImageUnifiedRollout(BaseRollout):
         if self.is_validate:
             return answer, gen_sequences, None
 
-        T = len(outputs.scores)
+        T = len(outputs.logits)  
         sampled_token_ids = gen_sequences[:, -T:]  # exclude prompt_len
 
         token_logprobs = self.token_logprobs_from_scores(
-            outputs.scores,
+            outputs.logits,
             sampled_token_ids,
             out_dtype=torch.float32,
         )
 
         return answer, gen_sequences, token_logprobs
 
+    @torch.no_grad()
     def _prepare_regen_cfg_embeds(self, data_proto: DataProto) -> Tuple[torch.Tensor, torch.Tensor]:
-        input_ids = data_proto.batch['task3_input_ids']
-        attention_mask = data_proto.batch['task3_attention_mask']
-        input_embeds = data_proto.batch['task3_input_embeds']
+        input_ids = data_proto.batch["task3_input_ids"]              # [B, L]
+        attention_mask = data_proto.batch["task3_attention_mask"]    # [B, L]
+        input_embeds = data_proto.batch["task3_input_embeds"]        # [B, L, D]
 
+        B, L, D = input_embeds.shape
         cond_embeds = input_embeds
         uncond_embeds = input_embeds.clone()
 
-        pad_id = torch.tensor(self.processor.pad_id, device=input_ids.device)
+        pad_id = torch.tensor(self.processor.pad_id, device=input_ids.device, dtype=torch.long)
 
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
             pad_embed = self.module.language_model.get_input_embeddings()(pad_id).unsqueeze(0)
             pad_embed = pad_embed.to(dtype=torch.bfloat16)
 
-        start_marker = torch.tensor([100593, 185], device=input_ids.device) # <end_of_image>\n
-        end_marker = torch.tensor([100602], device=input_ids.device) # <|Assistant|>
+        m1 = (input_ids[:, :-1] == 100593)
+        m2 = (input_ids[:, 1:]  == 185)
+        m = m1 & m2
 
-        def find_sequence(inp_id, start_marker):
-            len_needle = start_marker.shape[0]
-            for i in range(inp_id.shape[0] - len_needle + 1):
-                if torch.equal(inp_id[i:i+len_needle], start_marker):
-                    return i # Return the starting index of the match
-            return -1 # Return -1 if not found
+        has_start = m.any(dim=1)
+        start_idx = m.to(torch.long).argmax(dim=1)
+        start_idx = torch.where(has_start, start_idx, torch.full_like(start_idx, -1))
 
-        for i, row in enumerate(input_ids):
-            start_pos = find_sequence(row, start_marker)
-            end_pos = find_sequence(row, end_marker)
-            
-            if start_pos != -1 and end_pos != -1 and start_pos < end_pos:
-                content_start_index = start_pos + 1
-                content_end_index = end_pos + 2
+        e = (input_ids == 100602)
+        has_end = e.any(dim=1)
+        end_idx = e.to(torch.long).argmax(dim=1) 
+        end_idx = torch.where(has_end, end_idx, torch.full_like(end_idx, -1))
 
-                if content_start_index < content_end_index:
-                    uncond_embeds[i, content_start_index:content_end_index] = pad_embed
-        
-        batch_size, seq_len, embed_dim = input_embeds.shape
-        
-        regen_final_cfg_embeds = pad_embed.expand(batch_size * 2, seq_len, embed_dim).clone()
-        regen_final_cfg_attention_mask = torch.zeros((batch_size * 2, seq_len), dtype=torch.long, device=attention_mask.device)
-        
-        regen_final_cfg_embeds[0::2] = cond_embeds
-        regen_final_cfg_embeds[1::2] = uncond_embeds
-        
-        regen_final_cfg_attention_mask[0::2] = attention_mask
-        regen_final_cfg_attention_mask[1::2] = attention_mask 
-            
+        valid = (start_idx >= 0) & (end_idx >= 0) & (start_idx < end_idx)   # [B] bool
+
+        content_start = start_idx + 1
+        content_end_excl = end_idx + 2 
+
+        idx = torch.arange(L, device=input_ids.device).view(1, L)
+        range_mask = (idx >= content_start.view(B, 1)) & (idx < content_end_excl.view(B, 1))
+        range_mask = range_mask & valid.view(B, 1)
+
+        uncond_embeds = torch.where(range_mask.unsqueeze(-1), pad_embed, uncond_embeds)
+
+        regen_final_cfg_embeds = torch.stack([cond_embeds, uncond_embeds], dim=1).reshape(B * 2, L, D)
+        regen_final_cfg_attention_mask = torch.stack([attention_mask, attention_mask], dim=1).reshape(B * 2, L)
+
         return regen_final_cfg_embeds, regen_final_cfg_attention_mask

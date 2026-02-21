@@ -61,17 +61,32 @@ data:
 
 actor_rollout_ref:
   actor:
+    _target_: verl.workers.config.actor.FSDPActorConfig
     use_rollout_log_probs: ${oc.select:async_training.use_rollout_log_probs, True}
+    adaptive_entropy_coeff:
+      enable: False
+      text:
+        init_alpha: 0.0
+        target_entropy: 2.0
+        lr: 5e-5
+        min_coeff: -5e-3
+        max_coeff: 5e-3
+      image:
+        init_alpha: 0.0
+        target_entropy: 7.0
+        lr: 5e-5
+        min_coeff: -5e-3
+        max_coeff: 5e-3
     optim:
       warmup_style: constant
   rollout:
     _target_: recipe.image_rl.config.ImageGenerationRolloutConfig
     cfg_weight: 5.0
     temperature: 1.0
-    txt_top_k: null
-    txt_top_p: null
-    img_top_k: null
-    img_top_p: null
+    txt_top_k: 0
+    txt_top_p: 1.0
+    img_top_k: 0
+    img_top_p: 1.0
     name: image_unified
     mode: sync
     prompt_length: 1024
@@ -81,11 +96,11 @@ actor_rollout_ref:
     image_token_num_per_image: 576
     val_kwargs:
       _target_: recipe.image_rl.config.ImageGenerationSamplingConfig
-      val_cfg_weight: 5.0
+      val_cfg_weight: 1.0
       val_temperature: 1.0
-      val_txt_top_k: 50
+      val_txt_top_k: null
       val_txt_top_p: 1.0
-      val_img_top_k: 4096
+      val_img_top_k: null
       val_img_top_p: 1.0
     calculate_log_probs: true
 

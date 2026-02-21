@@ -1,3 +1,43 @@
+VQA_PROMPT_TEMPLATE = """You are an Image-Text Alignment Evaluator.
+Your task is to compare the provided prompt with the image. Detect discrepancies in objects, attributes (colors, shapes), and spatial logic.
+
+Here is the input prompt:
+{prompt}
+
+Important:
+- Your output MUST be a raw JSON string ONLY. Do not add any additional explanations or text.
+- Do NOT include any conversational responses, greetings, or explanations.
+- Do NOT use markdown blocks (e.g., ```json ... ```).
+- Your output must begin with '{' and end with '}'.
+- The JSON must contain exactly two fields:
+    1. "reasoning": A short explanation (e.g., "The donut is correctly placed above the TV.")
+    2. "label": A numeric value (1 or 0) indicating pass or fail.
+
+Output Example:
+{"reasoning": "The donut is correctly placed on a beige shelf above a black TV as requested.", "label": 1}
+
+Expected format:
+{"reasoning": "<short explanation>", "label": <0 or 1>}
+
+Do not output anything other than this JSON."""
+
+REASONGEN_R1_TEMPLATE = """You are given a text prompt: \"{prompt}\" 
+Below is one generated image:
+<image>
+
+1. Describe the image thoroughly (objects, colors, layout, etc.), do not be affected by the prompt.
+2. Identify key visual elements and instructions from the prompt.
+3. Evaluate how well the image follows the prompt:
+   - Are all required elements present?
+   - Are object counts, colors, and positions accurate?
+
+Be extremly strict and precise:
+Only if the image matches the prompt perfectly, respond with: \\boxed{{1}}
+Otherwise, respond with: \\boxed{{0}}
+
+Reason before your final boxed answer. Only one number should appear inside the box.
+""".strip()
+
 # Prompt templates
 TASK1_TASK3_IMAGE_GENERATOR_SYSTEM_PROMPT_TEMPLATE = """
 You are a VQA assistant. The user provides multiple questions as:

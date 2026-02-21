@@ -27,6 +27,12 @@ from .optimizer import OptimizerConfig
 
 __all__ = ["PolicyLossConfig", "RouterReplayConfig", "ActorConfig", "FSDPActorConfig", "McoreActorConfig"]
 
+@dataclass
+class AdaptiveEntropyCoeffConfig(BaseConfig):
+    enable: bool = False
+    # 하위 항목을 dict로 정의해야 .text.get()이 작동합니다.
+    text: dict[str, Any] = field(default_factory=dict)
+    image: dict[str, Any] = field(default_factory=dict)
 
 @dataclass
 class RouterReplayConfig(BaseConfig):
@@ -280,6 +286,9 @@ class FSDPActorConfig(ActorConfig):
     use_remove_padding: bool = False
     profiler: ProfilerConfig = field(default_factory=ProfilerConfig)
     use_rollout_log_probs: bool = False
+
+    multi_task: dict[str, Any] = field(default_factory=dict)
+    adaptive_entropy_coeff: AdaptiveEntropyCoeffConfig = field(default_factory=AdaptiveEntropyCoeffConfig)
 
     def __post_init__(self):
         """Validate FSDP actor configuration parameters."""

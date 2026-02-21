@@ -427,7 +427,7 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
                 mixed_precision=mixed_precision,
                 sync_module_states=True,
                 device_mesh=self.device_mesh,
-                use_orig_params=self.use_orig_params,
+                use_orig_params=False,#self.use_orig_params,
                 forward_prefetch=fsdp_config.get("forward_prefetch", False),
             )
         elif fsdp_strategy == "fsdp2":
@@ -1112,13 +1112,17 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
                 sd = self.actor_module_fsdp.state_dict()
 
             sd = convert_weight_keys(sd, getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp))
-            
+
             if rank == 0:
                 sorted_keys = sorted(sd.keys())
                 total_numel = sum(sd[k].numel() for k in sorted_keys)
                 
                 flat_tensor = torch.empty(total_numel, dtype=torch.bfloat16, pin_memory=True)
                 
+                attn_keys = [k for k in sorted_keys if "language_model.model.layers" in k and ("q_proj" in k or "down_proj" in k) and "weight" in k]
+                check_key = attn_keys[0] if attn_keys else sorted_keys[0]
+                print(f"[EXPORT] '{check_key}' first 3 values: {sd[check_key].view(-1)[:3].tolist()}")
+
                 offset = 0
                 for k in sorted_keys:
                     param = sd[k]
@@ -1126,9 +1130,16 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
                     flat_tensor[offset : offset + numel].copy_(param.view(-1))
                     offset += numel
                     del sd[k]
-                
+
                 dt = time.time() - t0
-                
+
+                keys_blob = "\n".join(sorted_keys).encode("utf-8")
+                import hashlib
+                key_fp = hashlib.sha256(keys_blob).hexdigest()
+
+                print(f"[EXPORT] key_fp={key_fp} nkeys={len(sorted_keys)}")
+                print(f"[EXPORT] flat_tensor checksum: {flat_tensor.float().sum()}")
+               
                 return flat_tensor.view(torch.int16).numpy()
             else:
                 return None

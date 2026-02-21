@@ -17,7 +17,7 @@ Contain small torch utilities
 
 import math
 from contextlib import contextmanager
-from typing import Optional
+from typing import Union, List, Any, Optional, Dict, Tuple
 
 import torch
 import torch.distributed
@@ -264,6 +264,25 @@ def get_response_mask(response_id: torch.Tensor, eos_token: int | list[int] = 2,
     """
     eos_mask = torch.isin(response_id, torch.tensor(eos_token, device=response_id.device)).int()
     return (eos_mask.cumsum(dim=1) - eos_mask).eq(0).to(dtype)
+
+def get_eos_mask(response_id: torch.Tensor, eos_token: Union[int, List[int]] = 2, dtype=torch.int64):
+    '''
+    end of sentence token can be int or list: 1 or [1, 2]
+    e.g. eos_token=1
+    response_id: [0, 0, 2, 42, 3, 5, 1, 0, 0]
+    eos_mask:     [1, 1, 1, 1,  1, 1, 1, 0, 0]
+    '''
+    if isinstance(eos_token, int):
+        eos_token = [eos_token]
+
+    eos_mask = torch.zeros_like(response_id, dtype=torch.bool)
+    for token in eos_token:
+        eos_mask |= response_id.eq(token)
+
+    eos_mask = eos_mask.long()
+    eos_mask = (torch.cumsum(eos_mask, dim=1) - eos_mask).bool()
+    eos_mask = torch.logical_not(eos_mask).to(dtype)
+    return eos_mask
 
 
 def compute_grad_norm(model: nn.Module):
