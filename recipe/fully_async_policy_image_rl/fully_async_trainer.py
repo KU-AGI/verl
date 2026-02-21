@@ -134,7 +134,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
 
         # required_samples use ppo_mini_batch_size*require_batches as the minimum number of samples.
         self.require_batches = config.async_training.require_batches
-        self.required_samples = config.actor_rollout_ref.actor.ppo_mini_batch_size * self.require_batches
+        self.required_samples = config.actor_rollout_ref.actor.ppo_mini_batch_size * self.require_batches * config.actor_rollout_ref.rollout.n
         self.compute_prox_log_prob = self.config.async_training.compute_prox_log_prob
         total_gpus = (
             config.trainer.nnodes * config.trainer.n_gpus_per_node
@@ -342,28 +342,12 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                     if hasattr(batch, 'meta_info') and 'reward' in batch.meta_info:
                         timing_raw['reward'] = batch.meta_info['reward']
 
-                    # async_training = self.config.get("async_training", None)
-                    # use_mis = async_training and async_training.use_rollout_log_probs
-                    # local_trigger = self.local_trigger_step if self.compute_prox_log_prob else None
-                    # should_swap = use_mis and local_trigger is not None and local_trigger > 1
-                    
-                    # if use_mis:
-                    #     if local_trigger == 1:
-                    #         self.actor_rollout_wg.save_model_to_cpu(1)
-                    #     elif should_swap:
-                    #         self.actor_rollout_wg.save_model_to_cpu(local_trigger)
-                    #         self.actor_rollout_wg.restore_model_from_cpu(1)
-
                     for task_id in [1, 2, 3]:
                         batch.batch["task_id"] = torch.tensor([task_id for _ in range(len(batch))], dtype=int)
 
                         batch = self._process_batch_common(
                             batch, metrics, timing_raw, self.local_trigger_step if self.compute_prox_log_prob else None, task_id
                         )
-
-                    # if should_swap:
-                    #     self.actor_rollout_wg.restore_model_from_cpu(local_trigger)
-                    #     self.actor_rollout_wg.clear_cpu_model(local_trigger)
                 
                     # update critic
                     if self.use_critic:

@@ -145,16 +145,22 @@ class ImageRLDataset(Dataset):
         total = len(self.dataframe)
         print(f"dataset len: {len(self.dataframe)}")
 
-        if self.max_samples > 0 and self.max_samples < total:
-            if self.shuffle:
-                rngs_args = (self.seed,) if self.seed is not None else ()
-                rng = np.random.default_rng(*rngs_args)
-                indices = rng.choice(total, size=self.max_samples, replace=False)
-            else:
-                indices = np.arange(self.max_samples)
-            self.dataframe = self.dataframe.select(indices.tolist())
-            print(f"selected {self.max_samples} random samples out of {total}")
+        if self.shuffle:
+            rngs_args = (self.seed,) if self.seed is not None else ()
+            rng = np.random.default_rng(*rngs_args)
+            indices = rng.permutation(total) # 전체를 무작위로 섞음
+            print(f"Shuffling dataset with seed {self.seed}")
+        else:
+            indices = np.arange(total) # 순서대로
 
+        # 그 다음, max_samples가 설정되어 있으면 앞에서부터 자릅니다.
+        if 0 < self.max_samples < total:
+            indices = indices[:self.max_samples]
+            print(f"Selected {self.max_samples} samples.")
+
+        # 최종적으로 선택/섞인 인덱스로 데이터셋 재구성
+        self.dataframe = self.dataframe.select(indices.tolist())
+        
     def resume_dataset_state(self):
         self.serialize_dataset = not hasattr(self, "original_data_files")
         # resume dataframe if not it's serialized in data.pt

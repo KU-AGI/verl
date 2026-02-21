@@ -96,6 +96,11 @@ class _HFModelWrapper:
                     # 가중치 순서 보장을 위해 state_dict 키 정렬
                     current_sd = actual_module.state_dict()
                     sorted_keys = sorted(current_sd.keys())
+
+                    import hashlib
+                    keys_blob = "\n".join(sorted_keys).encode("utf-8")
+                    key_fp = hashlib.sha256(keys_blob).hexdigest()
+                    print(f"[ROLLOUT][init_weight_map] key_fp={key_fp} nkeys={len(sorted_keys)}", flush=True)
                     
                     param_dict = dict(actual_module.named_parameters())
                     buffer_dict = dict(actual_module.named_buffers())
@@ -133,6 +138,8 @@ class _HFModelWrapper:
                         if flat_tensor.numel() != self._total_numel:
                             raise ValueError(f"Size mismatch! Expected {self._total_numel}, got {flat_tensor.numel()}")
 
+                        print(f"[LOAD] flat_tensor checksum: {flat_tensor.float().sum()}")
+
                         actual_module = self._module
                         if hasattr(actual_module, "_fsdp_wrapped_module"):
                             actual_module = actual_module._fsdp_wrapped_module
@@ -162,7 +169,18 @@ class _HFModelWrapper:
                         # strict=False because we might only be loading a subset of weights
                         missing_keys, unexpected_keys = actual_module.load_state_dict(weights, strict=False)
 
-                        loaded_count = len(weights) - len(missing_keys)
+                        if unexpected_keys:
+                            raise RuntimeError(
+                                f"[ImageUnifiedRollout] Key mismatch: {len(unexpected_keys)} keys in weights "
+                                f"not found in model (silent skip). First 10: {unexpected_keys[:10]}"
+                            )
+
+                        loaded_count = len(weights)
+                        if missing_keys:
+                            print(
+                                f"[ImageUnifiedRollout] Warning: {len(missing_keys)} model keys not in weights "
+                                f"(partial load). First 10: {missing_keys[:10]}"
+                            )
 
                         return {"loaded_elements": loaded_count, "status": "success"}
                 
@@ -885,11 +903,13 @@ class ImageUnifiedRollout(BaseRollout):
                 
                 logits = logit_uncond + self.cfg_weight * (logit_cond-logit_uncond)
 
+                if not self.is_validate:
+                    all_logprobs = torch.log_softmax(logits, dim=-1)
+
                 next_token = self._sample_from_logits(logits, is_text=False, generator=generator)
                 generated_tokens[:, i] = next_token.squeeze(-1)
 
                 if not self.is_validate:
-                    all_logprobs = torch.log_softmax(logits, dim=-1)
                     token_logprobs = all_logprobs.gather(dim=-1, index=next_token)
                     generated_logprobs[:, i] = token_logprobs.squeeze(-1)
 
@@ -934,7 +954,7 @@ class ImageUnifiedRollout(BaseRollout):
                 eos_token_id=self.processor.tokenizer.eos_token_id,
                 bos_token_id=self.processor.tokenizer.bos_token_id,
                 return_dict_in_generate=True,
-                output_scores=not self.is_validate,
+                output_logits=not self.is_validate,
             )
 
         gen_sequences = outputs.sequences
@@ -943,11 +963,11 @@ class ImageUnifiedRollout(BaseRollout):
         if self.is_validate:
             return answer, gen_sequences, None
 
-        T = len(outputs.scores)
+        T = len(outputs.logits) 
         sampled_token_ids = gen_sequences[:, -T:]  # exclude prompt_len
 
         token_logprobs = self.token_logprobs_from_scores(
-            outputs.scores,
+            outputs.logits,
             sampled_token_ids,
             out_dtype=torch.float32,
         )

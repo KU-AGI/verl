@@ -525,10 +525,15 @@ class DataParallelImageGenerationActor(BasePPOActor):
         all_select_batch_keys.append("task_id")
         if "rollout_is_weights" in data.batch.keys():
             all_select_batch_keys.append("rollout_is_weights")
+
+        all_select_batch_keys = list(set(all_select_batch_keys))
         
-        data = data.select(meta_info_keys=list(set(all_select_batch_keys)))
+        non_tensor_select_keys = ['uid']
+        data = data.select(all_select_batch_keys, non_tensor_select_keys)
         
-        mini_batches = data.split(self.config.ppo_mini_batch_size)
+        num_mini_batches = data.batch.batch_size[0] // self.config.ppo_mini_batch_size
+        mini_batches = data.chunk(num_mini_batches)
+
         on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1
         
         metrics = {}
@@ -542,7 +547,13 @@ class DataParallelImageGenerationActor(BasePPOActor):
                     self.gradient_accumulation = (
                         self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
                     )
-                    micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
+
+                    num_micro_batches = (
+                        mini_batch.batch.batch_size[0] // self.config.ppo_micro_batch_size_per_gpu
+                    )
+                    micro_batches = mini_batch.select(
+                        all_select_batch_keys, non_tensor_select_keys
+                    ).chunk(num_micro_batches)
                 
                 self.actor_optimizer.zero_grad()
                 

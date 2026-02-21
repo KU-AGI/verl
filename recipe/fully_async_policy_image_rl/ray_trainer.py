@@ -685,7 +685,7 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
         for data_source, var2metric2val in data_src2var2metric2val.items():
             core_var = "acc" if "acc" in var2metric2val else "reward"
             for var_name, metric2val in var2metric2val.items():
-                n_max = max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys()])
+                n_max = max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys() if "@" in name], default=0)
                 for metric_name, metric_val in metric2val.items():
                     if (
                         (var_name == core_var)
@@ -952,20 +952,27 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                 return batch
 
             async_training = self.config.get("async_training", None)
-            if async_training and async_training.use_rollout_log_probs:  
-                if local_trigger_step is not None:
+            if async_training and async_training.use_rollout_log_probs:
+                # If local_triger_step == 1, load the training engine's parameters to the CPU
+                #  and save a copy for subsequent MIS use.
+                # If local_trigger_step == 2, 3, ..., restore the parameters of version 1 to calculate the old_log_prob,
+                # then restore the parameters of the current version.
+                if local_trigger_step == 1:
+                    self.actor_rollout_wg.save_model_to_cpu(1)
                     batch = compute_old_log_prob(batch)
+                elif local_trigger_step is not None:
+                    self.actor_rollout_wg.save_model_to_cpu(local_trigger_step)
+                    self.actor_rollout_wg.restore_model_from_cpu(1)
+                    batch = compute_old_log_prob(batch)
+                    self.actor_rollout_wg.restore_model_from_cpu(local_trigger_step)
+                    self.actor_rollout_wg.clear_cpu_model(local_trigger_step)
                 else:
-                    print("[FullyAsyncRayPPOTrainer] Use rollout log probs in async mode.")
-                    batch.batch[f"task{task_id}_old_log_probs"] = batch.batch[f"task{task_id}_rollout_log_probs"]
+                    batch.batch["old_log_probs"] = batch.batch["rollout_log_probs"]
                     batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+
             else:
-                if self.config.actor_rollout_ref.actor.use_rollout_log_probs:
-                    print("[FullyAsyncRayPPOTrainer] Use rollout log probs in sync mode.")
-                    batch.batch[f"task{task_id}_old_log_probs"] = batch.batch[f"task{task_id}_rollout_log_probs"]
-                    batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
-                else:
-                    batch = compute_old_log_prob(batch)
+                print(f"[DEBUG]: compute old log prob")
+                batch = compute_old_log_prob(batch)
 
         if self.use_reference_policy:
             # compute reference log_prob
@@ -1037,7 +1044,7 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                 if is_last_step:
                     last_val_metrics = val_metrics
             metrics.update(val_metrics)
-            return last_val_metrics
+        return last_val_metrics
 
     def _check_save_checkpoint(self, is_last_step, timing_raw):
         # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.

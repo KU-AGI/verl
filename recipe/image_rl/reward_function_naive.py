@@ -307,6 +307,18 @@ class ClientManager:
 vlm_client_manager = ClientManager(VLM_BASE_URLS, name="VLM")
 llm_client_manager = ClientManager(LLM_BASE_URLS, name="LLM")
 
+def content_from_prompt_with_images(prompt: str, image_urls: list[str]):
+    parts = prompt.split("<image>")
+    if len(parts) - 1 != len(image_urls):
+        raise ValueError(f"placeholder <image> cnt({len(parts)-1})and image_urls cnt({len(image_urls)}) different")
+
+    content = []
+    for i, part in enumerate(parts):
+        if part:
+            content.append({"type": "text", "text": part})
+        if i < len(image_urls):
+            content.append({"type": "image_url", "image_url": {"url": image_urls[i]}})
+    return content
 
 def convert_gen_img_to_base64(gen_img) -> Optional[str]:
     """Convert image to base64 data URL.
@@ -426,12 +438,16 @@ async def get_response_with_client(client, messages, model):
     response = await client.chat.completions.create(
         model=model,
         messages=messages,
+
         max_tokens=4096,
+        temperature=0.0,
+        top_p=1.0,
+
         extra_body={
-            "repetition_penalty": 1.2,
-            # "top_p": 1.0,
-            # "top_k": 40,
-            "temperature": 0.0,
+            "top_k": -1,
+            "min_p": 0.0,
+            "best_of": 1,
+            "repetition_penalty": 1.05,
         },
         timeout=300000.0,
     )

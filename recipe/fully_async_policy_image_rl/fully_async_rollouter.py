@@ -132,7 +132,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         # required_samples use ppo_mini_batch_size*require_batches as the minimum number of samples.
         self.rollout_prompt_size = config.async_training.get("rollout_prompt_size", 1)
         self.require_batches = config.async_training.require_batches
-        self.required_samples = config.actor_rollout_ref.actor.ppo_mini_batch_size * self.require_batches
+        self.required_samples = config.actor_rollout_ref.actor.ppo_mini_batch_size * self.require_batches * config.actor_rollout_ref.rollout.n
         self.max_required_samples = None
         self.max_concurrent_samples = None
         # queue size
@@ -175,6 +175,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         self._finalize_inflight_samples = 0
 
         self.server_token_q = None
+        self.is_validating = False
 
     async def set_param_synchronizer(self, h):
         async with self.lock:
@@ -214,9 +215,13 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 * (self.staleness_threshold + 1)
                 * self.config.async_training.trigger_parameter_sync_step
             )
+            prompts_per_update = (
+                self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+                * self.require_batches
+            )
             self.total_train_steps = int(
                 self.total_rollout_steps
-                / (self.required_samples * self.config.async_training.trigger_parameter_sync_step)
+                / (prompts_per_update * self.config.async_training.trigger_parameter_sync_step)
             )
             
             batch_size_per_prompt = self.config.actor_rollout_ref.rollout.n * self.rollout_prompt_size
@@ -287,7 +292,13 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 and self.current_param_version > 0  # don't test here in the initial parameter sync
             ) or (validate and self.val_reward_fn is not None):
                 with marked_timer("rollouter/validate_time", timing_raw, color="green"):
-                    val_metrics = await self._validate_async()
+                    self.is_validating = True
+                    self.paused = False
+                    self.condition.notify_all()
+                    try:
+                        val_metrics = await self._validate_async()
+                    finally:
+                        self.is_validating = False
             data = ValidateMetrics(
                 timing_raw=timing_raw, metrics=val_metrics, global_steps=global_steps, param_version=version
             )
@@ -1017,6 +1028,9 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                     f"due to full queue: size={queue_size}, max={self.max_queue_size}"
                 )
             return True
+
+        if self.is_validating:
+            return False
 
         if self.staleness_samples >= self.max_required_samples:
             if not self.paused:

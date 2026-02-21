@@ -283,16 +283,17 @@ def merge_rollout_sample(config, tokenizer, rs: RolloutSample, processor):
     task2_feedback_reward_score: list = [-100] * batch_size
     for i, (vqa_judge, predicted_judge) in enumerate(zip(vqa_judges, predicted_judges)):
 
-        vqa_judge = (vqa_judge == 1) # if all
-        
         if vqa_judge is None or predicted_judge is None: # Invalid case
             task2_feedback_reward_score[i] = 0.0
             extra_info["task2_judge_alignment_reward"][i] = -100
             extra_info["task2_feedback_reward"][i] = -100
             extra_info["task2_judge_alignment_reward_response"][i] = "Judge value is None."
             extra_info["task2_feedback_reward_response"][i] = "Judge value is None."
-            
-        elif vqa_judge and predicted_judge:  # VLM yes & Policy yes
+            continue
+
+        vqa_judge = (vqa_judge == 1)
+
+        if vqa_judge and predicted_judge:  # VLM yes & Policy yes
             task2_feedback_reward_score[i] = 1.0
             extra_info["task2_judge_alignment_reward"][i] = 1.0
             extra_info["task2_feedback_reward"][i] = 1.0
@@ -409,16 +410,15 @@ def merge_rollout_sample(config, tokenizer, rs: RolloutSample, processor):
 
         # Apply detail reward logging
         kept_meta_info = {}
-        for metric_name, metric_value in rs.full_batch.meta_info.items():
-            if isinstance(metric_value, list):
-                kept_meta_info[metric_name] = [metric_value[idx] for idx in kept_traj_idxs]
-            elif metric_name == "metrics":
+        for meta_key, meta_value in rs.full_batch.meta_info.items():
+            if isinstance(meta_value, list):
+                kept_meta_info[meta_key] = [meta_value[idx] for idx in kept_traj_idxs]
+            elif meta_key == "metrics":
+                kept_meta_info[meta_key] = {}
                 for sub_metric_name, sub_metric_value in rs.full_batch.meta_info["metrics"].items():
-                    if metric_name not in kept_meta_info:
-                        kept_meta_info[metric_name] = {}
-                    kept_meta_info[metric_name][sub_metric_name] = [sub_metric_value[idx] for idx in kept_traj_idxs]
+                    kept_meta_info[meta_key][sub_metric_name] = [sub_metric_value[idx] for idx in kept_traj_idxs]
             else:
-                kept_meta_info[metric_name] = metric_value
+                kept_meta_info[meta_key] = meta_value
 
         rs.full_batch.meta_info = kept_meta_info
 
