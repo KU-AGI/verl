@@ -375,6 +375,20 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
                 if self.rank == 0:
                     print("[actor model] No vision tower found.")
 
+        # Freeze image encoder modules before FSDP wrapping.
+        # requires_grad must be set before FSDP wrapping so that:
+        #   - FSDP1: flat parameter's requires_grad is correctly determined per unit
+        #   - FSDP2: each DTensor's requires_grad is set correctly from the start
+        # Only applies to actor; ref policy uses torch.no_grad() context for inference.
+        if role == "actor":
+            for module_name in ["gen_embed", "vision_model", "gen_vision_model"]:
+                module = getattr(actor_module, module_name, None)
+                if module is not None:
+                    module.requires_grad_(False)
+                    self.use_orig_params = True  # FSDP1: mixed requires_grad needs use_orig_params=True
+                    if self.rank == 0:
+                        print(f"[actor model] Froze {module_name}.")
+
         torch.distributed.barrier()
 
         if self.rank == 0:
@@ -910,6 +924,9 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
         get_torch_device().empty_cache()
         return output
 
+    # gen_params carried in meta_info by image_unified_rollout.generate_sequences
+    _GEN_PARAM_KEYS = ("temperature", "cfg_weight", "txt_top_k", "txt_top_p", "img_top_k", "img_top_p")
+
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="blue", role="actor_compute_log_prob")
     def compute_log_prob(self, data: DataProto):
@@ -928,7 +945,13 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
         data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
         data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
-        data.meta_info["temperature"] = self.config.rollout.temperature
+        # gen_params flow from image_unified_rollout.generate_sequences via meta_info;
+        # fall back to config values in case meta_info propagation is incomplete.
+        if "temperature" not in data.meta_info:
+            data.meta_info["temperature"] = self.config.rollout.temperature
+        if "cfg_weight" not in data.meta_info:
+            data.meta_info["cfg_weight"] = getattr(self.config.rollout, "cfg_weight", 5.0)
+
         # perform recompute log_prob
         with self.ulysses_sharding_manager:
             with adapter_ctx:
@@ -936,7 +959,7 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
             task_id = data.batch["task_id"].view(-1)[0].item()
             output = DataProto.from_dict(
                 tensors={f"task{task_id}_old_log_probs": output, f"task{task_id}_entropys": entropys},
-                meta_info={"temperature": self.config.rollout.temperature},
+                meta_info={k: data.meta_info[k] for k in self._GEN_PARAM_KEYS if k in data.meta_info},
             )
 
         output = output.to("cpu")
@@ -969,9 +992,10 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
 
         micro_batch_size = self.config.ref.log_prob_micro_batch_size_per_gpu
         data.meta_info["micro_batch_size"] = micro_batch_size
-        data.meta_info["temperature"] = self.config.rollout.temperature
         data.meta_info["max_token_len"] = self.config.ref.log_prob_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
+
+        # gen_params are already in meta_info from generate_sequences
         with self.ulysses_sharding_manager:
             data = data.to("cpu")  # data will to device with each micro batch on ref.compute_log_prob
             output, _ = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
@@ -1109,20 +1133,27 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
                 ):
                     sd = self.actor_module_fsdp.state_dict()
             else:
+                # FSDP2: state_dict() returns DTensors (local shards).
+                # .full_tensor() is a collective op — all ranks must participate simultaneously.
                 sd = self.actor_module_fsdp.state_dict()
+                sd = {
+                    k: v.full_tensor().to(dtype=torch.bfloat16, device="cpu")
+                       if isinstance(v, DTensor) else v.cpu()
+                    for k, v in sd.items()
+                }
 
             sd = convert_weight_keys(sd, getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp))
-            
+
             if rank == 0:
                 sorted_keys = sorted(sd.keys())
                 total_numel = sum(sd[k].numel() for k in sorted_keys)
                 
                 flat_tensor = torch.empty(total_numel, dtype=torch.bfloat16, pin_memory=True)
-
+                
                 attn_keys = [k for k in sorted_keys if "language_model.model.layers" in k and ("q_proj" in k or "down_proj" in k) and "weight" in k]
                 check_key = attn_keys[0] if attn_keys else sorted_keys[0]
                 print(f"[EXPORT] '{check_key}' first 3 values: {sd[check_key].view(-1)[:3].tolist()}")
-                
+
                 offset = 0
                 for k in sorted_keys:
                     param = sd[k]
@@ -1130,7 +1161,7 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
                     flat_tensor[offset : offset + numel].copy_(param.view(-1))
                     offset += numel
                     del sd[k]
-                
+
                 dt = time.time() - t0
 
                 keys_blob = "\n".join(sorted_keys).encode("utf-8")
@@ -1139,7 +1170,7 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
 
                 print(f"[EXPORT] key_fp={key_fp} nkeys={len(sorted_keys)}")
                 print(f"[EXPORT] flat_tensor checksum: {flat_tensor.float().sum()}")
-                
+               
                 return flat_tensor.view(torch.int16).numpy()
             else:
                 return None
