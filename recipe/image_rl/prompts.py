@@ -188,7 +188,7 @@ The JSON must have exactly these keys:
 
 ORIGINAL_PROMPT: {prompt}
 
-CURRENT_IMAGE: (provided as an image input)
+CURRENT_IMAGE: <image>
 
 FEEDBACK:
 {predicted_feedback}
