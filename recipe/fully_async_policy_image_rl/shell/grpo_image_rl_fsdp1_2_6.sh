@@ -11,7 +11,7 @@ exec > >(tee -a "${SCRIPT_LOG}")
 exec 2>&1
 
 project_name='mllm_reasoning'
-exp_name='0107_fully_on_policy_nipa'
+exp_name="test"
 
 export NCCL_IB_GID_INDEX=0
 export NCCL_CUDA_DEVICE_MAX_CONNECTIONS=8
@@ -36,13 +36,15 @@ RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/recipe/fully_async_policy_image_rl/sh
 # Paths
 HOME="/data"
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
-MODEL_PATH=/data/mllm/ckpt/step=014000.ckpt/hf_model # /data/mllm/checkpoints/Janus-Pro-7B
+#MODEL_PATH=/data/mllm/checkpoints/ReasonGen-R1-SFT # CaraJ/T2I-R1 # Franklin0/ReasonGen-R1 # /data/mllm/ckpt/step=014000.ckpt/hf_model # /data/mllm/checkpoints/Janus-Pro-7B
+MODEL_PATH="/data/mllm/ckpt/step=014000.ckpt/hf_model"
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
-TRAIN_FILES=/data/mllm/data/train_v2.parquet
-VAL_FILES=/data/mllm/data/val_v2.parquet
+TRAIN_FILES=/data/mllm/data/train_wo_focusdiff_v2.parquet
+VAL_FILES=['/data/mllm/data/val_wo_focusdiff_v2.parquet','/data/mllm/data/train_subset_24_wo_focusdiff_v2.parquet']
+# TRAIN_FILES='/data/users/pimang62/verl_image_rl/data/train_reasongen.parquet'
+# VAL_FILES=["/data/users/pimang62/verl_image_rl/data/val_reasongen_16.parquet","/data/users/pimang62/verl_image_rl/data/val_reasongen.parquet"] # 300
 
-export RM_VLM_MODEL_PATH="Qwen/Qwen3-VL-30B-A3B-Instruct" # OpenGVLab/InternVL3_5-38B
-export RM_LLM_MODEL_PATH="Qwen/Qwen3-30B-A3B-Instruct-2507" # OpenGVLab/InternVL3_5-38B
+export RM_VLM_MODEL_PATH="Qwen/Qwen2.5-VL-7B-Instruct"
 
 rollout_name=image_unified
 rollout_mode=async
@@ -53,15 +55,20 @@ adv_estimator=grpo_task_skip
 use_kl_in_reward=False
 kl_coef=0.0
 use_kl_loss=False
-kl_loss_coef=0.00
-entropy_coeff=0.002
+kl_loss_coef=0.04
+entropy_coeff=0.00
 
 clip_ratio_low=0.2
 clip_ratio_high=0.2
 
-enable_filter_groups=False
-filter_groups_metric=acc
-max_num_gen_batches=10
+enable_filter_groups=True
+filter_groups_metric=reward
+# max_num_gen_batches=10
+
+# Task IDs to train on: [1], [1,2], [1,2,3], [2], etc.
+# Rollout runs tasks 1 through max(task_ids) sequentially (dependencies).
+# Reward computation and model update only happen for the listed tasks.
+task_ids='[1]'
 
 norm_adv_by_std_in_grpo=True
 
@@ -76,16 +83,17 @@ overlong_penalty_factor=1.0
 loss_agg_mode="token-mean"
 
 # Algorithm
-cfg_weight=5.0
-temperature=1.2
-# txt_top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
-# txt_top_p=1.0
-# img_top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
-# img_top_p=1.0
+cfg_weight=1.0
+temperature=1.0
+txt_top_k=0  # 0 for no top_k filtering (HF rollout)
+txt_top_p=1.0
+img_top_k=0  # 0 for no top_k filtering (HF rollout)
+img_top_p=1.0
+val_cfg_weight=1.0
 val_temperature=1.0
-val_txt_top_k=50
+val_txt_top_k=0
 val_txt_top_p=1.0
-val_img_top_k=4096
+val_img_top_k=0
 val_img_top_p=1.0
 
 # Performance Related Parameter
@@ -113,20 +121,20 @@ n_resp_per_prompt=8
 rollout_prompt_size=2 # set to number of prompts per actor per batch, used in async mode
 val_rollout_prompt_size=16
 train_prompt_mini_bsz=16
-train_prompt_micro_bsz=4
+ppo_micro_batch_size_per_gpu=4
 total_rollout_steps=$(((512*100*3*10)))
-staleness_threshold=2.0
+staleness_threshold=0.0
 trigger_parameter_sync_step=1
 require_batches=2
 partial_rollout=False
 log_prob_micro_batch_size_per_gpu=4
 
 test_freq=10
-save_freq=$((test_freq * trigger_parameter_sync_step * 1))
+save_freq=10 # $((test_freq * trigger_parameter_sync_step * 1))
 total_epochs=10
 # total_training_steps=3000
 rollout_freq=1
-# log_val_generations=1
+# log_val_generations=20
 
 ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     --working-dir "${WORKING_DIR}" \
@@ -146,12 +154,12 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     actor_rollout_ref.nccl_timeout=120000000 \
     actor_rollout_ref.model.path=\"${MODEL_PATH}\" \
     actor_rollout_ref.actor.optim.lr=5e-6 \
-    actor_rollout_ref.actor.optim.warmup_style=constant \
-    actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
-    actor_rollout_ref.actor.optim.weight_decay=0.1 \
-    actor_rollout_ref.actor.strategy=fsdp \
+    actor_rollout_ref.actor.optim.lr_scheduler_type=constant \
+    actor_rollout_ref.actor.optim.lr_warmup_steps=0 \
+    actor_rollout_ref.actor.optim.weight_decay=0.0 \
+    actor_rollout_ref.actor.strategy=fsdp2 \
     actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${train_prompt_micro_bsz} \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${ppo_micro_batch_size_per_gpu} \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=${sp_size} \
     actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
     actor_rollout_ref.actor.use_kl_loss=${use_kl_loss} \
@@ -166,6 +174,8 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     algorithm.adv_estimator=${adv_estimator} \
     algorithm.use_kl_in_reward=${use_kl_in_reward} \
     algorithm.kl_ctrl.kl_coef=${kl_coef} \
+    algorithm.filter_groups.enable=${enable_filter_groups} \
+    algorithm.filter_groups.metric=${filter_groups_metric} \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.hybrid_engine=False \
     actor_rollout_ref.actor.use_dynamic_bsz=${use_dynamic_bsz} \
@@ -193,12 +203,17 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
     actor_rollout_ref.rollout.cfg_weight=${cfg_weight} \
     actor_rollout_ref.rollout.temperature=${temperature} \
+    actor_rollout_ref.rollout.txt_top_k=${txt_top_k} \
+    actor_rollout_ref.rollout.txt_top_p=${txt_top_p} \
+    actor_rollout_ref.rollout.img_top_k=${img_top_k} \
+    actor_rollout_ref.rollout.img_top_p=${img_top_p} \
     actor_rollout_ref.rollout.image_token_num_per_image=576 \
     actor_rollout_ref.rollout.prompt_length=${max_prompt_length} \
     actor_rollout_ref.rollout.response_length=${max_response_length} \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${gen_tp} \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.rollout.val_kwargs.n=${n_resp_per_prompt} \
+    actor_rollout_ref.rollout.val_kwargs.val_cfg_weight=${val_cfg_weight} \
     actor_rollout_ref.rollout.val_kwargs.val_temperature=${val_temperature} \
     actor_rollout_ref.rollout.val_kwargs.val_txt_top_k=${val_txt_top_k} \
     actor_rollout_ref.rollout.val_kwargs.val_txt_top_p=${val_txt_top_p} \
@@ -214,12 +229,12 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     actor_rollout_ref.ref.ulysses_sequence_parallel_size=${sp_size} \
     algorithm.kl_ctrl.kl_coef=${kl_coef} \
     algorithm.filter_groups.enable=${enable_filter_groups} \
-    algorithm.filter_groups.max_num_gen_batches=8 \
     algorithm.filter_groups.metric=${filter_groups_metric} \
     algorithm.norm_adv_by_std_in_grpo=${norm_adv_by_std_in_grpo} \
     trainer.critic_warmup=0 \
-    trainer.logger=['console','wandb'] \
-    trainer.val_before_train=True \
+    trainer.logger=['console'] \
+    trainer.val_before_train=False \
+    trainer.balance_batch=False \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
     trainer.save_freq="${save_freq}" \
@@ -235,8 +250,9 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     rollout.n_gpus_per_node="${n_gpus_rollout}" \
     actor_rollout_ref.rollout.agent.num_workers=$((NNODES * n_gpus_rollout)) \
     rollout.total_rollout_steps="${total_rollout_steps}" \
-    rollout.total_epochs="${total_epochs}" \
+    rollout.total_epochs=${total_epochs} \
     trainer.test_freq="${test_freq}" \
+    rollout.test_freq="${test_freq}" \
     async_training.rollout_prompt_size="${rollout_prompt_size}" \
     async_training.val_rollout_prompt_size="${val_rollout_prompt_size}" \
     async_training.staleness_threshold="${staleness_threshold}" \
@@ -244,15 +260,16 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     async_training.require_batches="${require_batches}" \
     async_training.partial_rollout="${partial_rollout}" \
     async_training.use_rollout_log_probs=False \
-    async_training.compute_prox_log_prob=True \
+    async_training.compute_prox_log_prob=False \
     reward_model.reward_manager=image_generation \
-    custom_reward_function.path=recipe/image_rl/reward_function.py \
+    custom_reward_function.path=recipe/image_rl/reward_function_naive.py \
     custom_reward_function.name=compute_score_batch \
     +reward_model.reward_kwargs.overlong_buffer_cfg.enable=${enable_overlong_buffer} \
     +reward_model.reward_kwargs.overlong_buffer_cfg.len=${overlong_buffer_len} \
     +reward_model.reward_kwargs.overlong_buffer_cfg.penalty_factor=${overlong_penalty_factor} \
     +reward_model.reward_kwargs.overlong_buffer_cfg.log=False \
     +reward_model.reward_kwargs.max_resp_len=${max_response_length} \
-    # +actor_rollout_ref.actor.multi_task.enable=True \
-    # +actor_rollout_ref.actor.multi_task.task_weights='[1.0,0.0,0.0]' \
-    # +actor_rollout_ref.actor.multi_task.task_selection=weighted_sample \
+    +actor_rollout_ref.actor.multi_task.enable=True \
+    +actor_rollout_ref.actor.multi_task.task_ids="${task_ids}" \
+    +actor_rollout_ref.actor.multi_task.task_weights='[1.0,0.0,0.0]' \
+    +actor_rollout_ref.actor.multi_task.task_selection=weighted_sample \

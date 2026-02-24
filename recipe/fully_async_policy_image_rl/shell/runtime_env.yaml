@@ -7,3 +7,5 @@ env_vars:
   VLLM_USE_V1: "1"
   NCCL_DEBUG: "INFO"
   HYDRA_FULL_ERROR: "1"
+  NCCL_SOCKET_IFNAME: "bond-srv.1518"
+  GLOO_SOCKET_IFNAME: "bond-srv.1518"
