@@ -107,27 +107,28 @@ class _HFModelWrapper:
                     
                     self._weight_map = []
                     pointer = 0
-                    
+                    skipped = []
+                    mapped = 0
+
                     for name in sorted_keys:
                         target = param_dict.get(name)
                         if target is None:
                             target = buffer_dict.get(name)
-                        
+
                         if target is None:
-                            if name in current_sd and isinstance(current_sd[name], torch.Tensor):
-                                pointer += current_sd[name].numel()
+                            # ✅ 여기가 진짜 "copy 안 되는 키" (tied alias일 수도 있고, 진짜 mismatch일 수도)
+                            skipped.append(name)
+                            t = current_sd.get(name, None)
+                            if isinstance(t, torch.Tensor):
+                                pointer += t.numel()
                             continue
-                        
+
+                        mapped += 1  # ✅ 매핑 성공 카운트
                         numel = target.numel()
-                        self._weight_map.append({
-                            'target': target,
-                            'start': pointer,
-                            'end': pointer + numel
-                        })
+                        self._weight_map.append({"target": target, "start": pointer, "end": pointer + numel})
                         pointer += numel
-                        
-                    self._total_numel = pointer
-                    print(f"[ImageUnifiedRollout] Weight map initialized: {len(self._weight_map)} tensors, Total numel: {self._total_numel}")
+
+                    self._total_numel = pointer                    
 
                 @torch.no_grad()
                 def load_weights(self, weights, **kwargs):
@@ -249,6 +250,8 @@ class ImageUnifiedRollout(BaseRollout):
         self.formatter = FormattingEvaluatorV2()
 
         self.image_token_num_per_image = getattr(config, "image_token_num_per_image", 576)
+
+        self.processor.tokenizer.pad_token_id = self.processor.pad_id
 
         self.is_validate = False
 
@@ -427,6 +430,17 @@ class ImageUnifiedRollout(BaseRollout):
         batch_size = prompts.batch.batch_size[0]
 
         self.set_generation_config(prompts[0])
+        # set_generation_config already handles train/val branching.
+        # Carry the params actually used into meta_info so downstream
+        # (compute_log_prob, update_actor) can read them without re-reading config.
+        prompts.meta_info.update(
+            temperature=self.temperature,
+            cfg_weight=self.cfg_weight,
+            txt_top_k=self.txt_top_k,
+            txt_top_p=self.txt_top_p,
+            img_top_k=self.img_top_k,
+            img_top_p=self.img_top_p,
+        )
 
         task_funcs = {
             1: self._generate_minibatch_image_generation,
@@ -434,17 +448,28 @@ class ImageUnifiedRollout(BaseRollout):
             3: self._generate_minibatch_regen_image_generation,
         }
 
-        # Check for task_id in batch
+        # Priority: batch task_id (set by agent loop per-iteration) > rollout_task_ids (meta_info) > all
         task_id_tensor = prompts.batch.get("task_id", None)
-        if task_id_tensor is None:
-            selected_funcs = task_funcs.values()
-        else:
+        if task_id_tensor is not None:
             task_id = task_id_tensor.view(-1)[0].item()
             selected_funcs = [task_funcs.get(task_id)]
+        else:
+            rollout_task_ids = prompts.meta_info.get("rollout_task_ids", None)
+            if rollout_task_ids is not None:
+                # Run tasks in rollout_task_ids order (sequential dependency maintained)
+                selected_funcs = [task_funcs[i] for i in rollout_task_ids if i in task_funcs]
+            else:
+                selected_funcs = list(task_funcs.values())
 
+        gen_start = time.perf_counter()
         for i, func in enumerate(selected_funcs):
             if func is not None:
                 prompts = func(prompts)
+        gen_elapsed = time.perf_counter() - gen_start
+
+        if "metrics" not in prompts.meta_info:
+            prompts.meta_info["metrics"] = {}
+        prompts.meta_info["metrics"]["generate_sequences"] = [gen_elapsed] * batch_size
 
         # Apply padding to all tensors before moving to CPU
         prompts = self._apply_padding_to_dataproto(prompts)
@@ -460,8 +485,6 @@ class ImageUnifiedRollout(BaseRollout):
     def _generate_minibatch_image_generation(self, data_proto: DataProto) -> DataProto:
         input_format = [self.get_sft_format(prompt) for prompt in data_proto.non_tensor_batch["prompt"]]
 
-        self.processor.tokenizer.pad_token_id = self.processor.pad_id
-
         inputs = self.processor.tokenizer(
             input_format,
             padding=True,
@@ -472,21 +495,14 @@ class ImageUnifiedRollout(BaseRollout):
         input_ids = inputs["input_ids"].to(self.device)
         attention_mask = inputs["attention_mask"].to(self.device)
 
-        data_proto.batch["task1_input_ids"] = input_ids
-        data_proto.batch["task1_attention_mask"] = attention_mask
+        data_proto.batch["task1_input_ids"] = input_ids.cpu()
+        data_proto.batch["task1_attention_mask"] = attention_mask.cpu()
 
         batch_size = data_proto.batch.batch_size[0]
-        
-        input_ids = data_proto.batch["task1_input_ids"]
-        attention_mask = data_proto.batch["task1_attention_mask"]
 
         # embedding
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-            input_embeds = self.module.language_model.get_input_embeddings()(input_ids)
-            input_embeds = input_embeds.to(dtype=torch.bfloat16)
-
-        # For computing logits: input (especially input text embedding)
-        data_proto.batch["task1_input_embeds"] = input_embeds
+            input_embeds = self.moduleㄴ.language_model.get_input_embeddings()(input_ids)
 
         gen_final_cfg_embeds, gen_final_cfg_attention_mask = self._prepare_cfg_embeds(data_proto)
         generated_tokens, generated_logprobs = self.generate_img(gen_final_cfg_embeds, gen_final_cfg_attention_mask)
@@ -501,12 +517,10 @@ class ImageUnifiedRollout(BaseRollout):
         gen_imgs_tensor = self.processor.image_processor(gen_imgs_pil_list).pixel_values
         # For generating feedback texts and computing logits: output
         data_proto.batch["task1_gen_imgs_pixel_values"] = gen_imgs_tensor.cpu()
-        gen_imgs_pixel_values = gen_imgs_tensor.to(self.device, dtype=torch.bfloat16)
 
-        # Postprocessing output embeds
-        B, C, H, W = gen_imgs_pixel_values.shape
+        B, C, H, W = gen_imgs_tensor.shape
         data_proto.batch["task1_gen_img_tokens"] = generated_tokens.detach().cpu()
-        data_proto.batch["task1_response_mask"] = torch.ones((B, generated_tokens.size(1)), dtype=torch.long, device=generated_tokens.device)
+        data_proto.batch["task1_response_mask"] = torch.ones((B, generated_tokens.size(1)), dtype=torch.long).cpu()
         if dist.get_rank() == 0:
             print(f"[IMG_GEN] Created DataProto with batch_size: {batch_size}")
 
@@ -627,8 +641,6 @@ class ImageUnifiedRollout(BaseRollout):
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
             text_embeds = self.module.language_model.get_input_embeddings()(batched_total_ids.long())
             image_embeds = self.module.aligner(self.module.vision_model(gen_imgs_pixel_values))
-            text_embeds = text_embeds.to(dtype=torch.bfloat16)
-            image_embeds = image_embeds.to(dtype=torch.bfloat16)
 
         # merge text and image embeds
         merged_embeds = self.merge_text_and_image_embeds(text_embeds, image_embeds, all_image_start_indices)
@@ -636,34 +648,21 @@ class ImageUnifiedRollout(BaseRollout):
         # For generating feedback texts
         data_proto.batch["task2_input_ids"] = batched_total_ids.detach().cpu()
         data_proto.batch["task2_attention_mask"] = batched_attention_mask.detach().cpu()
-        data_proto.batch["task2_input_embeds"] = merged_embeds.detach().cpu()
 
         feedback_texts, gen_sequences, log_probs = self.generate_text(merged_embeds, batched_attention_mask)
 
-        pad_token_id = self.processor.tokenizer.eos_token_id
-        response_mask = (gen_sequences != pad_token_id).long()
+        # pad_id로 패딩 위치 마스킹 (eos/image_start_id 모두 response에 포함됨)
+        response_mask = (gen_sequences != self.processor.pad_id).long()
 
-        first_pad_indices = (gen_sequences == pad_token_id).long().argmax(dim=-1)
-        has_pad = (gen_sequences == pad_token_id).any(dim=-1)
-        batch_indices = torch.arange(gen_sequences.size(0), device=gen_sequences.device)
-        response_mask[batch_indices, first_pad_indices] = torch.where(
-            has_pad, 
-            torch.ones_like(first_pad_indices), 
-            response_mask[batch_indices, first_pad_indices]
-        )
-        
         # For computing logits: output
         data_proto.non_tensor_batch["task2_feedback_texts"] = np.array(feedback_texts, dtype=object)
         data_proto.batch["task2_feedback_ids"] = gen_sequences.detach().cpu()
-        
+
         if not self.is_validate:
             log_probs = log_probs.masked_fill(response_mask == 0, 0.0)
             data_proto.batch['task2_rollout_log_probs'] = log_probs.detach().cpu()
 
         data_proto.batch["task2_response_mask"] = response_mask.detach().cpu()
-
-        feedback_ids = data_proto.batch["task2_feedback_ids"]
-        feedback_ids = feedback_ids.to(self.device)
 
         if dist.get_rank() == 0:
             print(f"[TEXT_GEN] Completed feedback generation")
@@ -694,12 +693,12 @@ class ImageUnifiedRollout(BaseRollout):
             print(f"[REGEN] Processing regen for {batch_size} images in batch")
 
         # Parse feedback texts
-        prompts = [prompt for prompt in data_proto.non_tensor_batch['prompt']]
+        prompts = data_proto.non_tensor_batch['prompt']
         feedback_texts = [self.formatter._split_text_into_parts(feedback)[-1] for feedback in data_proto.non_tensor_batch['task2_feedback_texts']]
 
         # Prepare messages for all images
         input_format = []
-        for (prompt, feedback) in zip(prompts, feedback_texts): # data_proto.non_tensor_batch['prompt'] 들어가야함
+        for (prompt, feedback) in zip(prompts, feedback_texts):
             _prefix =(
                 f"{self.image_start_tag}{self.image_tag}{self.image_end_tag}\n"
                 "Please edit the image as instructed.\n"
@@ -711,13 +710,14 @@ class ImageUnifiedRollout(BaseRollout):
                 prefix = self.get_sft_format(_prefix.format(prompt=prompt, feedback="No need to generate feedback."), system_prompt=self.regen_system_prompt)
             else:
                 prefix = self.get_sft_format(_prefix.format(prompt=prompt, feedback=feedback), system_prompt=self.regen_system_prompt)
-            input_format.append(prefix) # Add image placeholder at the end
+            input_format.append(prefix)
 
         self.processor.tokenizer.pad_token_id = self.processor.pad_id
 
         inputs = self.processor.tokenizer(
             input_format,
             padding=True,
+            padding_side='left',
             return_tensors="pt"
         )
 
@@ -735,8 +735,6 @@ class ImageUnifiedRollout(BaseRollout):
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
             image_embeds = self.module.gen_aligner(self.module.gen_embed(image_ids))
             text_embeds = self.module.language_model.get_input_embeddings()(batched_total_ids.long())
-            image_embeds = image_embeds.to(dtype=torch.bfloat16)
-            text_embeds = text_embeds.to(dtype=torch.bfloat16)
 
         # merge text and image embeds
         merged_embeds = self.merge_text_and_image_embeds(text_embeds, image_embeds, all_image_start_indices)
@@ -758,14 +756,10 @@ class ImageUnifiedRollout(BaseRollout):
         regen_imgs_tensor = self.processor.image_processor(regen_imgs_pil_list).pixel_values
         # For generating feedback texts and computing logits: output
         data_proto.batch["task3_regen_imgs_pixel_values"] = regen_imgs_tensor.cpu()
-        regen_imgs_pixel_values = regen_imgs_tensor.to(self.device, dtype=torch.bfloat16)
-
-        # Postprocessing output embeds
-        B, C, H, W = regen_imgs_pixel_values.shape
 
         # For reproducing regen images
         data_proto.batch["task3_regen_img_tokens"] = regenerated_tokens.detach().cpu()
-        data_proto.batch["task3_response_mask"] = torch.ones((B, regenerated_tokens.size(1)), dtype=torch.long, device=regenerated_tokens.device).cpu()
+        data_proto.batch["task3_response_mask"] = torch.ones((batch_size, regenerated_tokens.size(1)), dtype=torch.long).cpu()
         if dist.get_rank() == 0:
             print(f"[IMG_GEN] Created DataProto with batch_size: {batch_size}")
 
@@ -773,51 +767,42 @@ class ImageUnifiedRollout(BaseRollout):
         return data_proto
 
     def _prepare_cfg_embeds(self, data_proto: DataProto) -> Tuple[torch.Tensor, torch.Tensor]:
-        input_ids = data_proto.batch['task1_input_ids']
-        attention_mask = data_proto.batch['task1_attention_mask']
-        input_embeds = data_proto.batch['task1_input_embeds']
+        input_ids = data_proto.batch['task1_input_ids']          # CPU
+        attention_mask = data_proto.batch['task1_attention_mask'] # CPU
+        input_embeds = data_proto.batch['task1_input_embeds']     # GPU
 
         cond_embeds = input_embeds
         uncond_embeds = input_embeds.clone()
 
-        pad_id = torch.tensor(self.processor.pad_id, device=input_ids.device)
+        # pad_id must be on GPU to match the embedding layer weights
+        pad_id = torch.tensor(self.processor.pad_id, device=self.device)
 
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
             pad_embed = self.module.language_model.get_input_embeddings()(pad_id).unsqueeze(0)
-            pad_embed = pad_embed.to(dtype=torch.bfloat16)
 
+        # token search runs on CPU (input_ids is CPU)
         start_marker = torch.tensor([100601], device=input_ids.device) # <|User|>
-        end_marker = torch.tensor([100602], device=input_ids.device) # <|Assistant|>
+        end_marker = torch.tensor([100602], device=input_ids.device)   # <|Assistant|>
 
-        def find_sequence(inp_id, start_marker):
-            len_needle = start_marker.shape[0]
-            for i in range(inp_id.shape[0] - len_needle + 1):
-                if torch.equal(inp_id[i:i+len_needle], start_marker):
-                    return i # Return the starting index of the match
-            return -1 # Return -1 if not found
+        def find_sequence(inp_id, marker):
+            n = marker.shape[0]
+            for i in range(inp_id.shape[0] - n + 1):
+                if torch.equal(inp_id[i:i+n], marker):
+                    return i
+            return -1
 
         for i, row in enumerate(input_ids):
             start_pos = find_sequence(row, start_marker)
             end_pos = find_sequence(row, end_marker)
-            
             if start_pos != -1 and end_pos != -1 and start_pos < end_pos:
-                content_start_index = start_pos
-                content_end_index = end_pos + 2
+                uncond_embeds[i, start_pos:end_pos + 2] = pad_embed
 
-                if content_start_index < content_end_index:
-                    uncond_embeds[i, content_start_index:content_end_index] = pad_embed
-        
         batch_size, seq_len, embed_dim = input_embeds.shape
-        
-        gen_final_cfg_embeds = pad_embed.expand(batch_size * 2, seq_len, embed_dim).clone()
-        gen_final_cfg_attention_mask = torch.zeros((batch_size * 2, seq_len), dtype=torch.long, device=attention_mask.device)
-        
-        gen_final_cfg_embeds[0::2] = cond_embeds
-        gen_final_cfg_embeds[1::2] = uncond_embeds
-        
-        gen_final_cfg_attention_mask[0::2] = attention_mask
-        gen_final_cfg_attention_mask[1::2] = attention_mask 
-            
+        attention_mask_gpu = attention_mask.to(self.device)
+
+        gen_final_cfg_embeds = torch.stack([cond_embeds, uncond_embeds], dim=1).reshape(batch_size * 2, seq_len, embed_dim)
+        gen_final_cfg_attention_mask = attention_mask_gpu.repeat_interleave(2, dim=0)
+
         return gen_final_cfg_embeds, gen_final_cfg_attention_mask
 
     def _decode_image_tokens(self, generated_tokens: torch.Tensor) -> np.ndarray:
@@ -950,11 +935,14 @@ class ImageUnifiedRollout(BaseRollout):
                 max_new_tokens=self.response_length,
                 use_cache=True,
                 do_sample=True,
-                pad_token_id=self.processor.tokenizer.eos_token_id,
+                temperature=self.temperature,
+                top_k=self.txt_top_k,
+                top_p=self.txt_top_p,    
+                pad_token_id=self.processor.tokenizer.pad_token_id
                 eos_token_id=self.processor.tokenizer.eos_token_id,
                 bos_token_id=self.processor.tokenizer.bos_token_id,
                 return_dict_in_generate=True,
-                output_logits=not self.is_validate,
+                output_logits=not self.is_validate, 
             )
 
         gen_sequences = outputs.sequences
@@ -963,7 +951,7 @@ class ImageUnifiedRollout(BaseRollout):
         if self.is_validate:
             return answer, gen_sequences, None
 
-        T = len(outputs.logits) 
+        T = len(outputs.logits)  
         sampled_token_ids = gen_sequences[:, -T:]  # exclude prompt_len
 
         token_logprobs = self.token_logprobs_from_scores(
@@ -974,50 +962,52 @@ class ImageUnifiedRollout(BaseRollout):
 
         return answer, gen_sequences, token_logprobs
 
+    @torch.no_grad()
     def _prepare_regen_cfg_embeds(self, data_proto: DataProto) -> Tuple[torch.Tensor, torch.Tensor]:
-        input_ids = data_proto.batch['task3_input_ids']
-        attention_mask = data_proto.batch['task3_attention_mask']
-        input_embeds = data_proto.batch['task3_input_embeds']
+        input_ids = data_proto.batch["task3_input_ids"]              # [B, L]
+        attention_mask = data_proto.batch["task3_attention_mask"]    # [B, L]
+        input_embeds = data_proto.batch["task3_input_embeds"]        # [B, L, D]
 
+        # move to GPU for generation
+        input_ids = input_ids.to(self.device)
+        attention_mask = attention_mask.to(self.device)
+        input_embeds = input_embeds.to(self.device)
+
+        B, L, D = input_embeds.shape
         cond_embeds = input_embeds
         uncond_embeds = input_embeds.clone()
 
-        pad_id = torch.tensor(self.processor.pad_id, device=input_ids.device)
+        # pad_id must be on GPU to match the embedding layer weights
+        pad_id = torch.tensor(self.processor.pad_id, device=self.device, dtype=torch.long)
 
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
             pad_embed = self.module.language_model.get_input_embeddings()(pad_id).unsqueeze(0)
-            pad_embed = pad_embed.to(dtype=torch.bfloat16)
 
-        start_marker = torch.tensor([100593, 185], device=input_ids.device) # <end_of_image>\n
-        end_marker = torch.tensor([100602], device=input_ids.device) # <|Assistant|>
+        m1 = (input_ids[:, :-1] == 100593)
+        m2 = (input_ids[:, 1:]  == 185)
+        m = m1 & m2
 
-        def find_sequence(inp_id, start_marker):
-            len_needle = start_marker.shape[0]
-            for i in range(inp_id.shape[0] - len_needle + 1):
-                if torch.equal(inp_id[i:i+len_needle], start_marker):
-                    return i # Return the starting index of the match
-            return -1 # Return -1 if not found
+        has_start = m.any(dim=1)
+        start_idx = m.to(torch.long).argmax(dim=1)
+        start_idx = torch.where(has_start, start_idx, torch.full_like(start_idx, -1))
 
-        for i, row in enumerate(input_ids):
-            start_pos = find_sequence(row, start_marker)
-            end_pos = find_sequence(row, end_marker)
-            
-            if start_pos != -1 and end_pos != -1 and start_pos < end_pos:
-                content_start_index = start_pos + 1
-                content_end_index = end_pos + 2
+        e = (input_ids == 100602)
+        has_end = e.any(dim=1)
+        end_idx = e.to(torch.long).argmax(dim=1) 
+        end_idx = torch.where(has_end, end_idx, torch.full_like(end_idx, -1))
 
-                if content_start_index < content_end_index:
-                    uncond_embeds[i, content_start_index:content_end_index] = pad_embed
-        
-        batch_size, seq_len, embed_dim = input_embeds.shape
-        
-        regen_final_cfg_embeds = pad_embed.expand(batch_size * 2, seq_len, embed_dim).clone()
-        regen_final_cfg_attention_mask = torch.zeros((batch_size * 2, seq_len), dtype=torch.long, device=attention_mask.device)
-        
-        regen_final_cfg_embeds[0::2] = cond_embeds
-        regen_final_cfg_embeds[1::2] = uncond_embeds
-        
-        regen_final_cfg_attention_mask[0::2] = attention_mask
-        regen_final_cfg_attention_mask[1::2] = attention_mask 
-            
+        valid = (start_idx >= 0) & (end_idx >= 0) & (start_idx < end_idx)   # [B] bool
+
+        content_start = start_idx + 1
+        content_end_excl = end_idx + 2 
+
+        idx = torch.arange(L, device=input_ids.device).view(1, L)
+        range_mask = (idx >= content_start.view(B, 1)) & (idx < content_end_excl.view(B, 1))
+        range_mask = range_mask & valid.view(B, 1)
+
+        uncond_embeds = torch.where(range_mask.unsqueeze(-1), pad_embed, uncond_embeds)
+
+        regen_final_cfg_embeds = torch.stack([cond_embeds, uncond_embeds], dim=1).reshape(B * 2, L, D)
+        regen_final_cfg_attention_mask = attention_mask.repeat_interleave(2, dim=0)
+
         return regen_final_cfg_embeds, regen_final_cfg_attention_mask

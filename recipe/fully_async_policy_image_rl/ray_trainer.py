@@ -315,6 +315,11 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
         # Merge size (concat multiple val batches for batch generation)
         val_rollout_prompt_size = int(self.config.async_training.get("val_rollout_prompt_size", 1))
 
+        # Task IDs: only compute rewards for these tasks; rollout runs 1..max(task_ids)
+        task_ids = list(self.config.actor_rollout_ref.actor.multi_task.get("task_ids", [1]))
+        max_rollout_task = max(task_ids)
+        rollout_task_ids = list(range(1, max_rollout_task + 1))
+
         # Limit finalize backlog (memory protection)
         max_val_finalize_backlog = self.config.async_training.get("max_val_finalize_backlog_samples", None)
         if max_val_finalize_backlog is None:
@@ -392,8 +397,9 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                 batch_idx_list.append(val_batch_idx)
 
                 if len(batch_list) >= val_rollout_prompt_size:
-                    merged_batch = DataProto.concat(batch_list)
+                    merged_batch = DataProto.concat(batch_list)                
                     merged_gen_batch = self._get_gen_batch(merged_batch)
+                    merged_gen_batch.meta_info["rollout_task_ids"] = rollout_task_ids
                     await prepared_q.put((merged_batch, merged_gen_batch, batch_idx_list))
                     batch_list = []
                     batch_idx_list = []
@@ -401,6 +407,7 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
             if batch_list:
                 merged_batch = DataProto.concat(batch_list)
                 merged_gen_batch = self._get_gen_batch(merged_batch)
+                merged_gen_batch.meta_info["rollout_task_ids"] = rollout_task_ids
                 await prepared_q.put((merged_batch, merged_gen_batch, batch_idx_list))
 
             # Send completion signal
@@ -449,6 +456,9 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                 reward_tasks = []
 
                 def on_task_complete(task_id: int, batch_result: DataProto):
+                    # Only compute rewards for tasks we train on
+                    if int(task_id) not in task_ids:
+                        return
                     # Launch reward task immediately when stage completes
                     reward_task = asyncio.create_task(
                         _compute_val_reward_async(int(task_id), batch_result, reward_tensor_dict, reward_extra_infos),
@@ -543,11 +553,13 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                     data_source_lst.extend(data_source)
 
                     # Save in result batch
-                    for task_id in [1, 2, 3]:
+                    for task_id in task_ids:
+                        if task_id not in reward_tensor_dict:
+                            continue
                         task_reward_tensor = reward_tensor_dict[task_id]
                         result_batch.batch[f"task{task_id}_token_level_scores"] = task_reward_tensor
 
-                        task_reward_extra_info = reward_extra_infos[task_id]
+                        task_reward_extra_info = reward_extra_infos.get(task_id, {})
                         for k, v in task_reward_extra_info.items():
                             if not hasattr(result_batch, "meta_info"):
                                 result_batch.meta_info = {}
@@ -564,12 +576,17 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                     task1_gen_imgs_pil_list = [wandb.Image(gen_img, caption=prompts[i]) for i, gen_img in enumerate(task1_gen_imgs_pil_list)]
                     sample_task1_gen_imgs.extend(task1_gen_imgs_pil_list)
 
-                    task2_feedback_texts = result_batch.non_tensor_batch['task2_feedback_texts'].tolist()
-                    sample_task2_feedback_texts.extend(task2_feedback_texts)
+                    if 2 in task_ids:
+                        task2_feedback_texts = result_batch.non_tensor_batch.get('task2_feedback_texts', [None] * len(prompts))
+                        if hasattr(task2_feedback_texts, 'tolist'):
+                            task2_feedback_texts = task2_feedback_texts.tolist()
+                        sample_task2_feedback_texts.extend(task2_feedback_texts)
 
-                    task3_regen_imgs_pil_list = result_batch.non_tensor_batch['task3_regen_imgs_pil_list']
-                    task3_regen_imgs_pil_list = [wandb.Image(regen_img, caption=prompts[i]) for i, regen_img in enumerate(task3_regen_imgs_pil_list)]
-                    sample_task3_regen_imgs.extend(task3_regen_imgs_pil_list)
+                    if 3 in task_ids:
+                        task3_regen_imgs_pil_list = result_batch.non_tensor_batch.get('task3_regen_imgs_pil_list')
+                        if task3_regen_imgs_pil_list is not None:
+                            task3_regen_imgs_pil_list = [wandb.Image(regen_img, caption=prompts[i]) for i, regen_img in enumerate(task3_regen_imgs_pil_list)]
+                            sample_task3_regen_imgs.extend(task3_regen_imgs_pil_list)
 
                     # Note: If you skip _log_rollout_data process, need to change keys for dump
                     # # Add all task scores
@@ -579,17 +596,20 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                     #         scores[f"task{tid}_scores"] = batch.batch[key].sum(-1).cpu().tolist()
 
                     # Extend reward scores, infos for each task
-                    for task_id in [1, 2, 3]:
+                    for task_id in task_ids:
+                        if task_id not in reward_tensor_dict:
+                            continue
                         task_reward_tensor = reward_tensor_dict[task_id]
                         task_reward_tensors[task_id].append(task_reward_tensor)
 
-                        all_reward_extra_infos_batches.append(reward_extra_infos[task_id])
+                        extra_info = reward_extra_infos.get(task_id, {})
+                        all_reward_extra_infos_batches.append(extra_info)
 
                         # Compute per-sample scores
                         per_sample_scores = task_reward_tensor.sum(-1).cpu().tolist()
                         batch_scores[f"task{task_id}_scores"] = per_sample_scores
 
-                        for k, v in reward_extra_infos[task_id].items():
+                        for k, v in extra_info.items():
                             batch_reward_extra_infos[k] = v
 
                         if task_id == 1:
@@ -610,13 +630,19 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                         and self.config.trainer.test_freq > 0
                         and (is_last_step or current_v % self.config.trainer.test_freq == 0)
                     ):
+                        feedback_texts_to_dump = None
+                        if 2 in task_ids:
+                            feedback_texts_to_dump = result_batch.non_tensor_batch.get('task2_feedback_texts')
+                            if feedback_texts_to_dump is not None and hasattr(feedback_texts_to_dump, 'tolist'):
+                                feedback_texts_to_dump = feedback_texts_to_dump.tolist()
+                        regen_imgs_to_dump = result_batch.non_tensor_batch.get('task3_regen_imgs_pil_list') if 3 in task_ids else None
                         self._dump_generations(
                             uid=result_batch.non_tensor_batch["uid"].tolist(),
                             prompt_id=result_batch.non_tensor_batch["prompt_id"].tolist(),
                             prompt=result_batch.non_tensor_batch["prompt"].tolist(),
                             gen_imgs_pil_list=result_batch.non_tensor_batch.get('task1_gen_imgs_pil_list'),
-                            feedback_texts=result_batch.non_tensor_batch.get('task2_feedback_texts').tolist(),
-                            regen_imgs_pil_list=result_batch.non_tensor_batch.get('task3_regen_imgs_pil_list'), 
+                            feedback_texts=feedback_texts_to_dump,
+                            regen_imgs_pil_list=regen_imgs_to_dump,
                             gts_imgs=[item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in result_batch],
                             summarizes=[item.non_tensor_batch.get("reward_model", {}).get("summary", None) for item in result_batch],
                             gts_tuples=[item.non_tensor_batch.get("reward_model", {}).get("tuple", None) for item in result_batch],
@@ -646,15 +672,15 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
         await finalize_t
 
         # Prepare validation samples for logging
-        validation_samples = list(zip(
-            sample_prompts,
-            sample_task1_gen_imgs,
-            sample_task2_feedback_texts,
-            sample_task3_regen_imgs,
-            sample_task1_scores,
-            sample_task2_scores,
-            sample_task3_scores
-        ))
+        # validation_samples = list(zip(
+        #     sample_prompts,
+        #     sample_task1_gen_imgs,
+        #     sample_task2_feedback_texts,
+        #     sample_task3_regen_imgs,
+        #     sample_task1_scores,
+        #     sample_task2_scores,
+        #     sample_task3_scores
+        # ))
 
         # Flatten batched reward_extra_infos
         reward_extra_infos_dict = {}
@@ -805,7 +831,8 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                             del gen_baseline_batch, gen_baseline_output
 
                     batch = self._post_generate_batch(batch, gen_batch_output, metrics)
-                    for task_id in [1, 2, 3]:
+                    _task_ids = list(self.config.actor_rollout_ref.actor.multi_task.get("task_ids", [1]))
+                    for task_id in _task_ids:
                         batch.batch["task_id"] = torch.tensor([task_id for _ in range(len(batch))], dtype=int)
                         batch = self._process_batch_common(batch, metrics, timing_raw, local_trigger_step=None, task_id=task_id)
                         # Remove universal keys from batch
@@ -927,11 +954,12 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                 # Compute reward using reward model worker
                 reward_tensor = self.rm_wg.compute_rm_score(batch)
                 # Remove existing response_masks to allow overwriting with modified masks from reward computation
-                for tid in [1, 2, 3]:
+                _task_ids_cfg = list(self.config.actor_rollout_ref.actor.multi_task.get("task_ids", [1]))
+                for tid in _task_ids_cfg:
                     if f"task{tid}_response_mask" in batch.batch:
                         batch.batch.pop(f"task{tid}_response_mask")
                 batch = batch.union(reward_tensor)
-
+        
         with marked_timer("old_log_prob", timing_raw, color="blue"):
 
             def compute_old_log_prob(batch):
@@ -1078,7 +1106,8 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                 "training/epoch": epoch,
             }
         )
-        for task_id in [1, 2, 3]:
+        _task_ids = list(self.config.actor_rollout_ref.actor.multi_task.get("task_ids", [1]))
+        for task_id in _task_ids:
             batch.batch["task_id"] = torch.tensor([task_id for _ in range(len(batch))], dtype=int)
             # collect metrics
             metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))

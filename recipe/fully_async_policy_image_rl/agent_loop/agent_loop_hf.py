@@ -598,8 +598,11 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         
     async def generate_sequences_with_callback_on_server(self, prompts: DataProto, server_index: int, on_task_complete=None) -> DataProto:
 
+        rollout_task_ids_in_meta = prompts.meta_info.get("rollout_task_ids", None)
         task_id_tensor = prompts.batch.get("task_id", None)
-        if task_id_tensor is not None:
+        if rollout_task_ids_in_meta is not None:
+            tasks_to_run = list(rollout_task_ids_in_meta)
+        elif task_id_tensor is not None:
             tasks_to_run = [task_id_tensor.view(-1)[0].item()]
         else:
             tasks_to_run = [1, 2, 3]

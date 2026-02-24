@@ -538,42 +538,30 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             # f.write(f"  - Detector Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task1_detector_response', i)}\n")
             f.write("\n")
 
-            # Task 2
-            f.write(f"💬 [TASK 2] FEEDBACK GENERATION\n")
-            f.write(f"  - Total Score: {self._get_safe_val(scores, 'task2_scores', i)}\n")
-            f.write(f"  - Format Reward: {self._get_safe_val(reward_extra_infos_dict, 'task2_format_reward', i)}\n")
-            f.write(f"  - Part1 Reward (F1 + Consistency): {self._get_safe_val(reward_extra_infos_dict, 'task2_part1_reward', i)}\n")
-            f.write(f"  - Judge Alignment Gate (does not contribute to reward): {self._get_safe_val(reward_extra_infos_dict, 'task2_judge_alignment_reward', i)}\n")
-            f.write(f"  - Feedback Reward: {self._get_safe_val(reward_extra_infos_dict, 'task2_feedback_reward', i)}\n")
-            # f.write(f"  - Comparison Summarize Score: {self._get_safe_val(reward_extra_infos_dict, 'task2_comparison_summarize_score', i)}\n")
-            # f.write(f"  - Comparison Tuple Score: {self._get_safe_val(reward_extra_infos_dict, 'task2_comparison_tuple_score', i)}\n")
-            # f.write(f"  - Hallucination Check Score: {self._get_safe_val(reward_extra_infos_dict, 'task2_hallucination_check_score', i)}\n")
-            # f.write(f"  - Edit Instruction Score: {self._get_safe_val(reward_extra_infos_dict, 'task2_edit_instruction_score', i)}\n")
-            f.write(f"  - Model Feedback:\n{feedback_texts[i] if feedback_texts else 'N/A'}\n")
-            f.write(f"  - Judge Alignment Gate Response (does not contribute to reward): {self._get_safe_response(reward_extra_infos_dict, 'task2_judge_alignment_reward_response', i)}\n")
-            f.write(f"  - Feedback Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task2_feedback_reward_response', i)}\n")
-            # f.write(f"  - Comparison Summarize Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task2_comparison_summarize_response', i)}\n")
-            # f.write(f"  - Comparison Tuple Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task2_comparison_tuple_response', i)}\n")
-            # f.write(f"  - Hallucination Check Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task2_hallucination_check_response', i)}\n")
-            # f.write(f"  - Edit Instruction Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task2_edit_instruction_response', i)}\n")
-            f.write("\n")
+            _report_task_ids = list(self.config.actor_rollout_ref.actor.multi_task.get("task_ids", [1]))
 
-            # Task 3
-            f.write(f"🔄 [TASK 3] RE-GENERATION\n")
-            f.write(f"  - Total Score: {self._get_safe_val(scores, 'task3_scores', i)}\n")
-            f.write(f"  - VQA Reward: {self._get_safe_val(reward_extra_infos_dict, 'task3_vqa_reward', i)}\n")
-            f.write(f"  - Edit Instruction Following Reward: {self._get_safe_val(reward_extra_infos_dict, 'task3_edit_reward', i)}\n")
-            # f.write(f"  - Detector Reward: {self._get_safe_val(reward_extra_infos_dict, 'task3_detector_reward', i)}\n")
-            # f.write(f"  - VQA+Detector Bonus: {self._get_safe_val(reward_extra_infos_dict, 'task3_vqa_detector_bonus', i)}\n")
-            # f.write(f"  - Regeneration Followed by Editing Reward: {self._get_safe_val(reward_extra_infos_dict, 'task3_regeneration_followed_by_editing_reward', i)}\n")
-            f.write(f"  - Path: {paths['regen']}\n")
-            f.write(f"  - VQA Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task3_vqa_reward_response', i)}\n")
-            f.write(f"  - Edit Instruction Following Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task3_edit_reward_response', i)}\n")
-            # f.write(f"  - Detector Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task3_detector_response', i)}\n")
-            # f.write(f"  - Regeneration Followed by Editing Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task3_regeneration_followed_by_editing_response', i)}\n")
-            f.write("\n")
+            if 2 in _report_task_ids:
+                f.write(f"💬 [TASK 2] FEEDBACK GENERATION\n")
+                f.write(f"  - Total Score: {self._get_safe_val(scores, 'task2_scores', i)}\n")
+                f.write(f"  - Format Reward: {self._get_safe_val(reward_extra_infos_dict, 'task2_format_reward', i)}\n")
+                f.write(f"  - Part1 Reward (F1 + Consistency): {self._get_safe_val(reward_extra_infos_dict, 'task2_part1_reward', i)}\n")
+                f.write(f"  - Judge Alignment Gate (does not contribute to reward): {self._get_safe_val(reward_extra_infos_dict, 'task2_judge_alignment_reward', i)}\n")
+                f.write(f"  - Feedback Reward: {self._get_safe_val(reward_extra_infos_dict, 'task2_feedback_reward', i)}\n")
+                f.write(f"  - Model Feedback:\n{feedback_texts[i] if feedback_texts else 'N/A'}\n")
+                f.write(f"  - Judge Alignment Gate Response (does not contribute to reward): {self._get_safe_response(reward_extra_infos_dict, 'task2_judge_alignment_reward_response', i)}\n")
+                f.write(f"  - Feedback Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task2_feedback_reward_response', i)}\n")
+                f.write("\n")
 
-            # Ground Truth
+            if 3 in _report_task_ids:
+                f.write(f"🔄 [TASK 3] RE-GENERATION\n")
+                f.write(f"  - Total Score: {self._get_safe_val(scores, 'task3_scores', i)}\n")
+                f.write(f"  - VQA Reward: {self._get_safe_val(reward_extra_infos_dict, 'task3_vqa_reward', i)}\n")
+                f.write(f"  - Edit Instruction Following Reward: {self._get_safe_val(reward_extra_infos_dict, 'task3_edit_reward', i)}\n")
+                f.write(f"  - Path: {paths['regen']}\n")
+                f.write(f"  - VQA Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task3_vqa_reward_response', i)}\n")
+                f.write(f"  - Edit Instruction Following Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task3_edit_reward_response', i)}\n")
+                f.write("\n")
+
             f.write(f"📚 [GROUND TRUTH REFERENCE]\n")
             f.write(f"  - GT Image:\n{paths['gt']}\n")
             f.write(f"  - Summary:\n{summarizes[i] if summarizes else 'N/A'}\n")
@@ -595,9 +583,14 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             prompt_id = batch.non_tensor_batch['prompt_id'].tolist()
             uid = batch.non_tensor_batch["uid"].tolist()
             prompt = batch.non_tensor_batch['prompt'].tolist()
-            gen_imgs_pil_list = batch.non_tensor_batch['task1_gen_imgs_pil_list']
-            feedback_texts = batch.non_tensor_batch['task2_feedback_texts'].tolist()
-            regen_imgs_pil_list = batch.non_tensor_batch['task3_regen_imgs_pil_list']
+            task_ids = list(self.config.actor_rollout_ref.actor.multi_task.get("task_ids", [1]))
+            gen_imgs_pil_list = batch.non_tensor_batch.get('task1_gen_imgs_pil_list')
+            feedback_texts = None
+            if 2 in task_ids:
+                fb = batch.non_tensor_batch.get('task2_feedback_texts')
+                if fb is not None:
+                    feedback_texts = fb.tolist() if hasattr(fb, 'tolist') else list(fb)
+            regen_imgs_pil_list = batch.non_tensor_batch.get('task3_regen_imgs_pil_list') if 3 in task_ids else None
             gts_imgs = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
             summarizes = [item.non_tensor_batch.get("reward_model", {}).get("summary", None) for item in batch]
             gts_tuples = [item.non_tensor_batch.get("reward_model", {}).get("tuple", None) for item in batch]
@@ -611,7 +604,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
 
             scores = {}
             # Add all task scores
-            for tid in [1, 2, 3]:
+            for tid in task_ids:
                 key = f"task{tid}_token_level_scores"
                 if key in batch.batch:
                     scores[f"task{tid}_scores"] = batch.batch[key].sum(-1).cpu().tolist()
@@ -665,6 +658,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
 
     def _validate(self):
+        task_ids = list(self.config.actor_rollout_ref.actor.multi_task.get("task_ids", [1]))
         # task reward tensors collection
         task_reward_tensors = {1: [], 2: [], 3: []}
         data_source_lst = []
@@ -709,19 +703,24 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             task1_gen_imgs_pil_list = [wandb.Image(gen_img, caption=prompts[i]) for i, gen_img in enumerate(task1_gen_imgs_pil_list)]
             sample_task1_gen_imgs.extend(task1_gen_imgs_pil_list)
 
-            task2_feedback_texts = test_output_gen_batch.non_tensor_batch['task2_feedback_texts'].tolist()
-            sample_task2_feedback_texts.extend(task2_feedback_texts)
+            if 2 in task_ids:
+                task2_feedback_texts = test_output_gen_batch.non_tensor_batch.get('task2_feedback_texts', [None] * len(prompts))
+                if hasattr(task2_feedback_texts, 'tolist'):
+                    task2_feedback_texts = task2_feedback_texts.tolist()
+                sample_task2_feedback_texts.extend(task2_feedback_texts)
 
-            task3_regen_imgs_pil_list = test_output_gen_batch.non_tensor_batch['task3_regen_imgs_pil_list']
-            task3_regen_imgs_pil_list = [wandb.Image(regen_img, caption=prompts[i]) for i, regen_img in enumerate(task3_regen_imgs_pil_list)]
-            sample_task3_regen_imgs.extend(task3_regen_imgs_pil_list)
+            if 3 in task_ids:
+                task3_regen_imgs_pil_list = test_output_gen_batch.non_tensor_batch.get('task3_regen_imgs_pil_list')
+                if task3_regen_imgs_pil_list is not None:
+                    task3_regen_imgs_pil_list = [wandb.Image(regen_img, caption=prompts[i]) for i, regen_img in enumerate(task3_regen_imgs_pil_list)]
+                    sample_task3_regen_imgs.extend(task3_regen_imgs_pil_list)
 
             if self.config.reward_model.enable and not self.config.reward_model.paired:
                 reward_tensor = self.rm_wg.compute_rm_score(test_output_gen_batch)
                 test_output_gen_batch = test_output_gen_batch.union(reward_tensor)
 
             # evaluate using reward_function for each task
-            for task_id in [1, 2, 3]:
+            for task_id in task_ids:
                 task_reward_dict = self.val_reward_fn(test_output_gen_batch, eval=True, task_id=task_id, return_dict=True)
                 task_reward_tensor = task_reward_dict[f"task{task_id}_reward_tensor"]
                 task_reward_tensors[task_id].append(task_reward_tensor)
@@ -741,13 +740,19 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                 else:
                     sample_task3_scores.extend(per_sample_scores)
 
+            val_feedback_texts = None
+            if 2 in task_ids:
+                val_feedback_texts = test_output_gen_batch.non_tensor_batch.get('task2_feedback_texts')
+                if val_feedback_texts is not None and hasattr(val_feedback_texts, 'tolist'):
+                    val_feedback_texts = val_feedback_texts.tolist()
+            val_regen_imgs = test_output_gen_batch.non_tensor_batch.get('task3_regen_imgs_pil_list') if 3 in task_ids else None
             self._dump_generations(
                 uid=test_output_gen_batch.non_tensor_batch["uid"].tolist(),
                 prompt_id=test_output_gen_batch.non_tensor_batch["prompt_id"].tolist(),
                 prompt=test_output_gen_batch.non_tensor_batch["prompt"].tolist(),
                 gen_imgs_pil_list=test_output_gen_batch.non_tensor_batch.get('task1_gen_imgs_pil_list'),
-                feedback_texts=test_output_gen_batch.non_tensor_batch.get('task2_feedback_texts'),
-                regen_imgs_pil_list=test_output_gen_batch.non_tensor_batch.get('task3_regen_imgs_pil_list'), 
+                feedback_texts=val_feedback_texts,
+                regen_imgs_pil_list=val_regen_imgs,
                 gts_imgs=[item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_output_gen_batch],
                 summarizes=[item.non_tensor_batch.get("reward_model", {}).get("summary", None) for item in test_output_gen_batch],
                 gts_tuples=[item.non_tensor_batch.get("reward_model", {}).get("tuple", None) for item in test_output_gen_batch],
@@ -787,7 +792,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
 
         # task metrics computation
         metric_dict = {}
-        for task_id in [1, 2, 3]:
+        for task_id in task_ids:
             reward_tensor = torch.cat(task_reward_tensors[task_id], dim=0).sum(-1).cpu()
 
             # evaluate test_score based on data source
@@ -925,7 +930,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                                                         + batch.batch["task3_attention_mask"].sum(dim=-1) + batch.batch["task3_response_mask"].sum(dim=-1)
 
                     # Process all tasks to prepare data for multi-task training
-                    for task_id in [1, 2, 3]:
+                    for task_id in [1]:
 
                         batch.batch["attention_mask"] = torch.cat([batch.batch[f"task{task_id}_attention_mask"], batch.batch[f"task{task_id}_response_mask"]], dim=1)
 
@@ -1030,6 +1035,8 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor with all tasks together
                         with marked_timer("update_actor", timing_raw, color="red"):
+                            # gen_params (temperature, cfg_weight, txt_top_k, …) are already in
+                            # batch.meta_info from image_unified_rollout.generate_sequences.
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
                             # No task_id set here - actor will process all tasks based on config
                             actor_output = self.actor_rollout_wg.update_actor(batch)

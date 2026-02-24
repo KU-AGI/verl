@@ -234,7 +234,8 @@ class DataParallelImageGenerationActor(BasePPOActor):
         micro_batch: Dict[str, Any],
         temperature: float,
         calculate_entropy: bool = False,
-        task_id: int = 1
+        task_id: int = 1,
+        **kwargs
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Unified forward pass using model's internal processing.
@@ -268,6 +269,12 @@ class DataParallelImageGenerationActor(BasePPOActor):
         output = self.actor_module(
             task_id=task_id,
             batch=micro_batch,
+            cfg_weight=kwargs.get("cfg_weight", None),
+            temperature=temperature,
+            txt_top_k=kwargs.get("txt_top_k", 0),
+            txt_top_p=kwargs.get("txt_top_p", 1.0),
+            img_top_k=kwargs.get("img_top_k", 0),
+            img_top_p=kwargs.get("img_top_p", 1.0),
         )
         
         if local_has_output == 0:
@@ -334,7 +341,13 @@ class DataParallelImageGenerationActor(BasePPOActor):
 
         micro_batch_size = data.meta_info["micro_batch_size"]
         temperature = data.meta_info["temperature"]
+        cfg_weight = data.meta_info["cfg_weight"]
         use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
+
+        txt_top_k = data.meta_info.get("txt_top_k", 0)
+        txt_top_p = data.meta_info.get("txt_top_p", 1.0)
+        img_top_k = data.meta_info.get("img_top_k", 0)
+        img_top_p = data.meta_info.get("img_top_p", 1.0)
 
         task_id = data.batch["task_id"].view(-1)[0].item()
 
@@ -395,7 +408,9 @@ class DataParallelImageGenerationActor(BasePPOActor):
             
             with torch.no_grad():
                 entropy, log_probs = self._forward_micro_batch(
-                    model_inputs, temperature=temperature, calculate_entropy=calculate_entropy, task_id=task_id
+                    model_inputs, temperature=temperature, calculate_entropy=calculate_entropy, task_id=task_id,
+                    cfg_weight=cfg_weight, txt_top_k=txt_top_k, txt_top_p=txt_top_p,
+                    img_top_k=img_top_k, img_top_p=img_top_p,
                 )
             
             need = torch.ones(log_probs.size(0), device=log_probs.device, dtype=torch.bool)
@@ -437,60 +452,51 @@ class DataParallelImageGenerationActor(BasePPOActor):
 
         return log_probs, entropys
 
-    def freeze_param(self):
-        """Freeze and unfreeze parameters for training"""
-        for n, p in self.actor_module.language_model.named_parameters():
-            p.requires_grad = True
+    def _set_train_eval_modes(self):
+        """Set train/eval modes per module.
+
+        requires_grad is set once at model init in image_generation_worker._build_model_optimizer.
+        This method only controls BN/Dropout behaviour via train()/eval().
+        """
         self.actor_module.language_model.train()
-
-        for n, p in self.actor_module.gen_embed.named_parameters():
-            p.requires_grad = False
-        self.actor_module.gen_embed.eval()
-
-        for n, p in self.actor_module.gen_head.named_parameters():
-            p.requires_grad = True
         self.actor_module.gen_head.train()
-
-        for n, p in self.actor_module.gen_aligner.named_parameters():
-            p.requires_grad = True
         self.actor_module.gen_aligner.train()
-
-        for n, p in self.actor_module.aligner.named_parameters():
-            p.requires_grad = True
         self.actor_module.aligner.train()
-
-        for n, p in self.actor_module.vision_model.named_parameters():
-            p.requires_grad = False
+        self.actor_module.gen_embed.eval()
         self.actor_module.vision_model.eval()
-
-        for n, p in self.actor_module.gen_vision_model.named_parameters():
-            p.requires_grad = False
         self.actor_module.gen_vision_model.eval()
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
         """Update policy with multi-task support"""
         self.actor_module.train()
-        self.freeze_param()
+        self._set_train_eval_modes()
         
         temperature = data.meta_info["temperature"]
-        
+        cfg_weight = data.meta_info["cfg_weight"]
+        txt_top_k = data.meta_info.get("txt_top_k", 0)
+        txt_top_p = data.meta_info.get("txt_top_p", 1.0)
+        img_top_k = data.meta_info.get("img_top_k", 0)
+        img_top_p = data.meta_info.get("img_top_p", 1.0)
+
         # Multi-task configuration
         multi_task_config = self.config.get("multi_task", {})
-        enable_multi_task = multi_task_config.get("enable", True) # After remove "task_id" in batch
+        enable_multi_task = multi_task_config.get("enable", True)
         task_weights = multi_task_config.get("task_weights", [1.0, 1.0, 1.0])
         task_selection = multi_task_config.get("task_selection", "all")
-        
+
         # Determine which tasks to process
         if enable_multi_task:
-            if task_selection == "all":
+            configured_task_ids = multi_task_config.get("task_ids", None)
+            if configured_task_ids is not None:
+                # Explicit task_ids from config (shell: task_ids='[1]' or '[1,2]' etc.)
+                task_ids = list(configured_task_ids)
+            elif task_selection == "all":
                 task_ids = [1, 2, 3]
             elif task_selection == "weighted_sample":
-                # Sample tasks based on weights
                 import random
                 task_ids = random.choices([1, 2, 3], weights=task_weights, k=1)
             else:
-                # Fallback to single task from batch
                 task_ids = [data.batch["task_id"].view(-1)[0].item()]
         else:
             # Original behavior - single task
@@ -582,7 +588,9 @@ class DataParallelImageGenerationActor(BasePPOActor):
                         calculate_entropy = entropy_coeff != 0
                         entropy, log_prob = self._forward_micro_batch(
                             model_inputs, temperature=temperature,
-                            calculate_entropy=calculate_entropy, task_id=task_id
+                            calculate_entropy=calculate_entropy, task_id=task_id,
+                            cfg_weight=cfg_weight, txt_top_k=txt_top_k, txt_top_p=txt_top_p,
+                            img_top_k=img_top_k, img_top_p=img_top_p,
                         )
 
                         # Handle old_log_prob

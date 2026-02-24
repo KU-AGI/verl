@@ -764,10 +764,20 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 (batch_size,), used_version, dtype=np.int64
             )
 
+            # Determine which tasks to rollout (1 through max(task_ids)) and which to train on
+            task_ids = list(self.config.actor_rollout_ref.actor.multi_task.get("task_ids", [1,2,3]))
+            max_rollout_task = max(task_ids)
+            rollout_task_ids = list(range(1, max_rollout_task + 1))
+            rollout_sample.full_batch.meta_info["rollout_task_ids"] = rollout_task_ids
+            rollout_sample.full_batch.meta_info["param_version_start"] = used_version
+
             sample_reward_tasks = []
             reward_results = {}
 
             def on_task_complete(task_id: int, batch_result: DataProto):
+                # Only compute reward for tasks we actually train on
+                if task_id not in task_ids:
+                    return
                 reward_task = asyncio.create_task(
                     self._compute_single_task_reward(task_id, batch_result, reward_results),
                     name=f"reward_task{task_id}_{rollout_sample.sample_id}",
@@ -795,6 +805,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 self.active_sample_count -= batch_size
             active_released = True
 
+            result_batch.meta_info["param_version_end"] = self.current_param_version
             rollout_sample.full_batch = result_batch
             rollout_sample.agent_loop_output_list = []
 

@@ -257,85 +257,83 @@ def merge_rollout_sample(config, tokenizer, rs: RolloutSample, processor):
     # Step 3: Clear agent_loop_output_list
     rs.agent_loop_output_list = []
 
-    # Step 4: Calculate ramained reward
-    # Extract task 1 VQA judge
-    vqa_judges: list = rs.full_batch.meta_info.get("task1_vqa_reward", [None] * batch_size)
+    # Determine configured task_ids (which tasks to train on)
+    task_ids = list(config.actor_rollout_ref.actor.multi_task.get("task_ids", [1]))
 
-    # Extract task 2 predicted judge
-    formatting_evaluator = FormattingEvaluatorV2()
-    feedback_texts = rs.full_batch.non_tensor_batch.get('task2_feedback_texts', [None] * batch_size)
+    # Step 4: Feedback alignment reward for task2 (only when training on task2)
+    if 2 in task_ids:
+        vqa_judges: list = rs.full_batch.meta_info.get("task1_vqa_reward", [None] * batch_size)
 
-    predicted_judges: list = []
-    for feedback_text in feedback_texts:
-        par1, part2, part3, part4 = formatting_evaluator._split_text_into_parts(feedback_text.strip())
-        predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback = par1, part2, part3, part4
-        predict_decomposed_ans = formatting_evaluator._extract_answer_paragraphs(predicted_answer)
-        predicted_judge = formatting_evaluator.check_all_answers_positive(predict_decomposed_ans)
-        predicted_judges.append(predicted_judge)
+        formatting_evaluator = FormattingEvaluatorV2()
+        feedback_texts = rs.full_batch.non_tensor_batch.get('task2_feedback_texts', [None] * batch_size)
 
-    task2_token_level_scores = rs.full_batch.batch["task2_token_level_scores"]
-    task2_response_mask = rs.full_batch.batch["task2_response_mask"]
+        predicted_judges: list = []
+        for feedback_text in feedback_texts:
+            par1, part2, part3, part4 = formatting_evaluator._split_text_into_parts(feedback_text.strip())
+            predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback = par1, part2, part3, part4
+            predict_decomposed_ans = formatting_evaluator._extract_answer_paragraphs(predicted_answer)
+            predicted_judge = formatting_evaluator.check_all_answers_positive(predict_decomposed_ans)
+            predicted_judges.append(predicted_judge)
 
-    extra_info = rs.full_batch.meta_info
-    extra_info["task2_judge_alignment_reward"] = [-100] * batch_size 
-    extra_info["task2_judge_alignment_reward_response"] = [None] * batch_size
+        task2_token_level_scores = rs.full_batch.batch["task2_token_level_scores"]
+        task2_response_mask = rs.full_batch.batch["task2_response_mask"]
 
-    task2_feedback_reward_score: list = [-100] * batch_size
-    for i, (vqa_judge, predicted_judge) in enumerate(zip(vqa_judges, predicted_judges)):
+        extra_info = rs.full_batch.meta_info
+        extra_info["task2_judge_alignment_reward"] = [-100] * batch_size
+        extra_info["task2_judge_alignment_reward_response"] = [None] * batch_size
 
-        if vqa_judge is None or predicted_judge is None: # Invalid case
-            task2_feedback_reward_score[i] = 0.0
-            extra_info["task2_judge_alignment_reward"][i] = -100
-            extra_info["task2_feedback_reward"][i] = -100
-            extra_info["task2_judge_alignment_reward_response"][i] = "Judge value is None."
-            extra_info["task2_feedback_reward_response"][i] = "Judge value is None."
-            continue
+        task2_feedback_reward_score: list = [-100] * batch_size
+        for i, (vqa_judge, predicted_judge) in enumerate(zip(vqa_judges, predicted_judges)):
 
-        vqa_judge = (vqa_judge == 1)
+            vqa_judge = (vqa_judge == 1)  # if all
 
-        if vqa_judge and predicted_judge:  # VLM yes & Policy yes
-            task2_feedback_reward_score[i] = 1.0
-            extra_info["task2_judge_alignment_reward"][i] = 1.0
-            extra_info["task2_feedback_reward"][i] = 1.0
-            extra_info["task2_judge_alignment_reward_response"][i] = "No need to get feedback reward. Both VQA alignment and predicted answer judge are positive(+)."
-            extra_info["task2_feedback_reward_response"][i] = "No need to get feedback response. Both VQA alignment and predicted answer judge are positive(+)."
-            
-        elif not vqa_judge and not predicted_judge:  # VLM no & Policy no
-            # Get reward from API
-            # feedback_response = await feedback_task
-            feedback_reward = 0.0
-            
-            task2_feedback_reward_response = extra_info["task2_feedback_reward_response"][i]
-            if task2_feedback_reward_response is not None:
-                try:
-                    feedback_success = safe_json_loads(task2_feedback_reward_response)
-                    if feedback_success and feedback_success.get("answer", "").lower() == "yes":
-                        feedback_reward = 1.0
-                except:
-                    feedback_reward = 0.0
-            
-            task2_feedback_reward_score[i] = feedback_reward
-            extra_info["task2_judge_alignment_reward"][i] = 1.0
-            extra_info["task2_judge_alignment_reward_response"][i] = "Both VQA alignment and predicted answer judge are negative(-). Proceed to get feedback reward."
-            extra_info["task2_feedback_reward"][i] = feedback_reward
-            extra_info["task2_feedback_reward_response"][i] = task2_feedback_reward_response if task2_feedback_reward_response is not None else str(task2_feedback_reward_response)
-            
-        else:  # VLM yes & Policy no / VLM no & Policy yes (Mismatch)
-            task2_feedback_reward_score[i] = 0.0
-            extra_info["task2_judge_alignment_reward"][i] = 0.0
-            extra_info["task2_feedback_reward"][i] = 0.0
-            extra_info["task2_judge_alignment_reward_response"][i] = "Fail due to mismatch between VQA alignment and predicted answer judge."
-            extra_info["task2_feedback_reward_response"][i] = "Fail to get feedback reward due to mismatch between VQA alignment and predicted answer judge."
-        
-        # task2_token_level_scores update
-        valid_response_length = task2_response_mask[i].sum().int()
-        task2_token_level_scores[i, valid_response_length - 1] += task2_feedback_reward_score[i]
-    
-    rs.full_batch.batch["task2_token_level_scores"] = task2_token_level_scores
-    rs.full_batch.meta_info.update(extra_info)
+            if vqa_judge is None or predicted_judge is None:  # Invalid case
+                task2_feedback_reward_score[i] = 0.0
+                extra_info["task2_judge_alignment_reward"][i] = -100
+                extra_info["task2_feedback_reward"][i] = -100
+                extra_info["task2_judge_alignment_reward_response"][i] = "Judge value is None."
+                extra_info["task2_feedback_reward_response"][i] = "Judge value is None."
 
-    # Step 5: Mask invalid rewards (-100) for each task
-    for task_id in [1, 2, 3]:  # task1, task2, task3
+            elif vqa_judge and predicted_judge:  # VLM yes & Policy yes
+                task2_feedback_reward_score[i] = 1.0
+                extra_info["task2_judge_alignment_reward"][i] = 1.0
+                extra_info["task2_feedback_reward"][i] = 1.0
+                extra_info["task2_judge_alignment_reward_response"][i] = "No need to get feedback reward. Both VQA alignment and predicted answer judge are positive(+)."
+                extra_info["task2_feedback_reward_response"][i] = "No need to get feedback response. Both VQA alignment and predicted answer judge are positive(+)."
+
+            elif not vqa_judge and not predicted_judge:  # VLM no & Policy no
+                feedback_reward = 0.0
+                task2_feedback_reward_response = extra_info["task2_feedback_reward_response"][i]
+                if task2_feedback_reward_response is not None:
+                    try:
+                        feedback_success = safe_json_loads(task2_feedback_reward_response)
+                        if feedback_success and feedback_success.get("answer", "").lower() == "yes":
+                            feedback_reward = 1.0
+                    except:
+                        feedback_reward = 0.0
+
+                task2_feedback_reward_score[i] = feedback_reward
+                extra_info["task2_judge_alignment_reward"][i] = 1.0
+                extra_info["task2_judge_alignment_reward_response"][i] = "Both VQA alignment and predicted answer judge are negative(-). Proceed to get feedback reward."
+                extra_info["task2_feedback_reward"][i] = feedback_reward
+                extra_info["task2_feedback_reward_response"][i] = task2_feedback_reward_response if task2_feedback_reward_response is not None else str(task2_feedback_reward_response)
+
+            else:  # VLM yes & Policy no / VLM no & Policy yes (Mismatch)
+                task2_feedback_reward_score[i] = 0.0
+                extra_info["task2_judge_alignment_reward"][i] = 0.0
+                extra_info["task2_feedback_reward"][i] = 0.0
+                extra_info["task2_judge_alignment_reward_response"][i] = "Fail due to mismatch between VQA alignment and predicted answer judge."
+                extra_info["task2_feedback_reward_response"][i] = "Fail to get feedback reward due to mismatch between VQA alignment and predicted answer judge."
+
+            # task2_token_level_scores update
+            valid_response_length = task2_response_mask[i].sum().int()
+            task2_token_level_scores[i, valid_response_length - 1] += task2_feedback_reward_score[i]
+
+        rs.full_batch.batch["task2_token_level_scores"] = task2_token_level_scores
+        rs.full_batch.meta_info.update(extra_info)
+
+    # Step 5: Mask invalid rewards (-100) for each configured task
+    for task_id in task_ids:
         scores_key = f"task{task_id}_token_level_scores"
         response_mask_key = f"task{task_id}_response_mask"
 
@@ -357,74 +355,81 @@ def merge_rollout_sample(config, tokenizer, rs: RolloutSample, processor):
     else:
         metric_name = config.algorithm.filter_groups.metric
 
-        # Compute per-task metrics
-        for task_id in [1, 2, 3]:
-            task_scores = rs.full_batch.batch[f"task{task_id}_token_level_scores"]
-            rs.full_batch.non_tensor_batch[f"task{task_id}_{metric_name}"] = (
-                torch.where(task_scores >= 0, task_scores, torch.zeros_like(task_scores))
-                .sum(dim=-1).cpu().numpy()
-            )
-    
-        # Collect metric values per uid for each task
-        task_prompt_uid2metric_vals = {1: defaultdict(list), 2: defaultdict(list), 3: defaultdict(list)}
-        for task_id in [1, 2, 3]:
-            task_metric_key = f"task{task_id}_{metric_name}"
-            for uid, metric_val in zip(
-                rs.full_batch.non_tensor_batch["uid"],
-                rs.full_batch.non_tensor_batch[task_metric_key],
-                strict=True
-            ):
-                task_prompt_uid2metric_vals[task_id][uid].append(metric_val)
-        
-        # Compute std per uid for each task
-        task_prompt_uid2metric_std = {1: {}, 2: {}, 3: {}}
-        for task_id in [1, 2, 3]:
-            for prompt_uid, metric_vals in task_prompt_uid2metric_vals[task_id].items():
-                task_prompt_uid2metric_std[task_id][prompt_uid] = np.std(metric_vals)
-        
-        # Keep uid only if ALL tasks have std > 0 (or single trajectory)
-        all_uids = set(rs.full_batch.non_tensor_batch["uid"])
-        kept_prompt_uids = set()
-        
-        for uid in all_uids:
-            # Skip filtering if only one trajectory (no variance possible)
-            n_trajs = len(task_prompt_uid2metric_vals[1][uid])
-            if n_trajs == 1:
-                kept_prompt_uids.add(uid)
-                continue
-            
-            # Require std > 0 for ALL tasks to keep this prompt
-            all_tasks_have_variance = all(
-                task_prompt_uid2metric_std[task_id].get(uid, 0) > 0
-                for task_id in [1, 2, 3]
-            )
-            if all_tasks_have_variance:
-                kept_prompt_uids.add(uid)
-        
-        # Apply filtering
-        kept_traj_idxs = [
-            idx for idx, uid in enumerate(rs.full_batch.non_tensor_batch["uid"])
-            if uid in kept_prompt_uids
-        ]
-        rs.full_batch = rs.full_batch[kept_traj_idxs]
+    # 1. 모든 task_id에 대해 샘플별 metric 및 -100 여부 계산
+    #    -100 판별: Step 5와 동일하게 token_level_scores에 -100이 하나라도 있으면 해당 샘플은 -100 샘플
+    task_sample_metrics = {}   # task_id -> np.array [batch_size], 샘플별 reward 합산
+    task_sample_is_neg100 = {} # task_id -> np.array [batch_size], True면 -100 샘플
+    for task_id in task_ids:
+        task_scores = rs.full_batch.batch[f"task{task_id}_token_level_scores"]
+        per_sample_metric = (
+            torch.where(task_scores >= 0, task_scores, torch.zeros_like(task_scores))
+            .sum(dim=-1).cpu().numpy()
+        )
+        rs.full_batch.non_tensor_batch[f"task{task_id}_{metric_name}"] = per_sample_metric
+        task_sample_metrics[task_id] = per_sample_metric
+        task_sample_is_neg100[task_id] = (task_scores == -100).any(dim=1).cpu().numpy()
 
-        # Apply detail reward logging
-        kept_meta_info = {}
-        for meta_key, meta_value in rs.full_batch.meta_info.items():
-            if isinstance(meta_value, list):
-                kept_meta_info[meta_key] = [meta_value[idx] for idx in kept_traj_idxs]
-            elif meta_key == "metrics":
-                kept_meta_info[meta_key] = {}
-                for sub_metric_name, sub_metric_value in rs.full_batch.meta_info["metrics"].items():
-                    kept_meta_info[meta_key][sub_metric_name] = [sub_metric_value[idx] for idx in kept_traj_idxs]
-            else:
-                kept_meta_info[meta_key] = meta_value
+    # 2. UID별로 각 task의 metric 값과 -100 여부 수집
+    uids = rs.full_batch.non_tensor_batch["uid"]
+    prompt_uid2task_metrics = defaultdict(lambda: {tid: [] for tid in task_ids})
+    prompt_uid2task_neg100 = defaultdict(lambda: {tid: [] for tid in task_ids})
+    for i, uid in enumerate(uids):
+        for task_id in task_ids:
+            prompt_uid2task_metrics[uid][task_id].append(task_sample_metrics[task_id][i])
+            prompt_uid2task_neg100[uid][task_id].append(bool(task_sample_is_neg100[task_id][i]))
 
-        rs.full_batch.meta_info = kept_meta_info
+    # 3. 모든 task_id에 대해 AND 조건으로 UID 유지 여부 결정
+    #    각 task에 대한 keep 조건:
+    #      - -100이 아닌 샘플(유효 샘플) 수가 2 미만이면 제거
+    #        (전체가 -100: valid_count=0 / 하나만 -100이 아닌 경우: valid_count=1 / 샘플 1개: valid_count≤1)
+    #      - 유효 샘플들의 std가 0이면(변동성 없음) 제거
+    kept_prompt_uids = set()
+    for uid in prompt_uid2task_metrics:
+        keep = True
+        for task_id in task_ids:
+            metrics = prompt_uid2task_metrics[uid][task_id]
+            is_neg100_flags = prompt_uid2task_neg100[uid][task_id]
+            valid_count = sum(not flag for flag in is_neg100_flags)
+
+            # 유효 샘플이 2개 미만이면 제거
+            if valid_count < 2:
+                keep = False
+                break
+
+            # 유효 샘플들의 std가 0이면 제거 (모두 동일 점수, 학습 신호 없음)
+            valid_metrics = [m for m, neg in zip(metrics, is_neg100_flags) if not neg]
+            if np.std(valid_metrics) == 0:
+                keep = False
+                break
+
+        if keep:
+            kept_prompt_uids.add(uid)
+
+    # 4. 필터링 적용 (Kept UIDs에 속하는 인덱스만 추출)
+    kept_traj_idxs = [
+        idx for idx, uid in enumerate(uids)
+        if uid in kept_prompt_uids
+    ]
+
+    # 5. Batch 및 Meta Info 업데이트
+    rs.full_batch = rs.full_batch[kept_traj_idxs]
+
+    # Meta info 필터링 (기존 로직 유지)
+    kept_meta_info = {}
+    for m_name, m_value in rs.full_batch.meta_info.items():
+        if isinstance(m_value, list):
+            kept_meta_info[m_name] = [m_value[idx] for idx in kept_traj_idxs]
+        elif m_name == "metrics":
+            kept_meta_info[m_name] = {
+                sub_k: [sub_v[idx] for idx in kept_traj_idxs]
+                for sub_k, sub_v in rs.full_batch.meta_info["metrics"].items()
+            }
+        else:
+            kept_meta_info[m_name] = m_value
+
+    rs.full_batch.meta_info = kept_meta_info
 
     return rs
-
-
 def expand_rollout_sample(rs: RolloutSample) -> list[RolloutSample]:
     uids = rs.full_batch.non_tensor_batch['uid']
     original_batch_size = len(uids)
