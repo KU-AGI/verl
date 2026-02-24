@@ -43,16 +43,19 @@ from recipe.image_rl.custom_metric_utils import reduce_metrics # custom metric
 from recipe.image_rl.reward import compute_reward, compute_reward_async
 import asyncio
 
-def log_prob_metrics(metrics):
-    import numpy as np 
+def log_prob_metrics(metrics, task_ids):
+    import numpy as np
 
     log_prob_info = {}
 
-    for task_id in [1, 2, 3]:
+    for task_id in task_ids:
         task_pos_log_prob = f"actor/task{task_id}_pos_log_prob"
         task_neg_log_prob = f"actor/task{task_id}_neg_log_prob"
         task_pos_log_prob_cnt = f"actor/task{task_id}_pos_log_prob_cnt"
         task_neg_log_prob_cnt = f"actor/task{task_id}_neg_log_prob_cnt"
+
+        if task_pos_log_prob not in metrics:
+            continue
 
         pos_log_prob_sum = np.array(metrics.pop(task_pos_log_prob)).sum()
         pos_log_prob_cnt = np.array(metrics.pop(task_pos_log_prob_cnt)).sum()
@@ -63,7 +66,7 @@ def log_prob_metrics(metrics):
         log_prob_info[f"actor/task{task_id}_neg_log_prob_mean"] = neg_log_prob_sum / neg_log_prob_cnt if neg_log_prob_cnt > 0 else 0.0
 
         log_prob_info[f"actor/task{task_id}_log_probs_diff"] = log_prob_info[f"actor/task{task_id}_pos_log_prob_mean"] - log_prob_info[f"actor/task{task_id}_neg_log_prob_mean"]
-    
+
     return log_prob_info
 
 @ray.remote(num_cpus=10)
@@ -342,7 +345,8 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                     if hasattr(batch, 'meta_info') and 'reward' in batch.meta_info:
                         timing_raw['reward'] = batch.meta_info['reward']
 
-                    for task_id in [1, 2, 3]:
+                    task_ids = list(self.config.actor_rollout_ref.actor.multi_task.get("task_ids", [1]))
+                    for task_id in task_ids:
                         batch.batch["task_id"] = torch.tensor([task_id for _ in range(len(batch))], dtype=int)
 
                         batch = self._process_batch_common(
@@ -360,15 +364,17 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
+                            # gen_params (temperature, cfg_weight, txt_top_k, …) are already in
+                            # batch.meta_info from image_unified_rollout.generate_sequences.
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
                             actor_output = self.actor_rollout_wg.update_actor(batch)
-                        log_prob_info = log_prob_metrics(actor_output.meta_info["metrics"])
+                        log_prob_info = log_prob_metrics(actor_output.meta_info["metrics"], task_ids)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(log_prob_info)
                         metrics.update(actor_output_metrics)
 
                     reward_extra_infos_dict: dict[str, list] = {}
-                    for task_id in [1, 2, 3]:
+                    for task_id in task_ids:
                         # Get pre-computed reward_extra_infos_dict from meta_info
                         reward_extra_infos_dict.update({k: v for k, v in batch.meta_info.items()})
 
