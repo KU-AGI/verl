@@ -292,10 +292,15 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     # 2. Compute statistics for all _reward & _score metrics in reward_extra_info (overall)
     for metric_name, metric_values in batch.meta_info.items():
         if metric_name.endswith("_reward") or metric_name.endswith("_score"):
-            if len(metric_values) > 0:
-                metrics[f"critic/{metric_name}/mean"] = np.mean(metric_values)
-                metrics[f"critic/{metric_name}/max"] = np.max(metric_values)
-                metrics[f"critic/{metric_name}/min"] = np.min(metric_values)
+            # Filter out None values
+            none_count = sum(1 for v in metric_values if v is None)
+            if none_count > 0:
+                print(f"[DEBUG] {metric_name}: Found {none_count}/{len(metric_values)} None values")
+            valid_values = [v for v in metric_values if v is not None]
+            if len(valid_values) > 0:
+                metrics[f"critic/{metric_name}/mean"] = np.mean(valid_values)
+                metrics[f"critic/{metric_name}/max"] = np.max(valid_values)
+                metrics[f"critic/{metric_name}/min"] = np.min(valid_values)
     
     # 3. Compute statistics for _reward & _score metrics by data_source
     if "data_source" in batch.non_tensor_batch:
@@ -307,8 +312,11 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
                 data_src2metric_vals = defaultdict(list)
                 for idx, data_source in enumerate(data_sources):
                     if non_aborted_mask[idx] and idx < len(metric_values):
-                        data_src2metric_vals[data_source].append(metric_values[idx])
-                
+                        val = metric_values[idx]
+                        # Filter out None values
+                        if val is not None:
+                            data_src2metric_vals[data_source].append(val)
+
                 # Compute statistics for each data_source
                 for data_source, vals in data_src2metric_vals.items():
                     if len(vals) > 0:

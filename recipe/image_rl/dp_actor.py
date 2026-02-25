@@ -517,10 +517,12 @@ class DataParallelImageGenerationActor(BasePPOActor):
                 task_keys.extend([f"task{task_id}_gen_imgs_pixel_values", 
                                 f"task{task_id}_gen_img_tokens"])
             elif task_id == 2:
-                task_keys.append(f"task{task_id}_feedback_ids")
+                task_keys.extend([f"task{task_id}_feedback_ids",
+                                "task1_gen_imgs_pixel_values"])  # Task 2 needs task1 pixel values
             elif task_id == 3:
                 task_keys.extend([f"task{task_id}_regen_imgs_pixel_values",
-                                f"task{task_id}_regen_img_tokens"])
+                                f"task{task_id}_regen_img_tokens",
+                                "task1_gen_img_tokens"])  # Task 3 needs task1 image tokens
             
             all_select_batch_keys.extend(task_keys)
             

@@ -30,7 +30,7 @@ VLM_BASE_URLS = [
     # "http://10.100.44.4:8006/v1", # sub2
     # "http://10.100.44.4:8007/v1",
     # "http://10.100.44.6:8006/v1",
-    "http://192.169.0.2:8006/v1",
+    # "http://192.169.0.2:8006/v1",
     "http://192.169.0.2:8007/v1",
 ]
 LLM_BASE_URLS = [
@@ -42,8 +42,11 @@ LLM_BASE_URLS = [
 API_KEY = "EMPTY"
 MAX_RETRIES = 3
 BASE_DELAY = 2
-RM_VLM_MODEL_PATH = os.environ.get("RM_VLM_MODEL_PATH", "Qwen/Qwen2.5-VL-7B-Instruct")
-RM_LLM_MODEL_PATH = os.environ.get("RM_LLM_MODEL_PATH", "Qwen/Qwen3-30B-A3B-Instruct-2507")
+# Default model paths (can be overridden via reward_kwargs)
+DEFAULT_RM_VLM_MODEL_PATH = "Qwen/Qwen3-VL-30B-A3B-Instruct"
+DEFAULT_RM_LLM_MODEL_PATH = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+RM_VLM_MODEL_PATH = os.environ.get("RM_VLM_MODEL_PATH", DEFAULT_RM_VLM_MODEL_PATH)
+RM_LLM_MODEL_PATH = os.environ.get("RM_LLM_MODEL_PATH", DEFAULT_RM_LLM_MODEL_PATH)
 
 # Health checking configuration
 HEALTH_CHECK_INTERVAL = 30  # seconds
@@ -392,21 +395,16 @@ def get_messages(*args):
         user_prompt = TASK2_FEEDBACK_GENERATOR_USER_PROMPT_TEMPLATE_NAIVE.format(prompt=prompt, predicted_feedback=predicted_feedback)
         messages = [
             # {"role": "system", "content": system_prompt},
-            {"role": "user", "content": [
-                {"type": "image_url", "image_url": {"url": convert_gen_img_to_base64(gen_img)}},
-                {"type": "text", "text": user_prompt},
-            ]}
+            {"role": "user", "content": content_from_prompt_with_images(user_prompt, [convert_gen_img_to_base64(gen_img)])}
         ]
         model = RM_VLM_MODEL_PATH
     elif task_id == 3:
-        system_prompt = TASK1_TASK3_IMAGE_GENERATOR_SYSTEM_PROMPT_TEMPLATE
-        user_prompt = TASK1_TASK3_IMAGE_GENERATOR_USER_PROMPT_TEMPLATE.format(questions=vqa_question)
+        # system_prompt = TASK1_TASK3_IMAGE_GENERATOR_SYSTEM_PROMPT_TEMPLATE
+        # user_prompt = TASK1_TASK3_IMAGE_GENERATOR_USER_PROMPT_TEMPLATE.format(questions=vqa_question)
+        user_prompt = REASONGEN_R1_TEMPLATE.format(prompt=prompt.replace("A photo of ",""))
         messages = [
             # {"role": "system", "content": system_prompt},
-            {"role": "user", "content": [
-                {"type": "image_url", "image_url": {"url": convert_gen_img_to_base64(regen_img)}},
-                {"type": "text", "text": user_prompt}
-            ]}
+            {"role": "user", "content": content_from_prompt_with_images(user_prompt, [convert_gen_img_to_base64(regen_img)])}
         ]
         model = RM_VLM_MODEL_PATH
     else:
@@ -492,10 +490,12 @@ async def get_response(message_builder_fn, *args):
 
         except Exception as e:
             manager.record_request_result(sid, success=False, error=e)
+            print(f"[REWARD] API call failed (attempt {attempt+1}/{max_attempts}): {type(e).__name__}: {e}")
 
         finally:
             await release_rm_client(sid, is_vlm)
 
+    print(f"[REWARD] All {max_attempts} attempts failed for {message_builder_fn.__name__}, returning None")
     return None
 
 
@@ -515,6 +515,8 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
 
         # Process VQA response
         task1_vqa_reward_score = 0.0
+        if vqa_response is None:
+            print(f"[REWARD] Task {task_id}: vqa_response is None")
         if not isinstance(vqa_response, Exception) and vqa_response is not None:
             try:
                 # task1_idx_to_ans: dict = image_evaluator_parser(vqa_response)
@@ -550,7 +552,7 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
 
         # Rule-based: formatting reward
         task2_format_reward = 1.0 if all(part is not None for part in [predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback]) else 0.0
-        task2_reward_score += task2_format_reward
+        # task2_reward_score += task2_format_reward
         reward_extra_info[f"task{task_id}_format_reward"] = task2_format_reward
 
         # Rule-based: part 1 scoring
@@ -560,7 +562,7 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
 
         part1_reward_dict = formatting_evaluator._calculate_metrics_for_reward(feedback_parsed_tuple, predict_parsed_tuple, predict_decomposed_ans)
         task2_part1_reward = sum(part1_reward_dict.values())
-        task2_reward_score += task2_part1_reward
+        # task2_reward_score += task2_part1_reward
         reward_extra_info[f"task{task_id}_part1_reward"] = task2_part1_reward # +2
 
         # Launch all API requests in parallel
@@ -574,6 +576,8 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
 
         # Process feedback response
         task2_feedback_reward_score = 0.0
+        if feedback_response is None:
+            print(f"[REWARD] Task {task_id}: feedback_response is None")
         if not isinstance(feedback_response, Exception) and feedback_response is not None:
             try:
                 feedback_success = safe_json_loads(feedback_response)
@@ -596,8 +600,8 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
             reward_score = -100
             reward_extra_info[f"task{task_id}_vqa_reward"] = reward_score
             reward_extra_info[f"task{task_id}_vqa_reward_response"] = "No need to get VQA reward."
-            reward_extra_info[f"task{task_id}_edit_reward"] = reward_score
-            reward_extra_info[f"task{task_id}_edit_reward_response"] = "No need to get Edit reward."
+            # reward_extra_info[f"task{task_id}_edit_reward"] = reward_score
+            # reward_extra_info[f"task{task_id}_edit_reward_response"] = "No need to get Edit reward."
 
             return {
                 "score": reward_score,
@@ -608,41 +612,53 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
 
         # Gather results
         vqa_task = asyncio.create_task(get_response(get_messages, *args))
-        edit_task = asyncio.create_task(get_response(get_messsages_task3_edit_instruction_following, *args))
+        # edit_task = asyncio.create_task(get_response(get_messsages_task3_edit_instruction_following, *args))
 
         vqa_response = await vqa_task
 
         # Process VQA response
         task3_vqa_reward_score = 0.0
+        if vqa_response is None:
+            print(f"[REWARD] Task {task_id}: vqa_response is None")
         if not isinstance(vqa_response, Exception) and vqa_response is not None:
-            task3_vqa_idx_to_ans: dict = image_evaluator_parser(vqa_response)
-            task3_vqa_reward_score_sum = sum(task3_vqa_idx_to_ans.values())
-            task3_vqa_ans_count = len(task3_vqa_idx_to_ans)
-            task3_vqa_reward_score = (task3_vqa_reward_score_sum / task3_vqa_ans_count) if task3_vqa_ans_count > 0 else 0.0 # 1.0 if task3_vqa_reward_score_sum == task3_vqa_ans_count else 0.0
-            reward_score += task3_vqa_reward_score
-            reward_extra_info[f"task{task_id}_vqa_reward"] = task3_vqa_reward_score
+            try:
+                # task3_vqa_idx_to_ans: dict = image_evaluator_parser(vqa_response)
+                # task3_vqa_reward_score_sum = sum(task3_vqa_idx_to_ans.values())
+                # task3_vqa_ans_count = len(task3_vqa_idx_to_ans)
+                # task3_vqa_reward_score = (task3_vqa_reward_score_sum / task3_vqa_ans_count) if task3_vqa_ans_count > 0 else 0.0 # 1.0 if task3_vqa_reward_score_sum == task3_vqa_ans_count else 0.0
+                # ==================== Reasongen_R1 ====================
+                task3_vqa_reward_score = extract_boxed_content(vqa_response)
+                if task3_vqa_reward_score.startswith("{"): task3_vqa_reward_score.replace("{", "")
+                if task3_vqa_reward_score.endswith("}"): task3_vqa_reward_score.replace("}", "")
+                task3_vqa_reward_score = int(task3_vqa_reward_score)
+                reward_score += task3_vqa_reward_score
+                reward_extra_info[f"task{task_id}_vqa_reward"] = task3_vqa_reward_score
+            except Exception as e:
+                task3_vqa_reward_score = 0.0
+                reward_score += 0.0
+                reward_extra_info[f"task{task_id}_vqa_reward"] = 0.0
         else:
             reward_score += 0.0
             reward_extra_info[f"task{task_id}_vqa_reward"] = 0.0
         
         reward_extra_info[f"task{task_id}_vqa_reward_response"] = vqa_response if not isinstance(vqa_response, Exception) else str(vqa_response)
 
-        edit_response = await edit_task
+        # edit_response = await edit_task
 
         # Process Edit response
-        task3_edit_reward_score = 0.0
-        if not isinstance(edit_response, Exception) and edit_response is not None:
-            task3_edit_idx_to_ans: dict = image_evaluator_parser(edit_response)
-            task3_edit_reward_score_sum = sum(task3_edit_idx_to_ans.values())
-            task3_edit_ans_count = len(task3_edit_idx_to_ans)
-            task3_edit_reward_score = 1.0 if task3_edit_reward_score_sum == task3_edit_ans_count else 0.0
-            reward_score += task3_edit_reward_score
-            reward_extra_info[f"task{task_id}_edit_reward"] = task3_edit_reward_score
-        else:
-            reward_score += 0.0
-            reward_extra_info[f"task{task_id}_edit_reward"] = 0.0
+        # task3_edit_reward_score = 0.0
+        # if not isinstance(edit_response, Exception) and edit_response is not None:
+        #     task3_edit_idx_to_ans: dict = image_evaluator_parser(edit_response)
+        #     task3_edit_reward_score_sum = sum(task3_edit_idx_to_ans.values())
+        #     task3_edit_ans_count = len(task3_edit_idx_to_ans)
+        #     task3_edit_reward_score = 1.0 if task3_edit_reward_score_sum == task3_edit_ans_count else 0.0
+        #     reward_score += task3_edit_reward_score
+        #     reward_extra_info[f"task{task_id}_edit_reward"] = task3_edit_reward_score
+        # else:
+        #     reward_score += 0.0
+        #     reward_extra_info[f"task{task_id}_edit_reward"] = 0.0
         
-        reward_extra_info[f"task{task_id}_edit_reward_response"] = edit_response if not isinstance(edit_response, Exception) else str(edit_response)
+        # reward_extra_info[f"task{task_id}_edit_reward_response"] = edit_response if not isinstance(edit_response, Exception) else str(edit_response)
 
     return {
         "score": reward_score,
@@ -772,20 +788,34 @@ async def compute_score_batch_async(prompts, gen_imgs, feedback_texts, regen_img
     # Wait for all tasks to complete
     results = [None] * n
     completed_tasks = await asyncio.gather(*tasks, return_exceptions=True)
-    
+
+    none_indices = []
     for result in completed_tasks:
         if isinstance(result, Exception):
-            print(f"Task failed with exception: {result}")
+            print(f"[REWARD] Task failed with exception: {result}")
         else:
             idx, res = result
             results[idx] = res
+            if res is None:
+                none_indices.append(idx)
+
+    # Log None results
+    if none_indices:
+        print(f"[REWARD] Warning: {len(none_indices)}/{n} results are None at indices: {none_indices}")
 
     return results
 
 
 # Make this async to work with the async reward loop
-async def compute_score_batch(prompts, gen_imgs, feedback_texts, regen_imgs, ground_truth_imgs, summarizes, feedback_tuples, vqa_questions, extra_infos, task_ids):
+async def compute_score_batch(prompts, gen_imgs, feedback_texts, regen_imgs, ground_truth_imgs, summarizes, feedback_tuples, vqa_questions, extra_infos, task_ids, **kwargs):
     """Async batch processing - directly calls the async implementation"""
+    # Update model paths from kwargs if provided
+    global RM_VLM_MODEL_PATH, RM_LLM_MODEL_PATH
+    if 'rm_vlm_model_path' in kwargs:
+        RM_VLM_MODEL_PATH = kwargs['rm_vlm_model_path']
+    if 'rm_llm_model_path' in kwargs:
+        RM_LLM_MODEL_PATH = kwargs['rm_llm_model_path']
+
     return await compute_score_batch_async(prompts, gen_imgs, feedback_texts, regen_imgs, ground_truth_imgs, summarizes, feedback_tuples, vqa_questions, extra_infos, task_ids)
 
 
@@ -836,8 +866,15 @@ def safe_json_loads(text):
 
 
 # Make this async to work with the async reward loop
-async def compute_score_batch_with_postprocess(prompts, gen_imgs, feedback_texts, regen_imgs, ground_truth_imgs, summarizes, feedback_tuples, vqa_questions, extra_infos, task_ids):
+async def compute_score_batch_with_postprocess(prompts, gen_imgs, feedback_texts, regen_imgs, ground_truth_imgs, summarizes, feedback_tuples, vqa_questions, extra_infos, task_ids, **kwargs):
     """Async batch processing - directly calls the async implementation"""
+    # Update model paths from kwargs if provided
+    global RM_VLM_MODEL_PATH, RM_LLM_MODEL_PATH
+    if 'rm_vlm_model_path' in kwargs:
+        RM_VLM_MODEL_PATH = kwargs['rm_vlm_model_path']
+    if 'rm_llm_model_path' in kwargs:
+        RM_LLM_MODEL_PATH = kwargs['rm_llm_model_path']
+
     # First, compute all scores
     results = await compute_score_batch_async(
         prompts, gen_imgs, feedback_texts, regen_imgs, ground_truth_imgs, summarizes, feedback_tuples, vqa_questions, extra_infos, task_ids

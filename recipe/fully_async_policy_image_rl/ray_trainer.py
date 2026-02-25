@@ -443,6 +443,9 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                     print(f"[Rollouter][RewardTask{task_id}] ERROR: {e}")
                     import traceback
                     traceback.print_exc()
+                    # Set default values on error to prevent None propagation
+                    reward_tensor_dict[task_id] = torch.zeros((1, 1))
+                    reward_extra_infos[task_id] = {}
 
 
         async def _val_generate(test_batch: DataProto, test_gen_batch: DataProto, server_index: int, budget_n: int, val_batch_idx_list):

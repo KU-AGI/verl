@@ -502,7 +502,10 @@ class ImageUnifiedRollout(BaseRollout):
 
         # embedding
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-            input_embeds = self.moduleㄴ.language_model.get_input_embeddings()(input_ids)
+            input_embeds = self.module.language_model.get_input_embeddings()(input_ids)
+
+        # Store input_embeds for CFG preparation
+        data_proto.batch["task1_input_embeds"] = input_embeds.cpu()
 
         gen_final_cfg_embeds, gen_final_cfg_attention_mask = self._prepare_cfg_embeds(data_proto)
         generated_tokens, generated_logprobs = self.generate_img(gen_final_cfg_embeds, gen_final_cfg_attention_mask)
@@ -769,7 +772,12 @@ class ImageUnifiedRollout(BaseRollout):
     def _prepare_cfg_embeds(self, data_proto: DataProto) -> Tuple[torch.Tensor, torch.Tensor]:
         input_ids = data_proto.batch['task1_input_ids']          # CPU
         attention_mask = data_proto.batch['task1_attention_mask'] # CPU
-        input_embeds = data_proto.batch['task1_input_embeds']     # GPU
+        input_embeds = data_proto.batch['task1_input_embeds']     # CPU
+
+        # move to GPU for CFG processing
+        input_ids = input_ids.to(self.device)
+        attention_mask = attention_mask.to(self.device)
+        input_embeds = input_embeds.to(self.device)
 
         cond_embeds = input_embeds
         uncond_embeds = input_embeds.clone()
@@ -798,10 +806,9 @@ class ImageUnifiedRollout(BaseRollout):
                 uncond_embeds[i, start_pos:end_pos + 2] = pad_embed
 
         batch_size, seq_len, embed_dim = input_embeds.shape
-        attention_mask_gpu = attention_mask.to(self.device)
 
         gen_final_cfg_embeds = torch.stack([cond_embeds, uncond_embeds], dim=1).reshape(batch_size * 2, seq_len, embed_dim)
-        gen_final_cfg_attention_mask = attention_mask_gpu.repeat_interleave(2, dim=0)
+        gen_final_cfg_attention_mask = attention_mask.repeat_interleave(2, dim=0)
 
         return gen_final_cfg_embeds, gen_final_cfg_attention_mask
 
@@ -938,7 +945,7 @@ class ImageUnifiedRollout(BaseRollout):
                 temperature=self.temperature,
                 top_k=self.txt_top_k,
                 top_p=self.txt_top_p,    
-                pad_token_id=self.processor.tokenizer.pad_token_id
+                pad_token_id=self.processor.tokenizer.pad_token_id,
                 eos_token_id=self.processor.tokenizer.eos_token_id,
                 bos_token_id=self.processor.tokenizer.bos_token_id,
                 return_dict_in_generate=True,
