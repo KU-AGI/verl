@@ -74,7 +74,6 @@ from verl.workers.reward_manager.abstract import AbstractRewardManager
 
 from recipe.image_rl.reward import compute_reward, compute_reward_async
 from recipe.image_rl.tracking import ValidationGenerationsLogger
-from recipe.image_rl.utils import FormattingEvaluator
 
 @dataclass
 class ResourcePoolManager:
@@ -540,18 +539,30 @@ class RayImageGenerationTrainer(RayPPOTrainer):
 
             _report_task_ids = list(self.config.actor_rollout_ref.actor.multi_task.get("task_ids", [1]))
 
-            if 2 in _report_task_ids:
+            # Log Task 2 if feedback_texts exist (even if task_id != 2)
+            if feedback_texts and i < len(feedback_texts) and feedback_texts[i] is not None:
                 f.write(f"💬 [TASK 2] FEEDBACK GENERATION\n")
                 f.write(f"  - Total Score: {self._get_safe_val(scores, 'task2_scores', i)}\n")
-                f.write(f"  - Format Reward: {self._get_safe_val(reward_extra_infos_dict, 'task2_format_reward', i)}\n")
-                f.write(f"  - Part1 Reward (F1 + Consistency): {self._get_safe_val(reward_extra_infos_dict, 'task2_part1_reward', i)}\n")
-                f.write(f"  - Judge Alignment Gate (does not contribute to reward): {self._get_safe_val(reward_extra_infos_dict, 'task2_judge_alignment_reward', i)}\n")
-                f.write(f"  - Feedback Reward: {self._get_safe_val(reward_extra_infos_dict, 'task2_feedback_reward', i)}\n")
-                f.write(f"  - Model Feedback:\n{feedback_texts[i] if feedback_texts else 'N/A'}\n")
-                f.write(f"  - Judge Alignment Gate Response (does not contribute to reward): {self._get_safe_response(reward_extra_infos_dict, 'task2_judge_alignment_reward_response', i)}\n")
-                f.write(f"  - Feedback Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task2_feedback_reward_response', i)}\n")
+                f.write(f"  - Format Reward (rule-based) (add score): {self._get_safe_val(reward_extra_infos_dict, 'task2_rule_based_format_reward', i)}\n")
+                f.write(f"  - Decompose Reward (rule-based) (add score): {self._get_safe_val(reward_extra_infos_dict, 'task2_rule_based_decompose_reward', i)}\n")
+                f.write(f"  - Tuple Format OK (gating decompose): {self._get_safe_val(reward_extra_infos_dict, 'part2_internal_consistency_ok', i)}\n")
+                f.write(f"  - Tuple Format OK (gating s2): {self._get_safe_val(reward_extra_infos_dict, 'task2_tuple_format_ok', i)}\n")
+                f.write(f"  - VQA Format OK (gating s3): {self._get_safe_val(reward_extra_infos_dict, 'task2_vqa_format_ok', i)}\n")
+                f.write(f"  - Feedback Format OK (rule-based) (gating s4): {self._get_safe_val(reward_extra_infos_dict, 'task2_rule_based_feedback_format_ok', i)}\n")
+                f.write(f"  - No Feedback Needed (rule-based) (gating s4): {self._get_safe_val(reward_extra_infos_dict, 'task2_no_feedback_needed', i)}\n")
+                f.write(f"  - Stage1 Prompt→Summary Reward: {self._get_safe_val(reward_extra_infos_dict, 'task2_prompt_to_summary_reward', i)}\n")
+                f.write(f"  - Stage2 Summary→Tuple Reward: {self._get_safe_val(reward_extra_infos_dict, 'task2_summary_to_tuple_reward', i)}\n")
+                f.write(f"  - Stage3 Tuple→VQA Reward: {self._get_safe_val(reward_extra_infos_dict, 'task2_tuple_to_vqa_reward', i)}\n")
+                f.write(f"  - Stage4 VQA→Feedback Reward: {self._get_safe_val(reward_extra_infos_dict, 'task2_vqa_to_feedback_reward', i)}\n")
+                f.write(f"  - Total VLM Reward: {self._get_safe_val(reward_extra_infos_dict, 'task2_vlm_reward', i)}\n")
+                f.write(f"  - Model Feedback:\n{feedback_texts[i]}\n")
+                f.write(f"  - Stage1 Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task2_prompt_to_summary_response', i)}\n")
+                f.write(f"  - Stage2 Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task2_summary_to_tuple_response', i)}\n")
+                f.write(f"  - Stage3 Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task2_tuple_to_vqa_response', i)}\n")
+                f.write(f"  - Stage4 Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task2_vqa_to_feedback_response', i)}\n")
                 f.write("\n")
 
+            # Log Task 3 if regen images exist (even if task_id != 3)
             if 3 in _report_task_ids:
                 f.write(f"🔄 [TASK 3] RE-GENERATION\n")
                 f.write(f"  - Total Score: {self._get_safe_val(scores, 'task3_scores', i)}\n")
@@ -586,10 +597,9 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             task_ids = list(self.config.actor_rollout_ref.actor.multi_task.get("task_ids", [1]))
             gen_imgs_pil_list = batch.non_tensor_batch.get('task1_gen_imgs_pil_list')
             feedback_texts = None
-            if 2 in task_ids:
-                fb = batch.non_tensor_batch.get('task2_feedback_texts')
-                if fb is not None:
-                    feedback_texts = fb.tolist() if hasattr(fb, 'tolist') else list(fb)
+            fb = batch.non_tensor_batch.get('task2_feedback_texts')
+            if fb is not None:
+                feedback_texts = fb.tolist() if hasattr(fb, 'tolist') else list(fb)
             regen_imgs_pil_list = batch.non_tensor_batch.get('task3_regen_imgs_pil_list') if 3 in task_ids else None
             gts_imgs = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
             summarizes = [item.non_tensor_batch.get("reward_model", {}).get("summary", None) for item in batch]
@@ -604,7 +614,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
 
             scores = {}
             # Add all task scores
-            for tid in task_ids:
+            for tid in [1, 2, 3]:
                 key = f"task{tid}_token_level_scores"
                 if key in batch.batch:
                     scores[f"task{tid}_scores"] = batch.batch[key].sum(-1).cpu().tolist()
