@@ -20,7 +20,7 @@ from verl.workers.actor import BasePPOActor
 from verl.workers.config import ActorConfig
 
 from recipe.image_rl.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
-from recipe.image_rl.utils import FormattingEvaluator
+from recipe.image_rl.utils import FormattingEvaluatorV2
 import torch.distributed as dist
 
 logger = logging.getLogger(__file__)
@@ -116,7 +116,7 @@ class DataParallelImageGenerationActor(BasePPOActor):
         super().__init__(config)
         self.processor = processor
         self.tokenizer = tokenizer
-        self.formatter = FormattingEvaluator()
+        self.formatter = FormattingEvaluatorV2()
         self.actor_module = actor_module
         self.actor_optimizer = actor_optimizer
         role = "Ref" if actor_optimizer is None else "Actor"

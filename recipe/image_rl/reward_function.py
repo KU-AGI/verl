@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 import time
 from collections import defaultdict
 from verl.utils.reward_score.math_reward import last_boxed_only_string, remove_boxed
-from recipe.image_rl.utils import FormattingEvaluator, FormattingEvaluatorV2
+from recipe.image_rl.utils import FormattingEvaluatorV2
 from recipe.image_rl.prompts import *
 import asyncio
 import threading
@@ -881,8 +881,8 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
         reward_extra_info[f"task{task_id}_format_reward"] = task2_format_reward
 
         # Rule-based: part 1 scoring
-        feedback_parsed_tuple = formatting_evaluator._parse_part1(feedback_tuple) # GT Tuple
-        predict_parsed_tuple = formatting_evaluator._parse_part1(predicted_tuple) # Pred Tuple
+        feedback_parsed_tuple = formatting_evaluator._parse_part2(feedback_tuple) # GT Tuple
+        predict_parsed_tuple = formatting_evaluator._parse_part2(predicted_tuple) # Pred Tuple
         predict_decomposed_ans = formatting_evaluator._extract_answer_paragraphs(predicted_answer)
 
         part1_reward_dict = formatting_evaluator._calculate_metrics_for_reward(feedback_parsed_tuple, predict_parsed_tuple, predict_decomposed_ans)

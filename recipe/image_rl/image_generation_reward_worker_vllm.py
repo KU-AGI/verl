@@ -402,20 +402,20 @@ class ImageGenerationRewardModelWorker(Worker, DistProfilerExtension):
                 reward_extra_info[f"task{task_id}_reward_response"] = "No response"
 
         elif task_id == 2:
-            from recipe.image_rl.utils import FormattingEvaluator
+            from recipe.image_rl.utils import FormattingEvaluatorV2
             
             task2_reward_score = 0.0
             task2_ans_count = 0
             
-            formatting_evaluator = FormattingEvaluator()
+            formatting_evaluator = FormattingEvaluatorV2()
             part1, part2, part3 = formatting_evaluator._split_text_into_parts(feedback_text.strip())
             
             task2_reward_score += 1.0 if all(part is not None for part in [part1, part2, part3]) else 0.0
             task2_ans_count += 1
             
             if feedback_tuple and part1:
-                feedback_parsed_tuple = formatting_evaluator._parse_part1(feedback_tuple)
-                predict_parsed_tuple = formatting_evaluator._parse_part1(part1)
+                feedback_parsed_tuple = formatting_evaluator._parse_part2(feedback_tuple)
+                predict_parsed_tuple = formatting_evaluator._parse_part2(part1)
                 predict_decomposed_ans = formatting_evaluator._extract_answer_paragraphs(part2) if part2 else []
                 
                 part1_reward_dict = formatting_evaluator._calculate_metrics_for_reward(
@@ -489,8 +489,8 @@ class ImageGenerationRewardModelWorker(Worker, DistProfilerExtension):
                 scores.append(score_dict)
                 
         elif task_id == 3:
-            from recipe.image_rl.utils import FormattingEvaluator
-            formatting_evaluator = FormattingEvaluator()
+            from recipe.image_rl.utils import FormattingEvaluatorV2
+            formatting_evaluator = FormattingEvaluatorV2()
             
             prompts_to_generate = []
             valid_indices = []
@@ -595,7 +595,7 @@ class ImageGenerationRewardModelWorker(Worker, DistProfilerExtension):
         mean_reward = sum(valid_rewards) / len(valid_rewards) if valid_rewards else 0.0
         
         if self.rank == 0:
-            print(f"[REWARD] Computed {len(rewards)} rewards, valid={len(valid_rewards)}, mean={mean_reward:.4f}")
+            print(f"[REWARD] Computed {len(rewards)} rewards, {len(valid_rewards)}, mean={mean_reward:.4f}")
 
         return DataProto.from_dict(
             tensors={
