@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 import time
 from collections import defaultdict
 from verl.utils.reward_score.math_reward import last_boxed_only_string, remove_boxed
-from recipe.image_rl.utils import FormattingEvaluator, FormattingEvaluatorV2
+from recipe.image_rl.utils import FormattingEvaluatorV2
 from recipe.image_rl.prompts import *
 import asyncio
 import threading
@@ -433,23 +433,23 @@ def get_messsages_task3_edit_instruction_following(*args): # 5: part 4
 
 async def get_response_with_client(client, messages, model):
     """Get response from a specific client with improved error handling"""
+    extra_body = {
+        "top_k": -1,
+        "min_p": 0.0,
+        "best_of": 1,
+        "repetition_penalty": 1.05,
+    }
+
     response = await client.chat.completions.create(
         model=model,
         messages=messages,
 
-        # 출력 길이
-        max_tokens=1024,
+        max_tokens=16384,
 
-        # ✅ greedy
         temperature=0.0,
         top_p=1.0,
 
-        extra_body={
-            "top_k": -1,
-            "min_p": 0.0,
-            "best_of": 1,
-            "repetition_penalty": 1.05,
-        },
+        extra_body=extra_body,
 
         timeout=300000.0,
     )
@@ -479,10 +479,10 @@ async def get_response(message_builder_fn, *args):
         try:
             response = await get_response_with_client(client, messages, model)
             if not is_meaningful_response(response):
-                # Back off 
+                # Back off
                 manager.record_request_result(sid, success=False,
                                                      error=ValueError("Non-meaningful response"))
-                print(response) # DEBUG
+                # print(f"[REWARD DEBUG] Non-meaningful response from server {sid}: repr={repr(response)}, len={len(response) if response else 0}")
                 continue
             else:
                 manager.record_request_result(sid, success=True)
@@ -556,8 +556,8 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
         reward_extra_info[f"task{task_id}_format_reward"] = task2_format_reward
 
         # Rule-based: part 1 scoring
-        feedback_parsed_tuple = formatting_evaluator._parse_part1(feedback_tuple) # GT Tuple
-        predict_parsed_tuple = formatting_evaluator._parse_part1(predicted_tuple) # Pred Tuple
+        feedback_parsed_tuple = formatting_evaluator._parse_part2(feedback_tuple) # GT Tuple
+        predict_parsed_tuple = formatting_evaluator._parse_part2(predicted_tuple) # Pred Tuple
         predict_decomposed_ans = formatting_evaluator._extract_answer_paragraphs(predicted_answer)
 
         part1_reward_dict = formatting_evaluator._calculate_metrics_for_reward(feedback_parsed_tuple, predict_parsed_tuple, predict_decomposed_ans)
@@ -588,11 +588,11 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
         else:
             task2_feedback_reward_score = 0.0
 
-        # DO NOT record feedback reward in score right now
         reward_extra_info[f"task{task_id}_feedback_reward"] = task2_feedback_reward_score
-        reward_extra_info[f"task{task_id}_feedback_reward_response"] = feedback_response if not isinstance(feedback_response, Exception) else None # for postprocessing
+        reward_extra_info[f"task{task_id}_feedback_reward_response"] = feedback_response if not isinstance(feedback_response, Exception) else None
 
-        reward_score += task2_reward_score # not normalizing
+        # For naive reward, just use feedback_reward as the final score
+        reward_score += task2_feedback_reward_score
 
     elif task_id == 3: # Total score: 2.0
         last = predicted_feedback
@@ -714,39 +714,39 @@ def postprocess_task2_rewards(results: List[Dict], extra_infos: List[Dict], task
         # Get predicted judge
         predict_decomposed_ans = formatting_evaluator._extract_answer_paragraphs(predicted_answer)
         predicted_judge = formatting_evaluator.check_all_answers_positive(predict_decomposed_ans)
-        
-        # Calculate final feedback reward based on judge alignment
-        task2_feedback_reward_score = 0.0
-        
-        if vqa_judge and predicted_judge:
-            # VLM yes & Policy yes -> Direct reward without API
-            task2_feedback_reward_score = 1.0
-            reward_extra_info["task2_judge_alignment_reward"] = 1.0
-            reward_extra_info["task2_judge_alignment_reward_response"] = (
-                "No need to get feedback reward. Both VQA alignment and predicted answer judge are positive(+)."
-            )
-            reward_extra_info["task2_feedback_reward"] = task2_feedback_reward_score
-            
-        elif not vqa_judge and not predicted_judge:
-            # VLM no & Policy no -> Use the API feedback reward already computed
-            task2_feedback_reward_score = reward_extra_info.get("task2_feedback_reward", 0.0)
-            reward_extra_info["task2_judge_alignment_reward"] = 1.0
-            reward_extra_info["task2_judge_alignment_reward_response"] = (
-                "Both VQA alignment and predicted answer judge are negative(-). Using API feedback reward."
-            )
-            reward_extra_info["task2_feedback_reward"] = task2_feedback_reward_score
-            
-        else:
-            # Mismatch case: VLM yes & Policy no / VLM no & Policy yes
-            task2_feedback_reward_score = 0.0
-            reward_extra_info["task2_judge_alignment_reward"] = 0.0
-            reward_extra_info["task2_judge_alignment_reward_response"] = (
-                f"Fail due to mismatch between VQA alignment ({vqa_judge}) and predicted answer judge ({predicted_judge})."
-            )
-            reward_extra_info["task2_feedback_reward"] = 0.0
-        
-        # Update the score with feedback reward
-        result["score"] = current_score + task2_feedback_reward_score
+
+        # # Calculate final feedback reward based on judge alignment
+        # task2_feedback_reward_score = 0.0
+        #
+        # if vqa_judge and predicted_judge:
+        #     # VLM yes & Policy yes -> Direct reward without API
+        #     task2_feedback_reward_score = 1.0
+        #     reward_extra_info["task2_judge_alignment_reward"] = 1.0
+        #     reward_extra_info["task2_judge_alignment_reward_response"] = (
+        #         "No need to get feedback reward. Both VQA alignment and predicted answer judge are positive(+)."
+        #     )
+        #     reward_extra_info["task2_feedback_reward"] = task2_feedback_reward_score
+        #
+        # elif not vqa_judge and not predicted_judge:
+        #     # VLM no & Policy no -> Use the API feedback reward already computed
+        #     task2_feedback_reward_score = reward_extra_info.get("task2_feedback_reward", 0.0)
+        #     reward_extra_info["task2_judge_alignment_reward"] = 1.0
+        #     reward_extra_info["task2_judge_alignment_reward_response"] = (
+        #         "Both VQA alignment and predicted answer judge are negative(-). Using API feedback reward."
+        #     )
+        #     reward_extra_info["task2_feedback_reward"] = task2_feedback_reward_score
+        #
+        # else:
+        #     # Mismatch case: VLM yes & Policy no / VLM no & Policy yes
+        #     task2_feedback_reward_score = 0.0
+        #     reward_extra_info["task2_judge_alignment_reward"] = 0.0
+        #     reward_extra_info["task2_judge_alignment_reward_response"] = (
+        #         f"Fail due to mismatch between VQA alignment ({vqa_judge}) and predicted answer judge ({predicted_judge})."
+        #     )
+        #     reward_extra_info["task2_feedback_reward"] = 0.0
+        #
+        # # Update the score with feedback reward
+        # result["score"] = current_score + task2_feedback_reward_score
         result["reward_extra_info"] = reward_extra_info
         results[idx] = result
     
