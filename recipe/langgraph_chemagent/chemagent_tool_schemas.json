@@ -1,0 +1,438 @@
+{
+  "schemas": {
+    "analyze_overall_molecule_properties": {
+      "type": "function",
+      "function": {
+        "name": "analyze_overall_molecule_properties",
+        "description": "This tool analyzes and extracts a comprehensive suite of molecular properties and ADMET profiles using SMILES input. By processing the input string, the system calculates fundamental physicochemical constants—such as molecular weight, logP, logD, logS, TPSA, HBA, HBD, and fsp3—while identifying structural metrics including heavy atom number, rotatable bonds, formal charge, and ring counts (total and aromatic). Furthermore, the tool provides critical evaluative indices, such as BBBP, HIA, and QED, to deliver a multifaceted characterization of the molecule’s pharmacological and chemical profile.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "mol_smiles_list": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Target molecule smiles list to analyze its molecular properties."
+            }
+          },
+          "required": [
+            "mol_smiles_list"
+          ]
+        }
+      }
+    },
+    "search_wikipedia": {
+      "type": "function",
+      "function": {
+        "name": "search_wikipedia",
+        "description": "Search Wikipedia for general scientific background, historical context, or definitions. Input should be a common name or a concept (e.g., 'Ethanol', 'Haber process'), NOT a SMILES string.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query_text": {
+              "type": "string",
+              "description": "The search query or topic to look up on Wikipedia"
+            }
+          },
+          "required": [
+            "query_text"
+          ]
+        }
+      }
+    },
+    "search_pubchem": {
+      "type": "function",
+      "function": {
+        "name": "search_pubchem",
+        "description": "Retrieve comprehensive chemical data from PubChem using a SMILES string. Use 'search_keyword' to filter for specific sections like 'Toxicity', 'Boiling Point', or 'Safety'.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "mol_smiles": {
+              "type": "string",
+              "description": "The SMILES string of the target molecule."
+            },
+            "search_keyword": {
+              "type": "string",
+              "description": "(Optional) Specific term to filter relevant data sections. Examples: 'solubility', 'LD50', 'storage', 'density'."
+            }
+          },
+          "required": [
+            "mol_smiles",
+            "search_keyword"
+          ]
+        }
+      }
+    },
+    "run_python_code": {
+      "type": "function",
+      "function": {
+        "name": "run_python_code",
+        "description": "A Python shell that can execute python commands. Input should be a valid python command. You can input `!pip install ...` to install packages if needed.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "python_code": {
+              "type": "string",
+              "description": "Python code for the Python shell to execute"
+            }
+          },
+          "required": [
+            "python_code"
+          ]
+        }
+      }
+    },
+    "generate_molecules_by_property_ranges": {
+      "type": "function",
+      "function": {
+        "name": "generate_molecules_by_property_ranges",
+        "description": "Generate a molecule using MolMIM + client-side CMA-ES that best matches multiple ADMET-AI property ranges. The available properties for optimization include nine metrics: HBD, HBA, TPSA, BBBP, Mutag, HIA, QED, logS, and logD. A seed molecule is auto-selected from small set of MOSES db which has closest properties. If feasible molecules exist, returns one at random; otherwise returns the closest-to-feasible molecule.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "property_range_list": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "property": {
+                    "type": "string"
+                  },
+                  "range": {
+                    "type": "object",
+                    "properties": {
+                      "min": {
+                        "type": "number"
+                      },
+                      "max": {
+                        "type": "number"
+                      }
+                    }
+                  }
+                }
+              },
+              "description": "Property ranges to satisfy. Flexible formats supported, e.g. [{'QED':[0.7,0.9]}, {'HBD':[0,1]}] or [{'property':'QED','range':{'min':0.7,'max':0.9}}, ...]."
+            }
+          },
+          "required": [
+            "property_range_list"
+          ]
+        }
+      }
+    },
+    "optimize_molecule_by_prop_ranges": {
+      "type": "function",
+      "function": {
+        "name": "optimize_molecule_by_prop_ranges",
+        "description": "Optimize a molecule using MolMIM + client-side CMA-ES to best match multiple ADMET-AI property ranges. The available properties for optimization include nine metrics: HBD, HBA, TPSA, BBBP, Mutag, HIA, QED, logS, and logD. It is possible that the optimized molecule does not meet every specified constraint.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "seed_smiles": {
+              "type": "string",
+              "description": "Seed molecule SMILES. Optimized molecule will be constrained to be similar to this seed."
+            },
+            "property_range_list": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "property": {
+                    "type": "string"
+                  },
+                  "range": {
+                    "type": "object",
+                    "properties": {
+                      "min": {
+                        "type": "number"
+                      },
+                      "max": {
+                        "type": "number"
+                      }
+                    }
+                  }
+                }
+              },
+              "description": "Property ranges to satisfy. Flexible formats supported, e.g. [{'QED':[0.7,0.9]}, {'HBD':[0,1]}] or [{'property':'QED','range':{'min':0.7,'max':0.9}}, ...]."
+            }
+          },
+          "required": [
+            "seed_smiles",
+            "property_range_list"
+          ]
+        }
+      }
+    },
+    "get_functional_groups": {
+      "type": "function",
+      "function": {
+        "name": "get_functional_groups",
+        "description": "This tool identifies and quantifies key functional groups within a molecule using the RDKit library. By processing a SMILES input, the system matches predefined structural patterns to return a precise inventory of the types and frequencies of the functional groups present.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "mol_smiles": {
+              "type": "string",
+              "description": "Target molecule smiles to find functional groups."
+            }
+          },
+          "required": [
+            "mol_smiles"
+          ]
+        }
+      }
+    },
+    "query_moses_by_fg_counts_prop_ranges": {
+      "type": "function",
+      "function": {
+        "name": "query_moses_by_fg_counts_prop_ranges",
+        "description": "This tool identifies and retrieves molecules from the MOSES database that satisfy specific functional group requirements and physicochemical property constraints. By processing an input list of functional group counts—provided as either discrete integers for exact matches or [min, max] ranges—and a corresponding list of property ranges, the system filters the database to return molecules meeting all defined criteria. For property constraints, the tool specifically supports a predefined set of descriptors: HBD, HBA, TPSA, BBBP, Mutag, HIA, and QED. The tool supports flexible range configurations using None to represent unbounded limits (e.g., [None, 3] for values less than 3) and allows users to bypass either the functional group or property condition by setting the respective input to None.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "functional_group_number_dict": {
+              "type": "object",
+              "description": "List with dictionaries containing functional group names and their counts. Example: [{'ketone': 1, 'halogen': 2}]."
+            },
+            "property_range_dict": {
+              "type": "object",
+              "description": "List with dictionaries containing property names and their [min, max] range. Example: [{'TPSA': [30, 70], 'QED': [0.5, 0.8]}]."
+            }
+          },
+          "required": [
+            "functional_group_number_dict",
+            "property_range_dict"
+          ]
+        }
+      }
+    },
+    "convert_chemical_name_to_smiles": {
+      "type": "function",
+      "function": {
+        "name": "convert_chemical_name_to_smiles",
+        "description": "Convert a common chemical name (e.g., aspirin) to its SMILES representation.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "mol_name": {
+              "type": "string",
+              "description": "Target molecule name"
+            }
+          },
+          "required": [
+            "mol_name"
+          ]
+        }
+      }
+    },
+    "convert_iupac_to_smiles": {
+      "type": "function",
+      "function": {
+        "name": "convert_iupac_to_smiles",
+        "description": "Convert an IUPAC name of a molecule or compound into its SMILES representation. Use this tool when you need to translate systematic chemical names to structural strings.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "mol_iupac": {
+              "type": "string",
+              "description": "Target molecule IUPAC name"
+            }
+          },
+          "required": [
+            "mol_iupac"
+          ]
+        }
+      }
+    },
+    "convert_selfies_to_smiles": {
+      "type": "function",
+      "function": {
+        "name": "convert_selfies_to_smiles",
+        "description": "Convert a SELFIES representation of a molecule into its SMILES representation.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "mol_selfies": {
+              "type": "string",
+              "description": "Target molecule SELFIES string"
+            }
+          },
+          "required": [
+            "mol_selfies"
+          ]
+        }
+      }
+    },
+    "generate_molecule_with_fragments": {
+      "type": "function",
+      "function": {
+        "name": "generate_molecule_with_fragments",
+        "description": "Generate a simple molecule by connecting functional groups to a base structure and returns SMILES string. This tool exclusively supports: aliphatic hydroxyl, carboxylic acid, carbonyl o, thiocarbonyl, hydroxylamine, thiol, aldehyde, alkyl carbamate, amide, amidine, azo, barbiturate, benzene ring, benzodiazepine, diazo, ester, furan ring, guanidine, hydrazine, hydrazone, isocyanate, isothiocyanate, ketone, beta lactam, methoxy, nitrile, nitroso, oxazole ring, oxime, phenol, pyridine ring, thioether, sulfonamide, sulfone, thiazole ring, thiocyanate, thiophene ring, and urea.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "functional_group_list": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "integer",
+                  "description": "The required count for the specified functional group."
+                },
+                "description": "An object where keys are functional group names (e.g., \"benzene ring\") and values are their required counts."
+              },
+              "description": "List of functional groups and their required counts. Example format: [{'benzene ring': 1, 'ketone': 1, 'nitrile': 2}]"
+            }
+          },
+          "required": [
+            "functional_group_list"
+          ]
+        }
+      }
+    },
+    "edit_molecules_by_functional_groups": {
+      "type": "function",
+      "function": {
+        "name": "edit_molecules_by_functional_groups",
+        "description": "Modify a molecule SMILES by adding or removing specific functional groups and return the edited SMILES string. This tool exclusively supports: aliphatic hydroxyl, carboxylic acid, carbonyl o, thiocarbonyl, hydroxylamine, thiol, aldehyde, alkyl carbamate, amide, amidine, azo, barbiturate, benzene ring, benzodiazepine, diazo, ester, furan ring, guanidine, hydrazine, hydrazone, isocyanate, isothiocyanate, ketone, beta lactam, methoxy, nitrile, nitroso, oxazole ring, oxime, phenol, pyridine ring, thioether, sulfonamide, sulfone, thiazole ring, thiocyanate, thiophene ring, and urea.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "mol_smiles": {
+              "type": "string",
+              "description": "The SMILES string of the base molecule to be modified."
+            },
+            "functional_group_list_to_remove": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "integer",
+                  "description": "Number of specific functional groups to remove."
+                }
+              },
+              "description": "List of functional groups to remove. Example: [{'nitrile': 1}]"
+            },
+            "functional_group_list_to_insert": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "integer",
+                  "description": "Number of specific functional groups to insert."
+                }
+              },
+              "description": "List of functional groups to insert. Example: [{'benzene ring': 1}]"
+            }
+          },
+          "required": [
+            "mol_smiles",
+            "functional_group_list_to_remove",
+            "functional_group_list_to_insert"
+          ]
+        }
+      }
+    },
+    "calculate_tanimoto_similarity": {
+      "type": "function",
+      "function": {
+        "name": "calculate_tanimoto_similarity",
+        "description": "This tool computes the Tanimoto similarity between two molecules. By inputting two SMILES strings, the system evaluates their structural overlap and returns a precise similarity score.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "mol_smiles_1": {
+              "type": "string",
+              "description": "One of target molecule smiles to calculate molecule simiarity"
+            },
+            "mol_smiles_2": {
+              "type": "string",
+              "description": "The other target molecule smiles to calculate molecule simiarity"
+            }
+          },
+          "required": [
+            "mol_smiles_1",
+            "mol_smiles_2"
+          ]
+        }
+      }
+    },
+    "canonicalize_smiles": {
+      "type": "function",
+      "function": {
+        "name": "canonicalize_smiles",
+        "description": "Canonicalize SMILES representation. Input SMILES, returns canonicalized SMILES. You should use this tool when asked for canonicalized SMILES.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "mol_smiles": {
+              "type": "string",
+              "description": "Target molecule smiles"
+            }
+          },
+          "required": [
+            "mol_smiles"
+          ]
+        }
+      }
+    },
+    "count_molecule_atoms": {
+      "type": "function",
+      "function": {
+        "name": "count_molecule_atoms",
+        "description": "Count the number of heavy atoms (excluding hydrogens) in a molecule. Input SMILES, returns the types of atoms and their respective counts.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "mol_smiles": {
+              "type": "string",
+              "description": "Target molecule SMILES"
+            }
+          },
+          "required": [
+            "mol_smiles"
+          ]
+        }
+      }
+    },
+    "calculate_molecular_weight": {
+      "type": "function",
+      "function": {
+        "name": "calculate_molecular_weight",
+        "description": "Calculate the exact molecular weight of a molecule. Input SMILES, and it returns the weight in Daltons (atomic mass units).",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "mol_smiles": {
+              "type": "string",
+              "description": "Target molecule SMILES"
+            }
+          },
+          "required": [
+            "mol_smiles"
+          ]
+        }
+      }
+    }
+  },
+  "ports": {
+    "analyze_overall_molecule_properties": 9000,
+    "convert_iupac_to_smiles": 9001,
+    "calculate_tanimoto_similarity": 9002,
+    "canonicalize_smiles": 9003,
+    "count_molecule_atoms": 9004,
+    "calculate_molecular_weight": 9005,
+    "convert_chemical_name_to_smiles": 9006,
+    "convert_selfies_to_smiles": 9007,
+    "get_functional_groups": 9008,
+    "query_moses_by_fg_counts_prop_ranges": 9009,
+    "generate_molecule_with_fragments": 9010,
+    "edit_molecules_by_functional_groups": 9011,
+    "search_wikipedia": 9012,
+    "search_pubchem": 9013,
+    "generate_molecules_by_property_ranges": 9014,
+    "optimize_molecule_by_prop_ranges": 9015
+  }
+}

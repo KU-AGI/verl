@@ -1,0 +1,16 @@
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+actor_rollout_ref:
+
+  # Rollout model config.
+  rollout:
+
+    _target_: recipe.langgraph_chemagent.config.ChemagentRolloutConfig
+
+    enable_think: false

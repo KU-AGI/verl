@@ -1,0 +1,3 @@
+- name: mol_generation
+  _target_: recipe.langgraph_chemagent.agent_loop.ChemistryReactAgentLoop
+  
