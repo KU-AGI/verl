@@ -168,6 +168,11 @@ class RolloutSample:
     param_version_end: list[int]
     rollout_status: dict[str, Any]
 
+    # Quality-filter retry support
+    original_prompt_batch: Any = None      # pre-generation prompt batch (for retry)
+    accumulated_good_batch: Any = None     # DataProto of good samples kept across retries
+    retry_count: int = 0                   # number of retries attempted so far
+
 
 @dataclass
 class ValidateMetrics:
@@ -260,77 +265,83 @@ def merge_rollout_sample(config, tokenizer, rs: RolloutSample, processor):
     # Determine configured task_ids (which tasks to train on)
     task_ids = list(config.actor_rollout_ref.actor.multi_task.get("task_ids", [1]))
 
-    # Step 4: Feedback alignment reward for task2 (only when training on task2)
+    # Step 4: Feedback alignment reward for task2 (disabled - keys preserved for logging)
     if 2 in task_ids:
-        vqa_judges: list = rs.full_batch.meta_info.get("task1_vqa_reward", [None] * batch_size)
-
-        formatting_evaluator = FormattingEvaluatorV2()
-        feedback_texts = rs.full_batch.non_tensor_batch.get('task2_feedback_texts', [None] * batch_size)
-
-        predicted_judges: list = []
-        for feedback_text in feedback_texts:
-            par1, part2, part3, part4 = formatting_evaluator._split_text_into_parts(feedback_text.strip())
-            predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback = par1, part2, part3, part4
-            predict_decomposed_ans = formatting_evaluator._extract_answer_paragraphs(predicted_answer)
-            predicted_judge = formatting_evaluator.check_all_answers_positive(predict_decomposed_ans)
-            predicted_judges.append(predicted_judge)
-
-        task2_token_level_scores = rs.full_batch.batch["task2_token_level_scores"]
-        task2_response_mask = rs.full_batch.batch["task2_response_mask"]
-
         extra_info = rs.full_batch.meta_info
         extra_info["task2_judge_alignment_reward"] = [-100] * batch_size
         extra_info["task2_judge_alignment_reward_response"] = [None] * batch_size
-
-        task2_feedback_reward_score: list = [-100] * batch_size
-        for i, (vqa_judge, predicted_judge) in enumerate(zip(vqa_judges, predicted_judges)):
-
-            vqa_judge = (vqa_judge == 1)  # if all
-
-            if vqa_judge is None or predicted_judge is None:  # Invalid case
-                task2_feedback_reward_score[i] = 0.0
-                extra_info["task2_judge_alignment_reward"][i] = -100
-                extra_info["task2_feedback_reward"][i] = -100
-                extra_info["task2_judge_alignment_reward_response"][i] = "Judge value is None."
-                extra_info["task2_feedback_reward_response"][i] = "Judge value is None."
-
-            elif vqa_judge and predicted_judge:  # VLM yes & Policy yes
-                task2_feedback_reward_score[i] = 1.0
-                extra_info["task2_judge_alignment_reward"][i] = 1.0
-                extra_info["task2_feedback_reward"][i] = 1.0
-                extra_info["task2_judge_alignment_reward_response"][i] = "No need to get feedback reward. Both VQA alignment and predicted answer judge are positive(+)."
-                extra_info["task2_feedback_reward_response"][i] = "No need to get feedback response. Both VQA alignment and predicted answer judge are positive(+)."
-
-            elif not vqa_judge and not predicted_judge:  # VLM no & Policy no
-                feedback_reward = 0.0
-                task2_feedback_reward_response = extra_info["task2_feedback_reward_response"][i]
-                if task2_feedback_reward_response is not None:
-                    try:
-                        feedback_success = safe_json_loads(task2_feedback_reward_response)
-                        if feedback_success and feedback_success.get("answer", "").lower() == "yes":
-                            feedback_reward = 1.0
-                    except:
-                        feedback_reward = 0.0
-
-                task2_feedback_reward_score[i] = feedback_reward
-                extra_info["task2_judge_alignment_reward"][i] = 1.0
-                extra_info["task2_judge_alignment_reward_response"][i] = "Both VQA alignment and predicted answer judge are negative(-). Proceed to get feedback reward."
-                extra_info["task2_feedback_reward"][i] = feedback_reward
-                extra_info["task2_feedback_reward_response"][i] = task2_feedback_reward_response if task2_feedback_reward_response is not None else str(task2_feedback_reward_response)
-
-            else:  # VLM yes & Policy no / VLM no & Policy yes (Mismatch)
-                task2_feedback_reward_score[i] = 0.0
-                extra_info["task2_judge_alignment_reward"][i] = 0.0
-                extra_info["task2_feedback_reward"][i] = 0.0
-                extra_info["task2_judge_alignment_reward_response"][i] = "Fail due to mismatch between VQA alignment and predicted answer judge."
-                extra_info["task2_feedback_reward_response"][i] = "Fail to get feedback reward due to mismatch between VQA alignment and predicted answer judge."
-
-            # task2_token_level_scores update
-            valid_response_length = task2_response_mask[i].sum().int()
-            task2_token_level_scores[i, valid_response_length - 1] += task2_feedback_reward_score[i]
-
-        rs.full_batch.batch["task2_token_level_scores"] = task2_token_level_scores
         rs.full_batch.meta_info.update(extra_info)
+
+    # if 2 in task_ids:
+    #     vqa_judges: list = rs.full_batch.meta_info.get("task1_vqa_reward", [None] * batch_size)
+    #
+    #     formatting_evaluator = FormattingEvaluatorV2()
+    #     feedback_texts = rs.full_batch.non_tensor_batch.get('task2_feedback_texts', [None] * batch_size)
+    #
+    #     predicted_judges: list = []
+    #     for feedback_text in feedback_texts:
+    #         par1, part2, part3, part4 = formatting_evaluator._split_text_into_parts(feedback_text.strip())
+    #         predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback = par1, part2, part3, part4
+    #         predict_decomposed_ans = formatting_evaluator._extract_answer_paragraphs(predicted_answer)
+    #         predicted_judge = formatting_evaluator.check_all_answers_positive(predict_decomposed_ans)
+    #         predicted_judges.append(predicted_judge)
+    #
+    #     task2_token_level_scores = rs.full_batch.batch["task2_token_level_scores"]
+    #     task2_response_mask = rs.full_batch.batch["task2_response_mask"]
+    #
+    #     extra_info = rs.full_batch.meta_info
+    #     extra_info["task2_judge_alignment_reward"] = [-100] * batch_size
+    #     extra_info["task2_judge_alignment_reward_response"] = [None] * batch_size
+    #
+    #     task2_feedback_reward_score: list = [-100] * batch_size
+    #     for i, (vqa_judge, predicted_judge) in enumerate(zip(vqa_judges, predicted_judges)):
+    #
+    #         vqa_judge = (vqa_judge == 1)  # if all
+    #
+    #         if vqa_judge is None or predicted_judge is None:  # Invalid case
+    #             task2_feedback_reward_score[i] = 0.0
+    #             extra_info["task2_judge_alignment_reward"][i] = -100
+    #             extra_info["task2_feedback_reward"][i] = -100
+    #             extra_info["task2_judge_alignment_reward_response"][i] = "Judge value is None."
+    #             extra_info["task2_feedback_reward_response"][i] = "Judge value is None."
+    #
+    #         elif vqa_judge and predicted_judge:  # VLM yes & Policy yes
+    #             task2_feedback_reward_score[i] = 1.0
+    #             extra_info["task2_judge_alignment_reward"][i] = 1.0
+    #             extra_info["task2_feedback_reward"][i] = 1.0
+    #             extra_info["task2_judge_alignment_reward_response"][i] = "No need to get feedback reward. Both VQA alignment and predicted answer judge are positive(+)."
+    #             extra_info["task2_feedback_reward_response"][i] = "No need to get feedback response. Both VQA alignment and predicted answer judge are positive(+)."
+    #
+    #         elif not vqa_judge and not predicted_judge:  # VLM no & Policy no
+    #             feedback_reward = 0.0
+    #             task2_feedback_reward_response = extra_info["task2_feedback_reward_response"][i]
+    #             if task2_feedback_reward_response is not None:
+    #                 try:
+    #                     feedback_success = safe_json_loads(task2_feedback_reward_response)
+    #                     if feedback_success and feedback_success.get("answer", "").lower() == "yes":
+    #                         feedback_reward = 1.0
+    #                 except:
+    #                     feedback_reward = 0.0
+    #
+    #             task2_feedback_reward_score[i] = feedback_reward
+    #             extra_info["task2_judge_alignment_reward"][i] = 1.0
+    #             extra_info["task2_judge_alignment_reward_response"][i] = "Both VQA alignment and predicted answer judge are negative(-). Proceed to get feedback reward."
+    #             extra_info["task2_feedback_reward"][i] = feedback_reward
+    #             extra_info["task2_feedback_reward_response"][i] = task2_feedback_reward_response if task2_feedback_reward_response is not None else str(task2_feedback_reward_response)
+    #
+    #         else:  # VLM yes & Policy no / VLM no & Policy yes (Mismatch)
+    #             task2_feedback_reward_score[i] = 0.0
+    #             extra_info["task2_judge_alignment_reward"][i] = 0.0
+    #             extra_info["task2_feedback_reward"][i] = 0.0
+    #             extra_info["task2_judge_alignment_reward_response"][i] = "Fail due to mismatch between VQA alignment and predicted answer judge."
+    #             extra_info["task2_feedback_reward_response"][i] = "Fail to get feedback reward due to mismatch between VQA alignment and predicted answer judge."
+    #
+    #         # task2_token_level_scores update
+    #         valid_response_length = task2_response_mask[i].sum().int()
+    #         task2_token_level_scores[i, valid_response_length - 1] += task2_feedback_reward_score[i]
+    #
+    #     rs.full_batch.batch["task2_token_level_scores"] = task2_token_level_scores
+    #     rs.full_batch.meta_info.update(extra_info)
 
     # Step 5: Mask invalid rewards (-100) for each configured task
     for task_id in task_ids:
@@ -378,6 +389,17 @@ def merge_rollout_sample(config, tokenizer, rs: RolloutSample, processor):
             prompt_uid2task_metrics[uid][task_id].append(task_sample_metrics[task_id][i])
             prompt_uid2task_neg100[uid][task_id].append(bool(task_sample_is_neg100[task_id][i]))
 
+    # Initialize statistics tracking
+    total_groups = len(prompt_uid2task_metrics)
+    task_filter_stats = {
+        tid: {
+            "filtered_by_valid_count": 0,
+            "filtered_by_std_zero": 0,
+            "total_filtered": 0,
+        } for tid in task_ids
+    }
+    task_group_sizes = {tid: [] for tid in task_ids}  # Track valid group sizes for each task
+
     # 3. 모든 task_id에 대해 AND 조건으로 UID 유지 여부 결정
     #    각 task에 대한 keep 조건:
     #      - -100이 아닌 샘플(유효 샘플) 수가 2 미만이면 제거
@@ -386,6 +408,9 @@ def merge_rollout_sample(config, tokenizer, rs: RolloutSample, processor):
     kept_prompt_uids = set()
     for uid in prompt_uid2task_metrics:
         keep = True
+        filter_reason_task = None  # Track which task caused filtering
+        filter_reason_type = None  # Track reason type
+
         for task_id in task_ids:
             metrics = prompt_uid2task_metrics[uid][task_id]
             is_neg100_flags = prompt_uid2task_neg100[uid][task_id]
@@ -394,16 +419,33 @@ def merge_rollout_sample(config, tokenizer, rs: RolloutSample, processor):
             # 유효 샘플이 2개 미만이면 제거
             if valid_count < 2:
                 keep = False
+                filter_reason_task = task_id
+                filter_reason_type = "valid_count"
                 break
 
             # 유효 샘플들의 std가 0이면 제거 (모두 동일 점수, 학습 신호 없음)
             valid_metrics = [m for m, neg in zip(metrics, is_neg100_flags) if not neg]
             if np.std(valid_metrics) == 0:
                 keep = False
+                filter_reason_task = task_id
+                filter_reason_type = "std_zero"
                 break
 
         if keep:
             kept_prompt_uids.add(uid)
+            # Record valid group sizes for each task
+            for task_id in task_ids:
+                is_neg100_flags = prompt_uid2task_neg100[uid][task_id]
+                valid_count = sum(not flag for flag in is_neg100_flags)
+                task_group_sizes[task_id].append(valid_count)
+        else:
+            # Record which task caused the filtering
+            if filter_reason_task is not None:
+                task_filter_stats[filter_reason_task]["total_filtered"] += 1
+                if filter_reason_type == "valid_count":
+                    task_filter_stats[filter_reason_task]["filtered_by_valid_count"] += 1
+                elif filter_reason_type == "std_zero":
+                    task_filter_stats[filter_reason_task]["filtered_by_std_zero"] += 1
 
     # 4. 필터링 적용 (Kept UIDs에 속하는 인덱스만 추출)
     kept_traj_idxs = [
@@ -412,24 +454,46 @@ def merge_rollout_sample(config, tokenizer, rs: RolloutSample, processor):
     ]
 
     # 5. Batch 및 Meta Info 업데이트
+    orig_meta = rs.full_batch.meta_info
+    orig_len  = len(rs.full_batch)
+
     rs.full_batch = rs.full_batch[kept_traj_idxs]
+    rs.full_batch.meta_info = deep_slice_meta(orig_meta, kept_traj_idxs, orig_len)
 
-    # Meta info 필터링 (기존 로직 유지)
-    kept_meta_info = {}
-    for m_name, m_value in rs.full_batch.meta_info.items():
-        if isinstance(m_value, list):
-            kept_meta_info[m_name] = [m_value[idx] for idx in kept_traj_idxs]
-        elif m_name == "metrics":
-            kept_meta_info[m_name] = {
-                sub_k: [sub_v[idx] for idx in kept_traj_idxs]
-                for sub_k, sub_v in rs.full_batch.meta_info["metrics"].items()
-            }
+    kept_meta_info = rs.full_batch.meta_info 
+
+    # Add group-level statistics to meta_info for wandb logging
+    kept_groups = len(kept_prompt_uids)
+    filtered_groups = total_groups - kept_groups
+
+    rs.processing_times = [rs.processing_times[i] for i in kept_traj_idxs]
+    rs.param_version_start = [rs.param_version_start[i] for i in kept_traj_idxs]
+    rs.param_version_end   = [rs.param_version_end[i]   for i in kept_traj_idxs]
+
+    # Add overall group statistics (with fully_async prefix for automatic wandb logging)
+    kept_meta_info["fully_async/filter_groups/total_groups"] = total_groups
+    kept_meta_info["fully_async/filter_groups/kept_groups"] = kept_groups
+    kept_meta_info["fully_async/filter_groups/filtered_groups"] = filtered_groups
+    kept_meta_info["fully_async/filter_groups/filter_ratio"] = filtered_groups / total_groups if total_groups > 0 else 0.0
+
+    # Add per-task statistics
+    for task_id in task_ids:
+        prefix = f"fully_async/filter_groups/task{task_id}"
+
+        # 1. Number of groups filtered by this task
+        kept_meta_info[f"{prefix}/filtered_groups"] = task_filter_stats[task_id]["total_filtered"]
+        kept_meta_info[f"{prefix}/filtered_by_valid_count"] = task_filter_stats[task_id]["filtered_by_valid_count"]
+        kept_meta_info[f"{prefix}/filtered_by_std_zero"] = task_filter_stats[task_id]["filtered_by_std_zero"]
+
+        # 2. Average group size for valid groups
+        if task_group_sizes[task_id]:
+            avg_group_size = np.mean(task_group_sizes[task_id])
+            kept_meta_info[f"{prefix}/avg_valid_group_size"] = avg_group_size
         else:
-            kept_meta_info[m_name] = m_value
-
-    rs.full_batch.meta_info = kept_meta_info
+            kept_meta_info[f"{prefix}/avg_valid_group_size"] = 0.0
 
     return rs
+
 def expand_rollout_sample(rs: RolloutSample) -> list[RolloutSample]:
     uids = rs.full_batch.non_tensor_batch['uid']
     original_batch_size = len(uids)
@@ -440,20 +504,13 @@ def expand_rollout_sample(rs: RolloutSample) -> list[RolloutSample]:
             uid_to_indices[uid] = []
         uid_to_indices[uid].append(i)
 
-    def deep_slice(data, indices, batch_size):
-        if isinstance(data, dict):
-            return {k: deep_slice(v, indices, batch_size) for k, v in data.items()}
-        elif isinstance(data, list) and len(data) == batch_size:
-            return [data[i] for i in indices]
-        return data
-
     individual_samples = []
 
     for uid, indices in uid_to_indices.items():
         group_batch = rs.full_batch[indices]
         
-        if hasattr(group_batch, 'meta_info') and group_batch.meta_info:
-            group_batch.meta_info = deep_slice(group_batch.meta_info, indices, original_batch_size)
+        if getattr(rs.full_batch, "meta_info", None) is not None:
+            group_batch.meta_info = deep_slice_meta(rs.full_batch.meta_info, indices, original_batch_size)
 
         group_sample_id = f"{rs.sample_id}_{uid}"
         individual_sample = RolloutSample(
@@ -488,7 +545,7 @@ def assemble_batch_from_rollout_samples(
 
     # Pre-allocate lists
     rollout_samples_batch = [rs.full_batch for rs in rollout_samples]
-    final_batch = DataProto.concat(rollout_samples_batch)
+    final_batch = _concat_dataprotos_with_meta(rollout_samples_batch)
     
     processing_times = [t for rs in rollout_samples for t in rs.processing_times]
 
@@ -525,6 +582,62 @@ def assemble_batch_from_rollout_samples(
     num_diff0 = param_version_diff.count(0)
     n_diff = len(param_version_diff)
 
+    # Aggregate filter_groups statistics from all rollout_samples
+    filter_stats = {}
+    has_filter_stats = any("fully_async/filter_groups/total_groups" in rs.full_batch.meta_info for rs in rollout_samples)
+
+    if has_filter_stats:
+        # Aggregate overall group statistics
+        total_groups_all = sum(rs.full_batch.meta_info.get("fully_async/filter_groups/total_groups", 0) for rs in rollout_samples)
+        kept_groups_all = sum(rs.full_batch.meta_info.get("fully_async/filter_groups/kept_groups", 0) for rs in rollout_samples)
+        filtered_groups_all = total_groups_all - kept_groups_all
+
+        filter_stats["fully_async/filter_groups/total_groups"] = total_groups_all
+        filter_stats["fully_async/filter_groups/kept_groups"] = kept_groups_all
+        filter_stats["fully_async/filter_groups/filtered_groups"] = filtered_groups_all
+        filter_stats["fully_async/filter_groups/filter_ratio"] = filtered_groups_all / total_groups_all if total_groups_all > 0 else 0.0
+
+        # Collect all task IDs from all rollout samples
+        all_task_ids = set()
+        for rs in rollout_samples:
+            for key in rs.full_batch.meta_info.keys():
+                if key.startswith("fully_async/filter_groups/task") and "/filtered_groups" in key:
+                    task_id = int(key.split("task")[1].split("/")[0])
+                    all_task_ids.add(task_id)
+
+        # Aggregate per-task statistics
+        for task_id in sorted(all_task_ids):
+            prefix = f"fully_async/filter_groups/task{task_id}"
+
+            # Sum up filtered groups by this task across all rollout samples
+            total_filtered = sum(
+                rs.full_batch.meta_info.get(f"{prefix}/filtered_groups", 0)
+                for rs in rollout_samples
+            )
+            filtered_by_valid_count = sum(
+                rs.full_batch.meta_info.get(f"{prefix}/filtered_by_valid_count", 0)
+                for rs in rollout_samples
+            )
+            filtered_by_std_zero = sum(
+                rs.full_batch.meta_info.get(f"{prefix}/filtered_by_std_zero", 0)
+                for rs in rollout_samples
+            )
+
+            # Aggregate average group sizes (weighted average)
+            total_valid_groups = 0
+            weighted_sum = 0.0
+            for rs in rollout_samples:
+                avg_size = rs.full_batch.meta_info.get(f"{prefix}/avg_valid_group_size", 0.0)
+                kept_groups = rs.full_batch.meta_info.get("fully_async/filter_groups/kept_groups", 0)
+                if avg_size > 0 and kept_groups > 0:
+                    weighted_sum += avg_size * kept_groups
+                    total_valid_groups += kept_groups
+
+            filter_stats[f"{prefix}/filtered_groups"] = total_filtered
+            filter_stats[f"{prefix}/filtered_by_valid_count"] = filtered_by_valid_count
+            filter_stats[f"{prefix}/filtered_by_std_zero"] = filtered_by_std_zero
+            filter_stats[f"{prefix}/avg_valid_group_size"] = weighted_sum / total_valid_groups if total_valid_groups > 0 else 0.0
+
     final_batch.meta_info.update({
         "rollout_param_versions": all_param_versions,
         "param_version_diversity": len(set(all_param_versions)),
@@ -539,6 +652,7 @@ def assemble_batch_from_rollout_samples(
         "fully_async/partial/partial_ratio": (n_diff - num_diff0) / n_diff,
         "fully_async/partial/max_partial_span": max(param_version_diff),
         **rollout_status,
+        **filter_stats,  # Add aggregated filter statistics
     })
 
     print(f"[BatchUtils] Batch assembly completed in {time.time() - start_time:.2f}s")
@@ -709,3 +823,317 @@ class MetricsAggregator:
             "total_samples": sum(self.sample_counts),
             "metric_names": list(self.metric_values.keys()),
         }
+
+# ---------------------------------------------------------------------------
+# Quality-filter helpers
+# ---------------------------------------------------------------------------
+
+TASK2_QUALITY_THRESHOLD = 0.0
+
+
+def _is_sample_bad(batch: DataProto, idx: int, task2_threshold: float = TASK2_QUALITY_THRESHOLD) -> bool:
+    """Return True if sample at *idx* fails quality: task2 < threshold OR task3 == -100."""
+    if "task2_token_level_scores" in batch.batch:
+        t2_reward = float(batch.batch["task2_token_level_scores"][idx].clamp(min=0).sum().item())
+        if t2_reward < task2_threshold:
+            return True
+    if "task3_token_level_scores" in batch.batch:
+        if (batch.batch["task3_token_level_scores"][idx] == -100).any().item():
+            return True
+    return False
+
+
+def _get_task_rewards(batch: DataProto, task_id: int) -> np.ndarray:
+    """Per-sample scalar reward for task_id (sum of positive token-level scores)."""
+    key = f"task{task_id}_token_level_scores"
+    if key not in batch.batch:
+        return np.zeros(len(batch))
+    return batch.batch[key].clamp(min=0).sum(dim=-1).cpu().numpy()
+
+
+def _has_nonzero_std(batch: DataProto, task_ids: list) -> bool:
+    """Return True only if ALL task_ids have reward std > 0 (filter_groups won't drop it)."""
+    for task_id in task_ids:
+        if np.std(_get_task_rewards(batch, task_id)) <= 1e-8:
+            return False
+    return True
+
+# ---------------------------------------------------------------------------
+# meta_info-aware DataProto helpers (이 두 함수를 quality filter 헬퍼 섹션에 추가)
+# ---------------------------------------------------------------------------
+
+def deep_slice_meta(data, indices, batch_size: int):
+    """
+    Recursively slice meta-like structures by indices.
+    - dict: recurse
+    - list: if len == batch_size, slice
+    - np.ndarray: if shape[0] == batch_size, slice (optional but practical)
+    - otherwise: keep as-is
+    """
+    if isinstance(data, dict):
+        return {k: deep_slice_meta(v, indices, batch_size) for k, v in data.items()}
+
+    if isinstance(data, list):
+        if len(data) == batch_size:
+            return [data[i] for i in indices]
+        return data
+
+    if isinstance(data, np.ndarray):
+        # meta_info에 ndarray가 들어올 수 있으면 이 분기 넣는 게 안전
+        if data.ndim >= 1 and data.shape[0] == batch_size:
+            return data[indices]
+        return data
+
+    return data
+
+def _slice_meta_info(meta: dict, idxs: list[int], orig_len: int) -> dict:
+    return deep_slice_meta(meta, idxs, orig_len)
+
+
+def _slice_dataproto_with_meta(dp: DataProto, idxs: list[int]) -> DataProto:
+    """DataProto[idxs] + meta_info 슬라이스."""
+    orig_len = len(dp)
+    sub = dp[idxs]
+    if getattr(dp, "meta_info", None):
+        sub.meta_info = _slice_meta_info(dp.meta_info, idxs, orig_len)
+    return sub
+
+
+def _concat_dataprotos_with_meta(dps: list[DataProto]) -> DataProto:
+    # 1) meta를 안전하게 복사/병합
+    meta: dict = {}
+
+    def _clone(x):
+        if isinstance(x, list):
+            return list(x)
+        if isinstance(x, dict):
+            return {kk: _clone(vv) for kk, vv in x.items()}
+        return x
+
+    for dp in dps:
+        if getattr(dp, "meta_info", None) is None:
+            continue
+        dp_len = len(dp)
+        for k, v in dp.meta_info.items():
+            if isinstance(v, list) and len(v) == dp_len:
+                meta.setdefault(k, []).extend(list(v))
+            elif isinstance(v, dict):
+                meta.setdefault(k, {})
+                for sk, sv in v.items():
+                    if isinstance(sv, list) and len(sv) == dp_len:
+                        meta[k].setdefault(sk, []).extend(list(sv))
+                    else:
+                        meta[k].setdefault(sk, _clone(sv))
+            else:
+                meta.setdefault(k, _clone(v))
+
+    # 2) DataProto.concat이 입력 meta를 건드리지 못하게 meta_info를 잠시 제거
+    saved_meta = [getattr(dp, "meta_info", None) for dp in dps]
+    for dp in dps:
+        dp.meta_info = {}  # or None (concat 내부가 .items() 쓰므로 {}가 더 안전)
+
+    try:
+        out = DataProto.concat(dps)
+    finally:
+        # 3) 입력 복원
+        for dp, m in zip(dps, saved_meta):
+            dp.meta_info = m
+
+    # 4) 우리가 만든 meta로 덮어쓰기
+    out.meta_info = meta
+    return out
+
+
+def _select_diverse_candidates(
+    acc_batch: DataProto,
+    cand_batch: DataProto,
+    need_count: int,
+    task_ids: list,
+) -> list:
+    """Select *need_count* indices from cand_batch that maximise reward std when
+    combined with acc_batch.  Candidates that break a std=0 situation are scored
+    higher and picked first."""
+    n_cand = len(cand_batch)
+    need_count = min(need_count, n_cand)
+    if need_count <= 0:
+        return []
+
+    zero_std_const: dict = {}
+    for task_id in task_ids:
+        acc_r = _get_task_rewards(acc_batch, task_id)
+        if len(acc_r) > 0 and np.std(acc_r) < 1e-8:
+            zero_std_const[task_id] = acc_r[0]
+
+    if not zero_std_const:
+        return list(range(need_count))
+
+    scores = np.zeros(n_cand)
+    for task_id, const_val in zero_std_const.items():
+        cand_r = _get_task_rewards(cand_batch, task_id)
+        scores += (np.abs(cand_r - const_val) > 1e-6).astype(float)
+
+    sorted_idx = sorted(range(n_cand), key=lambda i: (-scores[i], i))
+    return sorted_idx[:need_count]
+
+
+def _slice_rollout_sample(rs: RolloutSample, indices: list) -> RolloutSample:
+    """Return a new RolloutSample containing only *indices* rows from rs.full_batch."""
+    original_size = len(rs.full_batch)
+    sub_batch = rs.full_batch[indices]
+
+    if getattr(rs.full_batch, "meta_info", None) is not None:
+        sub_batch.meta_info = deep_slice_meta(rs.full_batch.meta_info, indices, original_size)
+
+    pv_start = ([rs.param_version_start[i] for i in indices]
+                if isinstance(rs.param_version_start, list) else rs.param_version_start)
+    pv_end   = ([rs.param_version_end[i] for i in indices]
+                if isinstance(rs.param_version_end, list) else rs.param_version_end)
+    ptimes   = ([rs.processing_times[i] for i in indices]
+                if rs.processing_times else [0.0] * len(indices))
+
+    return RolloutSample(
+        full_batch=sub_batch,
+        agent_loop_output_list=[],
+        sample_id=rs.sample_id,
+        epoch=rs.epoch,
+        processing_times=ptimes,
+        tool_calls=rs.tool_calls,
+        param_version=rs.param_version,
+        param_version_start=pv_start,
+        param_version_end=pv_end,
+        rollout_status=rs.rollout_status,
+        original_prompt_batch=rs.original_prompt_batch,
+    )
+
+
+def _make_assembled_rollout_sample(rs: RolloutSample, final_batch: DataProto, uid: str) -> RolloutSample:
+    n = len(final_batch)
+    # 기존 meta_info 유지하면서 필요한 키만 추가/덮어쓰기
+    if final_batch.meta_info is None:
+        final_batch.meta_info = {}
+    final_batch.meta_info.update({
+        "param_version_start": rs.param_version,
+        "param_version_end":   rs.param_version,
+    })
+    return RolloutSample(
+        full_batch=final_batch,
+        agent_loop_output_list=[],
+        sample_id=f"{rs.sample_id}_{uid}_assembled",
+        epoch=rs.epoch,
+        processing_times=[0.0] * n,
+        tool_calls=rs.tool_calls,
+        param_version=rs.param_version,
+        param_version_start=[rs.param_version] * n,
+        param_version_end=[rs.param_version] * n,
+        rollout_status=rs.rollout_status,
+    )
+
+
+def quality_filter_rollout_sample(
+    rollout_sample: RolloutSample,
+    group_size: int,
+    task_ids: list,
+    max_retries: int = 3,
+    task2_threshold: float = TASK2_QUALITY_THRESHOLD,
+) -> tuple:
+
+    current_batch = rollout_sample.full_batch
+    uids = current_batch.non_tensor_batch["uid"]
+    is_retry = rollout_sample.retry_count > 0
+
+    uid_to_indices: dict = {}
+    for i, uid in enumerate(uids):
+        if uid not in uid_to_indices:
+            uid_to_indices[uid] = []
+        uid_to_indices[uid].append(i)
+
+    good_indices: list = []
+    assembled_groups: list = []
+    retry_samples: list = []
+    n_dropped: int = 0
+
+    for uid, indices in uid_to_indices.items():
+        # ① 수정: meta_info 보존
+        group_batch = _slice_dataproto_with_meta(current_batch, indices)
+        n_group = len(indices)
+
+        bad_mask = [_is_sample_bad(group_batch, local_i, task2_threshold) for local_i in range(n_group)]
+
+        if not any(bad_mask):
+            good_indices.extend(indices)
+            continue
+
+        good_local = [i for i, bad in enumerate(bad_mask) if not bad]
+        # ② 수정: meta_info 보존
+        new_good_batch = _slice_dataproto_with_meta(group_batch, good_local) if good_local else None
+
+        prev_accumulated = rollout_sample.accumulated_good_batch if is_retry else None
+
+        # ③ 수정: meta_info 보존
+        if new_good_batch is not None and prev_accumulated is not None:
+            accumulated = _concat_dataprotos_with_meta([prev_accumulated, new_good_batch])
+        elif new_good_batch is not None:
+            accumulated = new_good_batch
+        else:
+            accumulated = prev_accumulated
+
+        n_acc = len(accumulated) if accumulated is not None else 0
+        current_retry_count = rollout_sample.retry_count
+
+        if n_acc >= group_size:
+            n_prev = len(prev_accumulated) if prev_accumulated is not None else 0
+            if prev_accumulated is not None and new_good_batch is not None and n_prev < group_size:
+                needed = group_size - n_prev
+                diverse_idx = _select_diverse_candidates(prev_accumulated, new_good_batch, needed, task_ids)
+                selected_new = _slice_dataproto_with_meta(new_good_batch, diverse_idx)
+                final_batch = _concat_dataprotos_with_meta([prev_accumulated, selected_new])
+            elif prev_accumulated is not None and new_good_batch is not None and n_prev >= group_size:
+                # 기존 샘플 중 일부를 새 diverse 샘플로 교체
+                diverse_idx = _select_diverse_candidates(prev_accumulated, new_good_batch, len(new_good_batch), task_ids)
+                if diverse_idx:
+                    selected_new = _slice_dataproto_with_meta(new_good_batch, diverse_idx)
+                    # prev에서 교체할 개수만큼 뒤쪽을 잘라내고 new로 대체
+                    keep_count = group_size - len(diverse_idx)
+                    kept_prev = _slice_dataproto_with_meta(prev_accumulated, list(range(keep_count)))
+                    final_batch = _concat_dataprotos_with_meta([kept_prev, selected_new])
+                else:
+                    final_batch = _slice_dataproto_with_meta(accumulated, list(range(group_size)))
+            else:
+                final_batch = _slice_dataproto_with_meta(accumulated, list(range(group_size)))
+            assembled_groups.append((final_batch, uid))
+            continue
+
+        if current_retry_count < max_retries:
+            orig_prompt = rollout_sample.original_prompt_batch
+            if not is_retry:
+                orig_uids = orig_prompt.non_tensor_batch["uid"]
+                uid_prompt_idx = [i for i, u in enumerate(orig_uids) if u == uid]
+                # ⑦ 수정: meta_info 보존
+                uid_prompt = _slice_dataproto_with_meta(orig_prompt, uid_prompt_idx)
+            else:
+                uid_prompt = orig_prompt
+
+            retry_rs = RolloutSample(
+                full_batch=uid_prompt,
+                agent_loop_output_list=[],
+                sample_id=f"{rollout_sample.sample_id}_{uid}_r{current_retry_count + 1}",
+                epoch=rollout_sample.epoch,
+                processing_times=[0.0] * len(uid_prompt),
+                tool_calls=rollout_sample.tool_calls,
+                param_version=rollout_sample.param_version,
+                param_version_start=[rollout_sample.param_version] * len(uid_prompt),
+                param_version_end=[rollout_sample.param_version] * len(uid_prompt),
+                rollout_status=rollout_sample.rollout_status,
+                original_prompt_batch=uid_prompt,
+                accumulated_good_batch=accumulated,
+                retry_count=current_retry_count + 1,
+            )
+            retry_samples.append(retry_rs)
+        else:
+            print(
+                f"[QualityFilter] Dropping uid={uid}: "
+                f"max retries ({max_retries}) reached, "
+                f"n_acc={n_acc}/{group_size}"
+            )
+            n_dropped += n_group
+    return good_indices, assembled_groups, retry_samples, n_dropped
