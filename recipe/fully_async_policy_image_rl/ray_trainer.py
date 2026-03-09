@@ -319,6 +319,8 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
         task_ids = list(self.config.actor_rollout_ref.actor.multi_task.get("task_ids", [1]))
         max_rollout_task = max(task_ids)
         rollout_task_ids = list(range(1, max_rollout_task + 1))
+        # When task_ids=[3], also compute reward for task2 (intermediate step needed for logging)
+        reward_task_ids = [2, 3] if task_ids == [3] else task_ids
 
         # Limit finalize backlog (memory protection)
         max_val_finalize_backlog = self.config.async_training.get("max_val_finalize_backlog_samples", None)
@@ -459,8 +461,8 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                 reward_tasks = []
 
                 def on_task_complete(task_id: int, batch_result: DataProto):
-                    # Only compute rewards for tasks we train on
-                    if int(task_id) not in task_ids:
+                    # Only compute rewards for tasks we train on (task2 also computed when task_ids=[3])
+                    if int(task_id) not in reward_task_ids:
                         return
                     # Launch reward task immediately when stage completes
                     reward_task = asyncio.create_task(
@@ -555,8 +557,8 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                     data_source = result_batch.non_tensor_batch.get('data_source', ['unknown'] * batch_size)
                     data_source_lst.extend(data_source)
 
-                    # Save in result batch
-                    for task_id in task_ids:
+                    # Save in result batch (use reward_task_ids: includes task2 when task_ids=[3])
+                    for task_id in reward_task_ids:
                         if task_id not in reward_tensor_dict:
                             continue
                         task_reward_tensor = reward_tensor_dict[task_id]
@@ -579,7 +581,7 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                     task1_gen_imgs_pil_list = [wandb.Image(gen_img, caption=prompts[i]) for i, gen_img in enumerate(task1_gen_imgs_pil_list)]
                     sample_task1_gen_imgs.extend(task1_gen_imgs_pil_list)
 
-                    if 2 in task_ids:
+                    if 2 in reward_task_ids:
                         task2_feedback_texts = result_batch.non_tensor_batch.get('task2_feedback_texts', [None] * len(prompts))
                         if hasattr(task2_feedback_texts, 'tolist'):
                             task2_feedback_texts = task2_feedback_texts.tolist()
@@ -598,8 +600,8 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                     #     if key in batch.batch:
                     #         scores[f"task{tid}_scores"] = batch.batch[key].sum(-1).cpu().tolist()
 
-                    # Extend reward scores, infos for each task
-                    for task_id in task_ids:
+                    # Extend reward scores, infos for each task (use reward_task_ids: includes task2 when task_ids=[3])
+                    for task_id in reward_task_ids:
                         if task_id not in reward_tensor_dict:
                             continue
                         task_reward_tensor = reward_tensor_dict[task_id]
