@@ -1,25 +1,4 @@
-VQA_PROMPT_TEMPLATE = """You are an Image-Text Alignment Evaluator.
-Your task is to compare the provided prompt with the image. Detect discrepancies in objects, attributes (colors, shapes), and spatial logic.
-
-Here is the input prompt:
-{prompt}
-
-Important:
-- Your output MUST be a raw JSON string ONLY. Do not add any additional explanations or text.
-- Do NOT include any conversational responses, greetings, or explanations.
-- Do NOT use markdown blocks (e.g., ```json ... ```).
-- Your output must begin with '{' and end with '}'.
-- The JSON must contain exactly two fields:
-    1. "reasoning": A short explanation (e.g., "The donut is correctly placed above the TV.")
-    2. "label": A numeric value (1 or 0) indicating pass or fail.
-
-Output Example:
-{"reasoning": "The donut is correctly placed on a beige shelf above a black TV as requested.", "label": 1}
-
-Expected format:
-{"reasoning": "<short explanation>", "label": <0 or 1>}
-
-Do not output anything other than this JSON."""
+############################ Step 1, 3 Naive Reward ############################
 
 REASONGEN_R1_TEMPLATE = """You are given a text prompt: \"{prompt}\" 
 Below is one generated image:
@@ -37,48 +16,95 @@ Otherwise, respond with: \\boxed{{0}}
 
 Reason before your final boxed answer. Only one number should appear inside the box.
 """.strip()
+#############################################################################
 
-# Prompt templates
-TASK1_TASK3_IMAGE_GENERATOR_SYSTEM_PROMPT_TEMPLATE = """
-You are a VQA assistant. The user provides multiple questions as:
-<id> | <question>
+############################ Step 2 Naive Reward ############################
+TASK2_FEEDBACK_GENERATOR_USER_PROMPT_TEMPLATE_NAIVE = """
+You are an image-edit feasibility judge.
 
-For EACH question, output exactly TWO lines, in the same order as the questions:
-<id> | Reason: <EXACTLY ONE sentence, based only on visible cues in the image>.
-<id> | Answer: Yes
-or
-<id> | Answer: No
+You will be given:
+- ORIGINAL_PROMPT: the target description the final edited image must match.
+- CURRENT_IMAGE: the pre-edit image (provided as the attached image).
+- FEEDBACK: step-by-step edit instructions to apply to CURRENT_IMAGE.
+
+Task:
+(1) Caption the CURRENT_IMAGE in natural language.
+(2) Describe, in natural language, what the edited result would look like if FEEDBACK were applied exactly as written.
+(3) Decide whether that edited result would align with ORIGINAL_PROMPT.
 
 Rules:
-1) Visual-only: decide from what is visible. No typicality/context inference and no external verification.
-2) YES gate: answer "Yes" only if the Reason cites at least one specific visible part/structure AND its location (e.g., "wheels under the fuselage"). If you cannot cite this, answer "No".
-3) Visibility gating: for attributes, the entity must be visible; for relations, BOTH entities must be visible; otherwise Answer must be "No" and the Reason must mention what is not visible.
-4) Scope: do not add attributes/states not asked.
-5) Consistency: the Answer must be forced by the Reason.
+- Evidence-only for captioning: describe only what is visible in CURRENT_IMAGE. Do not guess.
+- Edit simulation: apply only the changes explicitly stated in FEEDBACK; do not add extra edits.
+- Alignment: the edited result aligns only if it satisfies ALL required elements in ORIGINAL_PROMPT (entities + key attributes + key relations). If any required element would be missing or contradicted, it does NOT align.
 
-Relation Rules:
+Return EXACTLY ONE valid JSON object and nothing else (no markdown, no code fences, no extra text).
+The JSON must have exactly these keys:
+{{
+  "caption": string (brief description of CURRENT_IMAGE),
+  "edited_result": string (brief description after applying FEEDBACK),
+  "reason": (one concise sentence explaining alignment or misalignment),
+  "answer": string ("Yes" or "No")
+}}
 
-Frame:
-- All relations use the camera perspective.
+ORIGINAL_PROMPT: {prompt}
 
-2D relations:
-- A left/right B: A must be clearly left/right of B.
-- A above/below B: A must be above/below B.
-- A (on the) top of B means the same as A above B.
-- A (on the) bottom of B means the same as A below B (NOT inside/underside; no contact required).
+CURRENT_IMAGE: <image>
 
-Proximity (NO overlap):
-- A (on the) side of / next to / near B: A and B must NOT overlap.
-- side of / next to: very close. near: close but can be farther.
-
-3D relations:
-- A in front of / behind / hidden by B: overlap NOT required; be as close as possible; slight overlap allowed.
-- Both A and B must remain visible (do not make either fully invisible).
-- A in front of B: A appears closer to camera than B.
-- A behind B / A hidden by B: A appears farther from the camera than B, so B appears in front of A.
-
-Output only the required lines, in order, with no extra text or blank lines.
+FEEDBACK:
+{predicted_feedback}
 """.strip()
+
+#############################################################################
+
+############################ Step 1, 3 Fine-Grained Reward ############################
+
+# # Prompt templates
+# TASK1_TASK3_IMAGE_GENERATOR_SYSTEM_PROMPT_TEMPLATE = r"""
+# You are a VQA assistant. The user provides a single image and multiple questions in the following exact input format:
+
+# [IMAGE]:
+# <input image here>
+
+# [QUESTIONS]:
+# <id> | <question>
+# <id> | <question>
+
+# For EACH question, output exactly TWO lines, in the same order as the questions:
+# <id> | Reason: <EXACTLY ONE sentence, based only on visible cues in the image>.
+# <id> | Answer: Yes
+# or
+# <id> | Answer: No
+
+# Rules:
+# 1) Visual-only: decide from what is visible. No typicality/context inference and no external verification.
+# 2) YES gate: answer "Yes" only if the Reason cites at least one specific visible part/structure AND its location (e.g., "wheels under the fuselage"). If you cannot cite this, answer "No".
+# 3) Visibility gating: for attributes, the entity must be visible; for relations, BOTH entities must be visible; otherwise Answer must be "No" and the Reason must mention what is not visible.
+# 4) Scope: do not add attributes/states not asked.
+# 5) Consistency: the Answer must be forced by the Reason.
+
+# Relation Rules:
+
+# Frame:
+# - All relations use the camera perspective.
+
+# 2D relations:
+# - A left/right B: A must be clearly left/right of B.
+# - A above/below B: A must be above/below B.
+# - A (on the) top of B means the same as A above B.
+# - A (on the) bottom of B means the same as A below B (NOT inside/underside; no contact required).
+
+# Proximity (NO overlap):
+# - A (on the) side of / next to / near B: A and B must NOT overlap.
+# - side of / next to: very close. near: close but can be farther.
+
+# 3D relations:
+# - A in front of / behind / hidden by B: overlap NOT required; be as close as possible; slight overlap allowed.
+# - Both A and B must remain visible (do not make either fully invisible).
+# - A in front of B: A appears closer to camera than B.
+# - A behind B / A hidden by B: A appears farther from the camera than B, so B appears in front of A.
+
+# Output only the required lines, in order, with no extra text or blank lines.
+# """.strip()
 
 TASK1_TASK3_IMAGE_GENERATOR_USER_PROMPT_TEMPLATE = """
 You are a VQA assistant. The user provides multiple questions as:
@@ -129,72 +155,9 @@ For each question, output EXACTLY two lines in this format:
 Questions:
 {questions}
 """.strip()
+#############################################################################
 
-TASK2_FEEDBACK_GENERATOR_SYSTEM_PROMPT_TEMPLATE_NAIVE = """
-You are an image-edit feasibility judge.
-
-You will be given:
-- ORIGINAL_PROMPT: the target description the final edited image must match.
-- CURRENT_IMAGE: the pre-edit image (provided as the attached image).
-- FEEDBACK: step-by-step edit instructions to apply to CURRENT_IMAGE.
-
-Task:
-(1) Caption the CURRENT_IMAGE in natural language.
-(2) Describe, in natural language, what the edited result would look like if FEEDBACK were applied exactly as written.
-(3) Decide whether that edited result would align with ORIGINAL_PROMPT.
-
-Rules:
-- Evidence-only for captioning: describe only what is visible in CURRENT_IMAGE. Do not guess.
-- Edit simulation: apply only the changes explicitly stated in FEEDBACK; do not add extra edits.
-- Alignment: the edited result aligns only if it satisfies ALL required elements in ORIGINAL_PROMPT (entities + key attributes + key relations). If any required element would be missing or contradicted, it does NOT align.
-
-Return EXACTLY ONE valid JSON object and nothing else (no markdown, no code fences, no extra text).
-The JSON must have exactly these keys:
-{
-  "caption": string (brief description of CURRENT_IMAGE),
-  "edited_result": string (brief description after applying FEEDBACK),
-  "reason": (one concise sentence explaining alignment or misalignment),
-  "answer": string ("Yes" or "No")
-}
-""".strip()
-
-
-TASK2_FEEDBACK_GENERATOR_USER_PROMPT_TEMPLATE_NAIVE = """
-You are an image-edit feasibility judge.
-
-You will be given:
-- ORIGINAL_PROMPT: the target description the final edited image must match.
-- CURRENT_IMAGE: the pre-edit image (provided as the attached image).
-- FEEDBACK: step-by-step edit instructions to apply to CURRENT_IMAGE.
-
-Task:
-(1) Caption the CURRENT_IMAGE in natural language.
-(2) Describe, in natural language, what the edited result would look like if FEEDBACK were applied exactly as written.
-(3) Decide whether that edited result would align with ORIGINAL_PROMPT.
-
-Rules:
-- Evidence-only for captioning: describe only what is visible in CURRENT_IMAGE. Do not guess.
-- Edit simulation: apply only the changes explicitly stated in FEEDBACK; do not add extra edits.
-- Alignment: the edited result aligns only if it satisfies ALL required elements in ORIGINAL_PROMPT (entities + key attributes + key relations). If any required element would be missing or contradicted, it does NOT align.
-
-Return EXACTLY ONE valid JSON object and nothing else (no markdown, no code fences, no extra text).
-The JSON must have exactly these keys:
-{{
-  "caption": string (brief description of CURRENT_IMAGE),
-  "edited_result": string (brief description after applying FEEDBACK),
-  "reason": (one concise sentence explaining alignment or misalignment),
-  "answer": string ("Yes" or "No")
-}}
-
-ORIGINAL_PROMPT: {prompt}
-
-CURRENT_IMAGE: <image>
-
-FEEDBACK:
-{predicted_feedback}
-""".strip()
-
-
+############################ Step 3 Fine-Grained Reward ############################
 TASK3_EDIT_INSTRUCTION_FOLLOWING_SYSTEM_PROMPT = """
 You are an evaluator for an image-editing result.
 
@@ -215,7 +178,6 @@ If two steps conflict on the same element, the later step overrides the earlier 
   (a) the edited image clearly violates or misses at least one requirement of step i, OR
   (b) there are clearly unrequested changes (i.e., changes not requested anywhere in FEEDBACK).
 """.strip()
-
 
 TASK3_EDIT_INSTRUCTION_FOLLOWING_USER_PROMPT = """
 You are an evaluator for an image-editing result.
@@ -275,8 +237,9 @@ ORIGINAL IMAGE: (provided as an first image input)
 
 EDITED IMAGE: (provided as an second image input)
 """.strip()
+#############################################################################
 
-
+############################ Step 2 Fine-Grained Reward ############################
 TASK2_COMPARISON_SUMMARIZE_SYSTEM_PROMPT = """[Role]
 You are an evaluator for prompt summarization.
 
@@ -284,18 +247,17 @@ You are an evaluator for prompt summarization.
 Given a long descriptive prompt and its summarization, evaluate whether the summarization is a short canonical prompt that preserves the MAIN, explicitly stated, while omitting minor details.
 
 Keep:
-- main entities (the 1-3 most salient objects)
+- main entities
 - key identity attributes of main entities 
 - essential parts of a main entity ONLY if they are explicitly emphasized as important visual cues
-- ONE primary spatial relation between main entities (e.g., left/right/behind/above/next to)
+- primary spatial relation between main entities
 - explicit integer counts ONLY when stated
 - explicit text content / image style ONLY when stated and salient
 
 Do NOT require preserving:
-- minor parts/details of entities (e.g., fur/skin texture, small spots, wrinkles) unless explicitly emphasized as essential
+- minor parts/details of entities unless explicitly emphasized as essential
 - lighting, shadows, mood, contrast, “surreal/whimsical”, “out of place”, etc.
 - negative scene statements unless explicitly required
-- every attribute mentioned in the long prompt
 
 Do NOT reward metaphors, emotions, or inferred intent.
 
@@ -414,7 +376,6 @@ OUTPUT:
 TASK2_COMPARISON_TUPLE_SYSTEM_PROMPT = """[Role]
 You are an evaluator for VLM prompt-decomposition outputs.
 
-
 [Task]
 Given GT (ground truth) tuples and PRED (predicted) tuples, compute tuple-level accuracy of PRED against GT.
 
@@ -427,8 +388,7 @@ where content follows the required argument pattern below.
 - relation - spatial (A, B, R): A and B are entities, R is a spatial relation (e.g., left/right/above/under/next to).
 - relation - action (A, B, R): A and B are entities, R is an interaction verb/phrase (e.g., holding/chasing).
 - action (X, verb, Y): X performs an action verb; Y is optional target if present.
-- count (X, k): X is an entity, k is an explicit number (digit or number word).
-
+- otehr - count (X, k): X is an entity, k is an explicit number (digit or number word).
 
 [Input]
 User message is JSON:
@@ -540,7 +500,6 @@ OUTPUT:
 }
 """.strip()
 
-
 TASK2_HALLUCINATION_CHECK_SYSTEM_PROMPT = """[Role]
 You are an evaluator for VLM-generated VQA responses.
 
@@ -556,7 +515,7 @@ IMPORTANT:
 [Input]
 User message is JSON:
 {
-  "image": <IMAGE>,
+  "image": <image>,
   "tuple": ["<tuple1>", "<tuple2>", ...],
   "answer": ["<reason1> Answer: <Yes/No>", "<reason2> Answer: <Yes/No>", ...]
 }
@@ -882,6 +841,8 @@ OUTPUT:
   ]
 }
 """.strip()
+
+#############################################################################
 
 TASK3_REGENERATION_FOLLOWED_BY_EDITING_SYSTEM_PROMPT = """
 [Role]
