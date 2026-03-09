@@ -28,6 +28,9 @@ from recipe.fully_async_policy_image_rl.detach_utils import (
     prepare_single_generation_data,
     merge_rollout_sample,
     expand_rollout_sample,
+    quality_filter_rollout_sample,
+    _make_assembled_rollout_sample,
+    _slice_rollout_sample,
 )
 from recipe.fully_async_policy_image_rl.message_queue import MessageQueueClient
 from recipe.fully_async_policy_image_rl.ray_trainer import FullyAsyncRayPPOTrainer
@@ -39,6 +42,8 @@ from verl import DataProto
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.profiler import marked_timer
 from recipe.image_rl.tracking import ValidationGenerationsLogger
+
+MAX_REGEN_RETRIES = 3  # maximum number of regeneration retries for bad samples
 
 
 @ray.remote(num_cpus=10, max_concurrency=100)
@@ -165,6 +170,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         self.pending_queue = asyncio.Queue(maxsize=2048)
         self.active_tasks = set()
         self.cancel_queue = asyncio.Queue()
+        self.retry_queue = asyncio.Queue()  # highest-priority queue for quality-filter retries
         self.reward_tasks = set()
 
         self.reward_finalize_queue = asyncio.Queue(maxsize=0)
@@ -233,7 +239,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             if cfg_limit is not None:
                 self.max_finalize_backlog_samples = int(cfg_limit)
             else:
-                self.max_finalize_backlog_samples = int(min(self.max_required_samples, max(self.max_concurrent_samples * 4, self.max_concurrent_samples)))
+                self.max_finalize_backlog_samples = int(max(self.max_concurrent_samples * (MAX_REGEN_RETRIES + 2), self.max_required_samples))
 
             print(
                 f"[FullyAsyncRollouter] required_samples : {self.required_samples} "
@@ -599,9 +605,13 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                         await self.condition.wait()
                 continue
 
-            # 1) Get next sample (prefer cancel_queue)
+            # 1) Get next sample (priority: retry_queue > cancel_queue > pending_queue)
+            sample_from_retry_queue = False
             sample_from_cancel_queue = False
-            if not self.cancel_queue.empty():
+            if not self.retry_queue.empty():
+                rollout_sample = await self.retry_queue.get()
+                sample_from_retry_queue = True
+            elif not self.cancel_queue.empty():
                 rollout_sample = await self.cancel_queue.get()
                 sample_from_cancel_queue = True
                 if rollout_sample != "DONE":
@@ -617,6 +627,13 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                     "[FullyAsyncRollouter][Processor] Received end signal, "
                     "waiting for remaining tasks to complete..."
                 )
+
+                # Discard any remaining retry items (end of training)
+                while not self.retry_queue.empty():
+                    try:
+                        self.retry_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
 
                 # Drain generation tasks
                 while True:
@@ -660,9 +677,9 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             # 3) Normal sample processing
             batch_size = len(rollout_sample.full_batch)
 
-            # Update staleness ONLY when dequeued from pending_queue (not cancel_queue)
+            # Update staleness ONLY when dequeued from pending_queue (not cancel/retry queues)
             async with self.lock:
-                if not sample_from_cancel_queue:
+                if not sample_from_cancel_queue and not sample_from_retry_queue:
                     self.staleness_samples += batch_size
 
             # 4) Concurrency throttle: wait until there is room for this batch_size
@@ -699,10 +716,10 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 self.active_tasks.add(task)
                 self.active_sample_count += batch_size
 
-            # 6) Mark queue task done
+            # 6) Mark queue task done (retry_queue has no join() so no task_done needed)
             if sample_from_cancel_queue:
                 self.cancel_queue.task_done()
-            else:
+            elif not sample_from_retry_queue:
                 self.pending_queue.task_done()
 
     async def _compute_single_task_reward(
@@ -774,9 +791,11 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             sample_reward_tasks = []
             reward_results = {}
 
+            reward_task_ids = [2, 3] if task_ids == [3] else task_ids
+
             def on_task_complete(task_id: int, batch_result: DataProto):
                 # Only compute reward for tasks we actually train on
-                if task_id not in task_ids:
+                if task_id not in reward_task_ids:
                     return
                 reward_task = asyncio.create_task(
                     self._compute_single_task_reward(task_id, batch_result, reward_results),
@@ -806,8 +825,14 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             active_released = True
 
             result_batch.meta_info["param_version_end"] = self.current_param_version
+            # Save pre-generation prompt batch for quality-filter retry before overwriting
+            rollout_sample.original_prompt_batch = rollout_sample.full_batch
             rollout_sample.full_batch = result_batch
             rollout_sample.agent_loop_output_list = []
+            n = len(result_batch)
+            rollout_sample.param_version_start = [used_version] * n
+            rollout_sample.param_version_end = [self.current_param_version] * n
+            rollout_sample.processing_times = [rollout_duration] * n
 
             # 3) finalize 워커로 넘기고 즉시 종료
             await self.reward_finalize_queue.put(
@@ -879,25 +904,31 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
 
     async def _reward_finalize_worker(self):
         print("[FullyAsyncRollouter][RewardFinalize] worker started")
+        group_size = self.config.actor_rollout_ref.rollout.n
+        task_ids = list(self.config.actor_rollout_ref.actor.multi_task.get("task_ids", [1]))
+
         while True:
             item = await self.reward_finalize_queue.get()
+            batch_size = 0
+            is_retry = None  # None means unknown (exception before assignment)
+            stats_updated = False
             try:
                 if item == "DONE":
                     break
 
                 finalize_start_time = time.perf_counter()
-
                 rollout_sample, sample_reward_tasks, reward_results, used_version, finalize_budget = item
                 batch_size = len(rollout_sample.full_batch)
+                is_retry = rollout_sample.retry_count > 0
 
-                # reward 완료 대기
+                # 1. reward 완료 대기
                 results = await asyncio.gather(*sample_reward_tasks, return_exceptions=True)
                 for r in results:
                     if isinstance(r, Exception):
                         import traceback
                         traceback.print_exception(type(r), r, r.__traceback__)
 
-                # reward 결과 반영
+                # 2. reward 결과 반영
                 for key, value in reward_results.items():
                     if key != "meta_info":
                         rollout_sample.full_batch.batch[key] = value
@@ -905,7 +936,6 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 if "meta_info" in reward_results:
                     if not hasattr(rollout_sample.full_batch, "meta_info"):
                         rollout_sample.full_batch.meta_info = {}
-                    
                     for task_key, task_extra_info in reward_results["meta_info"].items():
                         for k, v in task_extra_info.items():
                             rollout_sample.full_batch.meta_info[k] = v
@@ -917,31 +947,85 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                     "total_generated_samples": self.total_generated_samples,
                 }
 
-                rollout_sample = merge_rollout_sample(self.config, self.tokenizer, rollout_sample, self.processor)
-                individual_samples = expand_rollout_sample(rollout_sample)
+                # 3. Per-UID quality filter (task2 < threshold OR task3 == -100)
+
+                good_indices, assembled_groups, retry_rs_list, n_dropped = quality_filter_rollout_sample(
+                    rollout_sample,
+                    group_size=group_size,
+                    task_ids=task_ids,
+                    max_retries=MAX_REGEN_RETRIES,
+                )
 
                 finalize_duration = time.perf_counter() - finalize_start_time
-                if self.processed_sample_count % 100 == 0: # Rollout 로그와 동일한 시점에 출력
-                    print(f"[FullyAsyncRollouter][Finalize] 2. Finalize (Reward + Merge) Time: {finalize_duration:.4f}s")
+                if self.processed_sample_count % 100 == 0:
+                    print(
+                        f"[FullyAsyncRollouter][Finalize] 2. Finalize Time: {finalize_duration:.4f}s "
+                        f"| good={len(good_indices)} assembled={len(assembled_groups)} "
+                        f"retry={len(retry_rs_list)} dropped={n_dropped}"
+                    )
 
                 success_count = 0
-                for individual_sample in individual_samples:
+
+                # 4. 정상 그룹: merge → expand → send
+                if good_indices:
+                    good_rs = _slice_rollout_sample(rollout_sample, good_indices)
+                    merged_rs = merge_rollout_sample(self.config, self.tokenizer, good_rs, self.processor)
+                    for ind_sample in expand_rollout_sample(merged_rs):
+                        if len(ind_sample.full_batch) == 0:
+                            print(f"[FullyAsyncRollouter][Finalize] WARNING: 0-row sample in good path, skipping")
+                            continue
+                        success = await self.message_queue_client.put_sample(
+                            sample=ray.cloudpickle.dumps(ind_sample),
+                            param_version=ind_sample.param_version,
+                        )
+                        if success:
+                            success_count += len(ind_sample.full_batch)
+
+                # 5. accumulated 완성 그룹: merge → send (이미 단일 UID)
+                for final_batch, uid in assembled_groups:
+                    final_rs = _make_assembled_rollout_sample(rollout_sample, final_batch, uid)
+                    merged_final = merge_rollout_sample(self.config, self.tokenizer, final_rs, self.processor)
+                    if len(merged_final.full_batch) == 0:
+                        print(f"[FullyAsyncRollouter][Finalize] WARNING: 0-row sample in assembled path uid={uid}, skipping")
+                        continue
+
                     success = await self.message_queue_client.put_sample(
-                        sample=ray.cloudpickle.dumps(individual_sample),
-                        param_version=individual_sample.param_version,
+                        sample=ray.cloudpickle.dumps(merged_final),
+                        param_version=merged_final.param_version,
                     )
                     if success:
-                        success_count += len(individual_sample.full_batch)
+                        success_count += len(merged_final.full_batch)
 
+                # 6. retry 그룹: retry_queue에 넣기 (processor_worker가 재생성)
+                for retry_rs in retry_rs_list:
+                    await self.retry_queue.put(retry_rs)
+
+                # 7. 통계 업데이트
                 async with self.lock:
                     self.total_generated_samples += success_count
-                    self.staleness_samples -= batch_size
-                    self.dropped_stale_samples += (batch_size - success_count)
+                    # retry 아이템은 pending_queue에서 staleness 증가 안 했으므로 감소도 안 함
+                    if not is_retry:
+                        self.staleness_samples -= batch_size
+                        if self.paused:
+                            self.condition.notify_all()
+                    self.dropped_stale_samples += n_dropped
                     self.processed_sample_count += 1
+                stats_updated = True
+
+            except Exception as e:
+                import traceback
+                print(f"[RewardFinalizeWorker] FATAL ERROR, skipping item: {e}")
+                traceback.print_exc()
 
             finally:
                 if item != "DONE":
                     await self._release_finalize_budget(finalize_budget)
+                    # 예외로 step 7이 실행되지 않은 경우 staleness 감소 보장
+                    if not stats_updated and is_retry is False and batch_size > 0:
+                        async with self.lock:
+                            self.staleness_samples -= batch_size
+                            if self.paused:
+                                self.condition.notify_all()
                 self.reward_finalize_queue.task_done()
 
         print("[FullyAsyncRollouter][RewardFinalize] worker stopped")
