@@ -9,3 +9,4 @@ env_vars:
   HYDRA_FULL_ERROR: "1"
   NCCL_SOCKET_IFNAME: "bond-srv.1518"
   GLOO_SOCKET_IFNAME: "bond-srv.1518"
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
