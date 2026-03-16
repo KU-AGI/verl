@@ -43,9 +43,6 @@ from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.profiler import marked_timer
 from recipe.image_rl.tracking import ValidationGenerationsLogger
 
-MAX_REGEN_RETRIES = 3  # maximum number of regeneration retries for bad samples
-
-
 @ray.remote(num_cpus=10, max_concurrency=100)
 class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
     """
@@ -235,11 +232,13 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             self.max_concurrent_samples = min(self.max_concurrent_samples, self.max_required_samples)
             self.max_queue_size = self.max_required_samples
 
+            self.max_regen_retries = int(self.config.async_training.get("max_regen_retries", 3))
+
             cfg_limit = self.config.async_training.get("max_finalize_backlog_samples", None)
             if cfg_limit is not None:
                 self.max_finalize_backlog_samples = int(cfg_limit)
             else:
-                self.max_finalize_backlog_samples = int(max(self.max_concurrent_samples * (MAX_REGEN_RETRIES + 2), self.max_required_samples))
+                self.max_finalize_backlog_samples = int(max(self.max_concurrent_samples * (self.max_regen_retries + 2), self.max_required_samples))
 
             print(
                 f"[FullyAsyncRollouter] required_samples : {self.required_samples} "
@@ -948,13 +947,18 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 }
 
                 # 3. Per-UID quality filter (task2 < threshold OR task3 == -100)
-
-                good_indices, assembled_groups, retry_rs_list, n_dropped = quality_filter_rollout_sample(
-                    rollout_sample,
-                    group_size=group_size,
-                    task_ids=task_ids,
-                    max_retries=MAX_REGEN_RETRIES,
-                )
+                if self.config.algorithm.filter_groups.enable:
+                    good_indices, assembled_groups, retry_rs_list, n_dropped = quality_filter_rollout_sample(
+                        rollout_sample,
+                        group_size=group_size,
+                        task_ids=task_ids,
+                        max_retries=self.max_regen_retries,
+                    )
+                else:
+                    good_indices = list(range(len(rollout_sample.full_batch)))
+                    assembled_groups = []
+                    retry_rs_list = []
+                    n_dropped = 0
 
                 finalize_duration = time.perf_counter() - finalize_start_time
                 if self.processed_sample_count % 100 == 0:

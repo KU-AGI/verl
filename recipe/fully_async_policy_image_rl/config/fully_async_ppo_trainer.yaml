@@ -33,6 +33,21 @@ async_training:
   # compute_prox_log_prob
   compute_prox_log_prob: False
 
+  max_regen_retries: 3 # maximum number of regeneration retries for bad samples
+
+  # Replay buffer for filling idle time with additional training
+  replay_buffer:
+    enable: false
+    max_version_gap: 2 # max param version gap — stale entries are evicted, fresh ones persist
+    max_size_per_task: 100 # max number of samples per task_id
+    # Per-task minimum score threshold for replay buffer admission
+    # Samples with score < threshold are discarded. Keys are task_ids.
+    score_thresholds:
+      1: 0.5
+      2: 1.5
+      3: 0.5
+
+  weight_transfer_backend: "nixl" # default is "gloo"
 
 # Rollout config
 rollout:

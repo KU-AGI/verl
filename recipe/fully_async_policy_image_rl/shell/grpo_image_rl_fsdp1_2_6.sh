@@ -12,8 +12,8 @@ exec 2>&1
 
 project_name='mllm_reasoning'
 # exp_name="test2_fg"
-exp_name="0309_our_model_our_dataset_task2_fine_grained_reward"
-task_ids='[2]'
+exp_name="0316_replay_buffer_no_version_gap_filter"
+task_ids='[1,2,3]'
 
 export NCCL_IB_GID_INDEX=0
 export NCCL_CUDA_DEVICE_MAX_CONNECTIONS=8
@@ -47,7 +47,7 @@ VAL_FILES=['/data/mllm/data/val_wo_focusdiff_v2.parquet','/data/mllm/data/train_
 # TRAIN_FILES='/data/users/pimang62/verl_image_rl/data/train_reasongen.parquet'
 # VAL_FILES=["/data/users/pimang62/verl_image_rl/data/val_reasongen_16.parquet","/data/users/pimang62/verl_image_rl/data/val_reasongen.parquet"] # 300
 
-rm_vlm_model_path="Qwen/Qwen3.5-27B"
+rm_vlm_model_path="Qwen/Qwen3.5-35B-A3B"
 rm_llm_model_path="Qwen/Qwen3-30B-A3B-Instruct-2507"
 
 rollout_name=image_unified
@@ -66,7 +66,7 @@ clip_ratio_low=0.2
 clip_ratio_high=0.2
 
 enable_filter_groups=True
-filter_groups_metric=reward
+filter_groups_metric=acc
 # max_num_gen_batches=10
 
 norm_adv_by_std_in_grpo=True
@@ -260,6 +260,13 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     async_training.partial_rollout="${partial_rollout}" \
     async_training.use_rollout_log_probs=False \
     async_training.compute_prox_log_prob=False \
+    async_training.max_regen_retries=3 \
+    async_training.replay_buffer.enable=True \
+    async_training.replay_buffer.max_version_gap=-1 \
+    async_training.replay_buffer.max_size_per_task=1000 \
+    +async_training.replay_buffer.score_thresholds.1=0.8 \
+    +async_training.replay_buffer.score_thresholds.2=1.5 \
+    +async_training.replay_buffer.score_thresholds.3=0.8 \
     reward_model.reward_manager=image_generation \
     custom_reward_function.path=recipe/image_rl/reward_function_fine_grained.py \
     custom_reward_function.name=compute_score_batch \
