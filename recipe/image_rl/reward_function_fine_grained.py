@@ -13,6 +13,7 @@ from recipe.image_rl.utils import FormattingEvaluatorV2
 from recipe.image_rl.prompts import REASONGEN_R1_TEMPLATE
 from recipe.image_rl.prompts_finegrained_simple import (
     TASK1_TASK3_IMAGE_GENERATOR_SYSTEM_PROMPT_TEMPLATE,
+    TASK3_REGENERATION_FOLLOWED_BY_EDITING_SYSTEM_PROMPT,
     PROMPT_TO_SUMMARY_REWARD_SYSTEM_PROMPT,
     SUMMARY_TO_TUPLE_DECOMPOSITION_REWARD_SYSTEM_PROMPT,
     TUPLE_DECOMPOSITION_TO_VQA_REWARD_SYSTEM_PROMPT,
@@ -351,6 +352,18 @@ def _normalize_tuple_lines(text: str) -> str:
     return '\n'.join(lines)
 
 
+def _add_index_to_vqa_lines(text: str) -> str:
+    """Add 'N | ' index prefix to each VQA result line before sending to stage judges.
+
+    Model generates: 'The image shows a dog... Answer: Yes'
+    Judge expects:   '1 | The image shows a dog... Answer: Yes'
+    """
+    if not text:
+        return ''
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return '\n'.join(f'{i + 1} | {line}' for i, line in enumerate(lines))
+
+
 # --- Task-2 stage message builders ---
 
 def get_messages_task2_stage1(prompt: str, predicted_summarize: str):
@@ -405,6 +418,30 @@ def get_messages_task2_stage4(prompt: str, predicted_summarize: str, tuple_raw: 
     messages = [
         {"role": "system", "content": VQA_TO_FEEDBACK_REWARD_SYSTEM_PROMPT},
         {"role": "user", "content": user_content},
+    ]
+    return messages, RM_VLM_MODEL_PATH
+
+
+def get_messages_task3_edit(gen_img, predicted_feedback: str, regen_img):
+    """Task 3 edit reward: SOURCE_IMAGE + FEEDBACK -> EDITED_IMAGE judge.
+
+    Uses TASK3_REGENERATION_FOLLOWED_BY_EDITING_SYSTEM_PROMPT.
+    Returns JSON {"REWARD": 0.0..2.0}.
+    """
+    user_content = (
+        "SOURCE_IMAGE:\n<image>\n\n"
+        f"FEEDBACK:\n{predicted_feedback or ''}\n\n"
+        "EDITED_IMAGE:\n<image>"
+    )
+    messages = [
+        {"role": "system", "content": TASK3_REGENERATION_FOLLOWED_BY_EDITING_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": content_from_prompt_with_images(
+                user_content,
+                [convert_gen_img_to_base64(gen_img), convert_gen_img_to_base64(regen_img)],
+            ),
+        },
     ]
     return messages, RM_VLM_MODEL_PATH
 
@@ -572,10 +609,10 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
 
         # Prepare normalized inputs for stage judges
         tuple_raw = _normalize_tuple_lines(predicted_tuple or '')
-        vqa_raw = predicted_answer or ''
+        vqa_raw = _add_index_to_vqa_lines(predicted_answer or '')
 
         # Format gates: wrong format → skip judge (saves API call), _safe_stage_score maps None → 0.0
-        tuple_format_ok = len(predict_parsed_tuple) > 0         # valid "N | content" lines
+        tuple_format_ok = formatting_evaluator.check_tuple_schema_ok(predict_parsed_tuple)
         vqa_format_ok = len(predict_decomposed_ans) > 0         # has "Answer: Yes/No"
         # s4 runs only when feedback is needed AND format is correct
         s4_should_run = (not no_feedback_needed) and feedback_step_format_ok
@@ -616,12 +653,7 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
         else:
             scores = [s1, s2, s3, s4]
 
-        # Transform from -1~1 to 0~1 for geometric mean
-        normalized = [(s + 1) / 2 for s in scores]
-        # Compute geometric mean
-        geo_mean = math.prod(normalized) ** (1.0 / len(scores))
-        # Transform back to -1~1
-        vlm_reward = 2 * geo_mean - 1
+        vlm_reward = math.prod(scores) ** (1.0 / len(scores))
         
         reward_extra_info["task2_vlm_reward"] = vlm_reward
         reward_score += vlm_reward
@@ -635,15 +667,24 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
         reward_extra_info["task2_vqa_to_feedback_reward"] = s4
         reward_extra_info["task2_vqa_to_feedback_response"] = s4_resp if not isinstance(s4_resp, Exception) else str(s4_resp)
 
-    elif task_id == 3: # Total score: 2.0
+    elif task_id == 3: # Total score: vqa_reward (0..1) + edit_reward (0..2)
         if predicted_feedback is not None and "no need to generate feedback." in predicted_feedback.lower():
             reward_score = -100
             reward_extra_info[f"task{task_id}_vqa_reward"] = reward_score
             reward_extra_info[f"task{task_id}_vqa_reward_response"] = "No need to get VQA reward."
+            reward_extra_info[f"task{task_id}_edit_reward"] = reward_score
+            reward_extra_info[f"task{task_id}_edit_reward_response"] = "No need to get edit reward."
             return {"score": reward_score, "reward_extra_info": reward_extra_info}
 
         args = (prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback, vqa_question, extra_info, task_id)
-        vqa_response = await get_response(get_messages, *args)
+        async def _none():
+            return None
+
+        vqa_response, edit_response = await asyncio.gather(
+            get_response(get_messages, *args),
+            get_response(get_messages_task3_edit, gen_img, predicted_feedback, regen_img) if regen_img is not None else _none(),
+            return_exceptions=True,
+        )
 
         vqa_score = 0.0
         if vqa_response is None:
@@ -654,9 +695,21 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
             except Exception:
                 pass
 
-        reward_score += vqa_score
+        edit_score = 0.0
+        if edit_response is None:
+            print(f"[REWARD] Task {task_id}: edit_response is None")
+        elif not isinstance(edit_response, Exception):
+            try:
+                edit_score = _parse_json_score(edit_response)
+            except Exception:
+                pass
+
+        reward_score += vqa_score + edit_score
+        reward_score = edit_score
         reward_extra_info[f"task{task_id}_vqa_reward"] = vqa_score
         reward_extra_info[f"task{task_id}_vqa_reward_response"] = vqa_response if not isinstance(vqa_response, Exception) else str(vqa_response)
+        reward_extra_info[f"task{task_id}_edit_reward"] = edit_score
+        reward_extra_info[f"task{task_id}_edit_reward_response"] = edit_response if not isinstance(edit_response, Exception) else str(edit_response)
     
     return {
         "score": reward_score,

@@ -2,6 +2,23 @@ import re
 import torch
 import spacy
 
+_TUPLE_SCHEMA_PATTERNS = [
+    re.compile(r'^entity\s*-\s*whole\s*\([^,)]+\)$'),                          # single entity, no comma
+    re.compile(r'^entity\s*-\s*part\s*\([^,)]+\)$'),                           # flat string, no comma
+    re.compile(r'^relation\s*-\s*spatial\s*\([^,)]+,\s*[^,)]+,\s*[^,)]+\)$'),  # (A, B, rel_token)
+    re.compile(r'^action\s*-\s*\([^,)]+,\s*[^,)]+,\s*[^,)]+\)$'),             # (A, action_token, B)
+    re.compile(r'^attribute\s*-\s*state\s*\([^,)]+,\s*[^,)]+\)$'),
+    re.compile(r'^attribute\s*-\s*type\s*\([^,)]+,\s*[^,)]+\)$'),
+    re.compile(r'^attribute\s*-\s*material\s*\([^,)]+,\s*[^,)]+\)$'),
+    re.compile(r'^attribute\s*-\s*texture\s*\([^,)]+,\s*[^,)]+\)$'),
+    re.compile(r'^attribute\s*-\s*shape\s*\([^,)]+,\s*[^,)]+\)$'),
+    re.compile(r'^attribute\s*-\s*size\s*\([^,)]+,\s*[^,)]+\)$'),
+    re.compile(r'^attribute\s*-\s*color\s*\([^,)]+,\s*[^,)]+\)$'),
+    re.compile(r'^other\s*-\s*text\s*\([^,)]+,\s*[^,)]+\)$'),                 # (S, TEXT), comma 필수
+    re.compile(r'^other\s*-\s*count\s*\([^,)]+,\s*==\d+\)$'),
+    re.compile(r'^global\s*-\s*style\s*\([^,)]+\)$'),                          # single style token, no comma
+]
+
 class FormattingEvaluatorV2:
     def __init__(self):
         # 4단계 구조를 위한 새로운 패턴 정의
@@ -123,6 +140,19 @@ class FormattingEvaluatorV2:
         final_metrics = {k: v.item() if isinstance(v, torch.Tensor) else v for k, v in metrics.items()}
         
         return final_metrics
+
+    def check_tuple_schema_ok(self, parsed_tuples: list) -> bool:
+        """각 tuple content가 사전 정의된 스키마 중 하나와 일치하는지 검사.
+
+        parsed_tuples: _parse_part2()가 반환한 (index, content) 리스트
+        하나라도 스키마와 다르거나 리스트가 비어 있으면 False.
+        """
+        if not parsed_tuples:
+            return False
+        return all(
+            any(p.match(content) for p in _TUPLE_SCHEMA_PATTERNS)
+            for _, content in parsed_tuples
+        )
 
     def check_feedback_step_format(self, feedback_text: str) -> bool:
         """각 non-empty 줄이 Step N:으로 시작하고 1부터 연속인지 확인"""
