@@ -961,11 +961,14 @@ class DataProto:
                         if k in merged_meta_info:
                             if v is not None:
                                 if isinstance(v, list):
-                                    merged_meta_info[k].extend(v)
+                                    merged_meta_info[k] = merged_meta_info[k] + v
                                 else:
                                     merged_meta_info[k] = v
                         else:
-                            merged_meta_info[k] = v
+                            if isinstance(v, list):
+                                merged_meta_info[k] = list(v)
+                            else:
+                                merged_meta_info[k] = v
 
             # Flatten list of dicts to dict of lists for consistent metrics structure
             if all_metrics:

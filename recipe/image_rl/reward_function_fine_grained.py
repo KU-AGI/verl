@@ -321,7 +321,7 @@ def convert_gen_img_to_base64(gen_img) -> Optional[str]:
     
 
 def image_evaluator_parser(text):
-    ans_line_re = re.compile(r'(?:step\s+)?(\d+)\s*\|\s*Answer:\s*(Yes|No)', re.IGNORECASE) # whether step <index> or <index>
+    ans_line_re = re.compile(r'(?:step\s+)?(\d+)\s*\|\s*(?:Answer:\s*)?(Yes|No)', re.IGNORECASE) # whether step <index> or <index>
     
     idx_to_ans = {} # 1 | ... Answer: Yes or No -> {1: True or False}
     for idx_str, yn in ans_line_re.findall(text):

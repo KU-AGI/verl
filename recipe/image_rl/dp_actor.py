@@ -501,7 +501,14 @@ class DataParallelImageGenerationActor(BasePPOActor):
         else:
             # Original behavior - single task
             task_ids = [data.batch["task_id"].view(-1)[0].item()]
-        
+
+        # Filter to only tasks whose advantages were actually computed upstream
+        available_keys = set(data.batch.keys())
+        task_ids = [tid for tid in task_ids if f"task{tid}_advantages" in available_keys]
+        if not task_ids:
+            print("[dp_actor] WARNING: no tasks have computed advantages, skipping update_policy")
+            return {}
+
         # Prepare batch keys for all selected tasks
         all_select_batch_keys = []
         for task_id in task_ids:
@@ -530,7 +537,8 @@ class DataParallelImageGenerationActor(BasePPOActor):
                 all_select_batch_keys.append(f"task{task_id}_ref_log_prob")
         
         # Add common keys
-        all_select_batch_keys.append("task_id")
+        if "task_id" in data.batch.keys():
+            all_select_batch_keys.append("task_id")
         if "rollout_is_weights" in data.batch.keys():
             all_select_batch_keys.append("rollout_is_weights")
 
