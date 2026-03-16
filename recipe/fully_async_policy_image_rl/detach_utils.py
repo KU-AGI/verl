@@ -828,7 +828,7 @@ class MetricsAggregator:
 # Quality-filter helpers
 # ---------------------------------------------------------------------------
 
-TASK2_QUALITY_THRESHOLD = 0.0
+TASK2_QUALITY_THRESHOLD = -10000
 
 
 def _is_sample_bad(batch: DataProto, idx: int, task2_threshold: float = TASK2_QUALITY_THRESHOLD) -> bool:

@@ -73,7 +73,6 @@ from verl.workers.reward_manager.abstract import AbstractRewardManager
 
 from recipe.image_rl.reward import compute_reward, compute_reward_async
 from recipe.image_rl.tracking import ValidationGenerationsLogger
-from recipe.image_rl.utils import FormattingEvaluator
 
 @dataclass
 class ResourcePoolManager:

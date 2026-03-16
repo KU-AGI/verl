@@ -11,7 +11,7 @@ import numpy as np
 import time
 from recipe.image_rl.utils import FormattingEvaluatorV2
 from recipe.image_rl.prompts import REASONGEN_R1_TEMPLATE
-from recipe.image_rl.prompts_finegrained import (
+from recipe.image_rl.prompts_finegrained_simple import (
     TASK1_TASK3_IMAGE_GENERATOR_SYSTEM_PROMPT_TEMPLATE,
     PROMPT_TO_SUMMARY_REWARD_SYSTEM_PROMPT,
     SUMMARY_TO_TUPLE_DECOMPOSITION_REWARD_SYSTEM_PROMPT,
@@ -23,6 +23,7 @@ import threading
 import random
 from enum import Enum
 import torch
+import math
 from mathruler.grader import extract_boxed_content
 
 # Configuration
@@ -561,7 +562,7 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
         reward_extra_info["part2_internal_consistency_ok"] = int(consistency_ok)
         f1_score = part2_reward_dict.get("part2_accuracy", 0.0)
         task2_rule_based_decompose_reward = float(f1_score * consistency_ok)  # 0..1
-        reward_score += task2_rule_based_decompose_reward
+        #reward_score += task2_rule_based_decompose_reward
         reward_extra_info["task2_rule_based_decompose_reward"] = task2_rule_based_decompose_reward
 
         feedback_step_format_ok = formatting_evaluator.check_feedback_step_format(predicted_feedback)
@@ -576,8 +577,8 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
         # Format gates: wrong format → skip judge (saves API call), _safe_stage_score maps None → 0.0
         tuple_format_ok = len(predict_parsed_tuple) > 0         # valid "N | content" lines
         vqa_format_ok = len(predict_decomposed_ans) > 0         # has "Answer: Yes/No"
-        # s4 runs when feedback has proper "Step N:" format OR when model explicitly says no feedback needed
-        s4_format_ok = feedback_step_format_ok or no_feedback_needed
+        # s4 runs only when feedback is needed AND format is correct
+        s4_should_run = (not no_feedback_needed) and feedback_step_format_ok
         reward_extra_info["task2_tuple_format_ok"] = int(tuple_format_ok)
         reward_extra_info["task2_vqa_format_ok"] = int(vqa_format_ok)
 
@@ -589,7 +590,7 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
             get_response(get_messages_task2_stage1, prompt, predicted_summarize),
             get_response(get_messages_task2_stage2, predicted_summarize, tuple_raw) if tuple_format_ok else _none(),
             get_response(get_messages_task2_stage3, gen_img, tuple_raw, vqa_raw) if (gen_img is not None and vqa_format_ok) else _none(),
-            get_response(get_messages_task2_stage4, prompt, predicted_summarize, tuple_raw, vqa_raw, predicted_feedback) if s4_format_ok else _none(),
+            get_response(get_messages_task2_stage4, prompt, predicted_summarize, tuple_raw, vqa_raw, predicted_feedback) if s4_should_run else _none(),
             return_exceptions=True,
         )
 
@@ -606,8 +607,22 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
         s2 = _safe_stage_score(s2_resp)
         s3 = _safe_stage_score(s3_resp)
         s4 = _safe_stage_score(s4_resp)
+
+
+        # Reward calculation: geometric mean with range transformation
+        # no_feedback_needed: use s1~s3, otherwise use s1~s4
+        if no_feedback_needed:
+            scores = [s1, s2, s3]
+        else:
+            scores = [s1, s2, s3, s4]
+
+        # Transform from -1~1 to 0~1 for geometric mean
+        normalized = [(s + 1) / 2 for s in scores]
+        # Compute geometric mean
+        geo_mean = math.prod(normalized) ** (1.0 / len(scores))
+        # Transform back to -1~1
+        vlm_reward = 2 * geo_mean - 1
         
-        vlm_reward = (s1 * s2 * s3 * s4)**0.25
         reward_extra_info["task2_vlm_reward"] = vlm_reward
         reward_score += vlm_reward
 
@@ -755,11 +770,24 @@ def _parse_vqa_reward_score(vqa_response: str, is_fine_grained=True) -> int:
         return int(raw)
 
 
-def _parse_json_score(response: str, key: str = "score") -> float:
-    """Extract float score from a JSON response produced by stage judges."""
+def _parse_json_score(response: str, key: str = "REWARD") -> float:
+    """Extract float score from a JSON response or text format produced by stage judges.
+
+    Supports two formats:
+    1. JSON: {"REWARD": 1.0, ...}
+    2. Text: "REWARD: 1.00" or "REWARD: -0.5"
+    """
+    # Try JSON format first
     parsed = safe_json_loads(response)
     if parsed and key in parsed:
         return float(parsed[key])
+
+    # Try text format: "REWARD: <value>"
+    pattern = rf'{key}\s*:\s*(-?\d+(?:\.\d+)?)'
+    match = re.search(pattern, response, re.IGNORECASE)
+    if match:
+        return float(match.group(1))
+
     raise ValueError(f"'{key}' not found in response: {response}")
 
 

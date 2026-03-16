@@ -545,7 +545,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                 f.write(f"  - Total Score: {self._get_safe_val(scores, 'task2_scores', i)}\n")
                 f.write(f"  - Format Reward (rule-based) (add score): {self._get_safe_val(reward_extra_infos_dict, 'task2_rule_based_format_reward', i)}\n")
                 f.write(f"  - Decompose Reward (rule-based) (add score): {self._get_safe_val(reward_extra_infos_dict, 'task2_rule_based_decompose_reward', i)}\n")
-                f.write(f"  - Tuple Format OK (gating decompose): {self._get_safe_val(reward_extra_infos_dict, 'part2_internal_consistency_ok', i)}\n")
+                f.write(f"  - Internal Consistency OK (gating decompose): {self._get_safe_val(reward_extra_infos_dict, 'part2_internal_consistency_ok', i)}\n")
                 f.write(f"  - Tuple Format OK (gating s2): {self._get_safe_val(reward_extra_infos_dict, 'task2_tuple_format_ok', i)}\n")
                 f.write(f"  - VQA Format OK (gating s3): {self._get_safe_val(reward_extra_infos_dict, 'task2_vqa_format_ok', i)}\n")
                 f.write(f"  - Feedback Format OK (rule-based) (gating s4): {self._get_safe_val(reward_extra_infos_dict, 'task2_rule_based_feedback_format_ok', i)}\n")
