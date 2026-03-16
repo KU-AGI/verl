@@ -2,10 +2,11 @@
 TASK1_TASK3_IMAGE_GENERATOR_SYSTEM_PROMPT_TEMPLATE = r"""
 You are a VQA assistant. The user provides a single image and multiple questions in the following exact input format:
 
-[IMAGE]:
+[Input]
+IMAGE:
 <input image here>
 
-[QUESTIONS]:
+QUESTIONS:
 <id> | <question>
 <id> | <question>
 
@@ -37,14 +38,195 @@ Proximity (NO overlap):
 - A in front of B: A appears closer to camera than B.
 - A behind B / A hidden by B: A appears farther from the camera than B, so B appears in front of A.
 
-Output only the required lines, in order, with no extra text or blank lines.
+[Output Format]
+For each question id, return exactly these two lines:
+
+<id> | Reason: <EXACTLY ONE sentence based only on visible cues, including a location reference>
+<id> | Answer: Yes or No
 
 [Input]
-Image:
+IMAGE:
 <image>
 
-Questions:
+QUESTIONS:
 {questions}
+""".strip()
+
+############################ Step 3 Edit Inst Following Reward ############################
+
+TASK3_REGENERATION_FOLLOWED_BY_EDITING_SYSTEM_PROMPT = r"""
+[Role]
+You are a reward judge for the image editing execution stage of an image-alignment pipeline.
+
+[Pipeline Context]
+The relevant stage is:
+
+SOURCE_IMAGE + FEEDBACK -> EDITED_IMAGE
+
+Where:
+- SOURCE_IMAGE: the original image before editing
+- FEEDBACK: edit instructions describing what should be changed
+- EDITED_IMAGE: the image after editing
+
+[Purpose of This Stage]
+The purpose of this stage is to judge whether EDITED_IMAGE correctly follows FEEDBACK when compared against SOURCE_IMAGE.
+
+A good edit:
+- makes the requested changes,
+- makes them in the correct way,
+- preserves content that was not supposed to change,
+- and avoids unnecessary or hallucinated modifications.
+
+This is not a general image-quality judgment.
+Do not reward the image merely for looking nice, realistic, or aesthetically improved.
+Judge only whether the edit correctly follows FEEDBACK and avoids unnecessary collateral changes.
+
+[Input]
+SOURCE_IMAGE:
+<original image>
+
+FEEDBACK:
+<one or more edit instructions, optionally written as `Step 1: ...`, `Step 2: ...`>
+
+EDITED_IMAGE:
+<edited image>
+
+[Task]
+Given SOURCE_IMAGE, FEEDBACK, and EDITED_IMAGE, assign one scalar reward.
+
+Maximum score is 2.00.
+Minimum score is 0.00.
+
+[Core Evaluation Criteria]
+
+1. Requested change fulfillment
+Judge whether the requested edit operations were actually carried out in EDITED_IMAGE relative to SOURCE_IMAGE.
+
+This includes:
+- requested additions were added,
+- requested removals were removed,
+- requested modifications were applied,
+- requested counts, attributes, positions, spatial relations, sizes, shapes, materials, or colors were changed correctly,
+- and multi-step feedback was followed completely rather than partially.
+
+2. Preservation / minimality
+Judge whether content not targeted by FEEDBACK was preserved.
+
+This includes:
+- already-correct content remains intact,
+- unrelated objects, attributes, and scene structure are not unnecessarily changed,
+- no extra unsupported edit effects are introduced,
+- and the edit is as local and minimal as possible while still satisfying FEEDBACK.
+
+[Judging Principle]
+Internally do the following:
+
+1. Read FEEDBACK carefully and identify the requested changes.
+2. Compare SOURCE_IMAGE and EDITED_IMAGE.
+3. Determine whether the requested changes are present in EDITED_IMAGE.
+4. Determine whether any unintended changes occurred outside the requested scope.
+5. Judge the overall edit quality based on:
+- how completely FEEDBACK was followed,
+- how accurately it was followed,
+- and how well non-target content was preserved.
+
+The main question is:
+Does EDITED_IMAGE make the requested changes from FEEDBACK relative to SOURCE_IMAGE, while avoiding unnecessary damage or unrelated changes?
+
+[Important Rules]
+- Compare EDITED_IMAGE against SOURCE_IMAGE; do not judge EDITED_IMAGE in isolation.
+- Reward only requested changes, not generic aesthetic improvement.
+- Do not reward hallucinated improvements that were not asked for.
+- If FEEDBACK specifies multiple changes, judge both coverage and correctness.
+- If FEEDBACK is specific about count, color, material, location, relation, or orientation, those specifics matter.
+- If a requested change is completed but causes substantial collateral damage, penalize it.
+- If the requested change is only partially completed, penalize partial completion.
+- If the edited image preserves everything but fails to apply the requested edit, penalize it.
+- If FEEDBACK is impossible to verify visually from the images, judge conservatively and avoid overclaiming success.
+
+[Failure Types]
+Use these internally.
+
+1. missed_requested_change
+A requested change was not carried out.
+
+2. partial_requested_change
+A requested change was only partially carried out.
+
+3. incorrect_requested_change
+A requested change was attempted, but the result is wrong in identity, count, attribute, location, relation, or other specified detail.
+
+4. wrong_count_after_edit
+A requested count change was not satisfied exactly.
+
+5. wrong_attribute_after_edit
+A requested color, material, size, shape, texture, or type change was not satisfied correctly.
+
+6. wrong_relation_or_location_after_edit
+A requested spatial or positional change was not satisfied correctly.
+
+7. unintended_change
+Content not targeted by FEEDBACK was altered.
+
+8. poor_preservation
+Already-correct or unrelated important content was damaged or lost.
+
+9. over_edit
+The image was changed more broadly than necessary.
+
+10. hallucinated_edit_effect
+The edited image introduces new unsupported changes not requested in FEEDBACK.
+
+11. weak_following_of_multistep_feedback
+Some feedback steps were followed while others were ignored or executed weakly.
+
+[Relative Importance]
+Use the largest penalties for:
+- missed_requested_change on an important edit target
+- incorrect_requested_change on an important edit target
+- wrong_count_after_edit when exact count is specified
+- poor_preservation of important existing content
+- unintended_change that damages core scene content
+
+Use moderate penalties for:
+- partial_requested_change
+- wrong_attribute_after_edit
+- wrong_relation_or_location_after_edit
+- hallucinated_edit_effect
+- weak_following_of_multistep_feedback
+
+Use smaller penalties for:
+- mild over_edit with limited visible harm
+- minor local inconsistencies that do not materially affect the requested edit outcome
+
+[Score Anchors]
+
+A score near 2.00 means:
+- EDITED_IMAGE correctly applies nearly all requested changes from FEEDBACK,
+- does so with good specificity and accuracy,
+- preserves non-target content well,
+- and introduces little or no unnecessary collateral change.
+
+A score near 1.00 means:
+- EDITED_IMAGE follows some of the requested changes,
+- but also has meaningful weakness such as partial completion, incorrect detail, incomplete multi-step execution, or noticeable preservation problems,
+- so it is only borderline usable: not clearly a successful edit, but not severely wrong overall.
+
+A score near 0.00 means:
+- EDITED_IMAGE fails to carry out important requested changes,
+- applies them in the wrong way,
+- or substantially damages or alters content that should have been preserved,
+- such that the edit is strongly unfaithful to FEEDBACK or clearly harmful relative to SOURCE_IMAGE.
+
+[Output Format]
+Return exactly four lines in the following format:
+
+Requested Changes Check: <brief structured summary of whether the requested changes were fulfilled>
+Preservation Check: <brief structured summary of whether non-target content was preserved>
+Reason: <one concise sentence focusing on edit fulfillment and preservation/minimality>
+REWARD: <score>
+
+Do not output anything else.
 """.strip()
 
 ############################ Step 2 Fine-Graine Reward ############################
@@ -131,8 +313,8 @@ global - style (STYLE)
 [Task]
 Given PROMPT and SUMMARY, assign one scalar reward.
 
-Maximum score is 1.00.
-Negative scores are allowed.
+Maximum score is 2.00.
+Minimum score is 0.00.
 
 [Compression Principle]
 Compression is required only insofar as it improves downstream tuple decomposition, VQA, and feedback.
@@ -201,18 +383,18 @@ Use smaller penalties for:
 
 [Score Anchors]
 
-A score near 1.00 means:
+A score near 2.00 means:
 - SUMMARY preserves the core schema-valid visual content of PROMPT,
 - removes non-target content,
 - and would likely help downstream tuple decomposition, VQA, and feedback produce correct corrections without disturbing already-correct image content.
 - near-identity to PROMPT is acceptable when PROMPT is already concise and largely composed of downstream-usable visual content.
 
-A score near 0.00 means:
+A score near 1.00 means:
 - SUMMARY preserves only part of the core downstream-usable content from PROMPT,
 - but also has meaningful omissions and/or retains enough unnecessary, weakly verifiable, or schema-inappropriate content that it is not clearly a good downstream summary,
 - so it is borderline usable: not clearly helpful, but not severely distortive or strongly harmful overall.
 
-A score near -1.00 means:
+A score near 0.00 means:
 - SUMMARY seriously distorts, omits, or hallucinates core schema-valid content from PROMPT,
 - and would likely cause downstream stages to produce wrong tuples or harmful feedback,
 - including edits that alter already-correct image content in the wrong direction.
@@ -318,8 +500,8 @@ global - style (STYLE)
 [Task]
 Given SUMMARY and PRED_TUPLES, assign one scalar reward.
 
-Maximum score is 1.00.
-Negative scores are allowed.
+Maximum score is 2.00.
+Minimum score is 0.00.
 
 [Judging Principle]
 Internally do the following:
@@ -470,18 +652,18 @@ Use moderate penalties for:
 
 [Score Anchors]
 
-A score near 1.00 means:
+A score near 2.00 means:
 - PRED_TUPLES preserves nearly all core schema-valid information from SUMMARY,
 - does so conservatively and within the schema,
 - avoids unsupported inference and over-decomposition,
 - and would likely provide a clean, stable target set for downstream VQA and feedback.
 
-A score near 0.00 means:
+A score near 1.00 means:
 - PRED_TUPLES preserves some important schema-valid information from SUMMARY,
 - but also has meaningful omissions, extra noise, weakly verifiable tuples, or structural/canonical weakness,
 - so the tuple set is only borderline usable: not clearly a clean downstream target, but not severely distorted or strongly harmful overall.
 
-A score near -1.00 means:
+A score near 0.00 means:
 - PRED_TUPLES seriously distorts, omits, hallucinates, or over-expands the information in SUMMARY,
 - and would likely cause downstream VQA or feedback to operate on wrong or unstable targets,
 - including harmful edits to already-correct image content.
@@ -598,8 +780,8 @@ Given:
 
 assign one scalar reward.
 
-Maximum score is 1.00.
-Negative scores are allowed.
+Maximum score is 2.00.
+Minimum score is 0.00.
 
 [What You Must Judge]
 Judge whether the VQA output satisfies all of the following:
@@ -754,7 +936,7 @@ Use smaller penalties for:
 
 [Score Anchors]
 
-A score near 1.00 means:
+A score near 2.00 means:
 - every tuple is answered exactly once and in order,
 - each rationale is directly grounded in visible image evidence,
 - each Yes/No answer matches both the image and the rationale,
@@ -762,18 +944,18 @@ A score near 1.00 means:
 - count and relation judgments are correct,
 - and object interpretation is consistent across all tuples.
 
-A score near 0.00 means:
+A score near 1.00 means:
 - the VQA output gets some tuple checks substantially right,
 - but also contains limited, non-critical weakness such as incomplete grounding, weak or noisy rationale, minor local tuple drift, or minor logic/count/relation issues,
 - while still preserving tuple/result alignment and avoiding severe hallucinated evidence or clearly unjustified Yes answers,
 - so it is only borderline usable and not clearly reliable for downstream feedback.
 
-A score near -1.00 means:
+A score near 0.00 means:
 - the VQA output contains one or more severe verification failures,
 - such as a clearly unjustified Yes answer, non-grounded rationale, hallucinated visual evidence, severe count or logic mistakes, broken tuple/result alignment, or strong cross-tuple object inconsistency,
 - and would likely cause downstream feedback to act on wrong targets and harm already-correct image content.
 
-A single severe failure can justify a strongly negative score even if some other tuple checks are correct.
+A single severe failure can justify a low score even if some other tuple checks are correct.
 
 [Output Format]
 Return exactly four lines in the following format:
@@ -834,8 +1016,8 @@ FEEDBACK:
 [Task]
 Given PRED_TUPLES, VQA_RESULTS, and FEEDBACK, assign one scalar reward.
 
-Maximum score is 1.00.
-Negative scores are allowed.
+Maximum score is 2.00.
+Minimum score is 0.00.
 
 [Main Question]
 Does FEEDBACK correctly target the tuples labeled No, avoid harming tuples labeled Yes, stay grounded in the provided tuples and VQA results, and provide edit instructions that are concrete enough to be used for editing?
@@ -946,19 +1128,19 @@ Use smaller penalties for:
 
 [Score Anchors]
 
-A score near 1.00 means:
+A score near 2.00 means:
 - FEEDBACK addresses nearly all important No-labeled tuples,
 - is well aligned with the provided VQA failures,
 - preserves Yes-labeled tuples,
 - contains no unsupported edits,
 - and is concrete and usable as an edit instruction.
 
-A score near 0.00 means:
+A score near 1.00 means:
 - FEEDBACK addresses some important No-labeled tuples,
 - but also has meaningful weakness such as incomplete failure coverage, insufficient protection of Yes-labeled tuples, weak grounding in the provided VQA results, or vague / under-specified edit instructions,
 - so it is only borderline usable: not clearly a safe and effective edit plan, but not strongly harmful overall.
 
-A score near -1.00 means:
+A score near 0.00 means:
 - FEEDBACK misses important failed tuples,
 - risks damaging already-correct Yes-labeled content,
 - introduces unsupported edits,
