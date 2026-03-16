@@ -35,6 +35,11 @@ class WeightRelayActor:
         self.node_id = node_id
         self.latest_version = -1
 
+        # NIXL state (initialized via configure_nixl)
+        self._nixl_agent = None
+        self._nixl_recv_desc_bytes = None  # serialized recv descriptors for sender
+        self._nixl_sender_name = None  # name of the sender agent (for receivers)
+
     def configure_stream(self, rank: int, world_size: int, group_name: str, fanout: int, chunk_bytes: int):
         self.rank = rank
         self.world_size = world_size
@@ -287,3 +292,194 @@ class WeightRelayActor:
             "t_net": t_net, "t_save_pt": t_save, "t_total": t_total,
             "skip_write": False,
         }
+
+    # ==================== NIXL Methods ====================
+
+    def configure_nixl(self, role: str, listen_port: int = 0, recv_buf_bytes: int = 0):
+        """
+        Initialize NIXL agent on this relay.
+
+        Args:
+            role: "sender" (trainer node) or "receiver" (rollout node)
+            listen_port: port for NIXL metadata exchange (receiver should use non-zero)
+            recv_buf_bytes: pre-allocate receive buffer of this size (receiver only)
+
+        Returns:
+            dict with "name" and "metadata" (bytes) for peer registration
+        """
+        from recipe.fully_async_policy_image_rl.nixl_utils import NixlWeightAgent
+
+        agent_name = f"relay_{self.node_id[:8]}_{role}"
+        self._nixl_agent = NixlWeightAgent(agent_name, listen_port=listen_port)
+
+        result = {
+            "name": agent_name,
+            "metadata": self._nixl_agent.get_metadata(),
+            "node_id": self.node_id,
+        }
+
+        if role == "receiver" and recv_buf_bytes > 0:
+            shm_path = f"/dev/shm/.nixl_recv_{self.node_id[:8]}"
+            self._nixl_recv_desc_bytes = self._nixl_agent.allocate_recv_buffer(
+                recv_buf_bytes, shm_path
+            )
+            result["recv_descs"] = self._nixl_recv_desc_bytes
+
+        print(f"[WeightRelayActor][NIXL] Node {self.node_id} configured as {role}, "
+              f"agent={agent_name}", flush=True)
+        return result
+
+    def nixl_add_remote(self, metadata: bytes):
+        """Register a remote NIXL agent."""
+        return self._nixl_agent.add_remote(metadata)
+
+    def nixl_get_recv_descs(self, nbytes: int = 0):
+        """
+        Get (or resize) receiver descriptor bytes. Called by sender to know
+        where to WRITE.
+        """
+        if nbytes > 0 and nbytes != self._nixl_agent._recv_nbytes:
+            shm_path = f"/dev/shm/.nixl_recv_{self.node_id[:8]}"
+            self._nixl_recv_desc_bytes = self._nixl_agent.resize_recv_buffer(nbytes)
+        return self._nixl_recv_desc_bytes
+
+    async def nixl_send_to_peers(self, version: int, weights_ref, peer_infos: list):
+        """
+        Sender (trainer relay): send weights to all receiver relays via NIXL WRITE.
+
+        Args:
+            version: weight version
+            weights_ref: Ray ObjectRef or numpy array of exported weights
+            peer_infos: list of dicts with "name", "recv_descs" for each receiver
+
+        Returns:
+            dict with timing stats
+        """
+        t_total0 = time.time()
+
+        # Resolve weights
+        if isinstance(weights_ref, ray.ObjectRef):
+            w0 = await weights_ref
+        else:
+            w0 = weights_ref
+        if not isinstance(w0, np.ndarray):
+            raise TypeError(f"exported weights must be numpy.ndarray, got {type(w0)}")
+
+        w0 = np.ascontiguousarray(w0).reshape(-1)
+        nbytes = int(w0.view(np.uint8).nbytes)
+
+        # Register source buffer with NIXL
+        self._nixl_agent.register_source(w0)
+
+        t_net0 = time.time()
+
+        # Post WRITE transfers to all peers in parallel
+        handles = []
+        for info in peer_infos:
+            remote_name = info["name"]
+            recv_descs_bytes = info["recv_descs"]
+            remote_descs = self._nixl_agent.agent.deserialize_descs(recv_descs_bytes)
+
+            notif_msg = f"v{version}:{nbytes}".encode()
+            handle = self._nixl_agent.send_to_receiver(remote_name, remote_descs, notif_msg)
+            handles.append((handle, remote_name))
+
+        # Poll all transfers to completion
+        for handle, remote_name in handles:
+            success = self._nixl_agent.poll_xfer(handle)
+            if not success:
+                print(f"[WeightRelayActor][NIXL] TIMEOUT sending to {remote_name}", flush=True)
+            self._nixl_agent.release_handle(handle)
+
+        t_net = time.time() - t_net0
+
+        # Save .pt file locally (trainer node also needs it)
+        t_save0 = time.time()
+        file_path = f"/dev/shm/weights_v{version}.pt"
+        tmp_pt = f"/dev/shm/.nixl_wtmp_v{version}_sender.pt"
+        weights_tensor = torch.from_numpy(w0).view(torch.bfloat16)
+        torch.save(weights_tensor, tmp_pt)
+        os.replace(tmp_pt, file_path)
+
+        # Cleanup older versions
+        self._cleanup_old_weights(file_path)
+
+        t_save = time.time() - t_save0
+        t_total = time.time() - t_total0
+        self.latest_version = version
+
+        print(f"[WeightRelayActor][NIXL] Sender v{version} done: "
+              f"net={t_net:.2f}s save={t_save:.2f}s total={t_total:.2f}s "
+              f"peers={len(peer_infos)}", flush=True)
+
+        return {
+            "node": self.node_id, "role": "sender", "file": file_path,
+            "t_net": t_net, "t_save_pt": t_save, "t_total": t_total,
+            "skip_write": False, "nbytes": nbytes,
+        }
+
+    async def nixl_recv_and_save(self, version: int, sender_name: str):
+        """
+        Receiver (rollout relay): wait for NIXL notification, then materialize .pt file.
+
+        The actual data transfer is initiated by the sender via WRITE.
+        This method waits for the completion notification and then saves the
+        received raw bytes as a .pt file.
+
+        Args:
+            version: weight version
+            sender_name: name of the sender's NIXL agent
+
+        Returns:
+            dict with timing stats
+        """
+        t_total0 = time.time()
+        file_path = f"/dev/shm/weights_v{version}.pt"
+
+        # Wait for sender's notification that WRITE is complete
+        t_net0 = time.time()
+        notif = self._nixl_agent.wait_for_notif(sender_name, timeout_s=120.0)
+        t_net = time.time() - t_net0
+
+        # Parse nbytes from notification
+        # notif format: b"v{version}:{nbytes}"
+        notif_str = notif.decode()
+        nbytes = int(notif_str.split(":")[1])
+
+        # Materialize .pt file from receive buffer
+        t_save0 = time.time()
+        self._nixl_agent._recv_nbytes = nbytes
+        file_path = self._nixl_agent.materialize_pt(version)
+
+        # Cleanup older versions
+        self._cleanup_old_weights(file_path)
+
+        t_save = time.time() - t_save0
+        t_total = time.time() - t_total0
+        self.latest_version = version
+
+        print(f"[WeightRelayActor][NIXL] Receiver v{version} done: "
+              f"wait={t_net:.2f}s save={t_save:.2f}s total={t_total:.2f}s",
+              flush=True)
+
+        return {
+            "node": self.node_id, "role": "receiver", "file": file_path,
+            "t_net": t_net, "t_save_pt": t_save, "t_total": t_total,
+            "skip_write": False,
+        }
+
+    def _cleanup_old_weights(self, keep_path: str):
+        """Remove older weight .pt files from /dev/shm, keeping only keep_path."""
+        try:
+            for f in glob.glob("/dev/shm/weights_v*.pt"):
+                base = os.path.basename(f)
+                if (base.startswith("weights_v")
+                    and base.endswith(".pt")
+                    and base.count(".") == 1
+                    and os.path.abspath(f) != os.path.abspath(keep_path)):
+                    try:
+                        os.remove(f)
+                    except Exception:
+                        pass
+        except Exception:
+            pass

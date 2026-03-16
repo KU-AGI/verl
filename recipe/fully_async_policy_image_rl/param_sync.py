@@ -92,6 +92,23 @@ class ParameterSynchronizer:
         self._init_weights_info()
         self._init_sync_group()
 
+        # NIXL backend support (must be after _init_weights_info so weights_info is available)
+        self._use_nixl = False
+        self._nixl_peer_infos = []  # list of {name, recv_descs, node_id} for receivers
+        self._nixl_sender_name = None
+
+        weight_backend = getattr(config.async_training, "weight_transfer_backend", "gloo")
+        if weight_backend == "nixl":
+            try:
+                self._init_relay_nixl()
+                self._use_nixl = True
+                print("[ParameterSynchronizer] NIXL backend initialized successfully")
+            except Exception as e:
+                print(f"[ParameterSynchronizer] NIXL init failed, falling back to Gloo: {e}")
+                import traceback
+                traceback.print_exc()
+                self._use_nixl = False
+
         # Prevent overlapping weight distribution (vN and vN+1 race)
         self._dist_lock = asyncio.Lock()
 
@@ -202,6 +219,92 @@ class ParameterSynchronizer:
             )
         ray.get(cfg_tasks)
 
+    def _init_relay_nixl(self):
+        """
+        Initialize NIXL agents on all relay actors for point-to-point weight transfer.
+
+        - Trainer relay is configured as "sender"
+        - All rollout relays are configured as "receiver" with pre-allocated buffers
+        - Metadata is exchanged so sender knows how to reach each receiver
+        """
+        from recipe.fully_async_policy_image_rl.nixl_utils import NIXL_AVAILABLE
+        if not NIXL_AVAILABLE:
+            raise ImportError("nixl package not installed")
+
+        # Estimate receive buffer size from weights info
+        # weights_info contains the total number of parameters
+        recv_buf_bytes = 0
+        if self.weights_info is not None:
+            total_params = sum(v.numel() for v in self.weights_info.values()) if isinstance(self.weights_info, dict) else 0
+            # bfloat16 = 2 bytes per param, viewed as uint8 for transfer
+            recv_buf_bytes = total_params * 2 if total_params > 0 else 8 * (1024 ** 3)
+        if recv_buf_bytes <= 0:
+            recv_buf_bytes = 8 * (1024 ** 3)  # default 8GB
+
+        print(f"[ParamSync][NIXL] Estimated recv buffer: {recv_buf_bytes / (1024**3):.2f} GB")
+
+        rollout_node_ids = [n for n in self._relay_nodes_ordered if n != self._trainer_node_id]
+
+        # 1. Configure sender (trainer relay)
+        sender_result = ray.get(
+            self.relays[self._trainer_node_id].configure_nixl.remote(
+                role="sender", listen_port=0, recv_buf_bytes=0
+            )
+        )
+        self._nixl_sender_name = sender_result["name"]
+        sender_metadata = sender_result["metadata"]
+
+        # 2. Configure receivers (rollout relays) - use different listen ports
+        recv_tasks = {}
+        for i, node_id in enumerate(rollout_node_ids):
+            recv_tasks[node_id] = self.relays[node_id].configure_nixl.remote(
+                role="receiver",
+                listen_port=15100 + i,
+                recv_buf_bytes=recv_buf_bytes,
+            )
+        recv_results = {nid: ray.get(ref) for nid, ref in recv_tasks.items()}
+
+        # 3. Cross-register metadata: sender learns about all receivers
+        for nid, result in recv_results.items():
+            ray.get(self.relays[self._trainer_node_id].nixl_add_remote.remote(result["metadata"]))
+
+        # 4. Each receiver learns about the sender
+        for nid in rollout_node_ids:
+            ray.get(self.relays[nid].nixl_add_remote.remote(sender_metadata))
+
+        # 5. Build peer_infos for the sender to use during transfers
+        self._nixl_peer_infos = []
+        for nid in rollout_node_ids:
+            result = recv_results[nid]
+            self._nixl_peer_infos.append({
+                "name": result["name"],
+                "recv_descs": result["recv_descs"],
+                "node_id": nid,
+            })
+
+        print(f"[ParamSync][NIXL] Sender={self._nixl_sender_name}, "
+              f"Receivers={[p['name'] for p in self._nixl_peer_infos]}")
+
+    async def _distribute_via_nixl(self, version, weights_ref):
+        """Distribute weights to all rollout nodes via NIXL point-to-point WRITE."""
+        trainer_relay = self.relays[self._trainer_node_id]
+        rollout_node_ids = [n for n in self._relay_nodes_ordered if n != self._trainer_node_id]
+
+        # Sender sends to all receivers in parallel (NIXL handles parallelism internally)
+        send_task = trainer_relay.nixl_send_to_peers.remote(
+            version, weights_ref, self._nixl_peer_infos
+        )
+
+        # Receivers wait for notification and materialize .pt files
+        recv_tasks = [
+            self.relays[nid].nixl_recv_and_save.remote(version, self._nixl_sender_name)
+            for nid in rollout_node_ids
+        ]
+
+        # Wait for all to complete
+        all_results = await asyncio.gather(send_task, *recv_tasks)
+        return all_results
+
     def set_self_handle(self, handle):
         """Store the actor handle for this ParameterSynchronizer"""
         self.self_handle = handle
@@ -245,19 +348,20 @@ class ParameterSynchronizer:
 
         t_stream0 = time.time()
         async with self._dist_lock:
-            tasks = []
-            for node_id in self._relay_nodes_ordered:
-                relay = self.relays[node_id]
-                if node_id == self._trainer_node_id:
-                    tasks.append(relay.stream_to_shm_gloo.remote(version, weights_ref))
-                else:
-                    tasks.append(relay.stream_to_shm_gloo.remote(version, None))
-
-            results = await asyncio.gather(*tasks)
+            if self._use_nixl:
+                results = await self._distribute_via_nixl(version, weights_ref)
+            else:
+                tasks = []
+                for node_id in self._relay_nodes_ordered:
+                    relay = self.relays[node_id]
+                    if node_id == self._trainer_node_id:
+                        tasks.append(relay.stream_to_shm_gloo.remote(version, weights_ref))
+                    else:
+                        tasks.append(relay.stream_to_shm_gloo.remote(version, None))
+                results = await asyncio.gather(*tasks)
         t_stream = time.time() - t_stream0
 
-        # relay 결과에서 net/save를 집계
-        # root(rank0) 결과 포함, non-root 여러 개 중 “critical path”는 보통 max로 봅니다.
+        backend_label = "NIXL" if self._use_nixl else "GLOO"
         t_net_max = max(r.get("t_net", 0.0) for r in results)
         t_save_max = max(r.get("t_save_pt", 0.0) for r in results)
         t_relay_total_max = max(r.get("t_total", 0.0) for r in results)
@@ -265,7 +369,7 @@ class ParameterSynchronizer:
         t_total = time.time() - t_total0
 
         print(
-            f"[ParameterSynchronizer][GLOO] v{version} "
+            f"[ParameterSynchronizer][{backend_label}] v{version} "
             f"publish={t_pub:.2f}s | stream_total={t_stream:.2f}s | "
             f"relay_net_max={t_net_max:.2f}s | relay_ptsave_max={t_save_max:.2f}s | "
             f"relay_total_max={t_relay_total_max:.2f}s | total={t_total:.2f}s",
@@ -288,17 +392,20 @@ class ParameterSynchronizer:
         self.current_version = version
 
         async with self._dist_lock:
-            tasks = []
-            for node_id in self._relay_nodes_ordered:
-                relay = self.relays[node_id]
-                if node_id == self._trainer_node_id:
-                    tasks.append(relay.stream_to_shm_gloo.remote(version, weights_ref))
-                else:
-                    tasks.append(relay.stream_to_shm_gloo.remote(version, None))
+            if self._use_nixl:
+                await self._distribute_via_nixl(version, weights_ref)
+            else:
+                tasks = []
+                for node_id in self._relay_nodes_ordered:
+                    relay = self.relays[node_id]
+                    if node_id == self._trainer_node_id:
+                        tasks.append(relay.stream_to_shm_gloo.remote(version, weights_ref))
+                    else:
+                        tasks.append(relay.stream_to_shm_gloo.remote(version, None))
+                await asyncio.gather(*tasks)
 
-            await asyncio.gather(*tasks)
-
-        print(f"[ParameterSynchronizer][GLOO] v{version} Gloo stream done. Time: {time.time()-start_time:.2f}s")
+        backend_label = "NIXL" if self._use_nixl else "GLOO"
+        print(f"[ParameterSynchronizer][{backend_label}] v{version} stream done. Time: {time.time()-start_time:.2f}s")
 
         self.wait_last_update = self.rollouter.update_param_version.remote(version, validate, global_steps)
         self.wait_last_resume = None
