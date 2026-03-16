@@ -2,7 +2,7 @@
 
 export HF_HOME=/data/.cache/huggingface
 
-for i in 6; do
+for i in 7; do
     port=$((8000 + i))
     CUDA_VISIBLE_DEVICES=$i python -m sglang.launch_server \
         --model-path Qwen/Qwen3.5-35B-A3B \

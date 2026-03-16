@@ -1,8 +1,9 @@
-CONTAINER_NAME=verl-$(USER)
-IMAGE_NAME_TAG=verlai/verl:app-verl0.5-transformers4.55.4-vllm0.10.0-mcore0.13.0-te2.2
+CONTAINER_NAME=verl-image-rl-$(USER)
+IMAGE_NAME_TAG=verl_image_rl:v1.0.0 # verlai/verl:app-verl0.5-transformers4.55.4-vllm0.10.0-mcore0.13.0-te2.2
 
 init-container:
 	docker run -d \
+	--init \
 	--gpus all \
 	--network host \
 	-v ${PWD}:/verl \
@@ -10,13 +11,14 @@ init-container:
 	-v /home:/home \
 	-v /data/.cache:/root/.cache \
 	--shm-size=10g \
-	--ulimit memlock=1 \
+	--ulimit memlock=-1 \
 	--name $(CONTAINER_NAME) \
 	$(IMAGE_NAME_TAG) \
 	tail -f /dev/null
 
 init-container-with-infiniband:
 	docker run -d \
+		--init \
 		--gpus all \
 		--network host \
 		--ipc=host \
@@ -28,6 +30,7 @@ init-container-with-infiniband:
 		-e NCCL_IB_HCA="mlx5_0,mlx5_4,mlx5_5,mlx5_8" \
 		-e NCCL_CROSS_NIC=1 \
 		-e NCCL_SOCKET_IFNAME="bond-srv.1518" \
+		-e GLOO_SOCKET_IFNAME="bond-srv.1518" \
 		-e NCCL_P2P_LEVEL=NVL \
 		-e NCCL_NET_GDR_LEVEL=0 \
 		-e NCCL_CUDA_DEVICE_MAX_CONNECTIONS=1 \
@@ -52,33 +55,31 @@ MODEL_PATH=Qwen/Qwen3-VL-30B-A3B-Instruct # OpenGVLab/InternVL3_5-38B
 VLLM_CONTAINER_NAME_PREFIX=vllm-g
 SGLANG_CONTAINER_NAME_PREFIX=sglang-g
 
-# https://github.com/vllm-project/vllm/pull/22386
 start-vllm-servers:
-	for GPU in 4 ; do \
+	for GPU in 5 ; do \
 		PORT=$$((8000 + $$GPU)) ; \
 		docker run --rm -d --name ${VLLM_CONTAINER_NAME_PREFIX}$$GPU \
 			--gpus all \
 			-v /data:/data \
 			-v /home:/home \
 			-e HF_HOME=${CACHE_PATH} \
-			-e CUDA_VISIBLE_DEVICES=$$GPU,$$(($$GPU + 1)) \
+			-e CUDA_VISIBLE_DEVICES=$$GPU \
 			-e VLLM_WORKER_MULTIPROC_METHOD=spawn \
 			-p $${PORT}:8000 \
 			--ipc=host \
-			vllm/vllm-openai:v0.12.0 \
-			--model ${MODEL_PATH} \
-			--served-model-name ${MODEL_PATH} \
-			--trust-remote-code \
+			vllm/vllm-openai:nightly-4a9c07a0a2b8308a045476b48be29e37c349274b \
+			--model Qwen/Qwen3.5-27B \
+			--served-model-name Qwen/Qwen3.5-27B \
+			--gpu-memory-utilization 0.8 \
 			--host 0.0.0.0 \
 			--port 8000 \
-			--tensor-parallel-size 2 \
-			--limit-mm-per-prompt.video 0 \
-			--gpu-memory-utilization 0.7 \
-			--async-scheduling ; \
+			--max-model-len 262144 \
+			--reasoning-parser qwen3 \
+			--enable-prefix-caching ; \
 	done
 
 start-sglang-servers:
-	for GPU in 4 5 ; do \
+	for GPU in 6 ; do \
 		PORT=$$((8000 + $$GPU)) ; \
 		docker run --rm -d --name ${SGLANG_CONTAINER_NAME_PREFIX}$$GPU \
 			--gpus all \
@@ -91,16 +92,16 @@ start-sglang-servers:
 			--ipc=host \
 			lmsysorg/sglang:latest \
 			python -m sglang.launch_server \
-			--model-path Qwen/Qwen3-VL-30B-A3B-Instruct \
-			--trust-remote-code \
+			--model-path Qwen/Qwen3.5-27B \
 			--host 0.0.0.0 \
 			--port 8000 \
-			--mem-fraction-static 0.90 \
+			--mem-fraction-static 0.95 \
 			--max-running-requests 512 \
-			--max-total-tokens 65536 \
-			--chunked-prefill-size 4096 \
-			--attention-backend flashinfer \
-			--sampling-backend flashinfer ; \
+			--reasoning-parser qwen3 \
+			--speculative-algo NEXTN \
+			--speculative-num-steps 3 \
+			--speculative-eagle-topk 1 \
+			--speculative-num-draft-tokens 4 ; \
 	done
 
 stop-servers:

@@ -7,7 +7,7 @@ export MAX_JOBS=32
 
 echo "1. install inference frameworks and pytorch they need"
 if [ $USE_SGLANG -eq 1 ]; then
-    pip install "sglang[all]==0.5.2" --no-cache-dir && pip install torch-memory-saver --no-cache-dir
+    pip install "sglang[all]==0.5.9" --no-cache-dir && pip install torch-memory-saver --no-cache-dir
 fi
 pip install --no-cache-dir "vllm==0.11.0"
 
@@ -50,6 +50,12 @@ pip install opencv-fixer && \
 if [ $USE_MEGATRON -eq 1 ]; then
     echo "6. Install cudnn python package (avoid being overridden)"
     pip install nvidia-cudnn-cu12==9.10.2.21
+fi
+
+USE_NIXL=${USE_NIXL:-0}
+if [ $USE_NIXL -eq 1 ]; then
+    echo "7. Install NIXL for RDMA-based weight transfer"
+    pip install --no-cache-dir nixl
 fi
 
 echo "Successfully installed all packages"
