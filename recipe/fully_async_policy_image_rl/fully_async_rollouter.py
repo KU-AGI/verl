@@ -180,6 +180,15 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         self.server_token_q = None
         self.is_validating = False
 
+        # Per-version metrics accumulators (reset on each param version update)
+        self._version_rollout_durations = []
+        self._version_finalize_durations = []
+        self._version_good_counts = []  # samples sent to MQ
+        self._version_retry_counts = []  # samples sent to retry queue
+        self._version_dropped_counts = []  # samples dropped
+        self._version_start_sample_count = 0
+        self._version_start_time = None
+
     async def set_param_synchronizer(self, h):
         async with self.lock:
             self.param_synchronizer = h
@@ -277,10 +286,62 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 rollout_active_time = self.idle_start_time - self.version_start_time
                 rollout_version_time = time.time() - self.version_start_time
                 idle_ratio = 1 - rollout_active_time / rollout_version_time
-                timing_raw["rollouter/active_time"] = rollout_active_time
+                active_ratio = rollout_active_time / rollout_version_time
+                timing_raw["rollouter/active_ratio"] = active_ratio
                 timing_raw["rollouter/version_time"] = rollout_version_time
                 timing_raw["rollouter/idle_ratio"] = idle_ratio
                 self.idle_start_time = None
+
+            # Compute per-version metrics for wandb logging
+            current_time = time.time()
+            version_elapsed = current_time - self._version_start_time if self._version_start_time else 0
+            samples_this_version = self.total_generated_samples - self._version_start_sample_count
+
+            # Timing averages
+            if self._version_rollout_durations:
+                timing_raw["rollouter/rollout_duration_avg"] = sum(self._version_rollout_durations) / len(self._version_rollout_durations)
+            if self._version_finalize_durations:
+                timing_raw["rollouter/finalize_duration_avg"] = sum(self._version_finalize_durations) / len(self._version_finalize_durations)
+
+            # Cumulative sample counts
+            timing_raw["rollouter/total_generated_samples"] = self.total_generated_samples
+
+            # Throughput
+            if version_elapsed > 0:
+                timing_raw["rollouter/samples_per_second"] = samples_this_version / version_elapsed
+
+            # Per-version sample flow metrics
+            # total_generated = samples that went to MQ (good)
+            # total_retry = samples sent back to retry queue
+            # total_dropped = samples dropped (max retries exceeded)
+            total_to_mq = sum(self._version_good_counts) if self._version_good_counts else 0
+            total_retry = sum(self._version_retry_counts) if self._version_retry_counts else 0
+            total_dropped = sum(self._version_dropped_counts) if self._version_dropped_counts else 0
+            total_processed = total_to_mq + total_retry + total_dropped
+
+            # Total samples processed this version (before filtering)
+            timing_raw["rollouter/processed_this_version"] = total_processed
+
+            # Breakdown counts
+            timing_raw["rollouter/to_mq_count"] = total_to_mq
+            timing_raw["rollouter/retry_count"] = total_retry
+            timing_raw["rollouter/dropped_count"] = total_dropped
+
+            # Ratios (what fraction of processed samples went where)
+            if total_processed > 0:
+                timing_raw["rollouter/to_mq_ratio"] = total_to_mq / total_processed
+                timing_raw["rollouter/retry_ratio"] = total_retry / total_processed
+                timing_raw["rollouter/dropped_ratio"] = total_dropped / total_processed
+
+            # Reset accumulators for next version
+            self._version_rollout_durations = []
+            self._version_finalize_durations = []
+            self._version_good_counts = []
+            self._version_retry_counts = []
+            self._version_dropped_counts = []
+            self._version_start_sample_count = self.total_generated_samples
+            self._version_start_time = current_time
+
             print(
                 f"[FullyAsyncRollouter][Public][update_param_version] "
                 f"Parameter version updated from {old_version} to {version} "
@@ -835,7 +896,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
 
             # 3) finalize 워커로 넘기고 즉시 종료
             await self.reward_finalize_queue.put(
-                (rollout_sample, sample_reward_tasks, reward_results, used_version, finalize_budget)
+                (rollout_sample, sample_reward_tasks, reward_results, used_version, finalize_budget, rollout_duration)
             )
             enqueued_to_finalize = True
             return  # 여기서 끝
@@ -916,7 +977,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                     break
 
                 finalize_start_time = time.perf_counter()
-                rollout_sample, sample_reward_tasks, reward_results, used_version, finalize_budget = item
+                rollout_sample, sample_reward_tasks, reward_results, used_version, finalize_budget, rollout_duration = item
                 batch_size = len(rollout_sample.full_batch)
                 is_retry = rollout_sample.retry_count > 0
 
@@ -1014,6 +1075,13 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                             self.condition.notify_all()
                     self.dropped_stale_samples += n_dropped
                     self.processed_sample_count += 1
+
+                    # Accumulate per-version metrics for wandb logging
+                    self._version_rollout_durations.append(rollout_duration)
+                    self._version_finalize_durations.append(finalize_duration)
+                    self._version_good_counts.append(len(good_indices))
+                    self._version_retry_counts.append(len(retry_rs_list))
+                    self._version_dropped_counts.append(n_dropped)
                 stats_updated = True
 
             except Exception as e:
