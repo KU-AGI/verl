@@ -148,7 +148,7 @@ Does EDITED_IMAGE make the requested changes from FEEDBACK relative to SOURCE_IM
 Use these internally.
 
 1. missed_requested_change
-A requested change was not carried out.
+A requested change was not carried out at all.
 
 2. partial_requested_change
 A requested change was only partially carried out.
@@ -157,7 +157,7 @@ A requested change was only partially carried out.
 A requested change was attempted, but the result is wrong in identity, count, attribute, location, relation, or other specified detail.
 
 4. wrong_count_after_edit
-A requested count change was not satisfied exactly.
+A requested exact count change was not satisfied correctly.
 
 5. wrong_attribute_after_edit
 A requested color, material, size, shape, texture, or type change was not satisfied correctly.
@@ -166,56 +166,60 @@ A requested color, material, size, shape, texture, or type change was not satisf
 A requested spatial or positional change was not satisfied correctly.
 
 7. unintended_change
-Content not targeted by FEEDBACK was altered.
+A visible change not requested by FEEDBACK was introduced.
 
 8. poor_preservation
-Already-correct or unrelated important content was damaged or lost.
+Important existing content that should have remained unchanged was removed, damaged, or substantially altered.
 
 9. over_edit
-The image was changed more broadly than necessary.
+The image was changed more broadly than necessary, even if some requested change was applied.
 
-10. hallucinated_edit_effect
-The edited image introduces new unsupported changes not requested in FEEDBACK.
-
-11. weak_following_of_multistep_feedback
+10. weak_following_of_multistep_feedback
 Some feedback steps were followed while others were ignored or executed weakly.
+
+11. anchor_object_loss
+An existing object that serves as the reference or anchor for the requested edit is removed, lost, or heavily altered, making the requested edit unstable or invalid.
 
 [Relative Importance]
 Use the largest penalties for:
 - missed_requested_change on an important edit target
 - incorrect_requested_change on an important edit target
 - wrong_count_after_edit when exact count is specified
-- poor_preservation of important existing content
+- poor_preservation
 - unintended_change that damages core scene content
+- anchor_object_loss
 
 Use moderate penalties for:
 - partial_requested_change
 - wrong_attribute_after_edit
 - wrong_relation_or_location_after_edit
-- hallucinated_edit_effect
 - weak_following_of_multistep_feedback
+- over_edit
 
 Use smaller penalties for:
-- mild over_edit with limited visible harm
+- mild unintended_change with limited visible impact
 - minor local inconsistencies that do not materially affect the requested edit outcome
 
 [Score Anchors]
 
 A score near 2.00 means:
-- EDITED_IMAGE correctly applies nearly all requested changes from FEEDBACK,
-- does so with good specificity and accuracy,
-- preserves non-target content well,
-- and introduces little or no unnecessary collateral change.
+- EDITED_IMAGE correctly applies nearly all important requested changes from FEEDBACK,
+- does so with high specificity and accuracy,
+- preserves non-target and already-correct content well,
+- keeps anchor/reference objects intact,
+- and introduces little or no unintended change or collateral damage.
 
 A score near 1.00 means:
-- EDITED_IMAGE follows some of the requested changes,
-- but also has meaningful weakness such as partial completion, incorrect detail, incomplete multi-step execution, or noticeable preservation problems,
-- so it is only borderline usable: not clearly a successful edit, but not severely wrong overall.
+- EDITED_IMAGE follows some important requested changes,
+- but also has meaningful weakness such as partial completion, incorrect detail, incomplete multi-step execution, noticeable preservation problems, or limited unintended changes,
+- so it is only borderline successful: not clearly a clean and reliable edit, but not severely wrong or strongly harmful overall.
 
 A score near 0.00 means:
-- EDITED_IMAGE fails to carry out important requested changes,
+- EDITED_IMAGE fails to carry out one or more important requested changes,
 - applies them in the wrong way,
-- or substantially damages or alters content that should have been preserved,
+- substantially damages, removes, or alters content that should have been preserved,
+- loses an anchor/reference object needed for the requested edit,
+- or introduces major unintended changes,
 - such that the edit is strongly unfaithful to FEEDBACK or clearly harmful relative to SOURCE_IMAGE.
 
 [Output Format]
