@@ -1,93 +1,132 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Designate log path
+###############################################################################
+#                              LOGGING SETUP
+###############################################################################
 LOG_DIR=${LOG_DIR:-"logs"}
 mkdir -p "${LOG_DIR}"
 SCRIPT_LOG="${LOG_DIR}/script_$(date +%Y%m%d_%H%M%S).log"
-
-# Save log files
 exec > >(tee -a "${SCRIPT_LOG}")
 exec 2>&1
 
+###############################################################################
+#                         EXPERIMENT CONFIGURATION
+###############################################################################
 project_name='mllm_reasoning'
-# exp_name="test2_fg"
-exp_name="0316_replay_buffer_no_version_gap_filter"
-task_ids='[1,2,3]'
+exp_name="0317_our_model_our_dataset_task3_fine_grained_reward_edit"
+task_ids='[3]'
 
+###############################################################################
+#                           ENVIRONMENT VARIABLES
+###############################################################################
+# NCCL Settings
 export NCCL_IB_GID_INDEX=0
 export NCCL_CUDA_DEVICE_MAX_CONNECTIONS=8
-export CUDA_DEVICE_MAX_CONNECTIONS=8
 export NCCL_P2P_LEVEL="NVL"
 export NCCL_NET_GDR_LEVEL=2
 export NCCL_SOCKET_TIMEOUT=300000
 export NCCL_IB_TIMEOUT=300
 export NCCL_SOCKET_IFNAME=bond-srv.1518
-export GLOO_SOCKET_IFNAME=bond-srv.1518
 
+# CUDA & Other Settings
+export CUDA_DEVICE_MAX_CONNECTIONS=8
+export GLOO_SOCKET_IFNAME=bond-srv.1518
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-# export VLLM_ATTENTION_BACKEND=XFORMERS
 export HYDRA_FULL_ERROR=1
+# export VLLM_ATTENTION_BACKEND=XFORMERS
 # export TORCH_DISTRIBUTED_DEBUG=DETAIL
 
-# Ray
+###############################################################################
+#                               PATH SETTINGS
+###############################################################################
+# Ray Configuration
 RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
 WORKING_DIR=${WORKING_DIR:-"${PWD}"}
 RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/recipe/fully_async_policy_image_rl/shell/runtime_env.yaml"}
 
-# Paths
+# Model & Checkpoint Paths
 HOME="/data"
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
-#MODEL_PATH=/data/mllm/checkpoints/ReasonGen-R1-SFT # CaraJ/T2I-R1 # Franklin0/ReasonGen-R1 # /data/mllm/ckpt/step=014000.ckpt/hf_model # /data/mllm/checkpoints/Janus-Pro-7B
 MODEL_PATH="/data/mllm/ckpt/step=014000.ckpt/hf_model"
 # MODEL_PATH="/data/verl/ckpts/mllm_reasoning/0303_our_model_our_dataset_task2_naive_total_reward/global_step_50/hf"
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
-TRAIN_FILES=/data/mllm/data/train_wo_focusdiff_v2.parquet
-VAL_FILES=['/data/mllm/data/val_wo_focusdiff_v2.parquet','/data/mllm/data/train_subset_24_wo_focusdiff_v2.parquet']
-# TRAIN_FILES='/data/users/pimang62/verl_image_rl/data/train_reasongen.parquet'
-# VAL_FILES=["/data/users/pimang62/verl_image_rl/data/val_reasongen_16.parquet","/data/users/pimang62/verl_image_rl/data/val_reasongen.parquet"] # 300
 
+# Dataset Paths
+TRAIN_FILES=/data/mllm/data/train_wo_focusdiff_v2.parquet
+VAL_FILES='[/data/mllm/data/val_wo_focusdiff_v2.parquet,/data/mllm/data/train_subset_24_wo_focusdiff_v2.parquet]'
+# TRAIN_FILES='/data/users/pimang62/verl_image_rl/data/train_reasongen.parquet'
+# VAL_FILES=["/data/users/pimang62/verl_image_rl/data/val_reasongen_16.parquet","/data/users/pimang62/verl_image_rl/data/val_reasongen.parquet"]
+
+# Reward Model Paths
 rm_vlm_model_path="Qwen/Qwen3.5-35B-A3B"
 rm_llm_model_path="Qwen/Qwen3-30B-A3B-Instruct-2507"
 
+###############################################################################
+#                          DISTRIBUTED TRAINING
+###############################################################################
+# Node & GPU Configuration
+NNODES=${NNODES:-1}
+NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
+n_gpus_rollout=5
+n_gpus_training=2
+
+# FSDP & Parallelism
+fsdp_size=2  # Must be divisible by (n_gpus_training*n_nodes) and (n_gpus_rollout*n_nodes)
+gen_tp=1
+sp_size=1
+
+# Offloading
+ref_offload=False
+actor_offload=False
+
+###############################################################################
+#                           ALGORITHM PARAMETERS
+###############################################################################
+# Core Algorithm
+adv_estimator=grpo_task_skip
 rollout_name=image_unified
 rollout_mode=async
 
-# Algorithm parameters
-adv_estimator=grpo_task_skip
-
+# KL Divergence
 use_kl_in_reward=False
 kl_coef=0.0
 use_kl_loss=False
 kl_loss_coef=0.04
-entropy_coeff=0.00
 
+# PPO Clipping
 clip_ratio_low=0.2
 clip_ratio_high=0.2
+entropy_coeff=0.00
 
+# Group Filtering
 enable_filter_groups=True
-filter_groups_metric=acc
-# max_num_gen_batches=10
-
+filter_groups_metric=reward
 norm_adv_by_std_in_grpo=True
 
-# Response length parameters
+###############################################################################
+#                          SEQUENCE LENGTH SETTINGS
+###############################################################################
 max_prompt_length=1000
 max_response_length=2800
-enable_overlong_buffer=True # temporary
+
+# Overlong Buffer Configuration
+enable_overlong_buffer=True
 overlong_buffer_len=$((1024 * 4))
 overlong_penalty_factor=1.0
 
-# Training parameters
-loss_agg_mode="token-mean"
-
-# Algorithm
+###############################################################################
+#                          SAMPLING PARAMETERS
+###############################################################################
+# Training Sampling
 cfg_weight=1.0
-temperature=1.0
-txt_top_k=0  # 0 for no top_k filtering (HF rollout)
+temperature=1.1
+txt_top_k=0   # 0 for no top_k filtering
 txt_top_p=1.0
-img_top_k=0  # 0 for no top_k filtering (HF rollout)
+img_top_k=0   # 0 for no top_k filtering
 img_top_p=1.0
+
+# Validation Sampling
 val_cfg_weight=1.0
 val_temperature=1.0
 val_txt_top_k=0
@@ -95,44 +134,66 @@ val_txt_top_p=1.0
 val_img_top_k=0
 val_img_top_p=1.0
 
-# Performance Related Parameter
+###############################################################################
+#                            BATCH SIZE SETTINGS
+###############################################################################
+# Prompt Batch Sizes
+train_prompt_bsz=0            # not used in async mode
+gen_prompt_bsz=1              # streaming generation, set to 1
+train_prompt_mini_bsz=8
+rollout_prompt_size=2         # prompts per actor per batch (async mode)
+val_rollout_prompt_size=16
+
+# Response & Micro Batch
+n_resp_per_prompt=8
+ppo_micro_batch_size_per_gpu=4
+log_prob_micro_batch_size_per_gpu=4
+
+# Dynamic Batching
 use_dynamic_bsz=False
 actor_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 1))
 infer_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 1))
-ref_offload=False
-actor_offload=False
-gen_tp=1
-sp_size=1
 
-# Fully async specific parameters
-NNODES=${NNODES:-1}
-NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
+# Loss Aggregation
+loss_agg_mode="token-mean"
 
-n_gpus_rollout=5
-n_gpus_training=2 # $((NGPUS_PER_NODE - n_gpus_rollout))
+###############################################################################
+#                          OPTIMIZER SETTINGS
+###############################################################################
+lr=5e-6
+lr_scheduler_type=constant
+lr_warmup_steps=0
+weight_decay=0.0
 
-fsdp_size=2 # Must be divisible by (n_gpus_training*n_nodes) and (n_gpus_rollout*n_nodes)
-
+###############################################################################
+#                        ASYNC TRAINING PARAMETERS
+###############################################################################
 # https://verl.readthedocs.io/en/latest/advance/fully_async.html#parameter-description
-train_prompt_bsz=0 # not used in async mode
-gen_prompt_bsz=1 # streaming generation, set to 1
-n_resp_per_prompt=8
-rollout_prompt_size=2 # set to number of prompts per actor per batch, used in async mode
-val_rollout_prompt_size=16
-train_prompt_mini_bsz=8
-ppo_micro_batch_size_per_gpu=4
 total_rollout_steps=$(((512*100*3*10)))
 staleness_threshold=2.0
 trigger_parameter_sync_step=1
 require_batches=2
 partial_rollout=False
-log_prob_micro_batch_size_per_gpu=4
+use_rollout_log_probs=False
+compute_prox_log_prob=False
+max_regen_retries=3
 
-test_freq=10
-save_freq=50 # $((test_freq * trigger_parameter_sync_step * 1))
+# Replay Buffer
+replay_buffer_enable=False
+replay_buffer_max_version_gap=-1
+replay_buffer_max_size_per_task=1000
+replay_buffer_score_threshold_1=0.8
+replay_buffer_score_threshold_2=1.5
+replay_buffer_score_threshold_3=0.8
+
+###############################################################################
+#                         TRAINING SCHEDULE
+###############################################################################
 total_epochs=10
-# total_training_steps=3000
+test_freq=10
+save_freq=50
 rollout_freq=1
+# total_training_steps=3000
 # log_val_generations=20
 
 ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
@@ -152,10 +213,10 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     data.custom_cls.name=ImageRLDataset \
     actor_rollout_ref.nccl_timeout=120000000 \
     actor_rollout_ref.model.path=\"${MODEL_PATH}\" \
-    actor_rollout_ref.actor.optim.lr=5e-6 \
-    actor_rollout_ref.actor.optim.lr_scheduler_type=constant \
-    actor_rollout_ref.actor.optim.lr_warmup_steps=0 \
-    actor_rollout_ref.actor.optim.weight_decay=0.0 \
+    actor_rollout_ref.actor.optim.lr=${lr} \
+    actor_rollout_ref.actor.optim.lr_scheduler_type=${lr_scheduler_type} \
+    actor_rollout_ref.actor.optim.lr_warmup_steps=${lr_warmup_steps} \
+    actor_rollout_ref.actor.optim.weight_decay=${weight_decay} \
     actor_rollout_ref.actor.strategy=fsdp2 \
     actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${ppo_micro_batch_size_per_gpu} \
@@ -175,6 +236,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     algorithm.kl_ctrl.kl_coef=${kl_coef} \
     algorithm.filter_groups.enable=${enable_filter_groups} \
     algorithm.filter_groups.metric=${filter_groups_metric} \
+    algorithm.norm_adv_by_std_in_grpo=${norm_adv_by_std_in_grpo} \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.hybrid_engine=False \
     actor_rollout_ref.actor.use_dynamic_bsz=${use_dynamic_bsz} \
@@ -226,10 +288,6 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     actor_rollout_ref.ref.fsdp_config.use_torch_compile=False \
     actor_rollout_ref.ref.fsdp_config.wrap_policy.transformer_layer_cls_to_wrap=['LlamaDecoderLayer'] \
     actor_rollout_ref.ref.ulysses_sequence_parallel_size=${sp_size} \
-    algorithm.kl_ctrl.kl_coef=${kl_coef} \
-    algorithm.filter_groups.enable=${enable_filter_groups} \
-    algorithm.filter_groups.metric=${filter_groups_metric} \
-    algorithm.norm_adv_by_std_in_grpo=${norm_adv_by_std_in_grpo} \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
     trainer.val_before_train=True \
@@ -258,15 +316,15 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     async_training.trigger_parameter_sync_step="${trigger_parameter_sync_step}" \
     async_training.require_batches="${require_batches}" \
     async_training.partial_rollout="${partial_rollout}" \
-    async_training.use_rollout_log_probs=False \
-    async_training.compute_prox_log_prob=False \
-    async_training.max_regen_retries=3 \
-    async_training.replay_buffer.enable=True \
-    async_training.replay_buffer.max_version_gap=-1 \
-    async_training.replay_buffer.max_size_per_task=1000 \
-    +async_training.replay_buffer.score_thresholds.1=0.8 \
-    +async_training.replay_buffer.score_thresholds.2=1.5 \
-    +async_training.replay_buffer.score_thresholds.3=0.8 \
+    async_training.use_rollout_log_probs=${use_rollout_log_probs} \
+    async_training.compute_prox_log_prob=${compute_prox_log_prob} \
+    async_training.max_regen_retries=${max_regen_retries} \
+    async_training.replay_buffer.enable=${replay_buffer_enable} \
+    async_training.replay_buffer.max_version_gap=${replay_buffer_max_version_gap} \
+    async_training.replay_buffer.max_size_per_task=${replay_buffer_max_size_per_task} \
+    +async_training.replay_buffer.score_thresholds.1=${replay_buffer_score_threshold_1} \
+    +async_training.replay_buffer.score_thresholds.2=${replay_buffer_score_threshold_2} \
+    +async_training.replay_buffer.score_thresholds.3=${replay_buffer_score_threshold_3} \
     reward_model.reward_manager=image_generation \
     custom_reward_function.path=recipe/image_rl/reward_function_fine_grained.py \
     custom_reward_function.name=compute_score_batch \
