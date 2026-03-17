@@ -117,8 +117,6 @@ def quant_weights(weights, model, quant_config, dtype=torch.bfloat16):
     if quant_config.weight_block_size is None:
         raise ValueError("Currently only support blockwise quantization, please set weight_block_size in quant_config")
 
-    is_vllm_11_or_later = version.parse(vllm.__version__) >= version.parse("0.11.0")
-
     for k, v in weights:
         if not is_fp8_weight(k, model):
             yield (k, v)
@@ -138,13 +136,7 @@ def quant_weights(weights, model, quant_config, dtype=torch.bfloat16):
         yield (k, param_lp)
 
         # Yield the scale with appropriate naming based on vLLM version
-        if is_vllm_11_or_later:
-            if "expert" in k:
-                yield (k + "_scale_inv", param_scale)
-            else:
-                yield (k + "_scale", param_scale)
-        else:
-            yield (k + "_scale_inv", param_scale)
+        yield (k + "_scale_inv", param_scale)
 
         # Explicitly delete original tensor reference to help GC
         del v, param_lp, param_scale
@@ -160,14 +152,34 @@ def load_quanted_weights(weights, model_runner):
     # Monkey patch the param class to their subclass, as certain models
     # will check the param type to call the proper weightloader
     for name, param in model.named_parameters():
-        if hasattr(param, "subclass_type"):
+        if hasattr(param, "_verl_subclass_info"):
+            # New format: restore subclass type and attrs from bundled info
+            info = param._verl_subclass_info
+            param._verl_orig_class = param.__class__
+            param.__class__ = info["type"]
+            for attr_name, attr_val in info["attrs"].items():
+                # Skip read-only properties (e.g. input_dim, output_dim in vLLM >= 0.15)
+                try:
+                    setattr(param, attr_name, attr_val)
+                except AttributeError:
+                    pass
+        elif hasattr(param, "subclass_type"):
             param.orig_type = param.__class__
             param.__class__ = param.subclass_type
     # Finally load the weights into vllm
     loaded_params = model.load_weights(weights_quantized)
     # Undo the type change above to the original type
     for name, param in model.named_parameters():
-        if hasattr(param, "subclass_type"):
+        if hasattr(param, "_verl_subclass_info"):
+            info = param._verl_subclass_info
+            param.__class__ = param._verl_orig_class
+            for attr_name in info["attrs"]:
+                try:
+                    delattr(param, attr_name)
+                except AttributeError:
+                    pass
+            delattr(param, "_verl_orig_class")
+        elif hasattr(param, "subclass_type"):
             param.__class__ = param.orig_type
     return loaded_params
 
@@ -190,17 +202,18 @@ def process_weights_after_loading_for_vllm10(self, layer) -> None:
 
     def _create_param_from_subclass_attributes(custom_param):
         param = Parameter(custom_param.data, requires_grad=False)
-        base_param_dir = dir(torch.nn.Parameter)
+        base_param_dir = set(dir(torch.nn.Parameter))
         custom_param_dir = dir(custom_param)
         # Find the attributes that are unique to the custom parameter
         custom_attributes = [
             attr for attr in custom_param_dir if attr not in base_param_dir and not attr.startswith("__")
         ]
-        # Set the custom attributes into the base parameter object
-        for attr in custom_attributes:
-            setattr(param, attr, getattr(custom_param, attr))
-
-        param.subclass_type = type(custom_param)
+        # Store subclass info in a single dict to avoid polluting the parameter
+        # with extra attributes that break torch.compile/dynamo tracing.
+        param._verl_subclass_info = {
+            "type": type(custom_param),
+            "attrs": {attr: getattr(custom_param, attr) for attr in custom_attributes},
+        }
         return param
 
     assert self.block_quant and self.quant_config.is_checkpoint_fp8_serialized
@@ -248,17 +261,19 @@ def process_weights_after_loading_for_vllm11(self, layer) -> None:
 
     def _create_param_from_subclass_attributes(custom_param):
         param = Parameter(custom_param.data, requires_grad=False)
-        base_param_dir = dir(torch.nn.Parameter)
+        base_param_dir = set(dir(torch.nn.Parameter))
         custom_param_dir = dir(custom_param)
         # Find the attributes that are unique to the custom parameter
         custom_attributes = [
             attr for attr in custom_param_dir if attr not in base_param_dir and not attr.startswith("__")
         ]
-        # Set the custom attributes into the base parameter object
-        for attr in custom_attributes:
-            setattr(param, attr, getattr(custom_param, attr))
-
-        param.subclass_type = type(custom_param)
+        # Store subclass info in a single dict to avoid polluting the parameter
+        # with extra attributes that break torch.compile/dynamo tracing.
+        # Attributes are restored temporarily in load_quanted_weights().
+        param._verl_subclass_info = {
+            "type": type(custom_param),
+            "attrs": {attr: getattr(custom_param, attr) for attr in custom_attributes},
+        }
         return param
 
     weight_scale = layer.weight_scale_inv if hasattr(layer, "weight_scale_inv") else layer.weight_scale
@@ -272,16 +287,18 @@ def process_weights_after_loading_for_vllm11(self, layer) -> None:
             weight_loader=layer.weight.weight_loader,
         )
     )
-    layer.weight_scale = _create_param_from_subclass_attributes(
+    weight_scale_loader = layer.weight_scale_inv.weight_loader if hasattr(layer, "weight_scale_inv") else layer.weight_scale.weight_loader
+    layer.weight_scale_inv = _create_param_from_subclass_attributes(
         BlockQuantScaleParameter(
             data=weight_scale.data,
             output_dim=0,
             input_dim=1,
-            weight_loader=layer.weight_scale_inv.weight_loader,
+            weight_loader=weight_scale_loader,
         )
     )
 
-    del layer.weight_scale_inv
+    # Set input_scale to None for dynamic activation scheme (matches original vLLM behavior)
+    layer.input_scale = None
 
     if version.parse(vllm.__version__) == version.parse("0.11.0"):
         maybe_post_process_fp8_weight_block(layer, self.cutlass_block_fp8_supported)

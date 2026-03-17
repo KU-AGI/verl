@@ -279,6 +279,15 @@ class vLLMHttpServer:
                 # for subprocesses patching
                 os.environ["VERL_VLLM_FP8_QUANT_ENABLED"] = "1"
 
+        # For pre-quantized FP8 models, apply patches for weight transfer
+        # without overriding the model's existing quantization config.
+        if quantization is None and os.environ.get("VERL_VLLM_FP8_QUANT_ENABLED", "0") != "1":
+            hf_quant_config = getattr(self.model_config.hf_config, "quantization_config", None)
+            if hf_quant_config and hf_quant_config.get("quant_method") == "fp8":
+                logger.info("Detected pre-quantized FP8 model, applying FP8 patches for weight transfer")
+                apply_vllm_fp8_patches()
+                os.environ["VERL_VLLM_FP8_QUANT_ENABLED"] = "1"
+
         if quantization is not None and self.config.quantization_config_file is not None:
             hf_overrides["quantization_config_file"] = self.config.quantization_config_file
 
