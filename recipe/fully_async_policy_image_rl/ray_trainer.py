@@ -636,7 +636,7 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                         and (is_last_step or current_v % self.config.trainer.test_freq == 0)
                     ):
                         feedback_texts_to_dump = None
-                        if 2 in task_ids:
+                        if 2 in reward_task_ids:
                             feedback_texts_to_dump = result_batch.non_tensor_batch.get('task2_feedback_texts')
                             if feedback_texts_to_dump is not None and hasattr(feedback_texts_to_dump, 'tolist'):
                                 feedback_texts_to_dump = feedback_texts_to_dump.tolist()
