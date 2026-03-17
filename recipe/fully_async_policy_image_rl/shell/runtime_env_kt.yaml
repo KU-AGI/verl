@@ -14,3 +14,4 @@ env_vars:
   NCCL_NET: "Socket"
   GLOO_SOCKET_IFNAME: "eth0"
   NCCL_TIMEOUT: "300000"
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"

@@ -14,8 +14,8 @@ exec 2>&1
 #                         EXPERIMENT CONFIGURATION
 ###############################################################################
 project_name='mllm_reasoning'
-exp_name="0317_our_model_our_dataset_task3_fine_grained_reward_edit"
-task_ids='[3]'
+exp_name="0317_our_model_our_dataset_total_step_fine_grained_reward"
+task_ids='[1,2,3]'
 
 ###############################################################################
 #                           ENVIRONMENT VARIABLES
@@ -182,9 +182,9 @@ max_regen_retries=3
 replay_buffer_enable=False
 replay_buffer_max_version_gap=-1
 replay_buffer_max_size_per_task=1000
-replay_buffer_score_threshold_1=0.8
-replay_buffer_score_threshold_2=1.5
-replay_buffer_score_threshold_3=0.8
+replay_buffer_score_threshold_1=0.7
+replay_buffer_score_threshold_2=2.0 # 3점 만점 
+replay_buffer_score_threshold_3=1.5 # 2점 만점
 
 ###############################################################################
 #                         TRAINING SCHEDULE
