@@ -704,8 +704,7 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
             except Exception:
                 pass
 
-        reward_score += vqa_score + edit_score
-        reward_score = edit_score
+        reward_score = vqa_score + edit_score
         reward_extra_info[f"task{task_id}_vqa_reward"] = vqa_score
         reward_extra_info[f"task{task_id}_vqa_reward_response"] = vqa_response if not isinstance(vqa_response, Exception) else str(vqa_response)
         reward_extra_info[f"task{task_id}_edit_reward"] = edit_score
