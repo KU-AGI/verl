@@ -420,7 +420,7 @@ class RayPPOTrainer:
             entry = {k: v[i] for k, v in base_data.items()}
             lines.append(json.dumps(entry, ensure_ascii=False, default=_json_default))
 
-        with open(filename, "w") as f:
+        with open(filename, "w", errors="surrogatepass") as f:
             f.write("\n".join(lines) + "\n")
 
         print(f"Dumped generations to {filename}")
@@ -438,15 +438,25 @@ class RayPPOTrainer:
         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
             inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
             outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
+            # Also decode with special tokens preserved for multi-turn conversation readability
+            outputs_full = [s.strip() for s in self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=False)]
             scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
             sample_gts = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
 
             reward_extra_infos_to_dump = reward_extra_infos_dict.copy()
             if "request_id" in batch.non_tensor_batch:
-                reward_extra_infos_dict.setdefault(
+                reward_extra_infos_to_dump.setdefault(
                     "request_id",
                     batch.non_tensor_batch["request_id"].tolist(),
                 )
+
+            # Include structured conversation data if available
+            n = len(inputs)
+            if "conversation" in batch.non_tensor_batch:
+                conversations = batch.non_tensor_batch["conversation"].tolist()
+                if len(conversations) == n:
+                    reward_extra_infos_to_dump["conversation"] = conversations
+            reward_extra_infos_to_dump["output_full"] = outputs_full
 
             self._dump_generations(
                 inputs=inputs,
@@ -516,6 +526,8 @@ class RayPPOTrainer:
         sample_scores = []
         sample_turns = []
         sample_uids = []
+        sample_conversations = []
+        sample_outputs_full = []
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
@@ -569,7 +581,9 @@ class RayPPOTrainer:
             # Store generated outputs
             output_ids = test_output_gen_batch.batch["responses"]
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
+            output_texts_full = [self.tokenizer.decode(ids, skip_special_tokens=False).strip() for ids in output_ids]
             sample_outputs.extend(output_texts)
+            sample_outputs_full.extend(output_texts_full)
 
             test_batch = test_batch.union(test_output_gen_batch)
             test_batch.meta_info["validate"] = True
@@ -580,6 +594,10 @@ class RayPPOTrainer:
             input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
             sample_inputs.extend(input_texts)
             sample_uids.extend(test_batch.non_tensor_batch["uid"])
+
+            # Store structured conversation data if available
+            if "conversation" in test_batch.non_tensor_batch:
+                sample_conversations.extend(test_batch.non_tensor_batch["conversation"].tolist())
 
             # evaluate using reward_function
             reward_tensor, reward_extra_info = extract_reward(test_batch)
@@ -607,12 +625,16 @@ class RayPPOTrainer:
         # dump generations
         val_data_dir = self.config.trainer.get("validation_data_dir", None)
         if val_data_dir:
+            val_extra_infos = reward_extra_infos_dict.copy()
+            if sample_conversations:
+                val_extra_infos["conversation"] = sample_conversations
+            val_extra_infos["output_full"] = sample_outputs_full
             self._dump_generations(
                 inputs=sample_inputs,
                 outputs=sample_outputs,
                 gts=sample_gts,
                 scores=sample_scores,
-                reward_extra_infos_dict=reward_extra_infos_dict,
+                reward_extra_infos_dict=val_extra_infos,
                 dump_path=val_data_dir,
             )
 

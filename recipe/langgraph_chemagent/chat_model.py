@@ -22,6 +22,8 @@ import os
 import uuid
 from typing import Any, Optional
 
+from jinja2.exceptions import TemplateError
+
 from langchain_core.language_models import BaseChatModel
 from langchain_core.language_models.base import LanguageModelInput
 from langchain_core.messages import (
@@ -92,8 +94,16 @@ class ChatModel(BaseChatModel):
         """
         formatted_tools: list = [convert_to_openai_tool(tool) for tool in tools]
 
-        # used to remove system prompt prefix when encoding tool response
-        system_prompt = self.tokenizer.apply_chat_template([{}], add_generation_prompt=False, tokenize=True)
+        # Get the implicit prefix (e.g. default system prompt) that apply_chat_template
+        # prepends, so we can strip it when encoding tool responses later (line ~219).
+        # Qwen-style templates accept [{}] and return the default system prompt prefix;
+        # other templates (e.g. EXAONE) require a valid role and add no implicit prefix.
+        try:
+            system_prompt = self.tokenizer.apply_chat_template(
+                [{}], add_generation_prompt=False, tokenize=True
+            )
+        except (TemplateError, IndexError, KeyError):
+            system_prompt = []
         kwargs["system_prompt"] = system_prompt
 
         return self.bind(tools=formatted_tools, **kwargs)
@@ -194,6 +204,12 @@ class ChatModel(BaseChatModel):
                     enable_thinking=self.enable_think,
                 ),
             )
+            if hasattr(prompt_ids, "ids"):
+                prompt_ids = prompt_ids.ids
+            elif hasattr(prompt_ids, "input_ids"):
+                prompt_ids = prompt_ids.input_ids
+            if not isinstance(prompt_ids, list):
+                prompt_ids = list(prompt_ids)
             return str(uuid.uuid4()), prompt_ids, []
 
         # Case 2: follow up chat completion with tool/human response: [system], human, ai, human|tool, ...
@@ -214,6 +230,12 @@ class ChatModel(BaseChatModel):
                     messages, add_generation_prompt=True, tokenize=True
                 ),
             )
+            if hasattr(tool_response_ids, "ids"):
+                tool_response_ids = tool_response_ids.ids
+            elif hasattr(tool_response_ids, "input_ids"):
+                tool_response_ids = tool_response_ids.input_ids
+            if not isinstance(tool_response_ids, list):
+                tool_response_ids = list(tool_response_ids)
             tool_response_ids = tool_response_ids[len(kwargs["system_prompt"]) :]
         elif self.tool_parser == "gpt-oss":
             # Format tool responses manually
@@ -238,6 +260,10 @@ class ChatModel(BaseChatModel):
             tool_response_ids = await loop.run_in_executor(
                 None, lambda: self.tokenizer.encode(tool_response_text, add_special_tokens=False)
             )
+            if hasattr(tool_response_ids, "ids"):
+                tool_response_ids = tool_response_ids.ids
+            elif not isinstance(tool_response_ids, list):
+                tool_response_ids = list(tool_response_ids)
         else:
             raise ValueError(f"Unsupported tool parser: {self.tool_parser}")
 
@@ -399,9 +425,33 @@ def convert_to_agent_output(
             turn_tool_calls.append(list(msg.tool_calls) if msg.tool_calls else [])
             turn_invalid_tool_calls.append(list(msg.invalid_tool_calls) if msg.invalid_tool_calls else [])
 
+    # Serialize the full conversation for structured logging
+    # Map LangChain msg.type → standard role names: user, assistant, tool
+    ROLE_MAP = {"human": "user", "ai": "assistant", "system": "system", "tool": "tool"}
+    conversation = []
+    for msg in messages:
+        role = ROLE_MAP.get(msg.type, msg.type)
+        entry = {"role": role, "content": msg.content}
+        if msg.type == "ai":
+            if msg.tool_calls:
+                entry["tool_calls"] = [
+                    {"name": tc["name"], "args": tc["args"], "id": tc.get("id", "")}
+                    for tc in msg.tool_calls
+                ]
+            if msg.invalid_tool_calls:
+                entry["invalid_tool_calls"] = [
+                    {"name": tc["name"], "args": tc["args"], "error": tc.get("error", "")}
+                    for tc in msg.invalid_tool_calls
+                ]
+        elif msg.type == "tool":
+            entry["tool_call_id"] = getattr(msg, "tool_call_id", "")
+            entry["name"] = getattr(msg, "name", "")
+        conversation.append(entry)
+
     extra_fields: dict = {
         "turn_tool_calls": turn_tool_calls,
         "turn_invalid_tool_calls": turn_invalid_tool_calls,
+        "conversation": conversation,
     }
     if tool_schemas:
         extra_fields["tool_schemas"] = tool_schemas

@@ -33,6 +33,10 @@ def normalize_token_ids(tokenized_output) -> list[int]:
     elif hasattr(tokenized_output, "input_ids"):
         token_ids = tokenized_output.input_ids
 
+    # Handle tokenizers.Encoding objects (from HuggingFace's Rust tokenizer)
+    if hasattr(token_ids, "ids"):
+        token_ids = token_ids.ids
+
     if hasattr(token_ids, "tolist"):
         token_ids = token_ids.tolist()
 

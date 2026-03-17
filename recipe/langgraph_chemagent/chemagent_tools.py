@@ -20,6 +20,7 @@ enabling their use in ReactAgentLoop for RL training.
 
 import importlib
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -302,8 +303,14 @@ def convert_chemistry_tool_to_langchain(
         if not _fallback_instance:
             _fallback_instance.append(tool_class())
         try:
-            result = _fallback_instance[0]._run_base(query=kwargs)
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(_fallback_instance[0]._run_base, query=kwargs)
+                result = future.result(timeout=60)
             return str(result)
+        except concurrent.futures.TimeoutError:
+            logger.error(f"Timeout executing {func_name} (60s limit)")
+            return f"Error: {func_name} timed out after 60 seconds"
         except Exception as e:
             logger.error(f"Error executing {func_name}: {e}")
             return f"Error: {str(e)}"
@@ -349,21 +356,20 @@ def get_chemistry_tools(
     # Fall back to TOOLS_JSON_SCHEMA keys when TOOLS_CLASS is empty (JSON schema mode)
     tools_to_load = selected_tools if selected_tools else list(TOOLS_JSON_SCHEMA.keys())
 
-    # PythonShell always communicates with an external HTTP server internally
-    # (localhost:8888). Running it without that server blocks for the full
-    # requests timeout on every call, stalling all agent workers.
-    _HTTP_ONLY_TOOLS = {"run_python_code"}
+    # PythonShell always needs an external Jupyter server (e.g. localhost:9016).
+    # Without it, every call blocks for the full timeout, stalling agent workers.
+    # Excluded by default; set ENABLE_PYTHON_TOOL=1 to re-enable.
+    _EXCLUDED_TOOLS = set()
+    if not os.environ.get("ENABLE_PYTHON_TOOL"):
+        _EXCLUDED_TOOLS.add("run_python_code")
 
     for tool_key in tools_to_load:
         if tool_key not in TOOLS_JSON_SCHEMA:
             logger.warning(f"Tool {tool_key} not found in registered tools")
             continue
 
-        if not use_http and tool_key in _HTTP_ONLY_TOOLS:
-            logger.warning(
-                f"Skipping tool '{tool_key}': requires an external HTTP server "
-                f"(port 8888) which is not available in use_http=False mode."
-            )
+        if tool_key in _EXCLUDED_TOOLS:
+            logger.warning(f"Skipping tool '{tool_key}' (excluded; set ENABLE_PYTHON_TOOL=1 to enable)")
             continue
 
         try:
