@@ -667,15 +667,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         fresh_size = len(fresh_batch)
         shortfall = self.required_samples - fresh_size
 
-        # Always log replay state per task
-        task_buf_size = self.replay_buffer.size_per_task().get(task_id, 0)
-        fresh_batch.meta_info[f"replay/task{task_id}/fresh_size"] = fresh_size
-        fresh_batch.meta_info[f"replay/task{task_id}/shortfall"] = max(shortfall, 0)
-        fresh_batch.meta_info[f"replay/task{task_id}/buffer_size"] = task_buf_size
-
         if shortfall <= 0:
-            fresh_batch.meta_info[f"replay/task{task_id}/replay_size"] = 0
-            # Tag all as fresh
             fresh_batch.non_tensor_batch["sample_param_version"] = fresh_batch.non_tensor_batch["param_version"]
             return fresh_batch
 
@@ -683,59 +675,35 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         available = self.replay_buffer.task_eligible(self.current_param_version, task_id)
         replay_size = min(shortfall, available)
         if replay_size == 0:
-            fresh_batch.meta_info[f"replay/task{task_id}/replay_size"] = 0
             fresh_batch.non_tensor_batch["sample_param_version"] = fresh_batch.non_tensor_batch["param_version"]
             return fresh_batch
 
-        t_sample_start = time.time()
         replay_batch = self.replay_buffer.sample_task(
             self.current_param_version, task_id, replay_size, exclude_uids=fresh_uids
         )
-        t_sample_dur = time.time() - t_sample_start
 
         if replay_batch is None:
-            fresh_batch.meta_info[f"replay/task{task_id}/replay_size"] = 0
             fresh_batch.non_tensor_batch["sample_param_version"] = fresh_batch.non_tensor_batch["param_version"]
             return fresh_batch
 
         fresh_batch.non_tensor_batch["sample_param_version"] = fresh_batch.non_tensor_batch["param_version"]
         merged = DataProto.concat([fresh_batch, replay_batch])
-        actual_replay = len(replay_batch)
-
         merged.meta_info.update(fresh_batch.meta_info)
-        merged.meta_info[f"replay/task{task_id}/fresh_size"] = fresh_size
-        merged.meta_info[f"replay/task{task_id}/replay_size"] = actual_replay
-        merged.meta_info[f"replay/task{task_id}/shortfall"] = shortfall
-        merged.meta_info[f"replay/task{task_id}/buffer_size"] = task_buf_size
-        merged.meta_info[f"timing_s/replay_sample_task{task_id}"] = t_sample_dur
         print(
             f"[FullyAsyncTrainer] Replay fill task{task_id}: "
-            f"fresh={fresh_size}, shortfall={shortfall}, replay={actual_replay}, "
-            f"total={len(merged)}, buffer={task_buf_size}, "
-            f"sample={t_sample_dur:.3f}s"
+            f"fresh={fresh_size}, replay={len(replay_batch)}, total={len(merged)}"
         )
         return merged
 
     def _get_replay_only_batch(self, task_id: int) -> DataProto | None:
         """Get a training batch purely from a specific task's replay buffer (for idle time)."""
-        t_start = time.time()
         replay_batch = self.replay_buffer.sample_task(
             self.current_param_version, task_id, self.required_samples
         )
-        t_dur = time.time() - t_start
-
         if replay_batch is not None:
-            actual_replay = len(replay_batch)
-            replay_batch.meta_info[f"replay/task{task_id}/fresh_size"] = 0
-            replay_batch.meta_info[f"replay/task{task_id}/replay_size"] = actual_replay
-            replay_batch.meta_info[f"replay/task{task_id}/shortfall"] = self.required_samples
-            replay_batch.meta_info[f"replay/task{task_id}/buffer_size"] = self.replay_buffer.size_per_task().get(task_id, 0)
-            replay_batch.meta_info[f"replay/task{task_id}/is_replay_only"] = 1
-            replay_batch.meta_info[f"timing_s/replay_sample_task{task_id}"] = t_dur
             print(
                 f"[FullyAsyncTrainer] Replay-only task{task_id}: "
-                f"replay={actual_replay}, buffer={self.replay_buffer.size_per_task().get(task_id, 0)}, "
-                f"sample={t_dur:.3f}s"
+                f"replay={len(replay_batch)}"
             )
         return replay_batch
 
@@ -754,15 +722,14 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
             metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
             metrics.update(compute_group_reward_metrics(batch=batch))
-            # Log param version breakdown (version gap distribution)
+            # Log sample_param_version stats and fresh sample count
             if "sample_param_version" in batch.non_tensor_batch:
-                versions = batch.non_tensor_batch["sample_param_version"]
-                gap_counts = {}
-                for v in np.unique(versions):
-                    gap = self.current_param_version - int(v)
-                    gap_counts[gap] = gap_counts.get(gap, 0) + int(np.sum(versions == v))
-                for gap, cnt in sorted(gap_counts.items()):
-                    metrics[f"replay/task{task_id}_version_gap{gap}_count"] = cnt
+                versions = batch.non_tensor_batch["sample_param_version"].astype(float)
+                metrics[f"replay/task{task_id}_version_min"] = float(np.min(versions))
+                metrics[f"replay/task{task_id}_version_mean"] = float(np.mean(versions))
+                metrics[f"replay/task{task_id}_version_max"] = float(np.max(versions))
+                fresh_count = int(np.sum(versions == self.current_param_version))
+                metrics[f"replay/task{task_id}_fresh_count"] = fresh_count
             batch.pop(batch_keys=["task_id"])
 
     def _collect_step_metrics(self, batch, epoch, metrics, timing_raw):
