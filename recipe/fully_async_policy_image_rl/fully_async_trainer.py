@@ -68,6 +68,10 @@ def log_prob_metrics(metrics, task_ids):
 
         log_prob_info[f"actor/task{task_id}_log_probs_diff"] = log_prob_info[f"actor/task{task_id}_pos_log_prob_mean"] - log_prob_info[f"actor/task{task_id}_neg_log_prob_mean"]
 
+        total_cnt = pos_log_prob_cnt + neg_log_prob_cnt
+        log_prob_info[f"actor/task{task_id}_total_cnt"] = total_cnt
+        log_prob_info[f"actor/task{task_id}_pos_ratio"] = pos_log_prob_cnt / total_cnt if total_cnt > 0 else 0.0
+
     return log_prob_info
 
 @ray.remote(num_cpus=10)
