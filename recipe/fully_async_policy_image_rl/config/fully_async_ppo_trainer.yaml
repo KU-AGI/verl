@@ -40,6 +40,7 @@ async_training:
     enable: false
     max_version_gap: 2 # max param version gap — stale entries are evicted, fresh ones persist
     max_size_per_task: 100 # max number of samples per task_id
+    max_use_count: -1
     # Per-task minimum score threshold for replay buffer admission
     # Samples with score < threshold are discarded. Keys are task_ids.
     score_thresholds:
