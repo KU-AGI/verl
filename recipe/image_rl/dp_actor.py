@@ -359,22 +359,30 @@ class DataParallelImageGenerationActor(BasePPOActor):
             ]
             non_tensor_batch_keys = []
         elif task_id == 2:
+            available_keys = set(data.batch.keys())
             select_batch_keys = [
-                "task1_input_ids", "task1_attention_mask", "task1_gen_imgs_pixel_values", 
-                "task1_gen_img_tokens", "task1_response_mask",
-                "task2_input_ids", "task2_attention_mask", "task2_feedback_ids", 
-                "task2_response_mask", "task_id"
+                "task2_input_ids", "task2_attention_mask", "task2_feedback_ids",
+                "task2_response_mask",
             ]
+            if "task_id" in available_keys:
+                select_batch_keys.append("task_id")
+            if "task2_task1_gen_imgs_pixel_values" in available_keys:
+                select_batch_keys.append("task2_task1_gen_imgs_pixel_values")
+            elif "task1_gen_imgs_pixel_values" in available_keys:
+                select_batch_keys.append("task1_gen_imgs_pixel_values")
             non_tensor_batch_keys = ["task2_feedback_texts"]
         elif task_id == 3:
+            available_keys = set(data.batch.keys())
             select_batch_keys = [
-                "task1_input_ids", "task1_attention_mask", "task1_gen_imgs_pixel_values", 
-                "task1_gen_img_tokens", "task1_response_mask",
-                "task2_input_ids", "task2_attention_mask", "task2_feedback_ids", 
-                "task2_response_mask",
-                "task3_input_ids", "task3_attention_mask", "task3_regen_imgs_pixel_values", 
-                "task3_regen_img_tokens", "task3_response_mask", "task_id"
+                "task3_input_ids", "task3_attention_mask", "task3_regen_imgs_pixel_values",
+                "task3_regen_img_tokens", "task3_response_mask",
             ]
+            if "task_id" in available_keys:
+                select_batch_keys.append("task_id")
+            if "task3_task1_gen_img_tokens" in available_keys:
+                select_batch_keys.append("task3_task1_gen_img_tokens")
+            elif "task1_gen_img_tokens" in available_keys:
+                select_batch_keys.append("task1_gen_img_tokens")
             non_tensor_batch_keys = []
         else:
             raise ValueError(f"Unknown task_id: {task_id}")
@@ -405,7 +413,12 @@ class DataParallelImageGenerationActor(BasePPOActor):
         for i, micro_batch in enumerate(micro_batches):
             micro_batch = micro_batch.to(get_device_id())
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
-            
+
+            if task_id == 2 and "task2_task1_gen_imgs_pixel_values" in model_inputs:
+                model_inputs["task1_gen_imgs_pixel_values"] = model_inputs["task2_task1_gen_imgs_pixel_values"]
+            elif task_id == 3 and "task3_task1_gen_img_tokens" in model_inputs:
+                model_inputs["task1_gen_img_tokens"] = model_inputs["task3_task1_gen_img_tokens"]
+
             with torch.no_grad():
                 entropy, log_probs = self._forward_micro_batch(
                     model_inputs, temperature=temperature, calculate_entropy=calculate_entropy, task_id=task_id,
@@ -526,10 +539,16 @@ class DataParallelImageGenerationActor(BasePPOActor):
             elif task_id == 2:
                 task_keys.extend([f"task{task_id}_feedback_ids",
                                 "task1_gen_imgs_pixel_values"])  # Task 2 needs task1 pixel values
+                # Aliased key for replay: correct task1 context from task2's trajectory
+                if "task2_task1_gen_imgs_pixel_values" in available_keys:
+                    task_keys.append("task2_task1_gen_imgs_pixel_values")
             elif task_id == 3:
                 task_keys.extend([f"task{task_id}_regen_imgs_pixel_values",
                                 f"task{task_id}_regen_img_tokens",
                                 "task1_gen_img_tokens"])  # Task 3 needs task1 image tokens
+                # Aliased key for replay: correct task1 context from task3's trajectory
+                if "task3_task1_gen_img_tokens" in available_keys:
+                    task_keys.append("task3_task1_gen_img_tokens")
             
             all_select_batch_keys.extend(task_keys)
             
@@ -578,9 +597,18 @@ class DataParallelImageGenerationActor(BasePPOActor):
                     model_inputs = {**micro_batch.batch}
 
                     micro_batch_metrics = {}
-
+                    
                     # Process each task separately with backward
                     for task_id in task_ids:
+                        # Override cross-task context keys with per-task aliased versions
+                        # (only differs from model_inputs when replay fills the batch)
+                        if task_id == 2 and "task2_task1_gen_imgs_pixel_values" in model_inputs:
+                            model_inputs = {**model_inputs,
+                                "task1_gen_imgs_pixel_values": model_inputs["task2_task1_gen_imgs_pixel_values"]}
+                        elif task_id == 3 and "task3_task1_gen_img_tokens" in model_inputs:
+                            model_inputs = {**model_inputs,
+                                "task1_gen_img_tokens": model_inputs["task3_task1_gen_img_tokens"]}
+
                         # Get task-specific data
                         old_log_prob = model_inputs[f"task{task_id}_old_log_probs"]
                         advantages = model_inputs[f"task{task_id}_advantages"]

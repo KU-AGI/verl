@@ -290,7 +290,10 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
                 metrics[f"critic/task{task_id}/rewards/{data_source}/min"] = np.min(rewards)
     
     # 2. Compute statistics for all _reward & _score metrics in reward_extra_info (overall)
+    task_prefix = f"task{task_id}_"
     for metric_name, metric_values in batch.meta_info.items():
+        if not metric_name.startswith(task_prefix):
+            continue
         if metric_name.endswith("_reward") or metric_name.endswith("_score"):
             # Filter out None values
             none_count = sum(1 for v in metric_values if v is None)
@@ -301,12 +304,14 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
                 metrics[f"critic/{metric_name}/mean"] = np.mean(valid_values)
                 metrics[f"critic/{metric_name}/max"] = np.max(valid_values)
                 metrics[f"critic/{metric_name}/min"] = np.min(valid_values)
-    
+
     # 3. Compute statistics for _reward & _score metrics by data_source
     if "data_source" in batch.non_tensor_batch:
         data_sources = batch.non_tensor_batch["data_source"]
-        
+
         for metric_name, metric_values in batch.meta_info.items():
+            if not metric_name.startswith(task_prefix):
+                continue
             if metric_name.endswith("_reward") or metric_name.endswith("_score"):
                 # Group by data_source
                 data_src2metric_vals = defaultdict(list)
@@ -425,19 +430,32 @@ def compute_group_reward_metrics(batch: DataProto) -> dict[str, Any]:
             - group_rewards/task{task_id}/positive_ratio: Ratio of sequences with positive rewards
     """
     task_id = batch.batch["task_id"].view(-1)[0].item()
-    task_reward_extra_info = batch.meta_info.get(f"task{task_id}_reward_extra_info", {})
+    task_prefix = f"task{task_id}_"
 
     task_reward_section = {}
-    for name, value in task_reward_extra_info.items():
+    for name, value in batch.meta_info.items():
+        if not name.startswith(task_prefix):
+            continue
         if name.endswith("_reward") or name.endswith("_score"):
-            task_reward_section[f"group_rewards/{name}/mean"] = np.mean(value)
-            task_reward_section[f"group_rewards/{name}/max"] = np.max(value)
-            task_reward_section[f"group_rewards/{name}/min"] = np.min(value)
-            task_reward_section[f"group_rewards/{name}/positive_ratio"] = np.mean(np.array(value) > 0)
+            valid_values = [v for v in value if v is not None]
+            if not valid_values:
+                continue
+
+            valid_arr = np.asarray(valid_values, dtype=np.float32)
+            task_reward_section[f"group_rewards/{name}/mean"] = float(np.mean(valid_arr))
+            task_reward_section[f"group_rewards/{name}/max"] = float(np.max(valid_arr))
+            task_reward_section[f"group_rewards/{name}/min"] = float(np.min(valid_arr))
+            task_reward_section[f"group_rewards/{name}/positive_ratio"] = float(np.mean(valid_arr > 0))
+
 
     # Advantage collapse - computed per group (same uid = same prompt)
     sequence_score = batch.batch[f"task{task_id}_token_level_scores"].sum(-1).cpu().numpy()
-    uids = batch.non_tensor_batch.get("uid", None)
+    # Use task-specific uid if available (replay path: each task has independent samples with own uids).
+    # Fall back to shared uid (non-replay path: all tasks share the same batch).
+    uid_key = f"task{task_id}_uid"
+    uids = batch.non_tensor_batch.get(uid_key)
+    if uids is None:
+        uids = batch.non_tensor_batch.get("uid", None)
 
     cv_threshold = 0.01  # under 1%: regard as collapse
 
@@ -617,14 +635,11 @@ def process_validation_metrics(
     for data_source, uid2var2vals in data_src2uid2var2vals.items():
         for uid, var2vals in uid2var2vals.items():
             for var_name, var_vals in var2vals.items():
-                if isinstance(var_vals[0], str):
-                    continue
-
-                # Filter out -100 and None values (invalid/masked values)
-                valid_indices = [i for i, val in enumerate(var_vals) if val != -100 and val is not None]
+                # Filter out -100, None, and string values (e.g. _response keys padded with None)
+                valid_indices = [i for i, val in enumerate(var_vals) if val != -100 and val is not None and not isinstance(val, str)]
                 if len(valid_indices) == 0:
                     continue  # Skip if all values are invalid
-                
+
                 filtered_var_vals = [var_vals[i] for i in valid_indices]
 
                 metric = {}
