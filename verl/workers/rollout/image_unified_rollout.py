@@ -139,8 +139,6 @@ class _HFModelWrapper:
                         if flat_tensor.numel() != self._total_numel:
                             raise ValueError(f"Size mismatch! Expected {self._total_numel}, got {flat_tensor.numel()}")
 
-                        print(f"[LOAD] flat_tensor checksum: {flat_tensor.float().sum()}")
-
                         actual_module = self._module
                         if hasattr(actual_module, "_fsdp_wrapped_module"):
                             actual_module = actual_module._fsdp_wrapped_module

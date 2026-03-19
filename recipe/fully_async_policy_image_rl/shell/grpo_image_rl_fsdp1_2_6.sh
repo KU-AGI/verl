@@ -14,7 +14,8 @@ exec 2>&1
 #                         EXPERIMENT CONFIGURATION
 ###############################################################################
 project_name='mllm_reasoning'
-exp_name="0317_our_model_our_dataset_total_step_fine_grained_reward"
+# exp_name="0319_our_model_our_dataset_total_step_fine_grained_reward_v2"
+exp_name='testest'
 task_ids='[1,2,3]'
 
 ###############################################################################
@@ -179,12 +180,13 @@ compute_prox_log_prob=False
 max_regen_retries=3
 
 # Replay Buffer
-replay_buffer_enable=False
+replay_buffer_enable=True
 replay_buffer_max_version_gap=-1
-replay_buffer_max_size_per_task=1000
-replay_buffer_score_threshold_1=0.7
+replay_buffer_max_size_per_task=100
+replay_buffer_max_use_count=-1
+replay_buffer_score_threshold_1=0.8
 replay_buffer_score_threshold_2=2.0 # 3점 만점 
-replay_buffer_score_threshold_3=1.5 # 2점 만점
+replay_buffer_score_threshold_3=1.0 # 2점 만점
 
 ###############################################################################
 #                         TRAINING SCHEDULE
@@ -289,8 +291,8 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     actor_rollout_ref.ref.fsdp_config.wrap_policy.transformer_layer_cls_to_wrap=['LlamaDecoderLayer'] \
     actor_rollout_ref.ref.ulysses_sequence_parallel_size=${sp_size} \
     trainer.critic_warmup=0 \
-    trainer.logger=['console','wandb'] \
-    trainer.val_before_train=True \
+    trainer.logger=['console'] \
+    trainer.val_before_train=False \
     trainer.balance_batch=False \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
@@ -322,6 +324,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     async_training.replay_buffer.enable=${replay_buffer_enable} \
     async_training.replay_buffer.max_version_gap=${replay_buffer_max_version_gap} \
     async_training.replay_buffer.max_size_per_task=${replay_buffer_max_size_per_task} \
+    async_training.replay_buffer.max_use_count=${replay_buffer_max_use_count} \
     +async_training.replay_buffer.score_thresholds.1=${replay_buffer_score_threshold_1} \
     +async_training.replay_buffer.score_thresholds.2=${replay_buffer_score_threshold_2} \
     +async_training.replay_buffer.score_thresholds.3=${replay_buffer_score_threshold_3} \
