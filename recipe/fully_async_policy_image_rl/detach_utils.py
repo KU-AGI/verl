@@ -416,6 +416,10 @@ def merge_rollout_sample(config, tokenizer, rs: RolloutSample, processor):
             is_neg100_flags = prompt_uid2task_neg100[uid][task_id]
             valid_count = sum(not flag for flag in is_neg100_flags)
 
+            # 전부 -100이면 해당 task는 학습 불가 → filter 기준에서 제외 (response_mask로 처리됨)
+            if valid_count == 0:
+                continue
+
             # 유효 샘플이 2개 미만이면 제거
             if valid_count < 2:
                 keep = False
@@ -843,6 +847,15 @@ def _is_sample_bad(batch: DataProto, idx: int, task2_threshold: float = TASK2_QU
     return False
 
 
+def _is_sample_bad_task2_only(batch: DataProto, idx: int, task2_threshold: float = TASK2_QUALITY_THRESHOLD) -> bool:
+    """Return True if sample at *idx* fails task2 quality only (ignores task3)."""
+    if "task2_token_level_scores" in batch.batch:
+        t2_reward = float(batch.batch["task2_token_level_scores"][idx].clamp(min=0).sum().item())
+        if t2_reward < task2_threshold:
+            return True
+    return False
+
+
 def _get_task_rewards(batch: DataProto, task_id: int) -> np.ndarray:
     """Per-sample scalar reward for task_id (sum of positive token-level scores)."""
     key = f"task{task_id}_token_level_scores"
@@ -1035,6 +1048,7 @@ def quality_filter_rollout_sample(
     task_ids: list,
     max_retries: int = 3,
     task2_threshold: float = TASK2_QUALITY_THRESHOLD,
+    use_salvage: bool = True,
 ) -> tuple:
 
     current_batch = rollout_sample.full_batch
@@ -1050,7 +1064,9 @@ def quality_filter_rollout_sample(
     good_indices: list = []
     assembled_groups: list = []
     retry_samples: list = []
+    retry_uid_accumulations: dict = {}
     n_dropped: int = 0
+    n_salvaged: int = 0
 
     for uid, indices in uid_to_indices.items():
         # ① 수정: meta_info 보존
@@ -1059,7 +1075,7 @@ def quality_filter_rollout_sample(
 
         bad_mask = [_is_sample_bad(group_batch, local_i, task2_threshold) for local_i in range(n_group)]
 
-        if not any(bad_mask):
+        if not any(bad_mask) and not is_retry:
             good_indices.extend(indices)
             continue
 
@@ -1067,7 +1083,13 @@ def quality_filter_rollout_sample(
         # ② 수정: meta_info 보존
         new_good_batch = _slice_dataproto_with_meta(group_batch, good_local) if good_local else None
 
-        prev_accumulated = rollout_sample.accumulated_good_batch if is_retry else None
+        prev_accumulated_raw = rollout_sample.accumulated_good_batch if is_retry else None
+        if prev_accumulated_raw is not None:
+            acc_uids = prev_accumulated_raw.non_tensor_batch["uid"]
+            uid_acc_idx = [i for i, u in enumerate(acc_uids) if u == uid]
+            prev_accumulated = _slice_dataproto_with_meta(prev_accumulated_raw, uid_acc_idx) if uid_acc_idx else None
+        else:
+            prev_accumulated = None
 
         # ③ 수정: meta_info 보존
         if new_good_batch is not None and prev_accumulated is not None:
@@ -1104,36 +1126,106 @@ def quality_filter_rollout_sample(
             continue
 
         if current_retry_count < max_retries:
-            orig_prompt = rollout_sample.original_prompt_batch
-            if not is_retry:
-                orig_uids = orig_prompt.non_tensor_batch["uid"]
-                uid_prompt_idx = [i for i, u in enumerate(orig_uids) if u == uid]
-                # ⑦ 수정: meta_info 보존
-                uid_prompt = _slice_dataproto_with_meta(orig_prompt, uid_prompt_idx)
-            else:
-                uid_prompt = orig_prompt
+            retry_uid_accumulations[uid] = accumulated
+        else:
+            # max_retries 초과: task2만 기준으로 valid 샘플 추출해 salvage 시도
+            # good_local 샘플은 이미 accumulated에 포함되어 있으므로 제외 (중복 방지)
+            good_local_set = set(good_local)
+            t2_valid_local = [i for i in range(n_group)
+                              if not _is_sample_bad_task2_only(group_batch, i, task2_threshold)
+                              and i not in good_local_set]
+            t2_valid_batch = _slice_dataproto_with_meta(group_batch, t2_valid_local) if t2_valid_local else None
 
+            needed = group_size - n_acc
+            salvageable = use_salvage and t2_valid_batch is not None and len(t2_valid_batch) >= needed
+
+            if salvageable:
+                # task3 제외하고 task1/task2 기준으로만 diversity 선택
+                salvage_task_ids = [tid for tid in task_ids if tid != 3]
+                if accumulated is not None:
+                    diverse_idx = _select_diverse_candidates(accumulated, t2_valid_batch, needed, salvage_task_ids)
+                    selected = _slice_dataproto_with_meta(t2_valid_batch, diverse_idx)
+                    final_batch = _concat_dataprotos_with_meta([accumulated, selected])
+                else:
+                    final_batch = _slice_dataproto_with_meta(t2_valid_batch, list(range(group_size)))
+
+                # 그룹 내 task3 -100 하나라도 있으면 전체 task3 -100으로 통일
+                if "task3_token_level_scores" in final_batch.batch:
+                    if (final_batch.batch["task3_token_level_scores"] == -100).any():
+                        final_batch.batch["task3_token_level_scores"] = torch.full_like(
+                            final_batch.batch["task3_token_level_scores"], -100
+                        )
+
+                assembled_groups.append((final_batch, uid))
+                n_salvaged += 1  # prompt 단위
+                print(
+                    f"[QualityFilter] Salvaging uid={uid}: "
+                    f"max retries ({max_retries}) reached, task1/task2 only "
+                    f"(acc={n_acc}, t2_valid={len(t2_valid_batch)}, group_size={group_size})"
+                )
+            else:
+                print(
+                    f"[QualityFilter] Dropping uid={uid}: "
+                    f"max retries ({max_retries}) reached, "
+                    f"insufficient salvageable samples "
+                    f"(acc={n_acc}, t2_valid={len(t2_valid_batch) if t2_valid_batch else 0}/{group_size})"
+                )
+                n_dropped += n_group
+
+    if retry_uid_accumulations:
+        orig_prompt = rollout_sample.original_prompt_batch
+        current_retry_count = rollout_sample.retry_count
+        orig_uids = orig_prompt.non_tensor_batch["uid"]
+        all_uids_in_batch = list(dict.fromkeys(orig_uids))
+        retry_uids = set(retry_uid_accumulations.keys())
+        
+        if retry_uids == set(all_uids_in_batch):
+            # Case 1: 모든 uid retry → 두 uid 묶어서 하나의 rollout (no repeat)
+            combined_accumulated = None
+            acc_list = [acc for acc in retry_uid_accumulations.values() if acc is not None]
+            if acc_list:
+                combined_accumulated = _concat_dataprotos_with_meta(acc_list) if len(acc_list) > 1 else acc_list[0]
             retry_rs = RolloutSample(
-                full_batch=uid_prompt,
+                full_batch=orig_prompt,
                 agent_loop_output_list=[],
-                sample_id=f"{rollout_sample.sample_id}_{uid}_r{current_retry_count + 1}",
+                sample_id=f"{rollout_sample.sample_id}_r{current_retry_count + 1}",
                 epoch=rollout_sample.epoch,
-                processing_times=[0.0] * len(uid_prompt),
+                processing_times=[0.0] * len(orig_prompt),
                 tool_calls=rollout_sample.tool_calls,
                 param_version=rollout_sample.param_version,
-                param_version_start=[rollout_sample.param_version] * len(uid_prompt),
-                param_version_end=[rollout_sample.param_version] * len(uid_prompt),
+                param_version_start=[rollout_sample.param_version] * len(orig_prompt),
+                param_version_end=[rollout_sample.param_version] * len(orig_prompt),
                 rollout_status=rollout_sample.rollout_status,
-                original_prompt_batch=uid_prompt,
-                accumulated_good_batch=accumulated,
+                original_prompt_batch=orig_prompt,
+                accumulated_good_batch=combined_accumulated,
                 retry_count=current_retry_count + 1,
             )
             retry_samples.append(retry_rs)
         else:
-            print(
-                f"[QualityFilter] Dropping uid={uid}: "
-                f"max retries ({max_retries}) reached, "
-                f"n_acc={n_acc}/{group_size}"
-            )
-            n_dropped += n_group
-    return good_indices, assembled_groups, retry_samples, n_dropped
+            # Case 2: 일부 uid만 retry → 해당 uid만 슬라이스 후 2x repeat
+            for uid, accumulated in retry_uid_accumulations.items():
+                uid_prompt_idx = [i for i, u in enumerate(orig_uids) if u == uid]
+                uid_prompt = _slice_dataproto_with_meta(orig_prompt, uid_prompt_idx)
+                n_orig = len(orig_prompt)
+                n_uid = len(uid_prompt)
+                if n_uid < n_orig:
+                    repeat_factor = n_orig // n_uid
+                    uid_prompt = uid_prompt.repeat(repeat_times=repeat_factor, interleave=True)
+                retry_rs = RolloutSample(
+                    full_batch=uid_prompt,
+                    agent_loop_output_list=[],
+                    sample_id=f"{rollout_sample.sample_id}_{uid}_r{current_retry_count + 1}",
+                    epoch=rollout_sample.epoch,
+                    processing_times=[0.0] * len(uid_prompt),
+                    tool_calls=rollout_sample.tool_calls,
+                    param_version=rollout_sample.param_version,
+                    param_version_start=[rollout_sample.param_version] * len(uid_prompt),
+                    param_version_end=[rollout_sample.param_version] * len(uid_prompt),
+                    rollout_status=rollout_sample.rollout_status,
+                    original_prompt_batch=uid_prompt,
+                    accumulated_good_batch=accumulated,
+                    retry_count=current_retry_count + 1,
+                )
+                retry_samples.append(retry_rs)
+
+    return good_indices, assembled_groups, retry_samples, n_dropped, n_salvaged

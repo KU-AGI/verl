@@ -1,40 +1,70 @@
 import random
-from collections import deque
+import threading
+from dataclasses import dataclass
+
+import numpy as np
 
 from verl.protocol import DataProto
+from recipe.fully_async_policy_image_rl.detach_utils import (
+    _slice_dataproto_with_meta,
+    _concat_dataprotos_with_meta,
+)
+
+
+@dataclass
+class BufferEntry:
+    """Single uid-group entry in the replay buffer."""
+    uid: str
+    data: DataProto
+    param_version: int
+    mean_reward: float
+    used: bool = False
+    use_count: int = 0
 
 
 class ReplayBuffer:
-    """Per-task replay buffer with score-based filtering.
+    """Per-task replay buffer with post-use quality eviction.
 
-    Stores samples separately per task_id. On push, only samples whose
-    task score >= threshold are kept. On sample, draws equally from all
-    task buffers and merges into a single DataProto.
+    Thread-safe: all public methods acquire an internal lock.
+
+    Design:
+      1. All newly generated groups are pushed unconditionally (no score filtering).
+      2. Training batches are sampled from the buffer (group-level).
+      3. After training, used groups are evaluated:
+         - mean_reward >= threshold  -> keep
+         - mean_reward <  threshold  -> evict
+      4. When the buffer is full, oldest entries are dropped (FIFO).
     """
 
     def __init__(
         self,
-        max_version_gap: int,
         task_ids: list[int],
         score_thresholds: dict[int, float],
         max_size_per_task: int = -1,
+        max_version_gap: int = -1,
+        max_use_count: int = -1,
     ):
-        self.max_version_gap = max_version_gap
         self.task_ids = task_ids
         self.score_thresholds = score_thresholds  # {task_id: min_score}
         self.max_size_per_task = max_size_per_task
-        # per-task buffers: task_id -> deque of (DataProto, param_version)
-        # When max_size_per_task > 0, oldest entries are automatically dropped (FIFO).
-        maxlen = max_size_per_task if max_size_per_task > 0 else None
-        self.buffers: dict[int, deque] = {
-            tid: deque(maxlen=maxlen) for tid in task_ids
+        self.max_version_gap = max_version_gap
+        self.max_use_count = max_use_count  # -1 means unlimited
+        self._lock = threading.Lock()
+        # per-task buffers: task_id -> list[BufferEntry]
+        self.buffers: dict[int, list[BufferEntry]] = {
+            tid: [] for tid in task_ids
         }
 
-    def push(self, batch: DataProto, task_id: int):
-        """Store score-filtered samples for a specific task (uid-group-aware).
+    # ------------------------------------------------------------------
+    # Push: store ALL uid groups (no score filtering)
+    # ------------------------------------------------------------------
 
-        Filters by per-uid mean score >= threshold, keeping entire uid groups intact.
-        Uses rollout param_version (not trainer version) for staleness tracking.
+    def push(self, batch: DataProto, task_id: int) -> int:
+        """Store ALL uid groups from *batch* into the task buffer.
+
+        Each uid group becomes an individual BufferEntry with its mean reward
+        pre-computed (used later for post-use eviction).
+        Returns the total number of rows stored.
         """
         score_key = f"task{task_id}_token_level_scores"
         if score_key not in batch.batch:
@@ -43,145 +73,231 @@ class ReplayBuffer:
         scores = batch.batch[score_key].sum(-1)  # [batch_size]
         uids = batch.non_tensor_batch["uid"]
         param_versions = batch.non_tensor_batch["param_version"]
-        threshold = self.score_thresholds.get(task_id, 0.0)
 
-        # Compute per-uid mean score (only valid scores, ignoring -100 markers)
-        uid_scores: dict[str, list[float]] = {}
-        for i, uid in enumerate(uids):
-            uid_scores.setdefault(uid, []).append(scores[i].item())
-
-        good_uids = set()
-        for uid, s_list in uid_scores.items():
-            valid_scores = [s for s in s_list if s >= 0]
-            if valid_scores and sum(valid_scores) / len(valid_scores) >= threshold:
-                good_uids.add(uid)
-
-        if not good_uids:
-            # Debug: show why no uids passed
-            uid_means = {}
-            for uid, s_list in uid_scores.items():
-                valid = [s for s in s_list if s >= 0]
-                uid_means[uid] = sum(valid) / len(valid) if valid else -1.0
-            print(f"[ReplayBuffer] task{task_id}: no uids passed threshold={threshold}, "
-                  f"uid_means={uid_means}")
-            return 0
-
-        # Group by uid, use min version as representative (keep uid groups intact)
+        # Group indices by uid
         uid_idxs: dict[str, list[int]] = {}
-        uid_version: dict[str, int] = {}
         for i, uid in enumerate(uids):
-            if uid in good_uids:
-                uid_idxs.setdefault(uid, []).append(i)
-                v = int(param_versions[i])
-                uid_version[uid] = min(uid_version.get(uid, v), v)
+            uid_idxs.setdefault(uid, []).append(i)
 
-        # Group uids by their representative version, store as complete uid groups
-        version_groups: dict[int, list[int]] = {}
+        task_prefix = f"task{task_id}_"
+        total_stored = 0
+
+        entries_to_add: list[BufferEntry] = []
+
+        allowed_prefixes = tuple(f"task{t}_" for t in range(1, task_id + 1))
+        base_ntb = {"uid", "param_version", "data_source", "prompt_id", "prompt", "reward_model"}
+
         for uid, idxs in uid_idxs.items():
-            v = uid_version[uid]
-            version_groups.setdefault(v, []).extend(idxs)
-
-        total_kept = 0
-        for v, idxs in version_groups.items():
-            filtered = batch.select_idxs(idxs)
-            self.buffers[task_id].append((filtered, v))
-            total_kept += len(idxs)
-        return total_kept
-
-    def sample_task(self, current_version: int, task_id: int, n_samples: int,
-                    exclude_uids: set | None = None) -> DataProto | None:
-        """Sample n_samples rows from a specific task's buffer (uid-group-aware).
-
-        Evicts stale entries first, then samples uid groups.
-        exclude_uids: uids already in fresh batch, to prevent self-duplication.
-        """
-        evicted = self.evict_stale(current_version)
-        if evicted > 0:
-            per_task = self.size_per_task()
-            print(f"[ReplayBuffer] evict_stale: evicted {evicted} samples (current_version={current_version}), remaining={per_task}")
-
-        buf = list(self.buffers[task_id])
-        if not buf:
-            return None
-
-        # Tag each entry's samples with its param version before concat
-        for b, v in buf:
-            b.non_tensor_batch["sample_param_version"] = b.non_tensor_batch["param_version"]
-        all_batches = [b for b, _v in buf]
-        combined = DataProto.concat(all_batches)
-        if len(combined) == 0:
-            return None
-
-        # Sample uid groups, excluding fresh batch uids
-        uids = combined.non_tensor_batch["uid"]
-        uid_to_idxs: dict[str, list[int]] = {}
-        for i, uid in enumerate(uids):
-            if exclude_uids and uid in exclude_uids:
+            # Skip groups that contain any invalid (-100) sample
+            uid_scores = [scores[i].item() for i in idxs]
+            if any(s < 0 for s in uid_scores):
                 continue
-            uid_to_idxs.setdefault(uid, []).append(i)
+            mean_reward = sum(uid_scores) / len(uid_scores)
 
-        all_uid_keys = list(uid_to_idxs.keys())
-        random.shuffle(all_uid_keys)
-        selected_idxs = []
-        for uid in all_uid_keys:
-            if len(selected_idxs) >= n_samples:
-                break
-            selected_idxs.extend(uid_to_idxs[uid])
+            # Representative param version (min across group)
+            version = min(int(param_versions[i]) for i in idxs)
 
-        if not selected_idxs:
-            return None
+            # Slice the uid group from the full batch
+            filtered = _slice_dataproto_with_meta(batch, idxs)
 
-        return combined.select_idxs(selected_idxs)
+            # --- key filtering (for per-task storage) ---
+            # (a) batch keys: task-prefixed + cross-task context
+            cross_task_vals = {}
+            if task_id == 2:
+                if "task1_gen_imgs_pixel_values" in filtered.batch.keys():
+                    cross_task_vals["task2_task1_gen_imgs_pixel_values"] = filtered.batch["task1_gen_imgs_pixel_values"]
+                if "task1_token_level_scores" in filtered.batch.keys():
+                    cross_task_vals["task2_task1_token_level_scores"] = filtered.batch["task1_token_level_scores"]
+            elif task_id == 3:
+                if "task1_gen_img_tokens" in filtered.batch.keys():
+                    cross_task_vals["task3_task1_gen_img_tokens"] = filtered.batch["task1_gen_img_tokens"]
+                if "task1_token_level_scores" in filtered.batch.keys():
+                    cross_task_vals["task3_task1_token_level_scores"] = filtered.batch["task1_token_level_scores"]
+                if "task2_token_level_scores" in filtered.batch.keys():
+                    cross_task_vals["task3_task2_token_level_scores"] = filtered.batch["task2_token_level_scores"]
+            for k in list(filtered.batch.keys()):
+                if not k.startswith(task_prefix):
+                    del filtered.batch[k]
+            for k, val in cross_task_vals.items():
+                filtered.batch[k] = val
 
-    def evict_stale(self, current_version: int):
-        """Remove all entries that exceed max_version_gap from every task buffer.
+            # (b) non_tensor_batch keys
+            cross_ntb_vals = {}
+            if task_id == 2:
+                if "task1_gen_imgs_pil_list" in filtered.non_tensor_batch:
+                    cross_ntb_vals["task2_task1_gen_imgs_pil_list"] = filtered.non_tensor_batch["task1_gen_imgs_pil_list"]
+            elif task_id == 3:
+                if "task1_gen_imgs_pil_list" in filtered.non_tensor_batch:
+                    cross_ntb_vals["task3_task1_gen_imgs_pil_list"] = filtered.non_tensor_batch["task1_gen_imgs_pil_list"]
+                if "task2_feedback_texts" in filtered.non_tensor_batch:
+                    cross_ntb_vals["task3_task2_feedback_texts"] = filtered.non_tensor_batch["task2_feedback_texts"]
+            filtered.non_tensor_batch = {
+                k: v for k, v in filtered.non_tensor_batch.items()
+                if k in base_ntb or k.startswith(task_prefix)
+            }
+            filtered.non_tensor_batch.update(cross_ntb_vals)
+            if "data_source" in filtered.non_tensor_batch:
+                filtered.non_tensor_batch[f"task{task_id}_data_source"] = filtered.non_tensor_batch.pop("data_source")
 
-        If max_version_gap == -1, no entries are evicted (unlimited retention).
+            # (c) meta_info: cumulative task-prefixed keys
+            filtered.meta_info = {
+                k: v for k, v in filtered.meta_info.items()
+                if k.startswith(allowed_prefixes)
+            }
+
+            entries_to_add.append(BufferEntry(
+                uid=uid,
+                data=filtered,
+                param_version=version,
+                mean_reward=mean_reward,
+                used=False,
+            ))
+            total_stored += len(idxs)
+
+        with self._lock:
+            self.buffers[task_id].extend(entries_to_add)
+            # FIFO overflow: remove oldest entries if over capacity
+            if self.max_size_per_task > 0:
+                self._enforce_capacity(task_id)
+
+        return total_stored
+
+    # ------------------------------------------------------------------
+    # Sample: draw group-level samples from buffer
+    # ------------------------------------------------------------------
+
+    def sample_task(self, task_id: int, n_samples: int,
+                    current_version: int = -1) -> DataProto | None:
+        """Sample up to *n_samples* rows from *task_id*'s buffer.
+
+        Optionally evicts stale entries first (if max_version_gap is set).
+        Marks sampled entries as ``used`` for post-training eviction.
         """
-        if self.max_version_gap < 0:
-            return 0
-        total_evicted = 0
-        maxlen = self.max_size_per_task if self.max_size_per_task > 0 else None
-        for tid in self.task_ids:
-            before = len(self.buffers[tid])
-            self.buffers[tid] = deque(
-                ((b, v) for b, v in self.buffers[tid]
-                 if current_version - v <= self.max_version_gap),
-                maxlen=maxlen,
-            )
-            total_evicted += before - len(self.buffers[tid])
-        return total_evicted
+        with self._lock:
+            if self.max_version_gap >= 0 and current_version >= 0:
+                self._evict_stale(task_id, current_version)
 
-    def task_eligible(self, current_version: int, task_id: int) -> int:
-        """Count eligible rows for a specific task buffer.
+            buf = self.buffers[task_id]
+            if not buf:
+                return None
 
-        If max_version_gap == -1, all entries are eligible.
+            # Shuffle and pick groups until we have enough rows
+            indices = list(range(len(buf)))
+            random.shuffle(indices)
+            selected_indices: list[int] = []
+            collected = 0
+            for idx in indices:
+                if collected >= n_samples:
+                    break
+                selected_indices.append(idx)
+                collected += len(buf[idx].data)
+
+            if not selected_indices:
+                return None
+
+            # Mark selected entries as used and tag with version for downstream tracking
+            for idx in selected_indices:
+                buf[idx].used = True
+                buf[idx].use_count += 1
+                buf[idx].data.non_tensor_batch["sample_param_version"] = buf[idx].data.non_tensor_batch["param_version"]
+                buf[idx].data.non_tensor_batch["entry_use_count"] = np.full(len(buf[idx].data), buf[idx].use_count)
+
+            all_data = [buf[idx].data for idx in selected_indices]
+            result = _concat_dataprotos_with_meta(all_data)
+            # Truncate to exactly n_samples to guarantee consistent batch sizes
+            # across tasks (needed for TensorDict when merging task batches).
+            if len(result) > n_samples:
+                result = _slice_dataproto_with_meta(result, list(range(n_samples)))
+            return result
+
+    # ------------------------------------------------------------------
+    # Post-use eviction: evaluate used groups, remove low quality
+    # ------------------------------------------------------------------
+
+    def evict_after_use(self, task_id: int) -> tuple[int, int]:
+        """Evaluate used entries: keep if mean_reward >= threshold, else evict.
+
+        Returns ``(kept_count, evicted_count)`` among used entries.
+        Unused entries are always kept.
         """
-        if self.max_version_gap < 0:
-            return sum(len(b) for b, _ in self.buffers[task_id])
-        return sum(
-            len(b) for b, v in self.buffers[task_id]
-            if current_version - v <= self.max_version_gap
-        )
+        with self._lock:
+            threshold = self.score_thresholds.get(task_id, 0.0)
+            buf = self.buffers[task_id]
+            kept: list[BufferEntry] = []
+            evicted_count = 0
+            kept_used_count = 0
 
-    def total_eligible(self, current_version: int) -> int:
-        """Count total rows that would pass the version gap filter (without evicting)."""
-        return sum(
-            self.task_eligible(current_version, tid) for tid in self.task_ids
-        )
+            for entry in buf:
+                if entry.used:
+                    over_use_limit = (self.max_use_count >= 0 and entry.use_count >= self.max_use_count)
+                    if not over_use_limit and entry.mean_reward >= threshold:
+                        entry.used = False  # reset for next round
+                        kept.append(entry)
+                        kept_used_count += 1
+                    else:
+                        evicted_count += 1
+                else:
+                    kept.append(entry)
+
+            self.buffers[task_id] = kept
+            return kept_used_count, evicted_count
+
+    # ------------------------------------------------------------------
+    # Internal helpers (caller must hold self._lock)
+    # ------------------------------------------------------------------
+
+    def _enforce_capacity(self, task_id: int):
+        """Remove oldest entries (FIFO) when buffer exceeds max_size_per_task uid groups."""
+        buf = self.buffers[task_id]
+        if len(buf) <= self.max_size_per_task:
+            return
+        del buf[:len(buf) - self.max_size_per_task]
+
+    def _evict_stale(self, task_id: int, current_version: int):
+        """Remove entries exceeding max_version_gap for the given task."""
+        if self.max_version_gap < 0:
+            return
+        self.buffers[task_id] = [
+            e for e in self.buffers[task_id]
+            if current_version - e.param_version <= self.max_version_gap
+        ]
+
+    # ------------------------------------------------------------------
+    # Size / stats helpers (thread-safe)
+    # ------------------------------------------------------------------
+
+    def task_size(self, task_id: int) -> int:
+        """Total rows in task buffer."""
+        with self._lock:
+            return sum(len(e.data) for e in self.buffers[task_id])
 
     def total_size(self) -> int:
-        return sum(
-            sum(len(b) for b, _ in buf)
-            for buf in self.buffers.values()
-        )
+        with self._lock:
+            return sum(
+                sum(len(e.data) for e in self.buffers[tid])
+                for tid in self.task_ids
+            )
 
     def num_entries(self) -> int:
-        """Total number of stored batch entries (not rows)."""
-        return sum(len(buf) for buf in self.buffers.values())
+        """Total number of uid-group entries across all tasks."""
+        with self._lock:
+            return sum(len(buf) for buf in self.buffers.values())
 
     def size_per_task(self) -> dict[int, int]:
-        return {
-            tid: sum(len(b) for b, _ in buf)
-            for tid, buf in self.buffers.items()
-        }
+        with self._lock:
+            return {
+                tid: sum(len(e.data) for e in self.buffers[tid])
+                for tid in self.task_ids
+            }
+
+    def entries_per_task(self) -> dict[int, int]:
+        with self._lock:
+            return {tid: len(buf) for tid, buf in self.buffers.items()}
+
+    def stats_per_task(self) -> dict[int, tuple[int, int]]:
+        """Return (row_count, entry_count) per task under a single lock."""
+        with self._lock:
+            return {
+                tid: (sum(len(e.data) for e in self.buffers[tid]), len(self.buffers[tid]))
+                for tid in self.task_ids
+            }

@@ -162,11 +162,17 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             raw_thresholds = replay_cfg.get("score_thresholds", {})
             score_thresholds = {int(k): float(v) for k, v in raw_thresholds.items()}
             self.replay_buffer = ReplayBuffer(
-                max_version_gap=replay_cfg.get("max_version_gap", 2),
                 task_ids=task_ids,
                 score_thresholds=score_thresholds,
                 max_size_per_task=replay_cfg.get("max_size_per_task", -1),
+                max_version_gap=replay_cfg.get("max_version_gap", -1),
+                max_use_count=replay_cfg.get("max_use_count", -1),
             )
+            # Feeder thread state
+            self._feeder_stop = False
+            self._feeder_terminated = False
+            self._feeder_thread = None
+            self._feeder_task_ids = task_ids
             print(
                 f"[FullyAsyncTrainer] ReplayBuffer enabled: "
                 f"max_version_gap={self.replay_buffer.max_version_gap}, "
@@ -174,16 +180,94 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                 f"score_thresholds={score_thresholds}"
             )
 
+    # ------------------------------------------------------------------
+    # Background buffer feeder (replay-buffer mode only)
+    # ------------------------------------------------------------------
+
+    def _start_buffer_feeder(self):
+        """Start background thread that continuously drains queue into replay buffer."""
+        self._feeder_stop = False
+        self._feeder_terminated = False
+        self._feeder_thread = threading.Thread(target=self._run_buffer_feeder, daemon=True)
+        self._feeder_thread.start()
+        print("[FullyAsyncTrainer] Buffer feeder thread started.")
+
+    def _run_buffer_feeder(self):
+        """Background: blocking drain queue -> assemble -> push to replay buffer."""
+        balance_fn = self._balance_batch if self.config.trainer.balance_batch else None
+
+        while not self._feeder_stop:
+            try:
+                result = self.message_queue_client.get_sample_sync()
+                if result is None:
+                    print("[BufferFeeder] Termination signal (result is None).")
+                    self._feeder_terminated = True
+                    break
+                sample_data, queue_len = result
+                if sample_data is None:
+                    print("[BufferFeeder] Termination signal (sample_data is None).")
+                    self._feeder_terminated = True
+                    break
+
+                deserialized = ray.cloudpickle.loads(sample_data)
+
+                # Assemble single sample into DataProto
+                batch = assemble_batch_from_rollout_samples(
+                    [deserialized], self.tokenizer, self.config, balance_fn
+                )
+
+                # Push to all task buffers (lock is inside replay_buffer)
+                for tid in self._feeder_task_ids:
+                    stored = self.replay_buffer.push(batch, tid)
+                    if stored > 0:
+                        n = self.config.actor_rollout_ref.rollout.n
+                        required_groups = self.required_samples // n
+                        print(
+                            f"[BufferFeeder] task{tid}: pushed {stored} rows, "
+                            f"buffer={self.replay_buffer.task_size(tid)}/{self.required_samples} rows, "
+                            f"groups={self.replay_buffer.entries_per_task()[tid]}/{required_groups} groups, "
+                            f"mq_len={queue_len}"
+                        )
+            except Exception as e:
+                print(f"[BufferFeeder Error] {e}")
+                import traceback
+                traceback.print_exc()
+                time.sleep(1)
+
+    def _wait_for_buffer(self, min_samples: int | None = None) -> bool:
+        """Block until replay buffer has enough samples for all tasks.
+
+        Returns False if feeder terminated before buffer is ready.
+        """
+        if min_samples is None:
+            min_samples = self.required_samples
+
+        while True:
+            min_buf = min(
+                self.replay_buffer.task_size(tid)
+                for tid in self._feeder_task_ids
+            )
+            if min_buf >= min_samples:
+                return True
+            if self._feeder_terminated:
+                # Feeder stopped — check once more
+                min_buf = min(
+                    self.replay_buffer.task_size(tid)
+                    for tid in self._feeder_task_ids
+                )
+                return min_buf >= min_samples
+            time.sleep(0.5)
+
     def _run_prefetch(self):
         print("[FullyAsyncTrainer] Prefetch thread started.")
         while not self.stop_prefetch:
             try:
                 epoch, batch = self._get_samples_from_queue()
-                
+
                 if batch is None:
                     self.batch_buffer.put((None, None))
                     break
-                
+
                 # 수집된 128개 묶음을 버퍼에 투척 (버퍼가 차있으면 여기서 대기)
                 self.batch_buffer.put((epoch, batch))
             except Exception as e:
@@ -206,16 +290,14 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         """Get actor worker group"""
         return self.actor_wg
 
-    def _get_samples_from_queue(self, allow_partial: bool = False) -> tuple[None, None] | tuple[int, Any]:
-        """Collect samples from the message queue.
+    def _get_samples_from_queue(self) -> tuple[None, None] | tuple[int, Any]:
+        """Collect samples from the message queue (non-replay path only).
 
-        Args:
-            allow_partial: If True, collect fresh samples greedily (drain queue),
-                           then let replay fill the rest. Blocks only for the first sample.
-                           If False, block until required_samples are collected from queue only (original behavior).
+        Blocks until required_samples are collected. Drops stale samples
+        exceeding staleness_threshold.
         """
         print(
-            f"[FullyAsyncTrainer] Requesting {self.required_samples} rows from queue (partial={allow_partial})",
+            f"[FullyAsyncTrainer] Requesting {self.required_samples} rows from queue",
             flush=True,
         )
 
@@ -228,28 +310,6 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         dropped_rows = 0
 
         while current_rows < self.required_samples:
-            # Priority: 1) fresh from queue, 2) replay buffer, 3) wait for more fresh
-            if allow_partial and current_rows > 0:
-                remaining_in_queue = self.message_queue_client.get_sample_count_sync()
-                if remaining_in_queue == 0:
-                    shortfall = self.required_samples - current_rows
-                    min_replay = min(
-                        self.replay_buffer.task_eligible(self.current_param_version, tid)
-                        for tid in self.replay_buffer.task_ids
-                    )
-                    if min_replay >= shortfall:
-                        # Replay can fill the gap — stop collection
-                        print(
-                            f"[FullyAsyncTrainer] Partial mode: fresh={current_rows}, min_replay={min_replay}, "
-                            f"shortfall={shortfall}, stopping collection (replay sufficient)"
-                        )
-                        break
-                    # Replay not enough — wait for more fresh data
-                    print(
-                        f"[FullyAsyncTrainer] Partial mode: fresh={current_rows}, min_replay={min_replay}, "
-                        f"shortfall={shortfall}, waiting for more fresh..."
-                    )
-
             result = self.message_queue_client.get_sample_sync()
 
             if result is None:
@@ -258,7 +318,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
 
             sample_data, queue_len = result
             if sample_data is None:
-                f"[FullyAsyncTrainer] Detected termination signal (None), stopping sample collection. "
+                print("[FullyAsyncTrainer] Detected termination signal (None), stopping sample collection.")
                 break
 
             deserialized_sample = ray.cloudpickle.loads(sample_data)
@@ -289,7 +349,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             print(f"[FullyAsyncTrainer] No rows collected")
             return None, None
 
-        if not allow_partial and current_rows < self.required_samples:
+        if current_rows < self.required_samples:
             print(f"[FullyAsyncTrainer] Not enough rows collected: {current_rows}/{self.required_samples}")
             return None, None
 
@@ -379,45 +439,23 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             config=OmegaConf.to_container(self.config, resolve=True),
         )
 
-        #self.prefetch_thread = threading.Thread(target=self._run_prefetch, daemon=True)
-        #self.prefetch_thread.start()
         self.max_steps_duration = 0
 
         # get validate data before training
         self._log_validation_data()
 
-        # Use queue mode, no need for traditional dataloader iterator
-        # Initialize to get the first batch of data
+        # Start background feeder if replay buffer is enabled
+        if self.use_replay_buffer:
+            self._start_buffer_feeder()
         while True:
             metrics = {}
             timing_raw = {}
 
             with marked_timer("step", timing_raw):
                 with marked_timer("gen", timing_raw, color="red"):
-                    # In replay mode, allow partial collection — grab what's available, fill rest from buffer
-                    epoch, batch = self._get_samples_from_queue(allow_partial=self.use_replay_buffer)
                     training_start_time = time.time()
-
-                    is_replay_only = batch is None
-
-                    if not is_replay_only:
-                        self._collect_metrics_from_samples(batch, metrics)
-
-                    # Collect timing info from rollouter (reward computation time)
-                    if batch is not None and hasattr(batch, 'meta_info') and 'reward' in batch.meta_info:
-                        timing_raw['reward'] = batch.meta_info['reward']
-
                     task_ids = list(self.config.actor_rollout_ref.actor.multi_task.get("task_ids", [1]))
 
-                    # Push fresh batch into replay BEFORE per-task loop (batch is still clean)
-                    if self.use_replay_buffer and not is_replay_only:
-                        with marked_timer("replay/push", timing_raw):
-                            for _tid in task_ids:
-                                kept = self.replay_buffer.push(batch, _tid)
-                                if kept > 0:
-                                    print(f"[ReplayBuffer] task{_tid}: pushed {kept}/{len(batch)} samples "
-                                          f"(threshold={self.replay_buffer.score_thresholds.get(_tid, 0.0)})")
-                    
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     should_log_rollout = (
                         rollout_data_dir
@@ -426,63 +464,124 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                     )
 
                     task_batches: dict[int, DataProto] = {}
-                    for task_id in task_ids:
-                        # Per-task: merge fresh with task-specific replay, or use replay-only
-                        if self.use_replay_buffer:
-                            if not is_replay_only:
-                                with marked_timer(f"replay/merge_task{task_id}", timing_raw):
-                                    task_batch = self._merge_with_replay(batch, task_id)
-                            else:
-                                task_batch = self._get_replay_only_batch(task_id)
-                                if task_batch is None:
-                                    print(f"[FullyAsyncTrainer] task{task_id}: no replay available, skipping")
-                                    continue
-                        else:
-                            if is_replay_only:
-                                break
+                    task_timings: dict[int, dict] = {}
+
+                    if self.use_replay_buffer:
+                        # ---- Replay path: sample from buffer (feeder pushes in background) ----
+                        with marked_timer("replay/wait", timing_raw):
+                            buffer_ready = self._wait_for_buffer()
+                        if not buffer_ready:
+                            print("[FullyAsyncTrainer] Buffer feeder terminated and buffer insufficient, stopping.")
+                            break
+
+                        for task_id in task_ids:
+                            task_timing = {}
+                            with marked_timer("replay/sample_from_buffer", task_timing):
+                                task_batch = self.replay_buffer.sample_task(
+                                    task_id, self.required_samples, self.current_param_version
+                                )
+                            if task_batch is None:
+                                print(f"[FullyAsyncTrainer] task{task_id}: buffer empty after sample, skipping")
+                                continue
+
+                            buf_size = self.replay_buffer.task_size(task_id)
+                            print(
+                                f"[FullyAsyncTrainer] Replay sample task{task_id}: "
+                                f"sampled={len(task_batch)}, buffer_remaining={buf_size}"
+                            )
+                            use_counts = task_batch.non_tensor_batch.get("entry_use_count")
+                            if use_counts is not None:
+                                metrics[f"replay/task{task_id}_mean_use_count"] = float(np.mean(use_counts))
+                                metrics[f"replay/task{task_id}_min_use_count"] = float(np.min(use_counts))
+                                metrics[f"replay/task{task_id}_max_use_count"] = float(np.max(use_counts))
+
+                            task_batch.batch["task_id"] = torch.tensor([task_id for _ in range(len(task_batch))], dtype=int)
+                            task_batch = self._process_batch_common(
+                                task_batch, metrics, task_timing, self.local_trigger_step if self.compute_prox_log_prob else None, task_id
+                            )
+                            task_batches[task_id] = task_batch
+                            task_timings[task_id] = task_timing
+
+                            if should_log_rollout:
+                                task_reward_extra = {k: v for k, v in task_batch.meta_info.items()}
+                                task_rollout_dir = os.path.join(rollout_data_dir, f"task{task_id}")
+                                self._log_rollout_data(task_batch, task_reward_extra, task_timing, task_rollout_dir)
+                    else:
+                        # ---- Non-replay path: collect from queue (original behavior) ----
+                        epoch, batch = self._get_samples_from_queue()
+                        if batch is None:
+                            break
+
+                        self._collect_metrics_from_samples(batch, metrics)
+
+                        if hasattr(batch, 'meta_info') and 'reward' in batch.meta_info:
+                            timing_raw['reward'] = batch.meta_info['reward']
+
+                        for task_id in task_ids:
                             task_batch = batch
 
-                        task_batch.batch["task_id"] = torch.tensor([task_id for _ in range(len(task_batch))], dtype=int)
+                            task_batch.batch["task_id"] = torch.tensor([task_id for _ in range(len(task_batch))], dtype=int)
+                            task_batch = self._process_batch_common(
+                                task_batch, metrics, timing_raw, self.local_trigger_step if self.compute_prox_log_prob else None, task_id
+                            )
+                            task_batches[task_id] = task_batch
 
-                        task_batch = self._process_batch_common(
-                            task_batch, metrics, timing_raw, self.local_trigger_step if self.compute_prox_log_prob else None, task_id
-                        )
-                        task_batches[task_id] = task_batch
-
-                        # Log rollout data per task
-                        if should_log_rollout:
-                            task_reward_extra = {k: v for k, v in task_batch.meta_info.items()}
-                            task_rollout_dir = os.path.join(rollout_data_dir, f"task{task_id}")
-                            self._log_rollout_data(task_batch, task_reward_extra, timing_raw, task_rollout_dir)
+                            if should_log_rollout:
+                                task_reward_extra = {k: v for k, v in task_batch.meta_info.items()}
+                                task_rollout_dir = os.path.join(rollout_data_dir, f"task{task_id}")
+                                self._log_rollout_data(task_batch, task_reward_extra, timing_raw, task_rollout_dir)
 
                     if not task_batches:
                         break
 
-                    # Process each task's batch separately for critic/actor update and metrics
-                    for task_id, task_batch in task_batches.items():
-                        # update critic
-                        if self.use_critic:
-                            with marked_timer(f"update_critic_task{task_id}", timing_raw, color="pink"):
-                                critic_output = self.critic_wg.update_critic(task_batch)
-                            critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
-                            metrics.update(critic_output_metrics)
+                    # Merge all task batches into one combined batch
+                    combined_batch = self._merge_task_batches(task_batches)
 
-                        # implement critic warmup
-                        if self.config.trainer.critic_warmup <= self.global_steps:
-                            # update actor
-                            with marked_timer(f"update_actor_task{task_id}", timing_raw, color="red"):
-                                task_batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
-                                actor_output = self.actor_rollout_wg.update_actor(task_batch)
-                            log_prob_info = log_prob_metrics(actor_output.meta_info["metrics"], [task_id])
-                            actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
-                            metrics.update(log_prob_info)
-                            metrics.update(actor_output_metrics)
+                    # update critic (once with all tasks)
+                    if self.use_critic:
+                        with marked_timer("update_critic", timing_raw, color="pink"):
+                            critic_output = self.critic_wg.update_critic(combined_batch)
+                        critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
+                        metrics.update(critic_output_metrics)
 
-                        # Collect per-task data metrics
-                        self._collect_task_metrics(task_batch, metrics, timing_raw, task_ids=[task_id])
+                    # update actor (once with all tasks)
+                    if self.config.trainer.critic_warmup <= self.global_steps:
+                        with marked_timer("update_actor", timing_raw, color="red"):
+                            combined_batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+                            actor_output = self.actor_rollout_wg.update_actor(combined_batch)
+                        log_prob_info = log_prob_metrics(actor_output.meta_info["metrics"], task_ids)
+                        actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                        metrics.update(log_prob_info)
+                        metrics.update(actor_output_metrics)
 
-                    # Keep last task_batch as batch for downstream use
-                    batch = list(task_batches.values())[-1]
+                    # Post-training: evict low quality used groups from replay buffer
+                    if self.use_replay_buffer:
+                        with marked_timer("replay/evict", timing_raw):
+                            for _tid in task_ids:
+                                kept, evicted = self.replay_buffer.evict_after_use(_tid)
+                                metrics[f"replay/task{_tid}_kept"] = kept
+                                metrics[f"replay/task{_tid}_evicted"] = evicted
+                            # Read size and entry count under a single lock
+                            buf_stats = self.replay_buffer.stats_per_task()
+                            for _tid in task_ids:
+                                buf_size, buf_entries = buf_stats.get(_tid, (0, 0))
+                                metrics[f"replay/task{_tid}_buffer_size"] = buf_size
+                                metrics[f"replay/task{_tid}_buffer_entries"] = buf_entries
+                                print(
+                                    f"[ReplayBuffer] task{_tid}: evict_after_use "
+                                    f"kept={metrics[f'replay/task{_tid}_kept']}, "
+                                    f"evicted={metrics[f'replay/task{_tid}_evicted']}, "
+                                    f"buffer_size={buf_size}, entries={buf_entries}"
+                                )
+
+                    # Collect per-task data metrics
+                    for task_id in task_ids:
+                        # Replay path: merge shared timing with per-task timing so that
+                        # reward/old_log_prob/adv reflect each task's actual compute time.
+                        per_task_timing = {**timing_raw, **task_timings.get(task_id, {})} if task_timings else timing_raw
+                        self._collect_task_metrics(combined_batch, metrics, per_task_timing, task_ids=[task_id])
+
+                    batch = combined_batch
             # Collect step-level metrics (timing, throughput) after step timer completes
             self._collect_step_metrics(batch, 0, metrics, timing_raw)
             self.metrics_aggregator.add_step_metrics(
@@ -515,7 +614,12 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             self._log_validation_data()
             
         self.progress_bar.close()
-        #self.stop_prefetch = True
+
+        # Stop feeder thread
+        if self.use_replay_buffer and self._feeder_thread is not None:
+            self._feeder_stop = True
+            self._feeder_thread.join(timeout=5)
+            print("[FullyAsyncTrainer] Buffer feeder thread stopped.")
 
         self._check_save_checkpoint(timing_raw)
 
@@ -661,55 +765,77 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             )
         return self.current_param_version
 
-    def _merge_with_replay(self, fresh_batch: DataProto, task_id: int) -> DataProto:
-        """Fill shortfall for a specific task using that task's replay buffer.
+    def _merge_task_batches(self, task_batches: dict) -> DataProto:
+        """Merge per-task DataProto objects into a single combined batch.
 
-        - fresh >= required_samples → use fresh only
-        - fresh < required_samples  → fill gap from task-specific replay buffer
-        All uid groups remain intact (rollout.n responses per uid preserved).
+        For each task_id, only keys prefixed with f"task{task_id}_" are taken from
+        that task's batch. This ensures that replay samples for task N use the correct
+        input data (e.g. task2_input_ids from task2's batch, not task1's).
+        The base batch (task_ids[0]) provides all non-task-specific keys and meta_info.
         """
-        fresh_size = len(fresh_batch)
-        shortfall = self.required_samples - fresh_size
+        task_ids = sorted(task_batches.keys())
+        combined = task_batches[task_ids[0]]
 
-        if shortfall <= 0:
-            fresh_batch.non_tensor_batch["sample_param_version"] = fresh_batch.non_tensor_batch["param_version"]
-            return fresh_batch
+        for task_id in task_ids[1:]:
+            other = task_batches[task_id]
+            task_prefix = f"task{task_id}_"
 
-        fresh_uids = set(fresh_batch.non_tensor_batch["uid"])
-        available = self.replay_buffer.task_eligible(self.current_param_version, task_id)
-        replay_size = min(shortfall, available)
-        if replay_size == 0:
-            fresh_batch.non_tensor_batch["sample_param_version"] = fresh_batch.non_tensor_batch["param_version"]
-            return fresh_batch
+            for key in list(other.batch.keys()):
+                if key.startswith(task_prefix):
+                    combined.batch[key] = other.batch[key]
 
-        replay_batch = self.replay_buffer.sample_task(
-            self.current_param_version, task_id, replay_size, exclude_uids=fresh_uids
-        )
+            for key in list(other.non_tensor_batch.keys()):
+                if key.startswith(task_prefix):
+                    combined.non_tensor_batch[key] = other.non_tensor_batch[key]
 
-        if replay_batch is None:
-            fresh_batch.non_tensor_batch["sample_param_version"] = fresh_batch.non_tensor_batch["param_version"]
-            return fresh_batch
+            # Alias cross-task context keys so dp_actor can use the correct
+            # context for each task's replay samples (avoids misalignment).
+            # task2 forward needs task1_gen_imgs_pixel_values from task2's trajectory
+            # task3 forward needs task1_gen_img_tokens from task3's trajectory
+            if task_id == 2 and "task1_gen_imgs_pixel_values" in other.batch.keys():
+                combined.batch["task2_task1_gen_imgs_pixel_values"] = other.batch["task1_gen_imgs_pixel_values"]
+            elif task_id == 3 and "task1_gen_img_tokens" in other.batch.keys():
+                combined.batch["task3_task1_gen_img_tokens"] = other.batch["task1_gen_img_tokens"]
 
-        fresh_batch.non_tensor_batch["sample_param_version"] = fresh_batch.non_tensor_batch["param_version"]
-        merged = DataProto.concat([fresh_batch, replay_batch])
-        merged.meta_info.update(fresh_batch.meta_info)
-        print(
-            f"[FullyAsyncTrainer] Replay fill task{task_id}: "
-            f"fresh={fresh_size}, replay={len(replay_batch)}, total={len(merged)}"
-        )
-        return merged
+            # Alias sample_param_version per task so _collect_task_metrics
+            # uses the correct replay freshness versions for each task.
+            if "sample_param_version" in other.non_tensor_batch:
+                combined.non_tensor_batch[f"task{task_id}_sample_param_version"] = \
+                    other.non_tensor_batch["sample_param_version"]
 
-    def _get_replay_only_batch(self, task_id: int) -> DataProto | None:
-        """Get a training batch purely from a specific task's replay buffer (for idle time)."""
-        replay_batch = self.replay_buffer.sample_task(
-            self.current_param_version, task_id, self.required_samples
-        )
-        if replay_batch is not None:
-            print(
-                f"[FullyAsyncTrainer] Replay-only task{task_id}: "
-                f"replay={len(replay_batch)}"
-            )
-        return replay_batch
+            # Alias uid per task so compute_group_reward_metrics uses the correct
+            # uid groupings for advantage collapse metrics (replay path has different
+            # uid groups per task; without this, task2/task3 collapse metrics use task1's uids).
+            if "uid" in other.non_tensor_batch:
+                combined.non_tensor_batch[f"task{task_id}_uid"] = other.non_tensor_batch["uid"]
+
+            for k, v in other.meta_info.items():
+                if k.startswith(task_prefix):
+                    combined.meta_info[k] = v
+
+        # Create per-task data_source aliases for no-replay path
+        # In no-replay case all tasks share the same batch (same rows, same data_source per row).
+        if "data_source" in combined.non_tensor_batch:
+            for tid in task_ids:
+                ds_key = f"task{tid}_data_source"
+                if ds_key not in combined.non_tensor_batch:
+                    combined.non_tensor_batch[ds_key] = combined.non_tensor_batch["data_source"]
+
+        # Recompute global_token_num if missing (e.g. after replay buffer meta_info filtering)
+        if "global_token_num" not in combined.meta_info:
+            total = None
+            for tid in task_ids:
+                att_key = f"task{tid}_attention_mask"
+                resp_key = f"task{tid}_response_mask"
+                if att_key in combined.batch.keys():
+                    t = combined.batch[att_key].sum(-1)
+                    if resp_key in combined.batch.keys():
+                        t = t + combined.batch[resp_key].sum(-1)
+                    total = t if total is None else total + t
+            if total is not None:
+                combined.meta_info["global_token_num"] = total.tolist()
+
+        return combined
 
     def _collect_task_metrics(self, batch, metrics, timing_raw, task_ids=None):
         """Collect per-task data metrics (scores, advantages, sample sources)."""
@@ -723,17 +849,41 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             if f"task{task_id}_advantages" not in available_keys:
                 continue
             batch.batch["task_id"] = torch.tensor([task_id for _ in range(len(batch))], dtype=int)
+            # Temporarily set task-specific data_source so per-source metrics are correct per task
+            ds_key = f"task{task_id}_data_source"
+            orig_ds = batch.non_tensor_batch.get("data_source")
+            if ds_key in batch.non_tensor_batch:
+                batch.non_tensor_batch["data_source"] = batch.non_tensor_batch[ds_key]
             metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
             metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
             metrics.update(compute_group_reward_metrics(batch=batch))
+            if orig_ds is not None:
+                batch.non_tensor_batch["data_source"] = orig_ds
+            elif "data_source" in batch.non_tensor_batch:
+                del batch.non_tensor_batch["data_source"]
             # Log sample_param_version stats and fresh sample count
-            if "sample_param_version" in batch.non_tensor_batch:
-                versions = batch.non_tensor_batch["sample_param_version"].astype(float)
+            # Use per-task aliased key if available (replay case with different samples per task),
+            # fall back to common key (no-replay case where all tasks share the same batch).
+            spv_key = f"task{task_id}_sample_param_version"
+            if spv_key not in batch.non_tensor_batch:
+                spv_key = "sample_param_version"
+            if spv_key in batch.non_tensor_batch:
+                versions = batch.non_tensor_batch[spv_key].astype(float)
+                gaps = self.current_param_version - versions
+
                 metrics[f"replay/task{task_id}_version_min"] = float(np.min(versions))
                 metrics[f"replay/task{task_id}_version_mean"] = float(np.mean(versions))
                 metrics[f"replay/task{task_id}_version_max"] = float(np.max(versions))
+
+                metrics[f"replay/task{task_id}_gap_min"] = float(np.min(gaps))
+                metrics[f"replay/task{task_id}_gap_mean"] = float(np.mean(gaps))
+                metrics[f"replay/task{task_id}_gap_max"] = float(np.max(gaps))
+                metrics[f"replay/task{task_id}_stale_ratio"] = float(np.mean(gaps >= 1))
+                metrics[f"replay/task{task_id}_fresh_ratio"] = float(np.mean(gaps == 0))
+
                 fresh_count = int(np.sum(versions == self.current_param_version))
                 metrics[f"replay/task{task_id}_fresh_count"] = fresh_count
+
             batch.pop(batch_keys=["task_id"])
 
     def _collect_step_metrics(self, batch, epoch, metrics, timing_raw):
