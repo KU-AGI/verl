@@ -322,13 +322,24 @@ def convert_gen_img_to_base64(gen_img) -> Optional[str]:
     
 
 def image_evaluator_parser(text):
-    ans_line_re = re.compile(r'(?:step\s+)?(\d+)\s*\|\s*(?:Answer:\s*)?(Yes|No)', re.IGNORECASE) # whether step <index> or <index>
-    
-    idx_to_ans = {} # 1 | ... Answer: Yes or No -> {1: True or False}
-    for idx_str, yn in ans_line_re.findall(text):
-        idx = int(idx_str)
-        idx_to_ans[idx] = (yn.strip().lower() == "yes")
-    
+    idx_to_ans = {}  # 1 | ... Answer: Yes or No -> {1: True or False}
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # Match lines starting with "N | " (or "step N | ")
+        m = re.match(r'(?:step\s+)?(\d+)\s*\|(.+)', line, re.IGNORECASE)
+        if not m:
+            continue
+        idx = int(m.group(1))
+        rest = m.group(2)
+        # Find Answer: Yes/No anywhere in the rest of the line (handles both
+        # split-line format "1 | Answer: No" and inline format "1 | Reason: ... Answer: No")
+        ans_m = re.search(r'\bAnswer:\s*(Yes|No)\b', rest, re.IGNORECASE)
+        if ans_m:
+            idx_to_ans[idx] = (ans_m.group(1).lower() == "yes")
+
     return idx_to_ans
 
 
@@ -595,8 +606,8 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
         predict_decomposed_ans = formatting_evaluator._extract_answer_paragraphs(predicted_answer)
         part2_reward_dict = formatting_evaluator._calculate_metrics_for_reward(feedback_parsed_tuple, predict_parsed_tuple, predict_decomposed_ans)
 
-        consistency_ok = part2_reward_dict.get("part2_internal_consistency_ok", 0)
-        reward_extra_info["part2_internal_consistency_ok"] = int(consistency_ok)
+        consistency_ok = part2_reward_dict.get("task2_internal_consistency_ok", 0)
+        reward_extra_info["task2_internal_consistency_ok"] = int(consistency_ok)
         f1_score = part2_reward_dict.get("part2_accuracy", 0.0)
         task2_rule_based_decompose_reward = float(f1_score * consistency_ok)  # 0..1
         #reward_score += task2_rule_based_decompose_reward
