@@ -1152,7 +1152,6 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
                 
                 attn_keys = [k for k in sorted_keys if "language_model.model.layers" in k and ("q_proj" in k or "down_proj" in k) and "weight" in k]
                 check_key = attn_keys[0] if attn_keys else sorted_keys[0]
-                print(f"[EXPORT] '{check_key}' first 3 values: {sd[check_key].view(-1)[:3].tolist()}")
 
                 offset = 0
                 for k in sorted_keys:
@@ -1167,9 +1166,6 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
                 keys_blob = "\n".join(sorted_keys).encode("utf-8")
                 import hashlib
                 key_fp = hashlib.sha256(keys_blob).hexdigest()
-
-                print(f"[EXPORT] key_fp={key_fp} nkeys={len(sorted_keys)}")
-                print(f"[EXPORT] flat_tensor checksum: {flat_tensor.float().sum()}")
                
                 return flat_tensor.view(torch.int16).numpy()
             else:
