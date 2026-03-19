@@ -449,7 +449,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                 t1 = self._get_safe_val(scores, 'task1_scores', i, 0.0)
                 t2 = self._get_safe_val(scores, 'task2_scores', i, 0.0)
                 t3 = self._get_safe_val(scores, 'task3_scores', i, 0.0)
-                total = t1 + t2 + t3 > 0 # exclude -100
+                total = sum(v for v in [t1, t2, t3] if v > -100) # exclude -100
                 
                 summary_rows.append(f"rollout_{r_idx:<3} | {t1:<5.2f} | {t2:<5.2f} | {t3:<5.2f} | {total:<6.2f} | {paths['gen']:<65} | {paths['regen']}")
 
@@ -545,7 +545,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                 f.write(f"  - Total Score: {self._get_safe_val(scores, 'task2_scores', i)}\n")
                 f.write(f"  - Format Reward (rule-based) (add score): {self._get_safe_val(reward_extra_infos_dict, 'task2_rule_based_format_reward', i)}\n")
                 f.write(f"  - Decompose Reward (rule-based) (add score): {self._get_safe_val(reward_extra_infos_dict, 'task2_rule_based_decompose_reward', i)}\n")
-                f.write(f"  - Internal Consistency OK (gating decompose): {self._get_safe_val(reward_extra_infos_dict, 'part2_internal_consistency_ok', i)}\n")
+                f.write(f"  - Internal Consistency OK (gating decompose): {self._get_safe_val(reward_extra_infos_dict, 'task2_internal_consistency_ok', i)}\n")
                 f.write(f"  - Tuple Format OK (gating s2): {self._get_safe_val(reward_extra_infos_dict, 'task2_tuple_format_ok', i)}\n")
                 f.write(f"  - VQA Format OK (gating s3): {self._get_safe_val(reward_extra_infos_dict, 'task2_vqa_format_ok', i)}\n")
                 f.write(f"  - Feedback Format OK (rule-based) (gating s4): {self._get_safe_val(reward_extra_infos_dict, 'task2_rule_based_feedback_format_ok', i)}\n")
@@ -595,9 +595,21 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             uid = batch.non_tensor_batch["uid"].tolist()
             prompt = batch.non_tensor_batch['prompt'].tolist()
             task_ids = list(self.config.actor_rollout_ref.actor.multi_task.get("task_ids", [1]))
+            # task1 gen images: direct key for task1 batch; cross-task alias for task2/3 replay batch
             gen_imgs_pil_list = batch.non_tensor_batch.get('task1_gen_imgs_pil_list')
+            if gen_imgs_pil_list is None:
+                for host_tid in task_ids:
+                    gen_imgs_pil_list = batch.non_tensor_batch.get(f'task{host_tid}_task1_gen_imgs_pil_list')
+                    if gen_imgs_pil_list is not None:
+                        break
             feedback_texts = None
+            # task2 feedback: direct key for task1/2 batch; cross-task alias for task3 replay batch
             fb = batch.non_tensor_batch.get('task2_feedback_texts')
+            if fb is None:
+                for host_tid in task_ids:
+                    fb = batch.non_tensor_batch.get(f'task{host_tid}_task2_feedback_texts')
+                    if fb is not None:
+                        break
             if fb is not None:
                 feedback_texts = fb.tolist() if hasattr(fb, 'tolist') else list(fb)
             regen_imgs_pil_list = batch.non_tensor_batch.get('task3_regen_imgs_pil_list') if 3 in task_ids else None
@@ -613,11 +625,17 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                 sample_versions = [self.current_param_version] * len(batch)
 
             scores = {}
-            # Add all task scores
+            # Add all task scores; for replay task_batch use cross-task aliases as fallback
             for tid in [1, 2, 3]:
                 key = f"task{tid}_token_level_scores"
                 if key in batch.batch:
                     scores[f"task{tid}_scores"] = batch.batch[key].sum(-1).cpu().tolist()
+                else:
+                    for host_tid in task_ids:
+                        cross_key = f"task{host_tid}_task{tid}_token_level_scores"
+                        if cross_key in batch.batch:
+                            scores[f"task{tid}_scores"] = batch.batch[cross_key].sum(-1).cpu().tolist()
+                            break
 
             reward_extra_infos_to_dump = reward_extra_infos_dict.copy()
 
