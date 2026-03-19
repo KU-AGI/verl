@@ -133,9 +133,9 @@ class FormattingEvaluatorV2:
         precision = correct_matches / len(pred_part2) if len(pred_part2) > 0 else 0.0
         recall = correct_matches / total_gt if total_gt > 0 else 0.0
         f1_score = (2 * precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
-        metrics['part2_accuracy'] = f1_score
+        metrics['task2_part2_accuracy'] = f1_score
         
-        metrics['part2_internal_consistency_ok'] = 1 if (len(pred_part2) == len(pred_paragraphs)) and (len(pred_part2) != 0) and (len(pred_paragraphs) != 0) else 0
+        metrics['task2_internal_consistency_ok'] = 1 if (len(pred_part2) == len(pred_paragraphs)) and (len(pred_part2) != 0) and (len(pred_paragraphs) != 0) else 0
 
         final_metrics = {k: v.item() if isinstance(v, torch.Tensor) else v for k, v in metrics.items()}
         
