@@ -1032,12 +1032,14 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 # 3. Per-UID quality filter (task2 < threshold OR task3 == -100)
                 if self.config.algorithm.filter_groups.enable:
                     _use_replay = self.config.async_training.get("replay_buffer", {}).get("enable", False)
+                    _task1_salvage_thr = float(self.config.async_training.get("task1_salvage_threshold", 1.0))
                     good_indices, assembled_groups, retry_rs_list, n_dropped, n_salvaged = quality_filter_rollout_sample(
                         rollout_sample,
                         group_size=group_size,
                         task_ids=task_ids,
                         max_retries=self.max_regen_retries,
                         use_salvage=_use_replay,
+                        task1_salvage_threshold=_task1_salvage_thr,
                     )
                 else:
                     good_indices = list(range(len(rollout_sample.full_batch)))

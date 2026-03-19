@@ -1049,6 +1049,7 @@ def quality_filter_rollout_sample(
     max_retries: int = 3,
     task2_threshold: float = TASK2_QUALITY_THRESHOLD,
     use_salvage: bool = True,
+    task1_salvage_threshold: float = 1.0,
 ) -> tuple:
 
     current_batch = rollout_sample.full_batch
@@ -1078,6 +1079,25 @@ def quality_filter_rollout_sample(
         if not any(bad_mask) and not is_retry:
             good_indices.extend(indices)
             continue
+
+        # task1 max=1인 샘플이 그룹 내 있으면 task3 -100 있어도 retry 없이 바로 전송 (salvage/replay buffer 사용 시에만)
+        if use_salvage and "task1_token_level_scores" in group_batch.batch and n_group >= group_size:
+            t1_scores = _get_task_rewards(group_batch, 1)
+            if t1_scores.max() >= task1_salvage_threshold - 1e-6:
+                final_batch = _slice_dataproto_with_meta(group_batch, list(range(group_size)))
+                has_t3_minus100 = False
+                if "task3_token_level_scores" in final_batch.batch:
+                    if (final_batch.batch["task3_token_level_scores"] == -100).any():
+                        final_batch.batch["task3_token_level_scores"] = torch.full_like(
+                            final_batch.batch["task3_token_level_scores"], -100
+                        )
+                        has_t3_minus100 = True
+                assembled_groups.append((final_batch, uid))
+                print(
+                    f"[QualityFilter] task1 max=1 early send uid={uid}: "
+                    f"task3_normalized={has_t3_minus100}"
+                )
+                continue
 
         good_local = [i for i, bad in enumerate(bad_mask) if not bad]
         # ② 수정: meta_info 보존
