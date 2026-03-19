@@ -1083,7 +1083,8 @@ def quality_filter_rollout_sample(
         # task1 max=1인 샘플이 그룹 내 있으면 task3 -100 있어도 retry 없이 바로 전송 (salvage/replay buffer 사용 시에만)
         if use_salvage and "task1_token_level_scores" in group_batch.batch and n_group >= group_size:
             t1_scores = _get_task_rewards(group_batch, 1)
-            if t1_scores.max() >= task1_salvage_threshold - 1e-6:
+            t1_above = (t1_scores >= task1_salvage_threshold - 1e-6).sum().item()
+            if t1_above >= group_size / 2:
                 final_batch = _slice_dataproto_with_meta(group_batch, list(range(group_size)))
                 has_t3_minus100 = False
                 if "task3_token_level_scores" in final_batch.batch:
@@ -1094,8 +1095,8 @@ def quality_filter_rollout_sample(
                         has_t3_minus100 = True
                 assembled_groups.append((final_batch, uid))
                 print(
-                    f"[QualityFilter] task1 max=1 early send uid={uid}: "
-                    f"task3_normalized={has_t3_minus100}"
+                    f"[QualityFilter] task1 salvage early send uid={uid}: "
+                    f"t1_above={t1_above}/{group_size}, task3_normalized={has_t3_minus100}"
                 )
                 continue
 
