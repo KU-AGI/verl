@@ -679,7 +679,11 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
         reward_extra_info["task2_vqa_to_feedback_response"] = s4_resp if not isinstance(s4_resp, Exception) else str(s4_resp)
 
     elif task_id == 3: # Total score: vqa_reward (0..1) + edit_reward (0..2)
-        if predicted_feedback is not None and "no need to generate feedback." in predicted_feedback.lower():
+        no_feedback_needed = (
+            (predicted_feedback is not None and "no need to generate feedback" in predicted_feedback.lower())
+            or "no need to generate" in (feedback_text or '').lower()
+        )
+        if no_feedback_needed:
             reward_score = -100
             reward_extra_info[f"task{task_id}_vqa_reward"] = reward_score
             reward_extra_info[f"task{task_id}_vqa_reward_response"] = "No need to get VQA reward."
