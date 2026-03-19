@@ -574,15 +574,15 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                                     f"buffer_size={buf_size}, entries={buf_entries}"
                                 )
 
-                    # Collect per-task data metrics
-                    for task_id in task_ids:
-                        # Replay path: merge shared timing with per-task timing so that
-                        # reward/old_log_prob/adv reflect each task's actual compute time.
-                        per_task_timing = {**timing_raw, **task_timings.get(task_id, {})} if task_timings else timing_raw
-                        self._collect_task_metrics(combined_batch, metrics, per_task_timing, task_ids=[task_id])
-
                     batch = combined_batch
             # Collect step-level metrics (timing, throughput) after step timer completes
+            # NOTE: _collect_task_metrics is called here (outside both step/gen timers) so that
+            # timing_raw["step"] and timing_raw["gen"] are populated before compute_timing_metrics runs.
+            for task_id in task_ids:
+                # Replay path: merge shared timing with per-task timing so that
+                # reward/old_log_prob/adv reflect each task's actual compute time.
+                per_task_timing = {**timing_raw, **task_timings.get(task_id, {})} if task_timings else timing_raw
+                self._collect_task_metrics(combined_batch, metrics, per_task_timing, task_ids=[task_id])
             self._collect_step_metrics(batch, 0, metrics, timing_raw)
             self.metrics_aggregator.add_step_metrics(
                 metrics=metrics, sample_count=self.required_samples, timestamp=time.time()
