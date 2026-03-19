@@ -183,9 +183,12 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         # Per-version metrics accumulators (reset on each param version update)
         self._version_rollout_durations = []
         self._version_finalize_durations = []
-        self._version_good_counts = []  # samples sent to MQ
-        self._version_retry_counts = []  # samples sent to retry queue
-        self._version_dropped_counts = []  # samples dropped
+        self._version_good_counts = []       # prompt: good_indices path
+        self._version_assembled_counts = []  # prompt: assembled path (incl. salvage)
+        self._version_salvaged_counts = []   # prompt: salvage path (task3 all -100)
+        self._version_retry_counts = []      # prompt: sent to retry queue
+        self._version_dropped_counts = []    # prompt: dropped (max retries exceeded)
+        self._version_retry_sum = []         # (assembled+dropped) * retry_count → avg_retry_count 계산용
         self._version_start_sample_count = 0
         self._version_start_time = None
 
@@ -310,35 +313,53 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             if version_elapsed > 0:
                 timing_raw["rollouter/samples_per_second"] = samples_this_version / version_elapsed
 
-            # Per-version sample flow metrics
-            # total_generated = samples that went to MQ (good)
-            # total_retry = samples sent back to retry queue
-            # total_dropped = samples dropped (max retries exceeded)
-            total_to_mq = sum(self._version_good_counts) if self._version_good_counts else 0
-            total_retry = sum(self._version_retry_counts) if self._version_retry_counts else 0
-            total_dropped = sum(self._version_dropped_counts) if self._version_dropped_counts else 0
-            total_processed = total_to_mq + total_retry + total_dropped
+            # Per-version prompt flow metrics (모두 prompt/UID 단위)
+            total_good_prompts     = sum(self._version_good_counts)      if self._version_good_counts      else 0
+            total_assembled_prompts= sum(self._version_assembled_counts) if self._version_assembled_counts else 0
+            total_salvaged_prompts = sum(self._version_salvaged_counts)  if self._version_salvaged_counts  else 0
+            total_retry_prompts    = sum(self._version_retry_counts)     if self._version_retry_counts     else 0
+            total_dropped_prompts  = sum(self._version_dropped_counts)   if self._version_dropped_counts   else 0
+            total_to_trainer       = total_good_prompts + total_assembled_prompts
+            total_processed        = total_good_prompts + total_retry_prompts + total_dropped_prompts
 
-            # Total samples processed this version (before filtering)
+            # Breakdown counts (prompt 단위)
             timing_raw["rollouter/processed_this_version"] = total_processed
+            timing_raw["rollouter/to_trainer_count"]   = total_to_trainer
+            timing_raw["rollouter/good_count"]         = total_good_prompts
+            timing_raw["rollouter/assembled_count"]    = total_assembled_prompts
+            timing_raw["rollouter/salvaged_count"]     = total_salvaged_prompts
+            timing_raw["rollouter/retry_count"]        = total_retry_prompts
+            timing_raw["rollouter/dropped_count"]      = total_dropped_prompts
 
-            # Breakdown counts
-            timing_raw["rollouter/to_mq_count"] = total_to_mq
-            timing_raw["rollouter/retry_count"] = total_retry
-            timing_raw["rollouter/dropped_count"] = total_dropped
-
-            # Ratios (what fraction of processed samples went where)
+            # Ratios
             if total_processed > 0:
-                timing_raw["rollouter/to_mq_ratio"] = total_to_mq / total_processed
-                timing_raw["rollouter/retry_ratio"] = total_retry / total_processed
-                timing_raw["rollouter/dropped_ratio"] = total_dropped / total_processed
+                timing_raw["rollouter/good_ratio"]    = total_good_prompts    / total_processed
+                timing_raw["rollouter/retry_ratio"]   = total_retry_prompts   / total_processed
+                timing_raw["rollouter/dropped_ratio"] = total_dropped_prompts / total_processed
+
+            # Task3-absent ratio: trainer행 prompt 중 task3 없는 비율
+            if total_to_trainer > 0:
+                timing_raw["rollouter/task3_absent_ratio"] = total_salvaged_prompts / total_to_trainer
+
+            # retry 이후 통과 비율: assembled / (assembled + dropped)
+            retry_attempted = total_assembled_prompts + total_dropped_prompts
+            if retry_attempted > 0:
+                timing_raw["rollouter/retry_pass_ratio"] = total_assembled_prompts / retry_attempted
+
+            # 평균 retry 횟수: retry를 거친 prompt들의 retry_count 평균
+            total_retry_sum = sum(self._version_retry_sum) if self._version_retry_sum else 0
+            if retry_attempted > 0:
+                timing_raw["rollouter/avg_retry_count"] = total_retry_sum / retry_attempted
 
             # Reset accumulators for next version
             self._version_rollout_durations = []
             self._version_finalize_durations = []
             self._version_good_counts = []
+            self._version_assembled_counts = []
+            self._version_salvaged_counts = []
             self._version_retry_counts = []
             self._version_dropped_counts = []
+            self._version_retry_sum = []
             self._version_start_sample_count = self.total_generated_samples
             self._version_start_time = current_time
 
@@ -996,6 +1017,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 if "meta_info" in reward_results:
                     if not hasattr(rollout_sample.full_batch, "meta_info"):
                         rollout_sample.full_batch.meta_info = {}
+                    
                     for task_key, task_extra_info in reward_results["meta_info"].items():
                         for k, v in task_extra_info.items():
                             rollout_sample.full_batch.meta_info[k] = v
@@ -1009,17 +1031,20 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
 
                 # 3. Per-UID quality filter (task2 < threshold OR task3 == -100)
                 if self.config.algorithm.filter_groups.enable:
-                    good_indices, assembled_groups, retry_rs_list, n_dropped = quality_filter_rollout_sample(
+                    _use_replay = self.config.async_training.get("replay_buffer", {}).get("enable", False)
+                    good_indices, assembled_groups, retry_rs_list, n_dropped, n_salvaged = quality_filter_rollout_sample(
                         rollout_sample,
                         group_size=group_size,
                         task_ids=task_ids,
                         max_retries=self.max_regen_retries,
+                        use_salvage=_use_replay,
                     )
                 else:
                     good_indices = list(range(len(rollout_sample.full_batch)))
                     assembled_groups = []
                     retry_rs_list = []
                     n_dropped = 0
+                    n_salvaged = 0
 
                 finalize_duration = time.perf_counter() - finalize_start_time
                 if self.processed_sample_count % 100 == 0:
@@ -1079,9 +1104,16 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                     # Accumulate per-version metrics for wandb logging
                     self._version_rollout_durations.append(rollout_duration)
                     self._version_finalize_durations.append(finalize_duration)
-                    self._version_good_counts.append(len(good_indices))
-                    self._version_retry_counts.append(len(retry_rs_list))
-                    self._version_dropped_counts.append(n_dropped)
+                    # 모든 누적기는 prompt(UID) 단위
+                    n_assembled_p = len(assembled_groups)
+                    n_dropped_p   = n_dropped // group_size
+                    self._version_good_counts.append(len(good_indices) // group_size)
+                    self._version_assembled_counts.append(n_assembled_p)
+                    self._version_salvaged_counts.append(n_salvaged)       # quality_filter에서 이미 prompt 단위
+                    self._version_retry_counts.append(len(retry_rs_list))  # 이미 prompt 단위
+                    self._version_dropped_counts.append(n_dropped_p)
+                    # assembled/dropped된 prompt의 retry 횟수 합산 (avg_retry_count 계산용)
+                    self._version_retry_sum.append((n_assembled_p + n_dropped_p) * rollout_sample.retry_count)
                 stats_updated = True
 
             except Exception as e:
