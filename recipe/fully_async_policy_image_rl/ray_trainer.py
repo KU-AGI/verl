@@ -1000,8 +1000,9 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                     self.actor_rollout_wg.restore_model_from_cpu(local_trigger_step)
                     self.actor_rollout_wg.clear_cpu_model(local_trigger_step)
                 else:
-                    batch.batch[f"task{task_id}_old_log_probs"] = batch.batch[f"task{task_id}_rollout_log_probs"]
-                    batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+                    batch = self._apply_old_log_probs_with_rollout_corr(
+                        batch, compute_old_log_prob, task_id, metrics
+                    )
 
             else:
                 batch = compute_old_log_prob(batch)
@@ -1058,6 +1059,40 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                 config=self.config.algorithm,
                 task_id=task_id
             )
+
+        return batch
+
+    def _apply_old_log_probs_with_rollout_corr(self, batch, compute_old_log_prob_fn, task_id, metrics):
+        """Assign old_log_probs with optional IS correction via algorithm.rollout_correction.
+
+        - If rollout_correction.rollout_is is set: recompute old_log_probs with current policy
+          and apply IS correction / rejection sampling.
+        - Otherwise: passthrough (rollout_log_probs -> old_log_probs directly).
+        """
+        rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
+        if rollout_corr_config and rollout_corr_config.get("rollout_is", None) is not None:
+            batch = compute_old_log_prob_fn(batch)
+
+            from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
+
+            # Alias task-prefixed keys to standard keys
+            batch.batch["old_log_probs"] = batch.batch[f"task{task_id}_old_log_probs"]
+            batch.batch["rollout_log_probs"] = batch.batch[f"task{task_id}_rollout_log_probs"]
+            batch.batch["response_mask"] = batch.batch[f"task{task_id}_response_mask"]
+
+            batch, corr_metrics = compute_rollout_correction_and_add_to_batch(batch, rollout_corr_config)
+
+            # Copy results back to task-prefixed keys
+            batch.batch[f"task{task_id}_response_mask"] = batch.batch.pop("response_mask")
+            batch.batch[f"task{task_id}_old_log_probs"] = batch.batch.pop("old_log_probs")
+            batch.batch.pop("rollout_log_probs")
+            if "rollout_is_weights" in batch.batch:
+                batch.batch[f"task{task_id}_rollout_is_weights"] = batch.batch.pop("rollout_is_weights")
+
+            metrics.update({f"rollout_corr/task{task_id}/{k}": v for k, v in corr_metrics.items()})
+        else:
+            batch.batch[f"task{task_id}_old_log_probs"] = batch.batch[f"task{task_id}_rollout_log_probs"]
+            batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
 
         return batch
 
