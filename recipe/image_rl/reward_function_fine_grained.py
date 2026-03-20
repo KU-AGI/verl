@@ -479,7 +479,7 @@ def get_messages(*args):
         )
         messages = [
             {"role": "system", "content": TASK1_TASK3_IMAGE_GENERATOR_SYSTEM_PROMPT_TEMPLATE},
-            {"role": "user", "content": content_from_prompt_with_images(user_content, [convert_gen_img_to_base64(gen_img)])}
+            {"role": "user", "content": content_from_prompt_with_images(user_content, [convert_gen_img_to_base64(regen_img)])}
         ]
     else:
         raise ValueError(f"Invalid task: {task_id} is must be one of task1, task2, or task3.")
@@ -696,7 +696,7 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
             return None
 
         vqa_response, edit_response = await asyncio.gather(
-            get_response(get_messages, *args),
+            get_response(get_messages, *args) if regen_img is not None else _none(),
             get_response(get_messages_task3_edit, gen_img, predicted_feedback, regen_img) if regen_img is not None else _none(),
             return_exceptions=True,
         )
@@ -719,7 +719,7 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
             except Exception:
                 pass
 
-        reward_score = vqa_score + edit_score
+        reward_score = np.sqrt((vqa_score * 2) * edit_score)
         reward_extra_info[f"task{task_id}_vqa_reward"] = vqa_score
         reward_extra_info[f"task{task_id}_vqa_reward_response"] = vqa_response if not isinstance(vqa_response, Exception) else str(vqa_response)
         reward_extra_info[f"task{task_id}_edit_reward"] = edit_score

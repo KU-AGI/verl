@@ -143,6 +143,8 @@ Does EDITED_IMAGE make the requested changes from FEEDBACK relative to SOURCE_IM
 - If the requested change is only partially completed, penalize partial completion.
 - If the edited image preserves everything but fails to apply the requested edit, penalize it.
 - If FEEDBACK is impossible to verify visually from the images, judge conservatively and avoid overclaiming success.
+- Do not penalize minor realism, texture, or sharpness differences unless FEEDBACK explicitly requires those properties.
+- Do not comment on image quality, realism, or sharpness unless those are explicitly part of FEEDBACK or clearly prevent the requested edit from being satisfied.
 
 [Failure Types]
 Use these internally.
@@ -225,6 +227,8 @@ A score near 0.00 means:
 [Output Format]
 Return exactly four lines in the following format:
 
+Source Image Key Content: <brief list of major visible objects and scene elements>
+Edited Image Key Content: <brief list of major visible objects and scene elements after editing>
 Requested Changes Check: <brief structured summary of whether the requested changes were fulfilled>
 Preservation Check: <brief structured summary of whether non-target content was preserved>
 Reason: <one concise sentence focusing on edit fulfillment and preservation/minimality>
