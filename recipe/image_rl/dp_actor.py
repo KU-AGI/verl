@@ -554,12 +554,12 @@ class DataParallelImageGenerationActor(BasePPOActor):
             
             if self.config.use_kl_loss:
                 all_select_batch_keys.append(f"task{task_id}_ref_log_prob")
-        
+            if f"task{task_id}_rollout_is_weights" in available_keys:
+                all_select_batch_keys.append(f"task{task_id}_rollout_is_weights")
+
         # Add common keys
         if "task_id" in data.batch.keys():
             all_select_batch_keys.append("task_id")
-        if "rollout_is_weights" in data.batch.keys():
-            all_select_batch_keys.append("rollout_is_weights")
 
         all_select_batch_keys = list(set(all_select_batch_keys))
         
@@ -641,7 +641,7 @@ class DataParallelImageGenerationActor(BasePPOActor):
                                 old_log_prob = model_inputs[f"task{task_id}_old_log_probs"]
 
                         loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
-                        rollout_is_weights = model_inputs.get("rollout_is_weights", None)
+                        rollout_is_weights = model_inputs.get(f"task{task_id}_rollout_is_weights", None)
                         policy_loss_fn = get_policy_loss_fn(loss_mode)
 
                         # Compute policy loss
@@ -657,7 +657,9 @@ class DataParallelImageGenerationActor(BasePPOActor):
 
                         if entropy_coeff != 0:
                             entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-                            micro_batch_metrics[f"actor/task{task_id}_entropy"] = entropy_loss.detach().item()
+                            micro_batch_metrics[f"actor/task{task_id}_entropy"] = entropy_loss.detach().item() * loss_scale_factor
+                            micro_batch_metrics[f"actor/task{task_id}_entropy_loss"] = (entropy_loss * entropy_coeff).detach().item() * loss_scale_factor
+                            micro_batch_metrics[f"actor/task{task_id}_entropy_coeff"] = entropy_coeff
                             policy_loss = pg_loss - entropy_loss * entropy_coeff
                         else:
                             policy_loss = pg_loss
@@ -671,7 +673,8 @@ class DataParallelImageGenerationActor(BasePPOActor):
                             kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask,
                                             loss_agg_mode=loss_agg_mode)
                             policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
-                            micro_batch_metrics[f"actor/task{task_id}_kl_loss"] = kl_loss.detach().item() * loss_scale_factor
+                            micro_batch_metrics[f"actor/task{task_id}_kl"] = kl_loss.detach().item() * loss_scale_factor
+                            micro_batch_metrics[f"actor/task{task_id}_kl_loss"] = (kl_loss * self.config.kl_loss_coef).detach().item() * loss_scale_factor
                             micro_batch_metrics[f"actor/task{task_id}_kl_coef"] = self.config.kl_loss_coef
 
                         # Apply task weight and scale factor
