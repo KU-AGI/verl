@@ -38,6 +38,7 @@ async_training:
   # Replay buffer for filling idle time with additional training
   replay_buffer:
     enable: false
+    filter_mode: mean
     max_version_gap: 2 # max param version gap — stale entries are evicted, fresh ones persist
     max_size_per_task: 100 # max number of samples per task_id
     max_use_count: -1
