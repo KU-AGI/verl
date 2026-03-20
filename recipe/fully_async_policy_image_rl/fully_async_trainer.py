@@ -167,6 +167,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                 max_size_per_task=replay_cfg.get("max_size_per_task", -1),
                 max_version_gap=replay_cfg.get("max_version_gap", -1),
                 max_use_count=replay_cfg.get("max_use_count", -1),
+                filter_mode=replay_cfg.get("filter_mode", "mean"),
             )
             # Feeder thread state
             self._feeder_stop = False
@@ -177,6 +178,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                 f"[FullyAsyncTrainer] ReplayBuffer enabled: "
                 f"max_version_gap={self.replay_buffer.max_version_gap}, "
                 f"max_size_per_task={self.replay_buffer.max_size_per_task}, "
+                f"filter_mode={self.replay_buffer.filter_mode}, "
                 f"score_thresholds={score_thresholds}"
             )
 

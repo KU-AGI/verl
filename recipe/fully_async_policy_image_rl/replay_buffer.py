@@ -18,6 +18,8 @@ class BufferEntry:
     data: DataProto
     param_version: int
     mean_reward: float
+    reward_std: float = 0.0
+    max_reward: float = 0.0
     used: bool = False
     use_count: int = 0
 
@@ -43,12 +45,14 @@ class ReplayBuffer:
         max_size_per_task: int = -1,
         max_version_gap: int = -1,
         max_use_count: int = -1,
+        filter_mode: str = "mean",
     ):
         self.task_ids = task_ids
         self.score_thresholds = score_thresholds  # {task_id: min_score}
         self.max_size_per_task = max_size_per_task
         self.max_version_gap = max_version_gap
         self.max_use_count = max_use_count  # -1 means unlimited
+        self.filter_mode = filter_mode  # "mean" or "std"
         self._lock = threading.Lock()
         # per-task buffers: task_id -> list[BufferEntry]
         self.buffers: dict[int, list[BufferEntry]] = {
@@ -93,6 +97,12 @@ class ReplayBuffer:
             if any(s < 0 for s in uid_scores):
                 continue
             mean_reward = sum(uid_scores) / len(uid_scores)
+            max_reward = max(uid_scores)
+            if len(uid_scores) > 1:
+                variance = sum((s - mean_reward) ** 2 for s in uid_scores) / len(uid_scores)
+                reward_std = variance ** 0.5
+            else:
+                reward_std = 0.0
 
             # Representative param version (min across group)
             version = min(int(param_versions[i]) for i in idxs)
@@ -150,6 +160,8 @@ class ReplayBuffer:
                 data=filtered,
                 param_version=version,
                 mean_reward=mean_reward,
+                reward_std=reward_std,
+                max_reward=max_reward,
                 used=False,
             ))
             total_stored += len(idxs)
@@ -230,7 +242,13 @@ class ReplayBuffer:
             for entry in buf:
                 if entry.used:
                     over_use_limit = (self.max_use_count >= 0 and entry.use_count >= self.max_use_count)
-                    if not over_use_limit and entry.mean_reward >= threshold:
+                    if self.filter_mode == "std":
+                        metric = entry.reward_std
+                    elif self.filter_mode == "max":
+                        metric = entry.max_reward
+                    else:  # "mean"
+                        metric = entry.mean_reward
+                    if not over_use_limit and metric >= threshold:
                         entry.used = False  # reset for next round
                         kept.append(entry)
                         kept_used_count += 1
