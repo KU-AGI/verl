@@ -345,6 +345,9 @@ Only consider information that is:
 
 3. Compare the two.
 
+Mere listing, co-occurrence, or mention within the same PROMPT does not imply any relation or action.
+A relation - spatial should be treated as preserve-worthy only if it is explicitly stated in PROMPT.
+
 Reward SUMMARY when it:
 - preserves the core PROMPT information that is schema-expressible,
 - preserves main entities, key attributes, key actions, key spatial relations, and meaning-changing visible attributes,
@@ -363,6 +366,7 @@ Penalize SUMMARY when it:
 - remains unnecessarily verbose or unchanged when PROMPT contains removable non-target content that should have been filtered out.
 - mere verbatim copying is not a failure if PROMPT is already concise, concrete, and largely downstream-usable.
 - preserves unsupported, generic, or weakly diagnosable style wording as if it were a valid downstream style target,
+- adds a relation or action that is not explicitly stated in PROMPT,
 
 [Important Constraints]
 - Do not require SUMMARY to preserve information that is not representable in the tuple schema.
