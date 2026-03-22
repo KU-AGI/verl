@@ -571,7 +571,7 @@ Weak or invalid targets include:
 [Reward High When]
 Reward PRED_TUPLES when it:
 - preserves the core schema-valid information in SUMMARY,
-- captures main entities, key actions, key spatial relations, and meaning-changing visible attributes,
+- captures main entities, key spatial relations, key countings, and meaning-changing visible attributes, key actions,
 - uses the correct tuple types,
 - stays within schema constraints,
 - remains conservative and non-inferential,
