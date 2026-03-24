@@ -1,5 +1,6 @@
 import random
 import threading
+from collections import deque
 from dataclasses import dataclass
 
 import numpy as np
@@ -46,17 +47,30 @@ class ReplayBuffer:
         max_version_gap: int = -1,
         max_use_count: int = -1,
         filter_mode: str = "mean",
+        reward_history_size: int = 100,
+        max_quantile: float = 0.25,
+        std_quantile: float = 0.25,
     ):
         self.task_ids = task_ids
         self.score_thresholds = score_thresholds  # {task_id: min_score}
         self.max_size_per_task = max_size_per_task
         self.max_version_gap = max_version_gap
         self.max_use_count = max_use_count  # -1 means unlimited
-        self.filter_mode = filter_mode  # "mean" or "std"
+        self.filter_mode = filter_mode  # "mean", "std", "max", or "max_and_std"
+        self.reward_history_size = reward_history_size
+        self.max_quantile = max_quantile
+        self.std_quantile = std_quantile
         self._lock = threading.Lock()
         # per-task buffers: task_id -> list[BufferEntry]
         self.buffers: dict[int, list[BufferEntry]] = {
             tid: [] for tid in task_ids
+        }
+        # per-task FIFO reward histories for dynamic threshold ("max_and_std" mode)
+        self.max_reward_history: dict[int, deque[float]] = {
+            tid: deque(maxlen=reward_history_size) for tid in task_ids
+        }
+        self.std_history: dict[int, deque[float]] = {
+            tid: deque(maxlen=reward_history_size) for tid in task_ids
         }
 
     # ------------------------------------------------------------------
@@ -168,6 +182,10 @@ class ReplayBuffer:
 
         with self._lock:
             self.buffers[task_id].extend(entries_to_add)
+            # Record max_reward / std into FIFO histories for dynamic threshold
+            for entry in entries_to_add:
+                self.max_reward_history[task_id].append(entry.max_reward)
+                self.std_history[task_id].append(entry.reward_std)
             # FIFO overflow: remove oldest entries if over capacity
             if self.max_size_per_task > 0:
                 self._enforce_capacity(task_id)
@@ -226,29 +244,56 @@ class ReplayBuffer:
     # Post-use eviction: evaluate used groups, remove low quality
     # ------------------------------------------------------------------
 
-    def evict_after_use(self, task_id: int) -> tuple[int, int]:
-        """Evaluate used entries: keep if mean_reward >= threshold, else evict.
+    def evict_after_use(self, task_id: int) -> tuple[int, int, dict]:
+        """Evaluate used entries and evict low quality ones.
 
-        Returns ``(kept_count, evicted_count)`` among used entries.
+        For "max_and_std" mode, thresholds are computed dynamically from
+        the FIFO reward histories using per-metric quantiles.
+        For other modes, static ``score_thresholds`` are used.
+
+        Returns ``(kept_count, evicted_count, info)`` among used entries.
+        ``info`` contains the dynamic thresholds and history sizes for logging.
         Unused entries are always kept.
         """
         with self._lock:
-            threshold = self.score_thresholds.get(task_id, 0.0)
             buf = self.buffers[task_id]
             kept: list[BufferEntry] = []
             evicted_count = 0
             kept_used_count = 0
+            info: dict = {}
+
+            # Compute thresholds
+            if self.filter_mode == "max_and_std":
+                max_hist = self.max_reward_history[task_id]
+                std_hist = self.std_history[task_id]
+                # History가 아직 꽉 차지 않았으면 필터링 skip (전부 keep)
+                history_full = len(max_hist) >= self.reward_history_size
+                max_thr = float(np.quantile(list(max_hist), self.max_quantile)) if history_full else 0.0
+                std_thr = float(np.quantile(list(std_hist), self.std_quantile)) if history_full else 0.0
+                info = {
+                    "max_threshold": max_thr,
+                    "std_threshold": std_thr,
+                    "max_history_len": len(max_hist),
+                    "std_history_len": len(std_hist),
+                    "history_full": int(history_full),
+                }
+            else:
+                static_thr = self.score_thresholds.get(task_id, 0.0)
 
             for entry in buf:
                 if entry.used:
                     over_use_limit = (self.max_use_count >= 0 and entry.use_count >= self.max_use_count)
-                    if self.filter_mode == "std":
-                        metric = entry.reward_std
+                    if self.filter_mode == "max_and_std":
+                        keep = (not over_use_limit
+                                and entry.max_reward >= max_thr
+                                and entry.reward_std >= std_thr)
+                    elif self.filter_mode == "std":
+                        keep = not over_use_limit and entry.reward_std >= static_thr
                     elif self.filter_mode == "max":
-                        metric = entry.max_reward
+                        keep = not over_use_limit and entry.max_reward >= static_thr
                     else:  # "mean"
-                        metric = entry.mean_reward
-                    if not over_use_limit and metric >= threshold:
+                        keep = not over_use_limit and entry.mean_reward >= static_thr
+                    if keep:
                         entry.used = False  # reset for next round
                         kept.append(entry)
                         kept_used_count += 1
@@ -258,7 +303,7 @@ class ReplayBuffer:
                     kept.append(entry)
 
             self.buffers[task_id] = kept
-            return kept_used_count, evicted_count
+            return kept_used_count, evicted_count, info
 
     # ------------------------------------------------------------------
     # Internal helpers (caller must hold self._lock)

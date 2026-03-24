@@ -184,10 +184,13 @@ replay_buffer_enable=True
 replay_buffer_max_version_gap=-1
 replay_buffer_max_size_per_task=30
 replay_buffer_max_use_count=-1
-replay_buffer_filter_mode=mean      # "mean", "std", or "max"
+replay_buffer_filter_mode=max_and_std  # "mean", "std", "max", or "max_and_std"
 replay_buffer_score_threshold_1=0.8
 replay_buffer_score_threshold_2=2.0 # 3점 만점
 replay_buffer_score_threshold_3=1.0 # 2점 만점
+replay_buffer_reward_history_size=100
+replay_buffer_max_quantile=0.75
+replay_buffer_std_quantile=0.50
 
 ###############################################################################
 #                        ROLLOUT CORRECTION
@@ -340,6 +343,9 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     +async_training.replay_buffer.score_thresholds.1=${replay_buffer_score_threshold_1} \
     +async_training.replay_buffer.score_thresholds.2=${replay_buffer_score_threshold_2} \
     +async_training.replay_buffer.score_thresholds.3=${replay_buffer_score_threshold_3} \
+    async_training.replay_buffer.reward_history_size=${replay_buffer_reward_history_size} \
+    async_training.replay_buffer.max_quantile=${replay_buffer_max_quantile} \
+    async_training.replay_buffer.std_quantile=${replay_buffer_std_quantile} \
     reward_model.reward_manager=image_generation \
     custom_reward_function.path=recipe/image_rl/reward_function_fine_grained.py \
     custom_reward_function.name=compute_score_batch \

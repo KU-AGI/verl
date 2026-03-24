@@ -168,6 +168,9 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                 max_version_gap=replay_cfg.get("max_version_gap", -1),
                 max_use_count=replay_cfg.get("max_use_count", -1),
                 filter_mode=replay_cfg.get("filter_mode", "mean"),
+                reward_history_size=replay_cfg.get("reward_history_size", 100),
+                max_quantile=replay_cfg.get("max_quantile", 0.25),
+                std_quantile=replay_cfg.get("std_quantile", 0.25),
             )
             # Feeder thread state
             self._feeder_stop = False
@@ -179,7 +182,10 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                 f"max_version_gap={self.replay_buffer.max_version_gap}, "
                 f"max_size_per_task={self.replay_buffer.max_size_per_task}, "
                 f"filter_mode={self.replay_buffer.filter_mode}, "
-                f"score_thresholds={score_thresholds}"
+                f"score_thresholds={score_thresholds}, "
+                f"reward_history_size={self.replay_buffer.reward_history_size}, "
+                f"max_quantile={self.replay_buffer.max_quantile}, "
+                f"std_quantile={self.replay_buffer.std_quantile}"
             )
 
     # ------------------------------------------------------------------
@@ -560,20 +566,24 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                     if self.use_replay_buffer:
                         with marked_timer("replay/evict", timing_raw):
                             for _tid in task_ids:
-                                kept, evicted = self.replay_buffer.evict_after_use(_tid)
+                                kept, evicted, evict_info = self.replay_buffer.evict_after_use(_tid)
                                 metrics[f"replay/task{_tid}_kept"] = kept
                                 metrics[f"replay/task{_tid}_evicted"] = evicted
+                                for k, v in evict_info.items():
+                                    metrics[f"replay/task{_tid}_{k}"] = v
                             # Read size and entry count under a single lock
                             buf_stats = self.replay_buffer.stats_per_task()
                             for _tid in task_ids:
                                 buf_size, buf_entries = buf_stats.get(_tid, (0, 0))
                                 metrics[f"replay/task{_tid}_buffer_size"] = buf_size
                                 metrics[f"replay/task{_tid}_buffer_entries"] = buf_entries
+                                evict_info_str = ", ".join(f"{k}={v:.4f}" for k, v in evict_info.items()) if evict_info else ""
                                 print(
                                     f"[ReplayBuffer] task{_tid}: evict_after_use "
                                     f"kept={metrics[f'replay/task{_tid}_kept']}, "
                                     f"evicted={metrics[f'replay/task{_tid}_evicted']}, "
                                     f"buffer_size={buf_size}, entries={buf_entries}"
+                                    + (f", {evict_info_str}" if evict_info_str else "")
                                 )
 
                     batch = combined_batch
