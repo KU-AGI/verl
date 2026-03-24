@@ -266,16 +266,16 @@ class ReplayBuffer:
             if self.filter_mode == "max_and_std":
                 max_hist = self.max_reward_history[task_id]
                 std_hist = self.std_history[task_id]
-                # History가 아직 꽉 차지 않았으면 필터링 skip (전부 keep)
-                history_full = len(max_hist) >= self.reward_history_size
-                max_thr = float(np.quantile(list(max_hist), self.max_quantile)) if history_full else 0.0
-                std_thr = float(np.quantile(list(std_hist), self.std_quantile)) if history_full else 0.0
+                
+                history_half = len(max_hist) >= self.reward_history_size // 2
+                max_thr = float(np.quantile(list(max_hist), self.max_quantile)) if history_half else 0.0
+                std_thr = float(np.quantile(list(std_hist), self.std_quantile)) if history_half else 0.0
                 info = {
                     "max_threshold": max_thr,
                     "std_threshold": std_thr,
                     "max_history_len": len(max_hist),
                     "std_history_len": len(std_hist),
-                    "history_full": int(history_full),
+                    "history_half": int(history_half),
                 }
             else:
                 static_thr = self.score_thresholds.get(task_id, 0.0)
