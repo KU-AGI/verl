@@ -40,7 +40,7 @@ LLM_BASE_URLS = [
 API_KEY = "EMPTY"
 MAX_RETRIES = 3
 # Default model paths (can be overridden via reward_kwargs)
-DEFAULT_RM_VLM_MODEL_PATH = "Qwen/Qwen3.5-27B"
+DEFAULT_RM_VLM_MODEL_PATH = "Qwen/Qwen3.5-35B-A3B"
 DEFAULT_RM_LLM_MODEL_PATH = "Qwen/Qwen3-30B-A3B-Instruct-2507"
 RM_VLM_MODEL_PATH = os.environ.get("RM_VLM_MODEL_PATH", DEFAULT_RM_VLM_MODEL_PATH)
 RM_LLM_MODEL_PATH = os.environ.get("RM_LLM_MODEL_PATH", DEFAULT_RM_LLM_MODEL_PATH)
