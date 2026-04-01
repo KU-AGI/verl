@@ -161,9 +161,12 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             task_ids = list(config.actor_rollout_ref.actor.multi_task.get("task_ids", [1]))
             raw_thresholds = replay_cfg.get("score_thresholds", {})
             score_thresholds = {int(k): float(v) for k, v in raw_thresholds.items()}
+            raw_std_thresholds = replay_cfg.get("score_std_thresholds", {})
+            score_std_thresholds = {int(k): float(v) for k, v in raw_std_thresholds.items()}
             self.replay_buffer = ReplayBuffer(
                 task_ids=task_ids,
                 score_thresholds=score_thresholds,
+                score_std_thresholds=score_std_thresholds,
                 max_size_per_task=replay_cfg.get("max_size_per_task", -1),
                 max_version_gap=replay_cfg.get("max_version_gap", -1),
                 max_use_count=replay_cfg.get("max_use_count", -1),

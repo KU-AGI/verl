@@ -51,6 +51,10 @@ async_training:
       1: 0.5
       2: 1.5
       3: 0.5
+    score_std_thresholds:
+      1: 0.5
+      2: 1.5
+      3: 0.5
 
   weight_transfer_backend: "nixl" # default is "gloo"
 
