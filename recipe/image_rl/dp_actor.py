@@ -21,6 +21,7 @@ from verl.workers.config import ActorConfig
 
 from recipe.image_rl.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
 from recipe.image_rl.utils import FormattingEvaluatorV2
+from verl.utils.adaptive_entropy_coeff import AdaptiveEntropyCoefficient
 import torch.distributed as dist
 
 logger = logging.getLogger(__file__)
@@ -143,6 +144,27 @@ class DataParallelImageGenerationActor(BasePPOActor):
             else entropy_from_logits
         )
         self.device_name = get_device_name()
+
+        # Adaptive entropy coefficient (per-task, follows multi_task.task_ids)
+        adaptive_cfg = self.config.get('adaptive_entropy_coeff', {})
+        if adaptive_cfg.get('enable', False):
+            self.use_adaptive_entropy_coeff = True
+            multi_task_cfg = self.config.get('multi_task', {})
+            task_ids = list(multi_task_cfg.get('task_ids', [1, 2, 3]))
+            self.adaptive_entropy_coeffs = {}
+            for tid in task_ids:
+                task_cfg = adaptive_cfg.get(f'task{tid}', {})
+                self.adaptive_entropy_coeffs[tid] = AdaptiveEntropyCoefficient(
+                    initial_alpha=task_cfg.get('initial_alpha', 0.0),
+                    target_entropy=task_cfg.get('target_entropy', -1.0),
+                    lr=task_cfg.get('lr', 1e-3),
+                    max_coeff=task_cfg.get('max_coeff', 1e-3),
+                    min_coeff=task_cfg.get('min_coeff', -1e-3),
+                )
+            if torch.distributed.get_rank() == 0:
+                print(f"Actor adaptive_entropy_coeff enabled for task_ids={task_ids}: {adaptive_cfg}")
+        else:
+            self.use_adaptive_entropy_coeff = False
 
         # Set processor in the model for unified forward pass
         if hasattr(self.actor_module, 'set_processor'):
@@ -614,7 +636,10 @@ class DataParallelImageGenerationActor(BasePPOActor):
                         advantages = model_inputs[f"task{task_id}_advantages"]
                         response_mask = model_inputs[f"task{task_id}_response_mask"]
 
-                        entropy_coeff = self.config.entropy_coeff
+                        if self.use_adaptive_entropy_coeff:
+                            entropy_coeff = -self.adaptive_entropy_coeffs[task_id].get_alpha().item()
+                        else:
+                            entropy_coeff = self.config.entropy_coeff
                         loss_agg_mode = self.config.loss_agg_mode
 
                         if self.config.use_dynamic_bsz:
@@ -623,7 +648,8 @@ class DataParallelImageGenerationActor(BasePPOActor):
                             loss_scale_factor = 1 / self.gradient_accumulation
 
                         # Forward pass for this task
-                        calculate_entropy = entropy_coeff != 0
+                        # adaptive entropy needs entropy even when coeff starts at 0
+                        calculate_entropy = entropy_coeff != 0 or self.use_adaptive_entropy_coeff
                         entropy, log_prob = self._forward_micro_batch(
                             model_inputs, temperature=temperature,
                             calculate_entropy=calculate_entropy, task_id=task_id,
@@ -655,8 +681,11 @@ class DataParallelImageGenerationActor(BasePPOActor):
                             rollout_is_weights=rollout_is_weights,
                         )
 
-                        if entropy_coeff != 0:
+                        if calculate_entropy:
                             entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                            # Update adaptive coeff after computing entropy
+                            if self.use_adaptive_entropy_coeff:
+                                self.adaptive_entropy_coeffs[task_id].update(entropy=entropy_loss.detach())
                             micro_batch_metrics[f"actor/task{task_id}_entropy"] = entropy_loss.detach().item() * loss_scale_factor
                             micro_batch_metrics[f"actor/task{task_id}_entropy_loss"] = (entropy_loss * entropy_coeff).detach().item() * loss_scale_factor
                             micro_batch_metrics[f"actor/task{task_id}_entropy_coeff"] = entropy_coeff

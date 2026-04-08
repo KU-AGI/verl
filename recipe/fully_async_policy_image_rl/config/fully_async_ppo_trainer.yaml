@@ -86,6 +86,26 @@ data:
 actor_rollout_ref:
   actor:
     use_rollout_log_probs: ${oc.select:async_training.use_rollout_log_probs, True}
+    adaptive_entropy_coeff:
+      enable: false
+      task1:
+        initial_alpha: 0.0
+        target_entropy: -1.0
+        lr: 1e-3
+        max_coeff: 1e-3
+        min_coeff: -1e-3
+      task2:
+        initial_alpha: 0.0
+        target_entropy: -1.0
+        lr: 1e-3
+        max_coeff: 1e-3
+        min_coeff: -1e-3
+      task3:
+        initial_alpha: 0.0
+        target_entropy: -1.0
+        lr: 1e-3
+        max_coeff: 1e-3
+        min_coeff: -1e-3
     optim:
       warmup_style: constant
   rollout:
