@@ -90,22 +90,22 @@ actor_rollout_ref:
       enable: false
       task1:
         initial_alpha: 0.0
-        target_entropy: -1.0
-        lr: 1e-3
-        max_coeff: 1e-3
-        min_coeff: -1e-3
+        target_entropy: 3.0
+        lr: 5e-5
+        max_coeff: 5e-5
+        min_coeff: -5e-3
       task2:
         initial_alpha: 0.0
-        target_entropy: -1.0
-        lr: 1e-3
-        max_coeff: 1e-3
-        min_coeff: -1e-3
+        target_entropy: 0.35
+        lr: 5e-5
+        max_coeff: 5e-5
+        min_coeff: -5e-3
       task3:
         initial_alpha: 0.0
-        target_entropy: -1.0
-        lr: 1e-3
-        max_coeff: 1e-3
-        min_coeff: -1e-3
+        target_entropy: 3.0
+        lr: 5e-5
+        max_coeff: 5e-5
+        min_coeff: -5e-3
     optim:
       warmup_style: constant
   rollout:
