@@ -420,7 +420,7 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
             offset += n
 
         cfg_imgs = torch.cat([
-            u[:min(len(c), len(u))] + self.guidance_scale * (c[:min(len(c), len(u))] - u[:min(len(c), len(u))])
+            u[:min(len(c), len(u))].detach() + self.guidance_scale * (c[:min(len(c), len(u))] - u[:min(len(c), len(u))].detach())
             for c, u in zip(cond_imgs, uncond_imgs)
         ], dim=0)
 
