@@ -1093,6 +1093,7 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
         else:
             batch.batch[f"task{task_id}_old_log_probs"] = batch.batch[f"task{task_id}_rollout_log_probs"]
             batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+            batch.meta_info["cfg_weight"] = getattr(self.config.actor_rollout_ref.rollout, "cfg_weight", 5.0)
 
         return batch
 
