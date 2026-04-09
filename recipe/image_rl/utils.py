@@ -176,3 +176,22 @@ class FormattingEvaluatorV2:
         # 각 토큰의 기본형(lemma)을 추출하여 공백 없이 결합
         normalized = "".join([token.lemma_.strip() for token in doc if not token.is_space])
         return normalized
+
+
+def filter_entity_questions(vqa_question: str) -> str:
+    """Remove entity-type tuple lines and re-index remaining lines.
+
+    Input format per line: "<idx> | <type> - <detail>"
+    Lines where <type> starts with 'entity' are removed.
+    Remaining lines are re-indexed from 1.
+    """
+    lines = vqa_question.strip().split('\n')
+    filtered = [line for line in lines if '| entity -' not in line]
+    reindexed = []
+    for new_idx, line in enumerate(filtered, 1):
+        parts = line.split(' | ', 1)
+        if len(parts) == 2:
+            reindexed.append(f"{new_idx} | {parts[1]}")
+        else:
+            reindexed.append(line)
+    return '\n'.join(reindexed)

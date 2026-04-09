@@ -9,7 +9,7 @@ import PIL.Image
 from openai import AsyncOpenAI
 import numpy as np
 import time
-from recipe.image_rl.utils import FormattingEvaluatorV2
+from recipe.image_rl.utils import FormattingEvaluatorV2, filter_entity_questions
 from recipe.image_rl.prompts import REASONGEN_R1_TEMPLATE
 from recipe.image_rl.prompts_finegrained_simple import (
     TASK1_TASK3_IMAGE_GENERATOR_SYSTEM_PROMPT_TEMPLATE,
@@ -462,20 +462,21 @@ def get_messages(*args):
     prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback, vqa_question, extra_info, task_id = args
 
     if task_id == 1:
-        
+        filtered_vqa = filter_entity_questions(vqa_question)
         user_content =(
             f"[IMAGE]:\n<image>\n\n"
-            f"[QUESTIONS]:\n{vqa_question}"
+            f"[QUESTIONS]:\n{filtered_vqa}"
         )
         messages = [
             {"role": "system", "content": TASK1_TASK3_IMAGE_GENERATOR_SYSTEM_PROMPT_TEMPLATE},
             {"role": "user", "content": content_from_prompt_with_images(user_content, [convert_gen_img_to_base64(gen_img)])}
         ]
-        
+
     elif task_id == 3:
+        filtered_vqa = filter_entity_questions(vqa_question)
         user_content =(
             f"[IMAGE]:\n<image>\n\n"
-            f"[QUESTIONS]:\n{vqa_question}"
+            f"[QUESTIONS]:\n{filtered_vqa}"
         )
         messages = [
             {"role": "system", "content": TASK1_TASK3_IMAGE_GENERATOR_SYSTEM_PROMPT_TEMPLATE},
