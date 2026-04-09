@@ -462,7 +462,7 @@ def get_messages(*args):
     prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback, vqa_question, extra_info, task_id = args
 
     if task_id == 1:
-        filtered_vqa = filter_entity_questions(vqa_question)
+        filtered_vqa = filter_entity_questions(feedback_tuple, vqa_question)
         user_content =(
             f"[IMAGE]:\n<image>\n\n"
             f"[QUESTIONS]:\n{filtered_vqa}"
@@ -473,7 +473,7 @@ def get_messages(*args):
         ]
 
     elif task_id == 3:
-        filtered_vqa = filter_entity_questions(vqa_question)
+        filtered_vqa = filter_entity_questions(feedback_tuple, vqa_question)
         user_content =(
             f"[IMAGE]:\n<image>\n\n"
             f"[QUESTIONS]:\n{filtered_vqa}"

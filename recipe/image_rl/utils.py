@@ -178,20 +178,41 @@ class FormattingEvaluatorV2:
         return normalized
 
 
-def filter_entity_questions(vqa_question: str) -> str:
-    """Remove entity-type tuple lines and re-index remaining lines.
+def filter_entity_questions(feedback_tuple: str, vqa_question: str) -> str:
+    """Remove vqa questions whose corresponding feedback_tuple entry is entity-type.
 
-    Input format per line: "<idx> | <type> - <detail>"
-    Lines where <type> starts with 'entity' are removed.
-    Remaining lines are re-indexed from 1.
+    feedback_tuple and vqa_question are 1-to-1 by index.
+    Finds indices in feedback_tuple where the type starts with 'entity -',
+    removes those same indices from vqa_question, and re-indexes from 1.
+
+    Line format: "<idx> | <content>"
     """
-    lines = vqa_question.strip().split('\n')
-    filtered = [line for line in lines if '| entity -' not in line]
-    reindexed = []
-    for new_idx, line in enumerate(filtered, 1):
+    # Collect entity indices from feedback_tuple
+    entity_indices = set()
+    for line in feedback_tuple.strip().split('\n'):
         parts = line.split(' | ', 1)
         if len(parts) == 2:
-            reindexed.append(f"{new_idx} | {parts[1]}")
-        else:
-            reindexed.append(line)
+            idx_str, content = parts
+            if content.strip().startswith('entity -'):
+                try:
+                    entity_indices.add(int(idx_str.strip()))
+                except ValueError:
+                    pass
+
+    # Filter vqa_question by those indices
+    reindexed = []
+    new_idx = 1
+    for line in vqa_question.strip().split('\n'):
+        parts = line.split(' | ', 1)
+        if len(parts) == 2:
+            idx_str, content = parts
+            try:
+                idx = int(idx_str.strip())
+            except ValueError:
+                idx = None
+            if idx in entity_indices:
+                continue
+        reindexed.append(f"{new_idx} | {parts[1] if len(parts) == 2 else line}")
+        new_idx += 1
+
     return '\n'.join(reindexed)
