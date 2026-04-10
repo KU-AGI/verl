@@ -713,7 +713,13 @@ class DataParallelImageGenerationActor(BasePPOActor):
                         # Backward for each task separately
                         weighted_loss.backward()
 
+                        # Per-task cumulative grad norm (no clipping, just measurement)
+                        task_grad_norm = torch.nn.utils.clip_grad_norm_(
+                            self.actor_module.parameters(), max_norm=float('inf')
+                        ).item()
+
                         # Store metrics per task
+                        micro_batch_metrics[f"actor/task{task_id}_cum_grad_norm"] = task_grad_norm
                         micro_batch_metrics.update({
                             f"actor/task{task_id}_pg_loss": pg_loss.detach().item() * loss_scale_factor,
                             f"actor/task{task_id}_pg_clipfrac": pg_clipfrac.detach().item(),

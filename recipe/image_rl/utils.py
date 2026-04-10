@@ -215,4 +215,7 @@ def filter_entity_questions(feedback_tuple: str, vqa_question: str) -> str:
         reindexed.append(f"{new_idx} | {parts[1] if len(parts) == 2 else line}")
         new_idx += 1
 
-    return '\n'.join(reindexed)
+    result = '\n'.join(reindexed)
+    if not result.strip():
+        return vqa_question
+    return result
