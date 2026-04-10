@@ -973,7 +973,7 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                 response_masks = batch.batch[f"task{task_id}_response_mask"]
                 loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
                 entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
-                old_log_prob_metrics = {f"actor/task{task_id}_entropy": entropy_agg.detach().item()}
+                old_log_prob_metrics = {f"actor/task{task_id}_old_entropy": entropy_agg.detach().item()}
                 metrics.update(old_log_prob_metrics)
                 old_log_prob.batch.pop(f"task{task_id}_entropys")
                 batch = batch.union(old_log_prob)

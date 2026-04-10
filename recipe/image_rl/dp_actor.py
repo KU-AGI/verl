@@ -686,7 +686,7 @@ class DataParallelImageGenerationActor(BasePPOActor):
                             # Update adaptive coeff after computing entropy
                             if self.use_adaptive_entropy_coeff:
                                 self.adaptive_entropy_coeffs[task_id].update(entropy=entropy_loss.detach())
-                            micro_batch_metrics[f"actor/task{task_id}_entropy"] = entropy_loss.detach().item() * loss_scale_factor
+                            micro_batch_metrics[f"actor/task{task_id}_entropy"] = entropy_loss.detach().item()
                             micro_batch_metrics[f"actor/task{task_id}_entropy_loss"] = (entropy_loss * entropy_coeff).detach().item() * loss_scale_factor
                             micro_batch_metrics[f"actor/task{task_id}_entropy_coeff"] = entropy_coeff
                             policy_loss = pg_loss - entropy_loss * entropy_coeff
@@ -702,7 +702,7 @@ class DataParallelImageGenerationActor(BasePPOActor):
                             kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask,
                                             loss_agg_mode=loss_agg_mode)
                             policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
-                            micro_batch_metrics[f"actor/task{task_id}_kl"] = kl_loss.detach().item() * loss_scale_factor
+                            micro_batch_metrics[f"actor/task{task_id}_kl"] = kl_loss.detach().item()
                             micro_batch_metrics[f"actor/task{task_id}_kl_loss"] = (kl_loss * self.config.kl_loss_coef).detach().item() * loss_scale_factor
                             micro_batch_metrics[f"actor/task{task_id}_kl_coef"] = self.config.kl_loss_coef
 
