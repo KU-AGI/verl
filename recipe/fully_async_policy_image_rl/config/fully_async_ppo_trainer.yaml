@@ -93,19 +93,19 @@ actor_rollout_ref:
         target_entropy: 3.0
         lr: 5e-5
         max_coeff: 5e-5
-        min_coeff: -5e-3
+        min_coeff: -1e-2
       task2:
         initial_alpha: 0.0
         target_entropy: 0.35
         lr: 5e-5
         max_coeff: 5e-5
-        min_coeff: -5e-3
+        min_coeff: -1e-2
       task3:
         initial_alpha: 0.0
         target_entropy: 3.0
         lr: 5e-5
         max_coeff: 5e-5
-        min_coeff: -5e-3
+        min_coeff: -1e-2
     optim:
       warmup_style: constant
   rollout:
