@@ -1037,140 +1037,140 @@ Maximum score is 2.00.
 Minimum score is 0.00.
 
 [Main Question]
-Does FEEDBACK correctly target the tuples labeled No, avoid harming tuples labeled Yes, stay grounded in the provided tuples and VQA results, and provide edit instructions that are concrete enough to be used for editing?
+Does FEEDBACK correctly target the tuples labeled No, avoid harming tuples
+labeled Yes, and provide edit instructions that are specific and actionable
+for fixing the failed tuples?
 
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [Judging Principle]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Internally do the following:
 
-1. Read PRED_TUPLES and VQA_RESULTS together.
-2. Identify:
-- failed targets: tuples labeled No
-- protected targets: tuples labeled Yes
+STEP 1 — Identify targets
+  - Failed targets: tuples labeled No → FEEDBACK must address these.
+  - Protected targets: tuples labeled Yes → FEEDBACK must not harm these.
 
-3. Judge FEEDBACK by asking:
-- Does it address the failed targets?
-- Would it likely change those No tuples in the correct direction?
-- Does it avoid changing protected Yes tuples?
-- Is it grounded only in the provided tuples and VQA results?
-- Is it specific and actionable enough to be used as an edit instruction?
-- Is it minimal, rather than unnecessarily broad or destructive?
+STEP 2 — Evaluate each feedback step
+  For each step in FEEDBACK, ask:
+  (a) Does this step contribute to fixing a No-labeled tuple?
+  (b) Does it risk changing content covered by a Yes-labeled tuple?
+  (c) Is it specific and actionable?
 
-[What Good FEEDBACK Looks Like]
-Good FEEDBACK:
-- directly addresses No-labeled tuples,
-- proposes edits aligned with the tuple semantics and VQA failure description,
-- preserves Yes-labeled tuples,
-- avoids introducing unsupported new content,
-- avoids abstract or aesthetic-only instructions,
-- is specific about what should change,
-- and prefers minimal/local correction over unnecessary global rewriting.
+  A feedback step is acceptable if it serves to fix a failed tuple.
+  This includes image-specific details (color, material, position,
+  count) that make the correction more concrete and actionable,
+  even if those details are not explicitly in the tuple text.
 
-[What Bad FEEDBACK Looks Like]
-Bad FEEDBACK:
-- ignores one or more important No-labeled tuples,
-- changes or risks changing content already labeled Yes,
-- adds new objects, attributes, relations, counts, text, or style not supported by the inputs,
-- contradicts the VQA results,
-- is too vague, abstract, or underspecified to be a usable edit instruction,
-- or proposes unnecessarily broad edits that may damage already-correct content.
+  A feedback step is penalized if:
+  - it does not contribute to fixing any No-labeled tuple, AND
+  - it risks unnecessary change to non-target content.
 
+STEP 3 — Judge overall FEEDBACK
+  - Did it cover all important No-labeled tuples?
+  - Did it avoid harming Yes-labeled tuples?
+  - Is it specific enough to be used as an edit instruction?
+  - Is it minimal rather than unnecessarily broad?
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [Definitions]
-
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Failed target:
-A tuple labeled No in VQA_RESULTS. FEEDBACK should try to correct it.
+A tuple labeled No in VQA_RESULTS. FEEDBACK should correct it.
 
 Protected target:
 A tuple labeled Yes in VQA_RESULTS. FEEDBACK should preserve it.
 
-Grounded feedback:
-Feedback is grounded when every requested edit is supported by the provided tuples and VQA results.
-Do not reward edits that add extra content not justified by the inputs.
-
 Actionable feedback:
-Feedback is actionable when it clearly indicates what should be changed and in what direction, in a form usable for editing.
-Instructions such as "fix it", "make it better", "improve realism", or "adjust the composition" are too vague unless tied to concrete tuple-level corrections.
+A step is actionable when it specifies:
+  (a) what object or region to change,
+  (b) what property to change (count, color, presence, etc.),
+  (c) what the target state should be.
+A step missing any of (a)(b)(c) is under_specified_edit.
+Instructions such as "fix it", "make it better", or "improve realism"
+are not actionable unless tied to a concrete tuple-level correction.
+
+Irrelevant feedback:
+A step that does not contribute to fixing any No-labeled tuple AND
+risks changing content not targeted by any failed tuple.
+Image-specific details are NOT irrelevant if they serve the
+failed tuple's correction.
 
 Minimal correction:
-Feedback should prefer the smallest change that fixes the failed tuples without disturbing already-correct tuples.
+Feedback should prefer the smallest change that fixes the failed
+tuples without disturbing already-correct content.
 
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [Failure Types]
-Use these categories internally.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Severe — large penalty:
+  1. missed_no_tuple
+     A No-labeled tuple is not addressed at all.
+  2. harms_yes_tuple
+     The feedback would likely alter or damage a Yes-labeled tuple.
+  3. irrelevant_edit_request
+     A feedback step does not contribute to fixing any No-labeled tuple
+     AND risks unnecessary change to non-target content.
+  4. contradicts_vqa
+     The feedback moves in the opposite direction of the VQA result.
 
-1. missed_no_tuple
-A failed No-labeled tuple is not addressed.
+Moderate — medium penalty:
+  5. wrong_targeting
+     The feedback addresses the wrong object, attribute, relation,
+     count, or text relative to the failed tuple.
+  6. vague_or_unactionable_feedback
+     The feedback is too abstract or ambiguous to serve as a usable
+     edit instruction.
+  7. under_specified_edit
+     The feedback identifies the problem but is missing (a), (b),
+     or (c) from the actionable definition above.
+  8. overly_global_edit
+     A local fix would suffice but the feedback proposes broad
+     scene-level changes that risk collateral damage.
 
-2. harms_yes_tuple
-The feedback would likely alter or damage a Yes-labeled tuple.
+Minor — small penalty:
+  9. non_minimal_edit
+     The feedback could fix the failure more simply but adds
+     unnecessary extra steps with limited collateral risk.
+  10. preserves_failure
+      The feedback leaves the failed condition effectively unchanged.
 
-3. hallucinated_edit_request
-The feedback asks for unsupported new content or unsupported changes not grounded in PRED_TUPLES and VQA_RESULTS.
-
-4. contradicts_vqa
-The feedback moves in the opposite direction of the VQA result.
-
-5. wrong_targeting
-The feedback focuses on the wrong object, attribute, relation, count, or text relative to the failed tuple.
-
-6. vague_or_unactionable_feedback
-The feedback is too abstract, generic, or ambiguous to serve as a usable edit instruction.
-
-7. under_specified_edit
-The feedback identifies a problem but does not specify enough about what should change.
-
-8. overly_global_edit
-A local fix would be enough, but the feedback proposes broad scene-level changes that risk collateral damage.
-
-9. non_minimal_edit
-The feedback could fix the failure more simply but instead proposes unnecessary extra changes.
-
-10. preserves_failure
-The feedback repeats the failure or leaves the failed condition effectively unchanged.
-
-[Relative Importance]
-Use the largest penalties for:
-- harms_yes_tuple
-- hallucinated_edit_request
-- contradicts_vqa
-- missed_no_tuple on core failed tuples
-
-Use moderate penalties for:
-- wrong_targeting
-- vague_or_unactionable_feedback
-- under_specified_edit
-- overly_global_edit
-
-Use smaller penalties for:
-- non_minimal_edit
-- mild redundancy or wording awkwardness that does not reduce edit usability
-
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [Score Anchors]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2.00 — All No-labeled tuples addressed correctly.
+        All Yes-labeled tuples preserved.
+        Each step is specific and actionable.
+        No irrelevant edits.
 
-A score near 2.00 means:
-- FEEDBACK addresses nearly all important No-labeled tuples,
-- is well aligned with the provided VQA failures,
-- preserves Yes-labeled tuples,
-- contains no unsupported edits,
-- and is concrete and usable as an edit instruction.
+1.50 — All No-labeled tuples addressed.
+        One step is slightly vague, minimally irrelevant, or
+        carries minor risk to a Yes-labeled tuple.
+        No severe errors.
 
-A score near 1.00 means:
-- FEEDBACK addresses some important No-labeled tuples,
-- but also has meaningful weakness such as incomplete failure coverage, insufficient protection of Yes-labeled tuples, weak grounding in the provided VQA results, or vague / under-specified edit instructions,
-- so it is only borderline usable: not clearly a safe and effective edit plan, but not strongly harmful overall.
+1.00 — Some No-labeled tuples addressed, but one moderate error
+        present: partial coverage, wrong targeting, vague instruction,
+        or a step that risks a Yes-labeled tuple.
+        Borderline usable.
 
-A score near 0.00 means:
-- FEEDBACK misses important failed tuples,
-- risks damaging already-correct Yes-labeled content,
-- introduces unsupported edits,
-- contradicts the provided VQA results,
-- or is so vague or misdirected that it would likely cause harmful or ineffective editing.
+0.50 — One severe error: an important No-labeled tuple missed,
+        a Yes-labeled tuple clearly harmed, or a clearly irrelevant
+        edit that risks non-target content.
 
+0.00 — Multiple severe errors, no meaningful correction attempted,
+        or FEEDBACK is invalid (empty, single character, etc.).
+
+A single severe error alone can justify 0.50 or below.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [Output Format]
-Return exactly four lines in the following format:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+All judgment must be completed internally before writing.
+Do not reason or self-correct inside the output fields.
 
-Failed Targets: <brief list of No-labeled tuples that should be corrected>
-Protected Targets: <brief list of Yes-labeled tuples that should be preserved>
-Reason: <one concise sentence focusing on coverage of No tuples, preservation of Yes tuples, grounding, and actionability>
+Return exactly four lines:
+
+Failed Targets: <T[n] (No): addressed/missed/wrong_targeting. One clause per tuple.>
+Protected Targets: <T[n] (Yes): preserved/at_risk. One clause per tuple.>
+Reason: <one sentence, max 20 words, on coverage, preservation, and actionability>
 REWARD: <score>
-
-Do not output anything else.
 """.strip()
