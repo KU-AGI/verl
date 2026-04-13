@@ -1,6 +1,7 @@
 ############################ Step 1, 3 Fine-Graine Reward ############################
 TASK1_TASK3_IMAGE_GENERATOR_SYSTEM_PROMPT_TEMPLATE = r"""
-You are a VQA assistant. The user provides a single image and multiple questions in the following exact input format:
+You are a VQA assistant. The user provides a single image and multiple 
+questions in the following exact input format:
 
 [Input]
 IMAGE:
@@ -10,12 +11,60 @@ QUESTIONS:
 <id> | <question>
 <id> | <question>
 
-Rules:
-1) Visual-only: decide from what is visible. No typicality/context inference and no external verification.
-2) YES gate: answer "Yes" only if the Reason cites at least one specific visible part/structure AND its location (e.g., "wheels under the fuselage"). If you cannot cite this, answer "No".
-3) Visibility gating: for attributes, the entity must be visible; for relations, BOTH entities must be visible; otherwise Answer must be "No" and the Reason must mention what is not visible.
-4) Scope: do not add attributes/states not asked.
-5) Consistency: the Answer must be forced by the Reason.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+JUDGMENT PROCEDURE — follow in order
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+STEP 1 — Inspect the image before reading the question.
+  Note what is actually visible, not what is expected or typical.
+
+STEP 2 — Read the question and locate the relevant region(s).
+  If you cannot clearly locate the entity or attribute in the image,
+  the answer is No. Do not infer from context or world knowledge.
+
+STEP 3 — Apply the appropriate gate below.
+
+[YES gate]
+Answer Yes only if ALL of the following hold:
+  (a) The entity or entities are clearly visible in the image.
+  (b) The Reason cites at least one specific visible structure AND 
+      its location (e.g., "wheels under the fuselage").
+  (c) The evidence is unambiguous. If you are uncertain whether what
+      you see matches the claim, answer No.
+
+[NO gate]
+Answer No if ANY of the following hold:
+  (a) The relevant entity is not clearly visible.
+  (b) For relations: either entity is not clearly visible.
+  (c) The evidence is ambiguous or requires inference.
+  (d) For counts: you cannot individually locate each instance
+      (see Count Rule below).
+
+[Count Rule]
+For any question involving a number:
+  - Individually locate and count each instance in the image.
+  - Do not estimate or approximate.
+  - If any instance is partially obscured or ambiguous, do not
+    include it in your count unless it is unambiguously identifiable.
+  - State the count you observed in the Reason before answering.
+  - If your observed count matches the claimed number exactly → Yes.
+  - If your observed count differs in any way → No.
+
+[Uncertainty Rule]
+If you are not highly confident in your observation, answer No.
+A wrong No is less harmful than a wrong Yes.
+Do not upgrade weak resemblance or partial visibility into a Yes.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+General Rules
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1) Visual-only: decide from what is visible. No typicality/context
+   inference and no external verification.
+2) Visibility gating: for attributes, the entity must be visible;
+   for relations, BOTH entities must be visible; otherwise Answer
+   must be No and the Reason must mention what is not visible.
+3) Scope: do not add attributes/states not asked.
+4) Consistency: the Answer must be forced by the Reason.
+   If the Reason does not clearly justify Yes, the Answer must be No.
 
 Relation Rules:
 
@@ -26,22 +75,28 @@ Frame:
 - A left/right B: A must be clearly left/right of B.
 - A above/below B: A must be above/below B.
 - A (on the) top of B means the same as A above B.
-- A (on the) bottom of B means the same as A below B (NOT inside/underside; no contact required).
+- A (on the) bottom of B means the same as A below B
+  (NOT inside/underside; no contact required).
 
 Proximity (NO overlap):
 - A (on the) side of / next to / near B: A and B must NOT overlap.
 - side of / next to: very close. near: close but can be farther.
 
 3D relations:
-- A in front of / behind / hidden by B: overlap NOT required; be as close as possible; slight overlap allowed.
-- Both A and B must remain visible (do not make either fully invisible).
+- A in front of / behind / hidden by B: overlap NOT required;
+  slight overlap allowed.
+- Both A and B must remain visible.
 - A in front of B: A appears closer to camera than B.
-- A behind B / A hidden by B: A appears farther from the camera than B, so B appears in front of A.
+- A behind B / A hidden by B: A appears farther from the camera,
+  so B appears in front of A.
 
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [Output Format]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 For each question id, return exactly these two lines:
 
-<id> | Reason: <EXACTLY ONE sentence based only on visible cues, including a location reference>
+<id> | Observation: <your own description per question.>
+<id> | Reason: <ONE sentence, visible cues only, with location reference>
 <id> | Answer: Yes or No
 
 [Input]
@@ -97,144 +152,165 @@ Given SOURCE_IMAGE, FEEDBACK, and EDITED_IMAGE, assign one scalar reward.
 Maximum score is 2.00.
 Minimum score is 0.00.
 
-[Core Evaluation Criteria]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⚠️ MANDATORY JUDGMENT PROCEDURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Follow these steps in order. Do NOT skip any step.
 
-1. Requested change fulfillment
-Judge whether the requested edit operations were actually carried out in EDITED_IMAGE relative to SOURCE_IMAGE.
+STEP 1 — READ FEEDBACK FIRST
+  List every requested change explicitly.
+  For each change, note whether it specifies:
+  - identity, count, attribute (color/material/shape/size/texture/type),
+    location, spatial relation, or orientation.
+  These specifics will be verified in Step 3.
 
-This includes:
+STEP 2 — INSPECT SOURCE_IMAGE
+  For each change target identified in Step 1, look at SOURCE_IMAGE and
+  note the current state of that target before the edit.
+  Do not skip this step. You must know the before state to judge the after.
+
+STEP 3 — INSPECT EDITED_IMAGE AND COMPARE AGAINST SOURCE_IMAGE
+  For each change target, compare EDITED_IMAGE directly against SOURCE_IMAGE.
+  Ask for each requested change:
+  - Is the change present in EDITED_IMAGE?
+  - Is it correct relative to what FEEDBACK specified?
+  - Does it differ visibly from SOURCE_IMAGE in the right way?
+
+  For preservation, ask:
+  - Did any non-target content visibly change between SOURCE_IMAGE
+    and EDITED_IMAGE without being requested?
+
+STEP 4 — SCORE
+  Combine your findings from Step 3 into one reward.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[Core Evaluation Axes]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. Edit fulfillment
+Judge whether EDITED_IMAGE correctly applies the requested changes in FEEDBACK
+relative to SOURCE_IMAGE. This includes:
 - requested additions were added,
 - requested removals were removed,
 - requested modifications were applied,
-- requested counts, attributes, positions, spatial relations, sizes, shapes, materials, or colors were changed correctly,
-- and multi-step feedback was followed completely rather than partially.
+- requested counts were changed correctly if exact counts are specified,
+- requested attributes (color, material, shape, size, texture, type)
+  were changed correctly if explicitly requested,
+- requested locations, placements, or spatial relations were changed
+  correctly if explicitly requested,
+- all important steps were completed if FEEDBACK contains multiple steps.
 
-2. Preservation / minimality
-Judge whether content not targeted by FEEDBACK was preserved.
+Partial completion rule:
+- If a change is attempted but less than half of the requested scope
+  is satisfied → partial_requested_change.
+- If a change is attempted and mostly satisfied but with a minor flaw
+  → apply a smaller penalty than full partial.
+- If a change is not attempted at all → missed_requested_change.
 
-This includes:
+2. Preservation
+Judge whether content not targeted by FEEDBACK was preserved. This includes:
 - already-correct content remains intact,
-- unrelated objects, attributes, and scene structure are not unnecessarily changed,
+- unrelated objects, attributes, and scene structure are not
+  unnecessarily changed,
 - no extra unsupported edit effects are introduced,
-- and the edit is as local and minimal as possible while still satisfying FEEDBACK.
+- the edit stays as local and minimal as possible while still
+  satisfying FEEDBACK.
 
-[Judging Principle]
-Internally do the following:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[Strict Scope Rule]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Judge only from SOURCE_IMAGE, FEEDBACK, and EDITED_IMAGE.
 
-1. Read FEEDBACK carefully and identify the requested changes.
-2. Compare SOURCE_IMAGE and EDITED_IMAGE.
-3. Determine whether the requested changes are present in EDITED_IMAGE.
-4. Determine whether any unintended changes occurred outside the requested scope.
-5. Judge the overall edit quality based on:
-- how completely FEEDBACK was followed,
-- how accurately it was followed,
-- and how well non-target content was preserved.
+In particular:
+- Do not reference VQA outputs.
+- Do not reference failed targets or protected targets.
+- Do not reference tuple-level verdicts.
+- Do not reference upstream stage decisions or pipeline-internal bookkeeping.
+- Do not penalize an edit merely because it disagrees with an earlier
+  pipeline stage.
+- Penalize only visible failure to follow FEEDBACK or visible failure
+  to preserve non-target content.
 
-The main question is:
-Does EDITED_IMAGE make the requested changes from FEEDBACK relative to SOURCE_IMAGE, while avoiding unnecessary damage or unrelated changes?
-
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [Important Rules]
-- Compare EDITED_IMAGE against SOURCE_IMAGE; do not judge EDITED_IMAGE in isolation.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- Always compare EDITED_IMAGE against SOURCE_IMAGE. Never judge
+  EDITED_IMAGE in isolation.
 - Reward only requested changes, not generic aesthetic improvement.
-- Do not reward hallucinated improvements that were not asked for.
-- If FEEDBACK specifies multiple changes, judge both coverage and correctness.
-- If FEEDBACK is specific about count, color, material, location, relation, or orientation, those specifics matter.
-- If a requested change is completed but causes substantial collateral damage, penalize it.
-- If the requested change is only partially completed, penalize partial completion.
-- If the edited image preserves everything but fails to apply the requested edit, penalize it.
-- If FEEDBACK is impossible to verify visually from the images, judge conservatively and avoid overclaiming success.
-- Do not penalize minor realism, texture, or sharpness differences unless FEEDBACK explicitly requires those properties.
-- Do not comment on image quality, realism, or sharpness unless those are explicitly part of FEEDBACK or clearly prevent the requested edit from being satisfied.
+- If FEEDBACK specifies multiple changes, judge both completeness
+  and correctness of each.
+- If FEEDBACK specifies count, color, material, type, size, shape,
+  texture, location, relation, or orientation, those specifics matter.
+- If FEEDBACK does not explicitly specify a location or placement,
+  do not penalize a plausible placement that satisfies the request.
+- If a requested change causes substantial collateral damage, penalize it.
+- If non-target content is changed unnecessarily, penalize preservation
+  failure even if the requested edit was applied.
+- If FEEDBACK is visually ambiguous or impossible to verify from the
+  images, judge conservatively and avoid overclaiming success.
+- Do not comment on image quality, realism, sharpness, or detail unless
+  those properties are explicitly requested in FEEDBACK.
 
-[Failure Types]
-Use these internally.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[Error Classification]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Severe — large penalty:
+  - missed_requested_change: a requested change was not carried out at all
+  - incorrect_requested_change: attempted but wrong in identity, count,
+    attribute, location, or relation
+  - wrong_count_after_edit: exact requested count not satisfied
+  - poor_preservation: important non-target content removed or damaged
+  - unintended_change: visible unrequested change that damages content
+  - anchor_object_loss: existing reference object removed or heavily altered
 
-1. missed_requested_change
-A requested change was not carried out at all.
+Moderate — medium penalty:
+  - partial_requested_change: change only partially carried out
+  - wrong_attribute_after_edit: requested attribute not correctly applied
+  - wrong_relation_or_location_after_edit: placement not correctly applied
+  - weak_following_of_multistep_feedback: one or more steps ignored
+  - over_edit: changed more broadly than necessary
 
-2. partial_requested_change
-A requested change was only partially carried out.
+Minor — small penalty:
+  - mild unintended_change with limited visible impact
+  - minor local inconsistencies that do not materially affect
+    edit fulfillment or preservation
 
-3. incorrect_requested_change
-A requested change was attempted, but the result is wrong in identity, count, attribute, location, relation, or other specified detail.
-
-4. wrong_count_after_edit
-A requested exact count change was not satisfied correctly.
-
-5. wrong_attribute_after_edit
-A requested color, material, size, shape, texture, or type change was not satisfied correctly.
-
-6. wrong_relation_or_location_after_edit
-A requested spatial or positional change was not satisfied correctly.
-
-7. unintended_change
-A visible change not requested by FEEDBACK was introduced.
-
-8. poor_preservation
-Important existing content that should have remained unchanged was removed, damaged, or substantially altered.
-
-9. over_edit
-The image was changed more broadly than necessary, even if some requested change was applied.
-
-10. weak_following_of_multistep_feedback
-Some feedback steps were followed while others were ignored or executed weakly.
-
-11. anchor_object_loss
-An existing object that serves as the reference or anchor for the requested edit is removed, lost, or heavily altered, making the requested edit unstable or invalid.
-
-[Relative Importance]
-Use the largest penalties for:
-- missed_requested_change on an important edit target
-- incorrect_requested_change on an important edit target
-- wrong_count_after_edit when exact count is specified
-- poor_preservation
-- unintended_change that damages core scene content
-- anchor_object_loss
-
-Use moderate penalties for:
-- partial_requested_change
-- wrong_attribute_after_edit
-- wrong_relation_or_location_after_edit
-- weak_following_of_multistep_feedback
-- over_edit
-
-Use smaller penalties for:
-- mild unintended_change with limited visible impact
-- minor local inconsistencies that do not materially affect the requested edit outcome
-
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [Score Anchors]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2.00 — All important requested changes correctly applied.
+        Requested specifics accurate. Non-target content well preserved.
+        Little or no unnecessary change.
 
-A score near 2.00 means:
-- EDITED_IMAGE correctly applies nearly all important requested changes from FEEDBACK,
-- does so with high specificity and accuracy,
-- preserves non-target and already-correct content well,
-- keeps anchor/reference objects intact,
-- and introduces little or no unintended change or collateral damage.
+1.50 — Most requested changes correctly applied.
+        One minor change missing, slightly incorrect, or one small
+        preservation issue. No severe errors.
 
-A score near 1.00 means:
-- EDITED_IMAGE follows some important requested changes,
-- but also has meaningful weakness such as partial completion, incorrect detail, incomplete multi-step execution, noticeable preservation problems, or limited unintended changes,
-- so it is only borderline successful: not clearly a clean and reliable edit, but not severely wrong or strongly harmful overall.
+1.00 — Some important requested changes followed, but one moderate
+        error present: partial completion, incorrect detail, incomplete
+        multi-step execution, or noticeable preservation problem.
+        Borderline successful overall.
 
-A score near 0.00 means:
-- EDITED_IMAGE fails to carry out one or more important requested changes,
-- applies them in the wrong way,
-- substantially damages, removes, or alters content that should have been preserved,
-- loses an anchor/reference object needed for the requested edit,
-- or introduces major unintended changes,
-- such that the edit is strongly unfaithful to FEEDBACK or clearly harmful relative to SOURCE_IMAGE.
+0.50 — One severe error present: an important change missed, applied
+        incorrectly, or significant preservation failure.
 
+0.00 — Multiple severe errors, or complete failure to follow FEEDBACK,
+        or major damage to non-target content.
+
+A single severe error alone can justify 0.50 or below.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [Output Format]
-Return exactly four lines in the following format:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+All judgment must be completed internally before writing.
+Do not reason, self-correct, or revise inside the output fields.
 
-Source Image Key Content: <brief list of major visible objects and scene elements>
-Edited Image Key Content: <brief list of major visible objects and scene elements after editing>
-Requested Changes Check: <brief structured summary of whether the requested changes were fulfilled>
-Preservation Check: <brief structured summary of whether non-target content was preserved>
-Reason: <one concise sentence focusing on edit fulfillment and preservation/minimality>
+Return exactly four lines:
+
+Edit Fulfillment: <one clause per requested change.>
+Preservation: <correct, or brief description of what changed unnecessarily>
+Reason: <one sentence, max 20 words, on the most important finding>
 REWARD: <score>
-
-Do not output anything else.
 """.strip()
 
 ############################ Step 2 Fine-Graine Reward ############################
@@ -463,6 +539,9 @@ A tuple line must be exactly one of the following forms:
 entity - whole (X)
 - explicit concrete depictable entity
 - include only if central or used by another tuple
+- Singular/plural surface variation in entity names is acceptable.
+- Do not penalize an entity tuple only because it uses a singular form in one place and a plural form in another.
+- Treat singular and plural surface forms as semantically equivalent unless they change the referent or create a real semantic mismatch.
 
 entity - part (OWNER PART)
 - only for explicit part-of relation
@@ -621,6 +700,8 @@ PRED_TUPLES introduces entity, attribute, action, relation, text, count, or styl
 
 6. schema_or_type_error
 A tuple violates the schema, uses the wrong tuple category, or represents the fact in a schema-inappropriate way.
+Do not treat singular/plural surface variation of the same entity noun as a schema_or_type_error.
+Penalize only when the noun change creates a real semantic mismatch beyond number morphology.
 
 7. non_verifiable_or_over_decomposed_content
 PRED_TUPLES introduces weakly verifiable tuples, unstable minor details, or unnecessary extra tuples that would make downstream VQA noisy.
@@ -784,200 +865,124 @@ global - style (STYLE)
 - do not use mood, ambiance, quality, realism level, camera, lighting, time of day, weather, or scene effect
 - if the style is not clearly and reliably visually diagnosable, omit it
 
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [Task]
-Given:
-1. an image,
-2. a list of input tuples,
-3. a policy-generated VQA output containing one rationale and one Yes/No answer per tuple,
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Given an image, a list of tuples, and a VQA output, assign a scalar
+reward between 0.00 and 2.00 judging whether the VQA output correctly
+verified the image against each tuple.
 
-assign one scalar reward.
+You are judging two things per tuple:
+  (A) Is the rationale valid? (does it correctly describe the image?)
+  (B) Is the answer correct? (does it correctly reflect whether the
+      image satisfies the tuple's claim?)
 
-Maximum score is 2.00.
-Minimum score is 0.00.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⚠️ MANDATORY JUDGMENT PROCEDURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Follow these steps in order. Do NOT skip Step 1.
 
-[What You Must Judge]
-Judge whether the VQA output satisfies all of the following:
+STEP 1 — INSPECT THE IMAGE INDEPENDENTLY (before reading VQA_RESULTS)
+  For each tuple, look at the image directly and determine:
+  - What does the image actually show regarding this tuple's claim?
+  - What is the correct Yes/No answer for this tuple?
+  This is your ground truth for Step 2.
 
-1. Image grounding:
-- Each rationale must be supported by directly visible evidence in the image.
-- The rationale must not rely on guesses, world knowledge, or unseen details.
+STEP 2 — EVALUATE EACH VQA RESULT
 
-2. Tuple-faithful verification:
-- Each rationale and answer must address the actual content of its corresponding tuple.
-- The tuple semantics must be interpreted correctly.
-- The answer must reflect whether the tuple is visually supported by the image.
+  [Criterion A] Rationale validity
+  A valid rationale must:
+  - describe only what is directly visible in the image,
+  - address the specific content of the tuple, not adjacent facts,
+  - contain no hallucinated objects, attributes, counts, or relations,
+  - not rely on inference or world knowledge in place of image evidence,
+  - logically support the Yes/No answer it concludes with.
 
-3. Rationale-answer consistency:
-- The final Yes/No answer must match the rationale.
-- No internal contradiction is allowed.
+  [Criterion B] Answer correctness
+  - Use your Step 1 finding as ground truth.
+  - Ask: given what the image actually shows, does the tuple's claim hold?
+  - The answer must follow from that comparison.
 
-4. Exact tuple alignment:
-- If there are N tuples, there must be exactly N VQA results.
-- The order must be preserved.
-- Each tuple must receive exactly one rationale and one Yes/No answer.
+  Correct reasoning pattern:
+    Tuple claims X. Image shows Y. Rationale correctly states Y.
+    If Y satisfies X → Answer: Yes.
+    If Y does not satisfy X → Answer: No.
+    Both are correct VQA behavior. Judge accordingly.
 
-5. No hallucination or unsupported inference:
-- Do not reward rationales that invent visual evidence not clearly present.
-- Do not reward rationales that overclaim uncertain object identity, exact count, exact relation, or exact attribute without clear evidence.
+  Failure pattern:
+    Tuple claims X. Image shows Y. Rationale correctly states Y.
+    Answer says Yes even though Y does not satisfy X.
+    → Criterion B fails. Severe error.
 
-6. Cross-tuple object consistency:
-- The same visual object or object set must be interpreted consistently across different tuples.
-- Do not allow one tuple to treat an object as one category and another tuple to treat the same object as a different category without clear visual justification.
-- Do not allow one tuple to verify "camera" while another tuple implicitly counts or reasons over a different object set.
+  [Yes/No Semantics — read carefully]
+  In VQA, Yes/No has one fixed meaning:
+    Yes = the tuple's claim IS satisfied by the image.
+    No  = the tuple's claim IS NOT satisfied by the image.
 
-7. Count and logic correctness:
-- For count tuples, the rationale must count the relevant objects correctly.
-- Arithmetic contradictions are severe errors.
-- "==N" means exactly N, not approximately N, at least N, or visually many.
+  "No" does NOT mean the rationale is wrong.
+  "No" does NOT mean the image observation is incorrect.
+  "No" simply means: the image fails to satisfy what the tuple claims.
 
-8. Relation correctness:
-- For spatial relation tuples, the rationale must judge the stated relation itself, not a nearby but different fact.
-- Background color or scene description is not enough unless it directly establishes the target relation.
+  A rationale that accurately describes the image and concludes "No"
+  because the image does not match the tuple's claim is fully correct.
 
-[Judging Principle]
-Internally do the following:
 
-1. Inspect the image yourself.
-2. Read each tuple carefully.
-3. Read the corresponding rationale and Yes/No answer.
-4. Judge whether the rationale is:
-- image-grounded,
-- tuple-relevant,
-- logically sound,
-- non-hallucinatory,
-- and consistent with the final answer.
-5. Also judge the VQA output globally for:
-- exact tuple/result alignment,
-- cross-tuple object consistency,
-- and stability of interpretation across the whole set.
+STEP 3 — STRUCTURAL AND CONSISTENCY CHECK
+  - Are there exactly N results for N tuples, in the same order?
+  - Is the same visual object interpreted consistently across tuples?
 
-The main question is:
-Does the VQA output provide correct, image-grounded, tuple-faithful verification for each tuple, without hallucination, inference, miscounting, or inconsistent object interpretation?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[Error Classification]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Severe — large penalty:
+  - Answer contradicts what the image actually shows
+  - Rationale describes things not present in the image (hallucination)
+  - Rationale logically contradicts its own answer
+  - Missing or extra VQA lines, broken order
+  ⚠️ Hallucination means inventing something not in the image at all.
+  Imprecise description of something that IS in the image
+  Downgrade such cases to Minor.
 
-[Definitions]
+  ⚠️ If the answer is correct, do not apply Severe penalty based
+  solely on rationale wording imprecision.
 
-Image-grounded rationale:
-A rationale is image-grounded when it refers only to visual evidence that is actually observable in the image.
+Moderate — medium penalty:
+  - Rationale drifts from the tuple's specific claim
+  - Same object described inconsistently across tuples
+  - Identity or attribute claim made with insufficient visual evidence
 
-Unsupported inference:
-A rationale makes unsupported inference when it:
-- assumes hidden details,
-- upgrades weak resemblance into certain identity without enough visual support,
-- invents exact counts not clearly visible,
-- uses background knowledge instead of image evidence,
-- or states visual facts not actually established by the image.
+Minor — small penalty:
+  - Rationale correct but verbose or slightly imprecise
 
-Tuple-faithful reasoning:
-A rationale is tuple-faithful when it directly checks the tuple's claimed entity, relation, attribute, count, text, or style, rather than drifting into loosely related description.
-
-Cross-tuple object consistency:
-This means that the same visual object, region, or object set is interpreted consistently across all tuples.
-For example, the model must not treat the same object as a taxi in one tuple and as skis in another tuple without clear visual basis.
-Likewise, it must not verify an entity tuple using one object set and verify a related count tuple using a different object set.
-
-[Failure Types]
-Use these internally.
-
-1. incorrect_answer
-The Yes/No answer is wrong given the image and tuple.
-
-2. rationale_answer_inconsistency
-The rationale and final answer do not logically match.
-
-3. non_grounded_rationale
-The rationale cites evidence not clearly supported by the image.
-
-4. unsupported_inference
-The rationale infers unseen or uncertain facts instead of verifying visible evidence.
-
-5. hallucinated_visual_detail
-The rationale invents objects, attributes, counts, relations, or text not actually established by the image.
-
-6. tuple_misread
-The tuple semantics are misunderstood.
-
-7. missing_vqa_line
-A tuple has no corresponding VQA result.
-
-8. extra_vqa_line
-A VQA result exists without a corresponding tuple.
-
-9. order_misalignment
-The tuple/result order is broken.
-
-10. cross_tuple_object_inconsistency
-The same visual object or object set is interpreted inconsistently across tuples.
-
-11. count_error
-The count rationale is numerically wrong, logically inconsistent, or does not verify exact equality.
-
-12. relation_error
-The spatial relation is judged incorrectly or using irrelevant evidence.
-
-13. noisy_or_irrelevant_rationale
-The rationale includes unnecessary aesthetic, stylistic, or descriptive content that does not help verify the tuple.
-
-14. false_positive_yes
-The tuple should not be verified from the image, but the output answers Yes anyway.
-
-15. overconfident_verification
-The rationale upgrades weak resemblance or uncertain evidence into a confident Yes judgment.
-
-[Relative Importance]
-Use the largest penalties for:
-- incorrect_answer, especially when the correct label should be No but the output say
-- false_positive_yes
-- overconfident_verification on core tuples
-- rationale_answer_inconsistency
-- non_grounded_rationale
-- unsupported_inference on core tuple content
-- hallucinated_visual_detail
-- cross_tuple_object_inconsistency
-- count_error
-- missing_vqa_line / extra_vqa_line / order_misalignment
-
-Use moderate penalties for:
-- tuple_misread
-- relation_error
-- weakly grounded identity claims
-- noisy_or_irrelevant_rationale
-
-Use smaller penalties for:
-- mild wording awkwardness
-- slightly verbose but still correct rationale
-
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [Score Anchors]
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2.00 — All rationales valid and image-grounded.
+        All answers correctly reflect the image vs. tuple comparison.
+        No hallucination, no structural issues.
 
-A score near 2.00 means:
-- every tuple is answered exactly once and in order,
-- each rationale is directly grounded in visible image evidence,
-- each Yes/No answer matches both the image and the rationale,
-- no unsupported inference or hallucinated detail is introduced,
-- count and relation judgments are correct,
-- and object interpretation is consistent across all tuples.
+1.50 — Mostly correct. One or two minor weaknesses. No severe errors.
 
-A score near 1.00 means:
-- the VQA output gets some tuple checks substantially right,
-- but also contains limited, non-critical weakness such as incomplete grounding, weak or noisy rationale, minor local tuple drift, or minor logic/count/relation issues,
-- while still preserving tuple/result alignment and avoiding severe hallucinated evidence or clearly unjustified Yes answers,
-- so it is only borderline usable and not clearly reliable for downstream feedback.
+1.00 — One moderate error or one weakly grounded key tuple.
+        Borderline usable.
 
-A score near 0.00 means:
-- the VQA output contains one or more severe verification failures,
-- such as a clearly unjustified Yes answer, non-grounded rationale, hallucinated visual evidence, severe count or logic mistakes, broken tuple/result alignment, or strong cross-tuple object inconsistency,
-- and would likely cause downstream feedback to act on wrong targets and harm already-correct image content.
+0.50 — One severe error present.
 
-A single severe failure can justify a low score even if some other tuple checks are correct.
+0.00 — Multiple severe errors or structural failure.
 
+A single severe error alone can justify 0.50 or below.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [Output Format]
-Return exactly four lines in the following format:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Return exactly five lines. No reasoning, no thinking-aloud, no
+self-correction. All judgment must be done internally before writing.
 
+Image Observation: <your own count or description per tuple subject.
 Tuple Check Summary: <brief structured summary of the main verification failures or strengths>
 Critical Errors: <brief list of the most important errors, or "none">
 Reason: <one concise sentence focusing on grounding, tuple-faithfulness, consistency, count/logic, or hallucination>
 REWARD: <score>
-
-Do not output anything else.
 """.strip()
 
 VQA_TO_FEEDBACK_REWARD_SYSTEM_PROMPT = r"""
