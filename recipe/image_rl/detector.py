@@ -81,7 +81,7 @@ class GDino:
             text_threshold=self.text_threshold,
             target_sizes=target_sizes
         )[0]
-
+        
         boxes_xyxy = res["boxes"]
         scores = res["scores"]
         pred_labels = res["labels"]
@@ -229,13 +229,13 @@ class GDino:
         norm = (rev_x**2 + rev_y**2)**0.5 + 1e-6
         dx, dy = rev_x / norm, rev_y / norm
 
-        if locality in ['left', 'right', 'top', 'bottom', 'above', 'below']:
+        if locality in ['left', 'left of', 'right', 'right of', 'top', 'bottom', 'above', 'below']:
             if abs(rev_x) < 1e-5 and abs(rev_y) < 1e-5:
                 return False, "Too close"
-            
-            if locality == 'left':
+
+            if locality in ['left', 'left of']:
                 score = (dx < -0.5)
-            elif locality == 'right':
+            elif locality in ['right', 'right of']:
                 score = (dx > 0.5)
             elif locality in ['top', 'above']:
                 score = (dy < -0.5)

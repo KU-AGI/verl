@@ -530,11 +530,15 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             f.write(f"🖼️ [TASK 1] INITIAL GEN\n")
             f.write(f"  - Total Score: {self._get_safe_val(scores, 'task1_scores', i)}\n")
             f.write(f"  - VQA Reward: {self._get_safe_val(reward_extra_infos_dict, 'task1_vqa_reward', i)}\n")
-            # f.write(f"  - Detector Reward: {self._get_safe_val(reward_extra_infos_dict, 'task1_detector_reward', i)}\n")
-            # f.write(f"  - VQA+Detector Bonus: {self._get_safe_val(reward_extra_infos_dict, 'task1_vqa_detector_bonus', i)}\n")
+            f.write(f"  - Detector Reward (bonus): {self._get_safe_val(reward_extra_infos_dict, 'task1_detector_reward', i)}\n")
             f.write(f"  - Path: {paths['gen']}\n")
             f.write(f"  - VQA Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task1_vqa_reward_response', i)}\n")
-            # f.write(f"  - Detector Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task1_detector_response', i)}\n")
+            det_details_1 = self._get_safe_response(reward_extra_infos_dict, 'task1_detector_details', i, default=[])
+            if det_details_1:
+                f.write(f"  - Detector Details:\n")
+                for d in det_details_1:
+                    f.write(f"    [{d.get('tuple_idx','?')}] {d.get('det_info',{})}\n")
+                    f.write(f"         judge={d.get('det_judge')} | reason={d.get('det_reason','')}\n")
             f.write("\n")
 
             _report_task_ids = list(self.config.actor_rollout_ref.actor.multi_task.get("task_ids", [1]))
@@ -568,9 +572,16 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                 f.write(f"  - Total Score: {self._get_safe_val(scores, 'task3_scores', i)}\n")
                 f.write(f"  - VQA Reward: {self._get_safe_val(reward_extra_infos_dict, 'task3_vqa_reward', i)}\n")
                 f.write(f"  - Edit Instruction Following Reward: {self._get_safe_val(reward_extra_infos_dict, 'task3_edit_reward', i)}\n")
+                f.write(f"  - Detector Reward (bonus): {self._get_safe_val(reward_extra_infos_dict, 'task3_detector_reward', i)}\n")
                 f.write(f"  - Path: {paths['regen']}\n")
                 f.write(f"  - VQA Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task3_vqa_reward_response', i)}\n")
                 f.write(f"  - Edit Instruction Following Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task3_edit_reward_response', i)}\n")
+                det_details_3 = self._get_safe_response(reward_extra_infos_dict, 'task3_detector_details', i, default=[])
+                if det_details_3:
+                    f.write(f"  - Detector Details:\n")
+                    for d in det_details_3:
+                        f.write(f"    [{d.get('tuple_idx','?')}] {d.get('det_info',{})}\n")
+                        f.write(f"         judge={d.get('det_judge')} | reason={d.get('det_reason','')}\n")
                 f.write("\n")
 
             f.write(f"📚 [GROUND TRUTH REFERENCE]\n")

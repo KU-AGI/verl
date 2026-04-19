@@ -25,7 +25,9 @@ import random
 from enum import Enum
 import torch
 import math
+import aiohttp
 from mathruler.grader import extract_boxed_content
+from recipe.image_rl.gdino_regex import _CONNECTORS, SKIP_KEYWORDS, _COMPILED_RELATIONS
 
 # Configuration
 VLM_BASE_URLS = [
@@ -53,6 +55,16 @@ RECOVERY_CHECK_INTERVAL = 60  # seconds to wait before checking if unhealthy ser
 RM_PER_SERVER_INFLIGHT = 16
 _rm_slot_lock = threading.Lock()
 _rm_slot_queues = {}  # {(loop_id, is_vlm): queue}
+
+# Detector configuration
+DETECTOR_URLS = [
+    "http://192.169.0.2:8086",
+]
+DETECTOR_TIMEOUT = 300000.0
+DETECTOR_MAX_RETRIES = 2
+DET_PER_SERVER_INFLIGHT = 4
+_det_slot_lock = threading.Lock()
+_det_slot_queues = {}  # {loop_id: queue}
 
 async def _ensure_rm_slots(is_vlm=True) -> asyncio.Queue:
     """Ensure slot queue exists for current event loop and model type"""
@@ -561,14 +573,242 @@ async def get_response(message_builder_fn, *args):
     return None
 
 
+# =============================================================================
+# Detector helpers
+# =============================================================================
+def _parse_tuple_lines(text):
+    if not isinstance(text, str):
+        return []
+    return [
+        (int(m.group(1)), m.group(2).strip())
+        for line in text.strip().split("\n")
+        if (m := re.match(r"(\d+)\s*\|\s*(.*)", line))
+    ]
+
+
+def verify_detection_single(feedback_tuple) -> List[Dict[str, Any]]:
+    parsed_tup = _parse_tuple_lines(feedback_tuple)
+
+    results = []
+    for num, content in parsed_tup:
+        info = None
+        if 'spatial' in content:
+            if m := re.search(r'\((.*?)\)', content):
+                parts = [p.strip() for p in m.group(1).split(',')]
+                if len(parts) >= 3:
+                    s, o = parts[0], parts[1]
+                    r_text = ", ".join(parts[2:])
+
+                    cs = re.sub(r"_\d+$", "", _CONNECTORS.sub('', s).strip())
+                    co = re.sub(r"_\d+$", "", _CONNECTORS.sub('', o).strip())
+
+                    if not (cs.lower() in SKIP_KEYWORDS or co.lower() in SKIP_KEYWORDS or cs.startswith('[')):
+                        canonical_rel = next((c for c, p, _ in _COMPILED_RELATIONS if p.search(r_text)), None)
+                        if canonical_rel:
+                            info = {
+                                "subject": cs,
+                                "object": co,
+                                "relation": canonical_rel,
+                                "tuple_idx": num,
+                                "type": "spatial",
+                            }
+
+        elif 'count' in content:
+            if m := re.search(r'\((.*?)\)', content):
+                parts = [p.strip() for p in m.group(1).split(',')]
+                if len(parts) >= 2:
+                    s, expr = parts[0], parts[1]
+                    cs = re.sub(r"_\d+$", "", _CONNECTORS.sub('', s).strip())
+                    if not (cs.lower() in SKIP_KEYWORDS or cs.startswith('[')) and re.search(r'\d', expr):
+                        info = {
+                            "subject": cs,
+                            "object": cs,
+                            "num": expr,
+                            "tuple_idx": num,
+                            "type": "counting",
+                        }
+
+        if info is not None:
+            results.append(info)
+
+    return results
+
+
+async def request_detector_single(detection_list: List[Dict[str, Any]], img) -> Dict[str, Any]:
+    """Send detection request to detector server with slot-based load balancing and retry."""
+
+    if not detection_list or not DETECTOR_URLS:
+        return {"results": {}, "details": [], "errors": []}
+
+    # ---- loop-local slot queue ----
+    async def _ensure_det_slots() -> asyncio.Queue:
+        loop = asyncio.get_running_loop()
+        loop_id = id(loop)
+
+        if loop_id in _det_slot_queues:
+            queue = _det_slot_queues[loop_id]
+            try:
+                queue.qsize()
+                return queue
+            except RuntimeError:
+                pass
+
+        with _det_slot_lock:
+            if loop_id in _det_slot_queues:
+                queue = _det_slot_queues[loop_id]
+                try:
+                    queue.qsize()
+                    return queue
+                except RuntimeError:
+                    del _det_slot_queues[loop_id]
+
+            q = asyncio.Queue()
+            start = random.randrange(len(DETECTOR_URLS))
+            for i in range(DET_PER_SERVER_INFLIGHT * len(DETECTOR_URLS)):
+                sid = (start + i) % len(DETECTOR_URLS)
+                q.put_nowait(sid)
+
+            _det_slot_queues[loop_id] = q
+            return q
+
+    slot_q = await _ensure_det_slots()
+
+    # ---- image -> raw base64 ----
+    img_b64 = convert_gen_img_to_base64(img)
+    if img_b64.startswith("data:"):
+        img_b64 = img_b64.split(",", 1)[1]
+
+    # ---- build payload ----
+    info_list = []
+    idx_mapping = {}
+
+    for det_info in detection_list:
+        det_type = det_info.get("type", "")
+        api_info = None
+
+        if det_type == "spatial":
+            api_info = {
+                "type": "spatial",
+                "subject": det_info.get("subject"),
+                "object": det_info.get("object"),
+                "relation": det_info.get("relation"),
+            }
+        elif det_type in ["counting", "numeracy"]:
+            api_info = {
+                "type": "numeracy",
+                "object": det_info.get("object"),
+                "num": str(det_info.get("num", "")),
+            }
+
+        if api_info is None:
+            continue
+
+        idx_mapping[len(info_list)] = det_info.get("tuple_idx", len(info_list))
+        info_list.append(api_info)
+
+    if not info_list:
+        return {"results": {}, "details": [], "errors": ["No valid detection items"]}
+
+    payload = {"info_list": info_list, "img_url": img_b64}
+
+    # ---- retry bookkeeping ----
+    per_server_attempts = {sid: 0 for sid in range(len(DETECTOR_URLS))}
+    max_total_attempts = len(DETECTOR_URLS) * DETECTOR_MAX_RETRIES
+
+    results: Dict[int, bool] = {}
+    details: List[Dict[str, Any]] = []
+    errors: List[str] = []
+
+    timeout = aiohttp.ClientTimeout(total=DETECTOR_TIMEOUT)
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for attempt in range(max_total_attempts):
+            sid = await slot_q.get()
+
+            if per_server_attempts[sid] >= DETECTOR_MAX_RETRIES:
+                slot_q.put_nowait(sid)
+                continue
+            per_server_attempts[sid] += 1
+
+            detect_url = f"{DETECTOR_URLS[sid]}/detect"
+
+            try:
+                async with session.post(detect_url, json=payload) as resp:
+                    if resp.status != 200:
+                        txt = await resp.text()
+                        errors.append(f"{detect_url} -> {resp.status}: {txt[:200]}")
+                        continue
+
+                    data = await resp.json()
+                    api_results = data.get("results", [])
+
+                    for api_idx, result_list in enumerate(api_results):
+                        if api_idx not in idx_mapping or not result_list:
+                            continue
+                        tuple_idx = idx_mapping[api_idx]
+                        r0 = result_list[0]
+
+                        det_judge = bool(r0.get("det_judge", False))
+                        results[tuple_idx] = det_judge
+                        details.append({
+                            "tuple_idx": tuple_idx,
+                            "det_judge": det_judge,
+                            "det_reason": r0.get("det_reason", ""),
+                            "det_info": r0.get("det_info", {}),
+                            "vis_data": r0.get("vis_data"),
+                            "server": DETECTOR_URLS[sid],
+                        })
+
+                    return {"results": results, "details": details, "errors": errors}
+
+            except Exception as e:
+                errors.append(f"{detect_url} exception: {repr(e)}")
+
+            finally:
+                slot_q.put_nowait(sid)
+
+            await asyncio.sleep(0.1 * (attempt + 1))
+
+    return {
+        "results": results,
+        "details": details,
+        "errors": errors if errors else ["All detector servers failed"],
+    }
+
+
+def _compute_detector_bonus(detector_response, detection_results) -> float:
+    """Compute detector bonus reward: ratio of passed detections (0..1)."""
+    if not detection_results or not detector_response:
+        return 0.0
+    det_results_dict = detector_response.get("results", {})
+    if not det_results_dict:
+        return 0.0
+    return sum(det_results_dict.values()) / len(det_results_dict)
+
+
 async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback, vqa_question, extra_info, task_id):
     """Async version of compute_score"""
     reward_score = 0.0
     reward_extra_info = {}
 
-    if task_id == 1: # Total score: 1.0
-        vqa_response = await get_response(get_messages, prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback, vqa_question, extra_info, task_id)
-    
+    if task_id == 1: # Total score: vqa (0..1) + detector bonus (0..1)
+        # Parse detection items from feedback_tuple
+        detection_results = verify_detection_single(feedback_tuple)
+
+        # Launch VQA and detector in parallel
+        vqa_task = asyncio.create_task(
+            get_response(get_messages, prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback, vqa_question, extra_info, task_id)
+        )
+        detector_task = None
+        if detection_results and DETECTOR_URLS:
+            detector_task = asyncio.create_task(
+                request_detector_single(detection_results, gen_img)
+            )
+
+        vqa_response = await vqa_task
+        detector_response = (await detector_task) if detector_task else {"results": {}, "details": [], "errors": []}
+
+        # VQA score
         vqa_score = 0.0
         if vqa_response is None:
             print(f"[REWARD] Task {task_id}: vqa_response is None")
@@ -581,6 +821,12 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
         reward_score += vqa_score
         reward_extra_info[f"task{task_id}_vqa_reward"] = vqa_score
         reward_extra_info[f"task{task_id}_vqa_reward_response"] = vqa_response if not isinstance(vqa_response, Exception) else str(vqa_response)
+
+        # Detector bonus
+        detector_bonus = _compute_detector_bonus(detector_response, detection_results)
+        reward_score += detector_bonus
+        reward_extra_info[f"task{task_id}_detector_reward"] = detector_bonus
+        reward_extra_info[f"task{task_id}_detector_details"] = detector_response.get("details", [])
 
     elif task_id == 2: # Total score: format 1.0 + decompose 0..1 + stage judges geometric mean 0..1
         formatting_evaluator = FormattingEvaluatorV2()
@@ -679,7 +925,7 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
         reward_extra_info["task2_vqa_to_feedback_reward"] = s4
         reward_extra_info["task2_vqa_to_feedback_response"] = s4_resp if not isinstance(s4_resp, Exception) else str(s4_resp)
 
-    elif task_id == 3: # Total score: vqa_reward (0..1) + edit_reward (0..2)
+    elif task_id == 3: # Total score: sqrt(vqa*2 * edit) + detector bonus (0..1)
         no_feedback_needed = (
             (predicted_feedback is not None and "no need to generate feedback" in predicted_feedback.lower())
             or "no need to generate" in (feedback_text or '').lower()
@@ -690,17 +936,28 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
             reward_extra_info[f"task{task_id}_vqa_reward_response"] = "No need to get VQA reward."
             reward_extra_info[f"task{task_id}_edit_reward"] = reward_score
             reward_extra_info[f"task{task_id}_edit_reward_response"] = "No need to get edit reward."
+            reward_extra_info[f"task{task_id}_detector_reward"] = 0.0
             return {"score": reward_score, "reward_extra_info": reward_extra_info}
 
-        args = (prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback, vqa_question, extra_info, task_id)
+        # Parse detection items from feedback_tuple
+        detection_results = verify_detection_single(feedback_tuple)
+
+        call_args = (prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback, vqa_question, extra_info, task_id)
         async def _none():
             return None
 
-        vqa_response, edit_response = await asyncio.gather(
-            get_response(get_messages, *args) if regen_img is not None else _none(),
+        # Launch VQA, edit, and detector in parallel
+        vqa_response, edit_response, detector_response = await asyncio.gather(
+            get_response(get_messages, *call_args) if regen_img is not None else _none(),
             get_response(get_messages_task3_edit, gen_img, predicted_feedback, regen_img) if regen_img is not None else _none(),
+            request_detector_single(detection_results, regen_img) if (detection_results and DETECTOR_URLS and regen_img is not None) else _none(),
             return_exceptions=True,
         )
+
+        # Handle detector exception from gather
+        if isinstance(detector_response, Exception):
+            print(f"[REWARD] Task {task_id}: detector exception: {detector_response}")
+            detector_response = None
 
         vqa_score = 0.0
         if vqa_response is None:
@@ -725,6 +982,12 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
         reward_extra_info[f"task{task_id}_vqa_reward_response"] = vqa_response if not isinstance(vqa_response, Exception) else str(vqa_response)
         reward_extra_info[f"task{task_id}_edit_reward"] = edit_score
         reward_extra_info[f"task{task_id}_edit_reward_response"] = edit_response if not isinstance(edit_response, Exception) else str(edit_response)
+
+        # Detector bonus
+        detector_bonus = _compute_detector_bonus(detector_response, detection_results)
+        reward_score += detector_bonus
+        reward_extra_info[f"task{task_id}_detector_reward"] = detector_bonus
+        reward_extra_info[f"task{task_id}_detector_details"] = detector_response.get("details", []) if detector_response else []
     
     return {
         "score": reward_score,
