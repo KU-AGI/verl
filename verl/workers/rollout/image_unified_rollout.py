@@ -522,6 +522,11 @@ class ImageUnifiedRollout(BaseRollout):
         B, C, H, W = gen_imgs_tensor.shape
         data_proto.batch["task1_gen_img_tokens"] = generated_tokens.detach().cpu()
         data_proto.batch["task1_response_mask"] = torch.ones((B, generated_tokens.size(1)), dtype=torch.long).cpu()
+
+        # Seed the "current image" stream consumed by task2/task3 on the first turn.
+        data_proto.batch["current_imgs_pixel_values"] = gen_imgs_tensor.cpu().clone()
+        data_proto.batch["current_img_tokens"] = generated_tokens.detach().cpu().clone()
+
         if dist.get_rank() == 0:
             print(f"[IMG_GEN] Created DataProto with batch_size: {batch_size}")
 
@@ -607,11 +612,14 @@ class ImageUnifiedRollout(BaseRollout):
         if dist.get_rank() == 0:
             print(f"[TEXT_GEN] Input batch_size: {batch_size}")
         
-        # Get images from batch
-        gen_imgs_pixel_values = data_proto.batch.get('task1_gen_imgs_pixel_values', [])
+        # Get images from batch — task2 always critiques the "current" image
+        # (seeded from task1 on turn 0, rolled forward from task3 on later turns).
+        gen_imgs_pixel_values = data_proto.batch.get('current_imgs_pixel_values', None)
+        if gen_imgs_pixel_values is None or len(gen_imgs_pixel_values) == 0:
+            gen_imgs_pixel_values = data_proto.batch.get('task1_gen_imgs_pixel_values', [])
         if len(gen_imgs_pixel_values) == 0:
-            raise ValueError("No images found in batch['task1_gen_imgs_pixel_values']")
-        
+            raise ValueError("No images found in batch['current_imgs_pixel_values' or 'task1_gen_imgs_pixel_values']")
+
         # Process all images in batch
         if dist.get_rank() == 0:
             print(f"[TEXT_GEN] Processing feedback for {len(gen_imgs_pixel_values)} images in batch")
@@ -677,12 +685,15 @@ class ImageUnifiedRollout(BaseRollout):
         if dist.get_rank() == 0:
             print(f"[REGEN] Input batch_size: {batch_size}")
 
-        # Get data from batch
-        gen_imgs_pixel_values = data_proto.batch.get('task1_gen_imgs_pixel_values', [])
+        # Get data from batch — task3 regenerates from the "current" image
+        # (seeded from task1 on turn 0, rolled forward from the previous turn's task3).
+        gen_imgs_pixel_values = data_proto.batch.get('current_imgs_pixel_values', None)
+        if gen_imgs_pixel_values is None or len(gen_imgs_pixel_values) == 0:
+            gen_imgs_pixel_values = data_proto.batch.get('task1_gen_imgs_pixel_values', [])
         feedback_texts = data_proto.non_tensor_batch.get('task2_feedback_texts', [])
-        
+
         if len(gen_imgs_pixel_values) == 0:
-            raise ValueError("No images found in batch['task1_gen_imgs_pixel_values']")
+            raise ValueError("No images found in batch['current_imgs_pixel_values' or 'task1_gen_imgs_pixel_values']")
         if len(feedback_texts) == 0:
             raise ValueError("No feedback texts found in non_tensor_batch['task2_feedback_texts']")
 
@@ -729,8 +740,11 @@ class ImageUnifiedRollout(BaseRollout):
 
         B, C, H, W = gen_imgs_pixel_values.shape
 
-        # embedding
-        image_ids = data_proto.batch.get('task1_gen_img_tokens', [])
+        # embedding — use the "current" image codebook tokens (task1 on turn 0,
+        # previous turn's task3 regen thereafter).
+        image_ids = data_proto.batch.get('current_img_tokens', None)
+        if image_ids is None or len(image_ids) == 0:
+            image_ids = data_proto.batch.get('task1_gen_img_tokens', [])
         image_ids = image_ids.to(self.device).long()
 
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
@@ -761,6 +775,12 @@ class ImageUnifiedRollout(BaseRollout):
         # For reproducing regen images
         data_proto.batch["task3_regen_img_tokens"] = regenerated_tokens.detach().cpu()
         data_proto.batch["task3_response_mask"] = torch.ones((batch_size, regenerated_tokens.size(1)), dtype=torch.long).cpu()
+
+        # Roll the "current image" stream forward so the next turn's task2/task3
+        # consume this turn's regenerated image.
+        data_proto.batch["current_imgs_pixel_values"] = regen_imgs_tensor.cpu().clone()
+        data_proto.batch["current_img_tokens"] = regenerated_tokens.detach().cpu().clone()
+
         if dist.get_rank() == 0:
             print(f"[IMG_GEN] Created DataProto with batch_size: {batch_size}")
 

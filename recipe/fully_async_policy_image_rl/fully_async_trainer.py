@@ -16,7 +16,7 @@ import os
 import time
 from datetime import datetime
 from pprint import pprint
-from typing import Any
+from typing import Any, Optional
 import threading
 import queue
 
@@ -222,13 +222,38 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
 
                 deserialized = ray.cloudpickle.loads(sample_data)
 
-                # Assemble single sample into DataProto
-                batch = assemble_batch_from_rollout_samples(
-                    [deserialized], self.tokenizer, self.config, balance_fn
-                )
+                # Multi-turn: prefer per-task batches produced by the orchestrator
+                # so task1 / task2 / task3 buffers each receive their own distinct
+                # rollouts (task1 = unique rollouts, task2/task3 = per-turn).
+                # Legacy: fall back to a single assembled batch shared across tasks.
+                multi_turn_task_batches = getattr(deserialized, "task_batches", None)
+
+                def _assemble_for_tid(tid: int) -> Optional[DataProto]:
+                    if multi_turn_task_batches is not None:
+                        task_dp = multi_turn_task_batches.get(tid)
+                        if task_dp is None:
+                            return None
+                        # Reuse assemble_batch's meta_info aggregation + token_lens
+                        # logic by temporarily swapping rs.full_batch to the per-task
+                        # DP for this assembly call.
+                        original_full = deserialized.full_batch
+                        deserialized.full_batch = task_dp
+                        try:
+                            return assemble_batch_from_rollout_samples(
+                                [deserialized], self.tokenizer, self.config, balance_fn
+                            )
+                        finally:
+                            deserialized.full_batch = original_full
+                    # Legacy path: same batch for all tasks.
+                    return assemble_batch_from_rollout_samples(
+                        [deserialized], self.tokenizer, self.config, balance_fn
+                    )
 
                 # Push to all task buffers (lock is inside replay_buffer)
                 for tid in self._feeder_task_ids:
+                    batch = _assemble_for_tid(tid)
+                    if batch is None:
+                        continue
                     stored = self.replay_buffer.push(batch, tid)
                     if stored > 0:
                         n = self.config.actor_rollout_ref.rollout.n
@@ -804,13 +829,27 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                     combined.non_tensor_batch[key] = other.non_tensor_batch[key]
 
             # Alias cross-task context keys so dp_actor can use the correct
-            # context for each task's replay samples (avoids misalignment).
-            # task2 forward needs task1_gen_imgs_pixel_values from task2's trajectory
-            # task3 forward needs task1_gen_img_tokens from task3's trajectory
-            if task_id == 2 and "task1_gen_imgs_pixel_values" in other.batch.keys():
-                combined.batch["task2_task1_gen_imgs_pixel_values"] = other.batch["task1_gen_imgs_pixel_values"]
-            elif task_id == 3 and "task1_gen_img_tokens" in other.batch.keys():
-                combined.batch["task3_task1_gen_img_tokens"] = other.batch["task1_gen_img_tokens"]
+            # INPUT context (= the image actually shown to the policy at
+            # rollout time) for each task's replay samples. Under multi-turn,
+            # task2/task3 consume `current_*` (rolling image stream), not
+            # task1's original output. Fall back to `task1_*` for single-turn
+            # batches that have no `current_*` stamped.
+            if task_id == 2:
+                src_key = (
+                    "current_imgs_pixel_values"
+                    if "current_imgs_pixel_values" in other.batch.keys()
+                    else "task1_gen_imgs_pixel_values"
+                )
+                if src_key in other.batch.keys():
+                    combined.batch["task2_task1_gen_imgs_pixel_values"] = other.batch[src_key]
+            elif task_id == 3:
+                src_key = (
+                    "current_img_tokens"
+                    if "current_img_tokens" in other.batch.keys()
+                    else "task1_gen_img_tokens"
+                )
+                if src_key in other.batch.keys():
+                    combined.batch["task3_task1_gen_img_tokens"] = other.batch[src_key]
 
             # Alias sample_param_version per task so _collect_task_metrics
             # uses the correct replay freshness versions for each task.

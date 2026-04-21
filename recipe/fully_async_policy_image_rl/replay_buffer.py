@@ -14,8 +14,19 @@ from recipe.fully_async_policy_image_rl.detach_utils import (
 
 @dataclass
 class BufferEntry:
-    """Single uid-group entry in the replay buffer."""
+    """Single (uid, turn_idx)-group entry in the replay buffer.
+
+    Multi-turn rollouts produce multiple rows per uid (one per turn for task2
+    and task3). We key each entry by the `(uid, turn_idx)` pair so:
+      * Pushes coming from different turns of the same uid produce distinct
+        entries rather than collapsing into one big per-uid group.
+      * Sampling naturally picks per-(uid, turn) groups, which matches the
+        GRPO group-size assumption on downstream training.
+    `turn_idx=0` for task1 pushes (task1 only runs in turn 0) and for any
+    batch that does not carry a `turn_idx` column (single-turn legacy path).
+    """
     uid: str
+    turn_idx: int
     data: DataProto
     param_version: int
     mean_reward: float
@@ -94,18 +105,30 @@ class ReplayBuffer:
         uids = batch.non_tensor_batch["uid"]
         param_versions = batch.non_tensor_batch["param_version"]
 
-        uid_idxs: dict[str, list[int]] = {}
+        # Per-turn grouping: rows are keyed by (uid, turn_idx) so each turn's
+        # rollout of the same prompt lives in its own group entry. turn_idx
+        # may come from the non_tensor_batch (multi-turn) or from the batch
+        # tensor (trainer stamping). Single-turn or missing → default to 0.
+        turn_idx_arr = None
+        if "turn_idx" in batch.non_tensor_batch:
+            turn_idx_arr = batch.non_tensor_batch["turn_idx"]
+        elif "turn_idx" in batch.batch:
+            t = batch.batch["turn_idx"]
+            turn_idx_arr = t.detach().cpu().numpy() if hasattr(t, "detach") else np.asarray(t)
+
+        key_idxs: dict[tuple[str, int], list[int]] = {}
         for i, uid in enumerate(uids):
-            uid_idxs.setdefault(uid, []).append(i)
+            t_idx = int(turn_idx_arr[i]) if turn_idx_arr is not None else 0
+            key_idxs.setdefault((uid, t_idx), []).append(i)
 
         task_prefix = f"task{task_id}_"
         total_stored = 0
         entries_to_add: list[BufferEntry] = []
 
         allowed_prefixes = tuple(f"task{t}_" for t in range(1, task_id + 1))
-        base_ntb = {"uid", "param_version", "data_source", "prompt_id", "prompt", "reward_model"}
+        base_ntb = {"uid", "turn_idx", "trajectory_id", "param_version", "data_source", "prompt_id", "prompt", "reward_model"}
 
-        for uid, idxs in uid_idxs.items():
+        for (uid, turn_idx), idxs in key_idxs.items():
             uid_scores = [scores[i].item() for i in idxs]
             if any(s < 0 for s in uid_scores):
                 continue
@@ -121,19 +144,45 @@ class ReplayBuffer:
             filtered = _slice_dataproto_with_meta(batch, idxs)
 
             cross_task_vals = {}
+            # Multi-turn: task2/task3 training should consume the image the
+            # policy actually saw at rollout time (`current_*` rolls forward
+            # per turn). Fall back to `task1_*` when `current_*` isn't
+            # stamped (single-turn legacy batches).
             if task_id == 2:
-                if "task1_gen_imgs_pixel_values" in filtered.batch.keys():
-                    cross_task_vals["task2_task1_gen_imgs_pixel_values"] = filtered.batch["task1_gen_imgs_pixel_values"]
+                img_src = (
+                    "current_imgs_pixel_values"
+                    if "current_imgs_pixel_values" in filtered.batch.keys()
+                    else "task1_gen_imgs_pixel_values"
+                )
+                if img_src in filtered.batch.keys():
+                    cross_task_vals["task2_task1_gen_imgs_pixel_values"] = filtered.batch[img_src]
                 if "task1_token_level_scores" in filtered.batch.keys():
                     cross_task_vals["task2_task1_token_level_scores"] = filtered.batch["task1_token_level_scores"]
             elif task_id == 3:
-                if "task1_gen_img_tokens" in filtered.batch.keys():
-                    cross_task_vals["task3_task1_gen_img_tokens"] = filtered.batch["task1_gen_img_tokens"]
+                tok_src = (
+                    "current_img_tokens"
+                    if "current_img_tokens" in filtered.batch.keys()
+                    else "task1_gen_img_tokens"
+                )
+                if tok_src in filtered.batch.keys():
+                    cross_task_vals["task3_task1_gen_img_tokens"] = filtered.batch[tok_src]
                 if "task1_token_level_scores" in filtered.batch.keys():
                     cross_task_vals["task3_task1_token_level_scores"] = filtered.batch["task1_token_level_scores"]
                 if "task2_token_level_scores" in filtered.batch.keys():
                     cross_task_vals["task3_task2_token_level_scores"] = filtered.batch["task2_token_level_scores"]
+            # Preserve trajectory-level outcome fields (stamped per-row by the
+            # orchestrator in `_attach_outcome_per_row`) and `turn_idx` (per-
+            # row turn origin). They don't carry a `taskN_` prefix so the
+            # strip-below would drop them — trainer's GRPO outcome advantage,
+            # rollout logging, and per-turn diagnostics all read these.
+            keep_non_task_prefix = {
+                "outcome_token_level_scores",
+                "outcome_task_id",
+                "turn_idx",
+            }
             for k in list(filtered.batch.keys()):
+                if k in keep_non_task_prefix:
+                    continue
                 if not k.startswith(task_prefix):
                     del filtered.batch[k]
             for k, val in cross_task_vals.items():
@@ -163,6 +212,7 @@ class ReplayBuffer:
 
             entries_to_add.append(BufferEntry(
                 uid=uid,
+                turn_idx=int(turn_idx),
                 data=filtered,
                 param_version=version,
                 mean_reward=mean_reward,

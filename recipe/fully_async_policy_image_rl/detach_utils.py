@@ -150,7 +150,10 @@ def postprocess_agent_loop_outputs(rs_or_list: Union["RolloutSample", list], tok
 class RolloutSample:
     """Enhanced rollout sample containing both original batch info and AgentLoopOutput"""
 
-    # Original batch information
+    # Original batch information. In multi-turn mode, `full_batch` is a
+    # legacy-compat flat concatenation of `task_batches` values tagged with
+    # `origin_task_id`; consumers that need per-task granularity should read
+    # `task_batches` directly.
     full_batch: Any
 
     # AgentLoopOutput from generation
@@ -172,6 +175,14 @@ class RolloutSample:
     original_prompt_batch: Any = None      # pre-generation prompt batch (for retry)
     accumulated_good_batch: Any = None     # DataProto of good samples kept across retries
     retry_count: int = 0                   # number of retries attempted so far
+
+    # Multi-turn: per-task DataProto dict {1: task1_dp, 2: task2_dp, 3: task3_dp}.
+    # task1_dp holds unique task1 rollouts (turn 0 only), task2_dp/task3_dp hold
+    # per-turn concatenated rollouts with `turn_idx` stamped per row. Rows also
+    # carry `outcome_token_level_scores` and `outcome_task_id` set by the
+    # orchestrator. None means the task did not produce output this rollout
+    # (e.g., task3_dp is None when every turn early-terminated at task2).
+    task_batches: Optional[dict[int, Any]] = None
 
 
 @dataclass
@@ -501,25 +512,60 @@ def merge_rollout_sample(config, tokenizer, rs: RolloutSample, processor):
 def expand_rollout_sample(rs: RolloutSample) -> list[RolloutSample]:
     uids = rs.full_batch.non_tensor_batch['uid']
     original_batch_size = len(uids)
-    
+
     uid_to_indices = {}
     for i, uid in enumerate(uids):
         if uid not in uid_to_indices:
             uid_to_indices[uid] = []
         uid_to_indices[uid].append(i)
 
+    # Per-task uid-index maps so we can slice each `task_batches[tid]` to the
+    # rows belonging to this uid. task2/task3 DPs may have more rows than
+    # `full_batch` (e.g. multi-turn concat), so indices here differ from the
+    # full_batch indices above.
+    src_task_batches = getattr(rs, "task_batches", None)
+    per_task_uid_indices: dict[int, dict] = {}
+    per_task_sizes: dict[int, int] = {}
+    if src_task_batches is not None:
+        for tid, tdp in src_task_batches.items():
+            if tdp is None or "uid" not in tdp.non_tensor_batch:
+                continue
+            per_task_sizes[tid] = len(tdp)
+            m: dict = {}
+            for i, u in enumerate(tdp.non_tensor_batch["uid"]):
+                m.setdefault(u, []).append(i)
+            per_task_uid_indices[tid] = m
+
     individual_samples = []
 
     for uid, indices in uid_to_indices.items():
         group_batch = rs.full_batch[indices]
-        
+
         if getattr(rs.full_batch, "meta_info", None) is not None:
             group_batch.meta_info = deep_slice_meta(rs.full_batch.meta_info, indices, original_batch_size)
+
+        # Slice each task_batches[tid] by this uid's rows in THAT DP, so the
+        # trainer's BufferFeeder sees per-task DPs with `taskN_token_level_scores`
+        # present — otherwise it falls back to `full_batch` (a single task's
+        # DP) and task3/task2 pushes miss their score key.
+        group_task_batches: Optional[dict[int, Any]] = None
+        if src_task_batches is not None:
+            group_task_batches = {}
+            for tid, tdp in src_task_batches.items():
+                if tdp is None:
+                    group_task_batches[tid] = None
+                    continue
+                uid_idx = per_task_uid_indices.get(tid, {}).get(uid, [])
+                if not uid_idx:
+                    group_task_batches[tid] = None
+                    continue
+                sub = _slice_dataproto_with_meta(tdp, uid_idx)
+                group_task_batches[tid] = sub
 
         group_sample_id = f"{rs.sample_id}_{uid}"
         individual_sample = RolloutSample(
             full_batch=group_batch,
-            agent_loop_output_list=[], 
+            agent_loop_output_list=[],
             sample_id=group_sample_id,
             epoch=rs.epoch,
             tool_calls=rs.tool_calls,
@@ -528,6 +574,7 @@ def expand_rollout_sample(rs: RolloutSample) -> list[RolloutSample]:
             param_version_end=[rs.param_version_end[i] for i in indices] if isinstance(rs.param_version_end, list) else rs.param_version_end,
             processing_times=[rs.processing_times[i] for i in indices] if rs.processing_times else [0.0],
             rollout_status=rs.rollout_status,
+            task_batches=group_task_batches,
         )
         individual_samples.append(individual_sample)
 
@@ -990,7 +1037,14 @@ def _select_diverse_candidates(
 
 
 def _slice_rollout_sample(rs: RolloutSample, indices: list) -> RolloutSample:
-    """Return a new RolloutSample containing only *indices* rows from rs.full_batch."""
+    """Return a new RolloutSample containing only *indices* rows from rs.full_batch.
+
+    `task_batches` is passed through unchanged (each task DP still has rows for
+    all uids). Downstream `expand_rollout_sample` selects per-uid rows from
+    each task DP based on the sliced `full_batch`'s uids, so carrying the
+    full task DPs here is correct and lets the trainer's BufferFeeder find
+    `taskN_token_level_scores` in its task-specific batch.
+    """
     original_size = len(rs.full_batch)
     sub_batch = rs.full_batch[indices]
 
@@ -1016,6 +1070,7 @@ def _slice_rollout_sample(rs: RolloutSample, indices: list) -> RolloutSample:
         param_version_end=pv_end,
         rollout_status=rs.rollout_status,
         original_prompt_batch=rs.original_prompt_batch,
+        task_batches=getattr(rs, "task_batches", None),
     )
 
 
@@ -1028,6 +1083,25 @@ def _make_assembled_rollout_sample(rs: RolloutSample, final_batch: DataProto, ui
         "param_version_start": rs.param_version,
         "param_version_end":   rs.param_version,
     })
+
+    # Slice each per-task DP to rows matching this uid so the trainer's
+    # BufferFeeder sees `taskN_token_level_scores` for task3/task2 pushes.
+    # Falling back to a single `full_batch` across tasks (the old behavior)
+    # loses per-task reward keys and drops task3 pushes in the replay buffer.
+    src_task_batches = getattr(rs, "task_batches", None)
+    group_task_batches: Optional[dict[int, Any]] = None
+    if src_task_batches is not None:
+        group_task_batches = {}
+        for tid, tdp in src_task_batches.items():
+            if tdp is None or "uid" not in tdp.non_tensor_batch:
+                group_task_batches[tid] = None
+                continue
+            uid_idx = [i for i, u in enumerate(tdp.non_tensor_batch["uid"]) if u == uid]
+            if not uid_idx:
+                group_task_batches[tid] = None
+                continue
+            group_task_batches[tid] = _slice_dataproto_with_meta(tdp, uid_idx)
+
     return RolloutSample(
         full_batch=final_batch,
         agent_loop_output_list=[],
@@ -1039,6 +1113,7 @@ def _make_assembled_rollout_sample(rs: RolloutSample, final_batch: DataProto, ui
         param_version_start=[rs.param_version] * n,
         param_version_end=[rs.param_version] * n,
         rollout_status=rs.rollout_status,
+        task_batches=group_task_batches,
     )
 
 
@@ -1051,7 +1126,21 @@ def quality_filter_rollout_sample(
     use_salvage: bool = True,
     task1_salvage_threshold: float = 1.0,
 ) -> tuple:
+    """Per-UID quality filter over `rollout_sample.full_batch`.
 
+    NOTE (multi-turn): when the orchestrator produces `rollout_sample.task_batches`,
+    `full_batch` is a legacy-compat view equal to `task_batches[2]` (task2 DP
+    across all turns) — not a single-turn batch. Consequences:
+      * Each UID has `max_turns * group_size` rows instead of `group_size`,
+        so the task1-salvage `n_group >= group_size` check still fires but
+        the subsequent `slice(..., range(group_size))` takes the first
+        `group_size` rows arbitrarily (task2-turn ordering).
+      * `task3_token_level_scores` is not present on task2_dp rows, so the
+        `== -100` bad-check always skips (cannot mark task3-failed rows bad).
+    For proper per-task filtering in multi-turn mode, call this function
+    on each `task_batches[task_id]` individually with task-specific
+    thresholds. That refactor is out of scope for this patch.
+    """
     current_batch = rollout_sample.full_batch
     uids = current_batch.non_tensor_batch["uid"]
     is_retry = rollout_sample.retry_count > 0

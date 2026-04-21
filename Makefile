@@ -79,7 +79,7 @@ start-vllm-servers:
 	done
 
 start-sglang-servers:
-	for GPU in 6 ; do \
+	for GPU in 7 ; do \
 		PORT=$$((8000 + $$GPU)) ; \
 		docker run --rm -d --name ${SGLANG_CONTAINER_NAME_PREFIX}$$GPU \
 			--gpus all \
@@ -92,7 +92,7 @@ start-sglang-servers:
 			--ipc=host \
 			lmsysorg/sglang:latest \
 			python -m sglang.launch_server \
-			--model-path Qwen/Qwen3.5-27B \
+			--model-path Qwen/Qwen3.5-35B-A3B \
 			--host 0.0.0.0 \
 			--port 8000 \
 			--mem-fraction-static 0.95 \
@@ -102,6 +102,11 @@ start-sglang-servers:
 			--speculative-num-steps 3 \
 			--speculative-eagle-topk 1 \
 			--speculative-num-draft-tokens 4 ; \
+	done
+
+stop-sglang-servers:
+	for GPU in 0 1 2 3 4 5 6 7 ; do \
+		docker stop ${SGLANG_CONTAINER_NAME_PREFIX}$$GPU || true ; \
 	done
 
 stop-servers:
