@@ -45,7 +45,11 @@ class ImageGenerationRolloutConfig(RolloutConfig):
     feedback_system_prompt : Optional[str] = None
     regen_system_prompt : Optional[str] = None
     image_token_num_per_image: int = 576
-    
+
+    # Multi-turn rollout knob: orchestrator runs `task1 -> (task2 -> task3) x max_turns`.
+    # Single-turn behavior is recovered with max_turns=1.
+    max_turns: int = 1
+
     val_kwargs: ImageGenerationSamplingConfig = field(default_factory=ImageGenerationSamplingConfig)
 
 

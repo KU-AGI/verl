@@ -21,6 +21,7 @@ import ray
 import torch
 from ray import ObjectRef
 import uuid
+from typing import Any
 
 from recipe.fully_async_policy_image_rl.detach_utils import (
     RolloutSample,
@@ -189,6 +190,20 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         self._version_retry_counts = []      # prompt: sent to retry queue
         self._version_dropped_counts = []    # prompt: dropped (max retries exceeded)
         self._version_retry_sum = []         # (assembled+dropped) * retry_count → avg_retry_count 계산용
+
+        # Per-task reward means (sum/count per sample, averaged at flush time)
+        self._version_task_reward_sum = {1: [], 2: [], 3: []}
+        self._version_task_reward_rows = {1: [], 2: [], 3: []}
+
+        # Outcome attribution — uses task1 batch (one row per trajectory) when
+        # available, so counts are trajectory-level. Tracks origin distribution
+        # (task1 = early-terminated vs task3 = completed regen) and the
+        # outcome reward mean split by origin.
+        self._version_outcome_task1_rows = []
+        self._version_outcome_task3_rows = []
+        self._version_outcome_task1_reward_sum = []
+        self._version_outcome_task3_reward_sum = []
+
         self._version_start_sample_count = 0
         self._version_start_time = None
 
@@ -351,6 +366,34 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             if retry_attempted > 0:
                 timing_raw["rollouter/avg_retry_count"] = total_retry_sum / retry_attempted
 
+            # Per-task reward mean (row-level across this version's samples)
+            for tid in (1, 2, 3):
+                total_rows = sum(self._version_task_reward_rows[tid])
+                if total_rows > 0:
+                    total_sum = sum(self._version_task_reward_sum[tid])
+                    timing_raw[f"rollouter/task{tid}_reward_mean"] = total_sum / total_rows
+
+            # Outcome attribution (trajectory-level when task1 is used as source)
+            total_outcome_t1 = sum(self._version_outcome_task1_rows)
+            total_outcome_t3 = sum(self._version_outcome_task3_rows)
+            total_outcome    = total_outcome_t1 + total_outcome_t3
+            if total_outcome > 0:
+                timing_raw["rollouter/outcome_from_task1_frac"] = total_outcome_t1 / total_outcome
+                timing_raw["rollouter/outcome_from_task3_frac"] = total_outcome_t3 / total_outcome
+            if total_outcome_t1 > 0:
+                timing_raw["rollouter/outcome_task1_reward_mean"] = (
+                    sum(self._version_outcome_task1_reward_sum) / total_outcome_t1
+                )
+            if total_outcome_t3 > 0:
+                timing_raw["rollouter/outcome_task3_reward_mean"] = (
+                    sum(self._version_outcome_task3_reward_sum) / total_outcome_t3
+                )
+            if total_outcome > 0:
+                timing_raw["rollouter/outcome_reward_mean"] = (
+                    sum(self._version_outcome_task1_reward_sum)
+                    + sum(self._version_outcome_task3_reward_sum)
+                ) / total_outcome
+
             # Reset accumulators for next version
             self._version_rollout_durations = []
             self._version_finalize_durations = []
@@ -360,6 +403,12 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             self._version_retry_counts = []
             self._version_dropped_counts = []
             self._version_retry_sum = []
+            self._version_task_reward_sum = {1: [], 2: [], 3: []}
+            self._version_task_reward_rows = {1: [], 2: [], 3: []}
+            self._version_outcome_task1_rows = []
+            self._version_outcome_task3_rows = []
+            self._version_outcome_task1_reward_sum = []
+            self._version_outcome_task3_reward_sum = []
             self._version_start_sample_count = self.total_generated_samples
             self._version_start_time = current_time
 
@@ -803,17 +852,77 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             elif not sample_from_retry_queue:
                 self.pending_queue.task_done()
 
+    def _accumulate_rollout_metrics(self, task_batches):
+        """Push per-task reward + outcome attribution stats from a finalized
+        sample's task_batches into the per-version accumulators.
+
+        Per-task reward stats are row-level (task2/task3 rows may duplicate
+        across turns — that matches how the trainer sees them).
+        Outcome stats are trajectory-level when task1 batch is present (one
+        row per trajectory), otherwise fall back to task2/task3.
+        """
+        if not isinstance(task_batches, dict):
+            return
+
+        for tid in (1, 2, 3):
+            dp = task_batches.get(tid)
+            if dp is None or getattr(dp, "batch", None) is None:
+                continue
+            key = f"task{tid}_token_level_scores"
+            if key not in dp.batch:
+                continue
+            with torch.no_grad():
+                per_row = dp.batch[key].clamp(min=0).sum(dim=-1).float()
+            self._version_task_reward_sum[tid].append(float(per_row.sum().item()))
+            self._version_task_reward_rows[tid].append(int(per_row.numel()))
+
+        # Outcome source: prefer task1 (1 row per trajectory). Fall back to
+        # task2/task3 only if task1 is absent (e.g., task_ids=[2,3] configs).
+        outcome_dp = (
+            task_batches.get(1)
+            or task_batches.get(2)
+            or task_batches.get(3)
+        )
+        if (
+            outcome_dp is None
+            or getattr(outcome_dp, "batch", None) is None
+            or "outcome_token_level_scores" not in outcome_dp.batch
+            or "outcome_task_id" not in outcome_dp.batch
+        ):
+            return
+
+        with torch.no_grad():
+            outcome_rew = outcome_dp.batch["outcome_token_level_scores"].clamp(min=0).sum(dim=-1).float()
+            otid = outcome_dp.batch["outcome_task_id"]
+            m1 = (otid == 1)
+            m3 = (otid == 3)
+            n1 = int(m1.sum().item())
+            n3 = int(m3.sum().item())
+        self._version_outcome_task1_rows.append(n1)
+        self._version_outcome_task3_rows.append(n3)
+        self._version_outcome_task1_reward_sum.append(
+            float(outcome_rew[m1].sum().item()) if n1 > 0 else 0.0
+        )
+        self._version_outcome_task3_reward_sum.append(
+            float(outcome_rew[m3].sum().item()) if n3 > 0 else 0.0
+        )
+
     async def _compute_single_task_reward(
         self,
         task_id: int,
         batch_result: DataProto,
-        reward_results: dict,
     ):
-        """Compute reward for a single task asynchronously"""
+        """Run reward computation for one task and return
+        `(reward_tensor, reward_extra_infos_dict)`.
+
+        Returns None on failure. Attachment onto the originating batch is the
+        awaiter's responsibility (see `FullyAsyncAgentLoopManager._await_reward_task`).
+        Doing it there guarantees the mutation lands on the same DataProto
+        reference that the turn loop stored in its per-task batch lists.
+        """
         try:
             from recipe.image_rl.reward import compute_reward_async
 
-            # Launch async reward computation
             future = compute_reward_async.remote(
                 data=batch_result,
                 config=self.config,
@@ -821,24 +930,16 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 processor=self.processor,
                 reward_fn=None,
                 eval=False,
-                task_id=task_id
+                task_id=task_id,
             )
-
-            # Wait for reward computation to complete
-            reward_result = await asyncio.to_thread(ray.get, future)
-            reward_tensor, reward_extra_infos_dict = reward_result
-
-            # Store reward in reward_results
-            reward_results[f"task{task_id}_token_level_scores"] = reward_tensor
-
-            if "meta_info" not in reward_results:
-                reward_results["meta_info"] = {}
-            reward_results["meta_info"][f"task{task_id}_reward_extra_info"] = reward_extra_infos_dict
+            reward_tensor, reward_extra_infos_dict = await asyncio.to_thread(ray.get, future)
+            return reward_tensor, reward_extra_infos_dict
 
         except Exception as e:
             print(f"[Rollouter][RewardTask{task_id}] ERROR: {e}")
             import traceback
             traceback.print_exc()
+            return None
 
         finally:
             current_task = asyncio.current_task()
@@ -870,27 +971,42 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             rollout_sample.full_batch.meta_info["param_version_start"] = used_version
 
             sample_reward_tasks = []
-            reward_results = {}
 
             reward_task_ids = [2, 3] if task_ids == [3] else task_ids
 
             def on_task_complete(task_id: int, batch_result: DataProto):
-                # Only compute reward for tasks we actually train on
+                """Fire an async reward task that returns
+                `(reward_tensor, reward_extras)`. Agent loop attaches it to
+                the originating batch via `_await_reward_task`.
+                """
                 if task_id not in reward_task_ids:
-                    return
+                    return None
                 reward_task = asyncio.create_task(
-                    self._compute_single_task_reward(task_id, batch_result, reward_results),
+                    self._compute_single_task_reward(task_id, batch_result),
                     name=f"reward_task{task_id}_{rollout_sample.sample_id}",
                 )
                 sample_reward_tasks.append(reward_task)
                 asyncio.create_task(self._track_reward_task(reward_task))
+                return reward_task
 
-            result_batch = await self.async_rollout_manager.generate_sequences_with_callback_on_server(
+            result = await self.async_rollout_manager.generate_sequences_with_callback_on_server(
                 rollout_sample.full_batch,
                 server_index=server_index,
                 on_task_complete=on_task_complete,
             )
             await self._wait_server_idle(server_index)
+
+            # Orchestrator now always returns {task_id: DataProto | None}.
+            # Pick a legacy `full_batch` view from the dict so existing
+            # consumers that read `rollout_sample.full_batch` still work.
+            task_batches: dict[int, Any] = result if isinstance(result, dict) else {1: result}
+            legacy_full_batch = None
+            for tid in (2, 3, 1):
+                if task_batches.get(tid) is not None:
+                    legacy_full_batch = task_batches[tid]
+                    break
+            if legacy_full_batch is None:
+                raise RuntimeError("[Rollouter] generate_sequences returned empty task_batches dict")
 
             rollout_duration = time.perf_counter() - rollout_start_time
             if self.processed_sample_count % 100 == 0: # 10번째 샘플에 대해서만 출력 (Warm-up 고려)
@@ -905,19 +1021,20 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 self.active_sample_count -= batch_size
             active_released = True
 
-            result_batch.meta_info["param_version_end"] = self.current_param_version
+            legacy_full_batch.meta_info["param_version_end"] = self.current_param_version
             # Save pre-generation prompt batch for quality-filter retry before overwriting
             rollout_sample.original_prompt_batch = rollout_sample.full_batch
-            rollout_sample.full_batch = result_batch
+            rollout_sample.full_batch = legacy_full_batch
+            rollout_sample.task_batches = task_batches
             rollout_sample.agent_loop_output_list = []
-            n = len(result_batch)
+            n = len(legacy_full_batch)
             rollout_sample.param_version_start = [used_version] * n
             rollout_sample.param_version_end = [self.current_param_version] * n
             rollout_sample.processing_times = [rollout_duration] * n
 
             # 3) finalize 워커로 넘기고 즉시 종료
             await self.reward_finalize_queue.put(
-                (rollout_sample, sample_reward_tasks, reward_results, used_version, finalize_budget, rollout_duration)
+                (rollout_sample, sample_reward_tasks, used_version, finalize_budget, rollout_duration)
             )
             enqueued_to_finalize = True
             return  # 여기서 끝
@@ -998,29 +1115,20 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                     break
 
                 finalize_start_time = time.perf_counter()
-                rollout_sample, sample_reward_tasks, reward_results, used_version, finalize_budget, rollout_duration = item
+                rollout_sample, sample_reward_tasks, used_version, finalize_budget, rollout_duration = item
                 batch_size = len(rollout_sample.full_batch)
                 is_retry = rollout_sample.retry_count > 0
 
                 # 1. reward 완료 대기
+                # Reward tasks have already written per-row tensors into
+                # `batch.batch[task{id}_token_level_scores]` and extras into
+                # `batch.meta_info[task{id}_reward_extra_info]` on the batches
+                # they were fired against. No side-channel merge needed.
                 results = await asyncio.gather(*sample_reward_tasks, return_exceptions=True)
                 for r in results:
                     if isinstance(r, Exception):
                         import traceback
                         traceback.print_exception(type(r), r, r.__traceback__)
-
-                # 2. reward 결과 반영
-                for key, value in reward_results.items():
-                    if key != "meta_info":
-                        rollout_sample.full_batch.batch[key] = value
-
-                if "meta_info" in reward_results:
-                    if not hasattr(rollout_sample.full_batch, "meta_info"):
-                        rollout_sample.full_batch.meta_info = {}
-                    
-                    for task_key, task_extra_info in reward_results["meta_info"].items():
-                        for k, v in task_extra_info.items():
-                            rollout_sample.full_batch.meta_info[k] = v
 
                 rollout_sample.param_version = used_version
                 rollout_sample.rollout_status = {
@@ -1106,6 +1214,8 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                     # Accumulate per-version metrics for wandb logging
                     self._version_rollout_durations.append(rollout_duration)
                     self._version_finalize_durations.append(finalize_duration)
+                    # Per-task reward + outcome attribution stats
+                    self._accumulate_rollout_metrics(getattr(rollout_sample, "task_batches", None))
                     # 모든 누적기는 prompt(UID) 단위
                     n_assembled_p = len(assembled_groups)
                     n_dropped_p   = n_dropped // group_size

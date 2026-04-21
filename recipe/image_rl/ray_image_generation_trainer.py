@@ -385,7 +385,8 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
     def _dump_generations(self, uid, prompt_id, prompt, gen_imgs_pil_list, feedback_texts, regen_imgs_pil_list,
-                        gts_imgs, summarizes, gts_tuples, gts_vqas, scores, reward_extra_infos_dict, sample_versions, dump_path):
+                        gts_imgs, summarizes, gts_tuples, gts_vqas, scores, reward_extra_infos_dict, sample_versions,
+                        dump_path, turn_idxs=None, trajectory_ids=None):
 
         trainer_ver = getattr(self, "current_param_version", self.global_steps)
         step_dir = os.path.abspath(os.path.join(dump_path, str(trainer_ver)))
@@ -430,9 +431,9 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             summary_header = [
                 f"📋 GRPO COMPARISON SUMMARY | STEP: {self.current_param_version}",
                 f"Sample Path: {sample_dir}",
-                "=" * 170,
-                f"{'Rollout':<10} | {'T1':<5} | {'T2':<5} | {'T3':<5} | {'Total':<6} | {'Gen Path (Initial)':<65} | {'Regen Path (Edited)'}",
-                "-" * 170
+                "=" * 205,
+                f"{'Rollout':<10} | {'Traj':<5} | {'Turn':<4} | {'T1':<5} | {'T2':<5} | {'T3':<5} | {'Total':<6} | {'OutSrc':<6} | {'Outcome':<7} | {'Gen Path (Initial)':<65} | {'Regen Path (Edited)'}",
+                "-" * 205
             ]
             summary_rows = []
 
@@ -444,18 +445,28 @@ class RayImageGenerationTrainer(RayPPOTrainer):
 
                 # 이미지 저장
                 paths = self._save_images(rollout_dir, i, gen_imgs_pil_list, regen_imgs_pil_list, gts_imgs)
-                
+
                 # 점수 계산
                 t1 = self._get_safe_val(scores, 'task1_scores', i, 0.0)
                 t2 = self._get_safe_val(scores, 'task2_scores', i, 0.0)
                 t3 = self._get_safe_val(scores, 'task3_scores', i, 0.0)
                 total = sum(v for v in [t1, t2, t3] if v > -100) # exclude -100
-                
-                summary_rows.append(f"rollout_{r_idx:<3} | {t1:<5.2f} | {t2:<5.2f} | {t3:<5.2f} | {total:<6.2f} | {paths['gen']:<65} | {paths['regen']}")
+                outcome = self._get_safe_val(scores, 'outcome_scores', i, 0.0)
+                out_src_raw = self._get_safe_val(scores, 'outcome_task_id', i, 0)
+                # 0 = missing (shouldn't happen after attach); render as '-'
+                out_src = f"t{int(out_src_raw)}" if out_src_raw else "-"
+                turn = int(turn_idxs[i]) if (turn_idxs is not None and i < len(turn_idxs)) else 0
+                traj_raw = trajectory_ids[i] if (trajectory_ids is not None and i < len(trajectory_ids)) else -1
+                traj = int(traj_raw) if traj_raw is not None else -1
+
+                summary_rows.append(
+                    f"rollout_{r_idx:<3} | {traj:<5} | {turn:<4} | {t1:<5.2f} | {t2:<5.2f} | {t3:<5.2f} | {total:<6.2f} | "
+                    f"{out_src:<6} | {outcome:<7.2f} | {paths['gen']:<65} | {paths['regen']}"
+                )
 
                 # 개별 리포트 생성
-                item = {'rollout_idx': r_idx, 'uid': uid[i]}
-                self._write_detailed_report(rollout_dir, i, item, paths, prompt, feedback_texts, scores, 
+                item = {'rollout_idx': r_idx, 'uid': uid[i], 'turn_idx': turn, 'trajectory_id': traj}
+                self._write_detailed_report(rollout_dir, i, item, paths, prompt, feedback_texts, scores,
                                         summarizes, gts_tuples, gts_vqas, reward_extra_infos_dict)
 
             with open(summary_path, 'w', encoding='utf-8') as f:
@@ -520,7 +531,9 @@ class RayImageGenerationTrainer(RayPPOTrainer):
 
         txt_path = os.path.join(rollout_dir, "txt.txt")
         with open(txt_path, 'w', encoding='utf-8') as f:
-            f.write(f"📊 ROLLOUT REPORT | STEP: {self.global_steps} | ROLLOUT: {item['rollout_idx']}\n")
+            turn_part = f" | TURN: {item['turn_idx']}" if 'turn_idx' in item else ""
+            traj_part = f" | TRAJ: {item['trajectory_id']}" if 'trajectory_id' in item else ""
+            f.write(f"📊 ROLLOUT REPORT | STEP: {self.global_steps} | ROLLOUT: {item['rollout_idx']}{traj_part}{turn_part}\n")
             f.write(f"Location: {os.path.abspath(rollout_dir)}\n")
             f.write("=" * 100 + "\n")
             f.write(f"📝 [PROMPT]\n{prompt[i]}\n")
@@ -584,6 +597,18 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                         f.write(f"         judge={d.get('det_judge')} | reason={d.get('det_reason','')}\n")
                 f.write("\n")
 
+            # Trajectory-level outcome (same value across all rows of a uid
+            # group because outcomes are attributed per trajectory_id).
+            # Source = 1 means trajectory terminated at task2 (outcome = task1
+            # reward); 3 means trajectory completed task3 (outcome = mean of
+            # task3 rewards across turns the trajectory reached task3).
+            out_src_raw = self._get_safe_val(scores, 'outcome_task_id', i, 0)
+            if out_src_raw:
+                f.write(f"🎯 [OUTCOME]\n")
+                f.write(f"  - Source Task: task{int(out_src_raw)}\n")
+                f.write(f"  - Outcome Reward: {self._get_safe_val(scores, 'outcome_scores', i, 0.0):.4f}\n")
+                f.write("\n")
+
             f.write(f"📚 [GROUND TRUTH REFERENCE]\n")
             f.write(f"  - GT Image:\n{paths['gt']}\n")
             f.write(f"  - Summary:\n{summarizes[i] if summarizes else 'N/A'}\n")
@@ -635,6 +660,30 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             else:
                 sample_versions = [self.current_param_version] * len(batch)
 
+            # Per-row turn_idx (multi-turn rollout). Stamped by the orchestrator
+            # via `_stamp_turn_idx`; may live in `batch` (tensor) or
+            # `non_tensor_batch` (post-replay-buffer passthrough). Default 0 if
+            # missing (single-turn / legacy).
+            turn_idxs = None
+            if 'turn_idx' in batch.non_tensor_batch:
+                ti = batch.non_tensor_batch['turn_idx']
+                turn_idxs = ti.tolist() if hasattr(ti, 'tolist') else list(ti)
+            elif 'turn_idx' in batch.batch:
+                ti = batch.batch['turn_idx']
+                turn_idxs = ti.detach().cpu().tolist() if hasattr(ti, 'detach') else list(ti)
+            else:
+                turn_idxs = [0] * len(batch)
+
+            # Per-row trajectory_id. Stamped by the orchestrator via
+            # `_stamp_trajectory_ids` so rows from the same trajectory
+            # (possibly across turns / padded duplicates) share an id.
+            trajectory_ids = None
+            if 'trajectory_id' in batch.non_tensor_batch:
+                ti = batch.non_tensor_batch['trajectory_id']
+                trajectory_ids = ti.tolist() if hasattr(ti, 'tolist') else list(ti)
+            else:
+                trajectory_ids = [-1] * len(batch)
+
             scores = {}
             # Add all task scores; for replay task_batch use cross-task aliases as fallback
             for tid in [1, 2, 3]:
@@ -647,6 +696,14 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                         if cross_key in batch.batch:
                             scores[f"task{tid}_scores"] = batch.batch[cross_key].sum(-1).cpu().tolist()
                             break
+
+            # Outcome reward (per-row trajectory outcome) + source task id
+            # (1 = early-terminated at task2, 3 = completed task3). Stamped by
+            # the orchestrator in `_attach_outcome_per_row`.
+            if "outcome_token_level_scores" in batch.batch:
+                scores["outcome_scores"] = batch.batch["outcome_token_level_scores"].sum(-1).cpu().tolist()
+            if "outcome_task_id" in batch.batch:
+                scores["outcome_task_id"] = batch.batch["outcome_task_id"].cpu().tolist()
 
             reward_extra_infos_to_dump = reward_extra_infos_dict.copy()
 
@@ -667,6 +724,8 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                 scores=scores,
                 reward_extra_infos_dict=reward_extra_infos_to_dump,
                 sample_versions=sample_versions,
+                turn_idxs=turn_idxs,
+                trajectory_ids=trajectory_ids,
                 dump_path=dump_path,
             )
 

@@ -926,18 +926,7 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
         reward_extra_info["task2_vqa_to_feedback_response"] = s4_resp if not isinstance(s4_resp, Exception) else str(s4_resp)
 
     elif task_id == 3: # Total score: sqrt(vqa*2 * edit) + detector bonus (0..1)
-        no_feedback_needed = (
-            (predicted_feedback is not None and "no need to generate feedback" in predicted_feedback.lower())
-            or "no need to generate" in (feedback_text or '').lower()
-        )
-        if no_feedback_needed:
-            reward_score = -100
-            reward_extra_info[f"task{task_id}_vqa_reward"] = reward_score
-            reward_extra_info[f"task{task_id}_vqa_reward_response"] = "No need to get VQA reward."
-            reward_extra_info[f"task{task_id}_edit_reward"] = reward_score
-            reward_extra_info[f"task{task_id}_edit_reward_response"] = "No need to get edit reward."
-            reward_extra_info[f"task{task_id}_detector_reward"] = 0.0
-            return {"score": reward_score, "reward_extra_info": reward_extra_info}
+        # NOTE: the `no_feedback_needed` → -100 shortcut was removed.
 
         # Parse detection items from feedback_tuple
         detection_results = verify_detection_single(feedback_tuple)

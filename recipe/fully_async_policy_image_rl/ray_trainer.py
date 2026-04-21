@@ -102,6 +102,28 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
     return data, metrics
 
 
+def _compute_grpo_group_index(data: DataProto) -> np.ndarray:
+    """Build the GRPO grouping index as composite `(uid, turn_idx)` so that
+    turn-0 and turn-1 rollouts of the same prompt are NOT collapsed into one
+    group. Different turns represent different policy inputs (turn 1 sees the
+    edited image from turn 0's regen, not the original), so their advantages
+    must be normalized within-turn — otherwise cross-turn variance dominates
+    and the relative ranking within a single turn is lost.
+
+    Falls back to raw `uid` if `turn_idx` is missing (single-turn legacy).
+    """
+    uids = data.non_tensor_batch["uid"]
+    turn_idx_arr = None
+    if "turn_idx" in data.batch:
+        t = data.batch["turn_idx"]
+        turn_idx_arr = t.detach().cpu().numpy() if hasattr(t, "detach") else np.asarray(t)
+    elif "turn_idx" in data.non_tensor_batch:
+        turn_idx_arr = np.asarray(data.non_tensor_batch["turn_idx"])
+    if turn_idx_arr is None:
+        return uids
+    return np.array([f"{u}_t{int(t)}" for u, t in zip(uids, turn_idx_arr)], dtype=object)
+
+
 def compute_advantage(
     data: DataProto,
     adv_estimator: AdvantageEstimator,
@@ -130,34 +152,22 @@ def compute_advantage(
     Returns:
         DataProto: The updated data with computed advantages and returns.
     """
-    if adv_estimator == AdvantageEstimator.GRPO:
-        # Initialize the mask for GRPO calculation
-        grpo_calculation_mask = data.batch[f"task{task_id}_response_mask"]
-
-        # Call compute_grpo_outcome_advantage with parameters matching its definition
-        advantages, returns = core_algos.compute_grpo_outcome_advantage(
-            token_level_rewards=data.batch[f"task{task_id}_token_level_rewards"],
-            response_mask=grpo_calculation_mask,
-            index=data.non_tensor_batch["uid"],
-            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+    if adv_estimator != AdvantageEstimator.GRPO:
+        raise ValueError(
+            f"[compute_advantage] Only GRPO is supported in this recipe "
+            f"(task_skip has been removed). Got: {adv_estimator}"
         )
-        data.batch[f"task{task_id}_advantages"] = advantages
-        data.batch[f"task{task_id}_returns"] = returns
 
-    elif adv_estimator == AdvantageEstimator.GRPO_TASK_SKIP: # GRPO task3 masking if needed
-        # Initialize the mask for GRPO calculation
-        grpo_calculation_mask = data.batch[f"task{task_id}_response_mask"]
+    grpo_calculation_mask = data.batch[f"task{task_id}_response_mask"]
+    advantages, returns = core_algos.compute_grpo_outcome_advantage(
+        token_level_rewards=data.batch[f"task{task_id}_token_level_rewards"],
+        response_mask=grpo_calculation_mask,
+        index=_compute_grpo_group_index(data),
+        norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+    )
+    data.batch[f"task{task_id}_advantages"] = advantages
+    data.batch[f"task{task_id}_returns"] = returns
 
-        # Call compute_grpo_task_skip_outcome_advantage with parameters matching its definition
-        advantages, returns = core_algos.compute_grpo_task_skip_outcome_advantage(
-            token_level_rewards=data.batch[f"task{task_id}_token_level_rewards"],
-            response_mask=grpo_calculation_mask,
-            index=data.non_tensor_batch["uid"],
-            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-        )
-        data.batch[f"task{task_id}_advantages"] = advantages
-        data.batch[f"task{task_id}_returns"] = returns
-    
     return data
 
 
@@ -399,9 +409,13 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                 batch_idx_list.append(val_batch_idx)
 
                 if len(batch_list) >= val_rollout_prompt_size:
-                    merged_batch = DataProto.concat(batch_list)                
+                    merged_batch = DataProto.concat(batch_list)
                     merged_gen_batch = self._get_gen_batch(merged_batch)
                     merged_gen_batch.meta_info["rollout_task_ids"] = rollout_task_ids
+                    # `_get_gen_batch` drops meta_info; re-stamp validate so
+                    # the agent loop takes the is_validate branch instead of
+                    # the training turn loop.
+                    merged_gen_batch.meta_info["validate"] = True
                     await prepared_q.put((merged_batch, merged_gen_batch, batch_idx_list))
                     batch_list = []
                     batch_idx_list = []
@@ -410,6 +424,7 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                 merged_batch = DataProto.concat(batch_list)
                 merged_gen_batch = self._get_gen_batch(merged_batch)
                 merged_gen_batch.meta_info["rollout_task_ids"] = rollout_task_ids
+                merged_gen_batch.meta_info["validate"] = True
                 await prepared_q.put((merged_batch, merged_gen_batch, batch_idx_list))
 
             # Send completion signal
@@ -463,13 +478,14 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                 def on_task_complete(task_id: int, batch_result: DataProto):
                     # Only compute rewards for tasks we train on (task2 also computed when task_ids=[3])
                     if int(task_id) not in reward_task_ids:
-                        return
+                        return None
                     # Launch reward task immediately when stage completes
                     reward_task = asyncio.create_task(
                         _compute_val_reward_async(int(task_id), batch_result, reward_tensor_dict, reward_extra_infos),
                         name=f"val_reward_task{task_id}",
                     )
                     reward_tasks.append(reward_task)
+                    return reward_task
 
                 result_batch = await self.async_rollout_manager.generate_sequences_with_callback_on_server(
                     test_gen_batch,
@@ -569,6 +585,25 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                             if not hasattr(result_batch, "meta_info"):
                                 result_batch.meta_info = {}
                             result_batch.meta_info[k] = v
+
+                    # No-edit masking: rows whose task2 emitted "No need to
+                    # generate feedback" didn't need task3. Zero the row and
+                    # place a single -100 sentinel at position 0 so per-row
+                    # `.sum(-1)` evaluates to exactly -100 (broadcasting -100
+                    # across every token would scale to -100*L in downstream
+                    # aggregation). response_mask is already zeroed in the
+                    # agent loop val branch.
+                    if 3 in reward_task_ids and "task3_token_level_scores" in result_batch.batch:
+                        from recipe.fully_async_policy_image_rl.agent_loop.agent_loop_hf import _is_edit_sample
+                        fb = result_batch.non_tensor_batch.get("task2_feedback_texts")
+                        if fb is not None:
+                            no_edit_idx = np.where(
+                                np.array([not _is_edit_sample(f) for f in fb])
+                            )[0]
+                            if len(no_edit_idx) > 0:
+                                t3_scores = result_batch.batch["task3_token_level_scores"]
+                                t3_scores[no_edit_idx] = 0
+                                t3_scores[no_edit_idx, 0] = -100
 
                     # Extend with batch data
                     batch_scores = {}
@@ -1059,6 +1094,59 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                 config=self.config.algorithm,
                 task_id=task_id
             )
+
+            # Fold the trajectory-level outcome advantage into the per-task
+            # advantage:
+            #   task{id}_advantages += outcome_gamma * outcome_advantages
+            # where `outcome_advantages` is computed here (not by the
+            # orchestrator) via GRPO on `outcome_token_level_scores` with the
+            # current task's `response_mask` providing the broadcast shape.
+            # `outcome_token_level_scores` was stamped per-row by the
+            # orchestrator: task3 reward if the row's trajectory finished a
+            # task3, else task1 reward (early-terminated at task2).
+            outcome_gamma = float(self.config.algorithm.get("outcome_gamma", 0.0))
+            outcome_key = "outcome_token_level_scores"
+            response_mask_key = f"task{task_id}_response_mask"
+            adv_key = f"task{task_id}_advantages"
+            if (
+                outcome_gamma != 0.0
+                and outcome_key in batch.batch
+                and response_mask_key in batch.batch
+                and adv_key in batch.batch
+            ):
+                outcome_advantages, _ = core_algos.compute_grpo_outcome_advantage(
+                    token_level_rewards=batch.batch[outcome_key],
+                    response_mask=batch.batch[response_mask_key],
+                    index=_compute_grpo_group_index(batch),
+                    norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                )
+                batch.batch[adv_key] = (
+                    batch.batch[adv_key]
+                    + outcome_gamma * outcome_advantages.to(batch.batch[adv_key].dtype)
+                )
+                metrics[f"actor/task{task_id}_outcome_gamma"] = outcome_gamma
+
+                # Outcome reward + advantage diagnostics so operators can tell
+                # at a glance how much signal the outcome term contributes
+                # vs the task's own reward.
+                with torch.no_grad():
+                    outcome_rew = batch.batch[outcome_key].clamp(min=0).sum(dim=-1).float()
+                    metrics[f"actor/task{task_id}_outcome_reward_mean"] = float(outcome_rew.mean().item())
+                    metrics[f"actor/task{task_id}_outcome_reward_std"] = float(outcome_rew.std().item())
+                    outcome_adv_scalar = outcome_advantages.float().sum(dim=-1)
+                    valid = outcome_adv_scalar[outcome_adv_scalar.abs() > 0]
+                    if valid.numel() > 0:
+                        metrics[f"actor/task{task_id}_outcome_adv_mean"] = float(valid.mean().item())
+                        metrics[f"actor/task{task_id}_outcome_adv_std"] = float(valid.std().item())
+                    # Outcome-task distribution: fraction of rows whose outcome
+                    # came from task1 (early-term) vs task3 (full turn). Helps
+                    # diagnose when training is dominated by early-terminated
+                    # trajectories.
+                    if "outcome_task_id" in batch.batch:
+                        otid = batch.batch["outcome_task_id"]
+                        total = max(int(otid.numel()), 1)
+                        metrics[f"actor/task{task_id}_outcome_from_task1_frac"] = float((otid == 1).sum().item()) / total
+                        metrics[f"actor/task{task_id}_outcome_from_task3_frac"] = float((otid == 3).sum().item()) / total
 
         return batch
 

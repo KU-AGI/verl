@@ -282,7 +282,17 @@ class DataParallelImageGenerationActor(BasePPOActor):
 
         valid_output_tokens = self._extract_valid_output_tokens(output_tokens, original_response_mask)
 
-        output_lengths = [original_response_mask[i].sum().item() for i in range(original_response_mask.size(0))]
+        # `output_lengths` MUST match the per-row slice length used inside
+        # `_extract_valid_output_tokens` (= position of last 1 + 1). Using
+        # `sum(mask)` instead would mismatch when the mask has a hole, which
+        # triggers flash-attn's `labels.shape == (n_rows,)` assert.
+        output_lengths = []
+        for i in range(original_response_mask.size(0)):
+            valid = (original_response_mask[i] == 1)
+            if valid.any():
+                output_lengths.append(int(valid.nonzero(as_tuple=False)[-1].item()) + 1)
+            else:
+                output_lengths.append(0)
         local_has_output = 1 if max(output_lengths) > 0 else 0
 
         # IMPORTANT: Always do forward pass even if no valid output
