@@ -123,6 +123,16 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         if self.config.algorithm.use_kl_in_reward:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
+        # Mirror RayImageGenerationTrainer's rollout-dump initialization.
+        # FullyAsyncTrainer does not call the parent __init__, but it now uses
+        # the same background dump submission helpers.
+        self._rollout_dump_executor = None
+        self._rollout_dump_futures = []
+        self._rollout_dump_workers = int(self.config.trainer.get("rollout_dump_workers", 1) or 0)
+        self._rollout_dump_max_pending = int(
+            self.config.trainer.get("rollout_dump_max_pending", max(2, 2 * max(self._rollout_dump_workers, 1))) or 0
+        )
+
         # ==================== fully async config ====================
 
         self.message_queue_client = None
