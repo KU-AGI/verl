@@ -19,6 +19,7 @@ This trainer supports model-agonistic model initialization with huggingface
 import json
 import os
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
 from contextlib import contextmanager
 from copy import deepcopy
@@ -308,7 +309,75 @@ class RayImageGenerationTrainer(RayPPOTrainer):
         if self.config.algorithm.use_kl_in_reward:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
+        self._rollout_dump_executor: Optional[ThreadPoolExecutor] = None
+        self._rollout_dump_futures = []
+        self._rollout_dump_workers = int(self.config.trainer.get("rollout_dump_workers", 1) or 0)
+        self._rollout_dump_max_pending = int(
+            self.config.trainer.get("rollout_dump_max_pending", max(2, 2 * max(self._rollout_dump_workers, 1))) or 0
+        )
+
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+
+    def _clone_batch_for_rollout_dump(self, batch: DataProto) -> DataProto:
+        return DataProto(
+            batch=batch.batch.clone() if getattr(batch, "batch", None) is not None else None,
+            non_tensor_batch=deepcopy(getattr(batch, "non_tensor_batch", None)),
+            meta_info=deepcopy(getattr(batch, "meta_info", None)),
+        )
+
+    def _reap_rollout_dump_futures(self, wait: bool = False):
+        if not self._rollout_dump_futures:
+            return
+        pending = []
+        for fut in self._rollout_dump_futures:
+            if wait:
+                fut.result()
+                continue
+            if fut.done():
+                fut.result()
+            else:
+                pending.append(fut)
+        self._rollout_dump_futures = pending
+
+    def _shutdown_rollout_dump_executor(self, wait: bool = True):
+        self._reap_rollout_dump_futures(wait=wait)
+        if self._rollout_dump_executor is not None:
+            self._rollout_dump_executor.shutdown(wait=wait)
+            self._rollout_dump_executor = None
+
+    def _submit_rollout_dump(
+        self,
+        batch: DataProto,
+        reward_extra_infos_dict: dict,
+        timing_raw: dict,
+        rollout_data_dir: str,
+    ):
+        if self._rollout_dump_workers <= 0:
+            self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
+            return
+
+        if self._rollout_dump_executor is None:
+            self._rollout_dump_executor = ThreadPoolExecutor(
+                max_workers=self._rollout_dump_workers,
+                thread_name_prefix="rollout_dump",
+            )
+
+        self._reap_rollout_dump_futures(wait=False)
+        if self._rollout_dump_max_pending > 0 and len(self._rollout_dump_futures) >= self._rollout_dump_max_pending:
+            oldest = self._rollout_dump_futures.pop(0)
+            oldest.result()
+
+        dump_batch = self._clone_batch_for_rollout_dump(batch)
+        dump_reward_extra = deepcopy(reward_extra_infos_dict)
+        dump_timing = dict(timing_raw)
+        fut = self._rollout_dump_executor.submit(
+            self._log_rollout_data,
+            dump_batch,
+            dump_reward_extra,
+            dump_timing,
+            rollout_data_dir,
+        )
+        self._rollout_dump_futures.append(fut)
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
@@ -385,89 +454,151 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
     def _dump_generations(self, uid, prompt_id, prompt, gen_imgs_pil_list, feedback_texts, regen_imgs_pil_list,
-                        gts_imgs, summarizes, gts_tuples, gts_vqas, scores, reward_extra_infos_dict, sample_versions,
-                        dump_path, turn_idxs=None, trajectory_ids=None):
+                        gts_imgs, summarizes, gts_tuples, gts_vqas, scores, reward_extra_infos_dict,
+                        sample_versions=None, dump_path=".", turn_idxs=None, trajectory_ids=None, phases=None,
+                        branch_ids=None):
 
         trainer_ver = getattr(self, "current_param_version", self.global_steps)
         step_dir = os.path.abspath(os.path.join(dump_path, str(trainer_ver)))
         os.makedirs(step_dir, exist_ok=True)
 
         n = len(prompt)
-        # 1. 샘플별로 인덱스 그룹화 (여기서 순서를 보존합니다)
-        sample_groups = defaultdict(list)
+
+        # Resolve per-row metadata with safe defaults
+        _turns = [int(turn_idxs[i]) if (turn_idxs is not None and i < len(turn_idxs)) else 0 for i in range(n)]
+        _trajs = [int(trajectory_ids[i]) if (trajectory_ids is not None and i < len(trajectory_ids)) else i for i in range(n)]
+        _vers = sample_versions if sample_versions is not None else [getattr(self, "current_param_version", self.global_steps)] * n
+        _phases = [int(phases[i]) if (phases is not None and i < len(phases)) else 1 for i in range(n)]
+        _branches = [int(branch_ids[i]) if (branch_ids is not None and i < len(branch_ids)) else -1 for i in range(n)]
+
+        # Parse prompt_id → sample_key for each row
+        sample_keys = []
         for i in range(n):
             pid_raw = prompt_id[i]
             pid_clean = pid_raw.replace("gen_img_", "").replace("text_", "")
             pid_core = pid_clean.split("_uid_")[0]
             parts = pid_core.split("_")
-            
-            source_parts = []
-            sample_id = "unknown"
+            source_parts, sample_id = [], "unknown"
             for p in parts:
                 if p.isdigit() and len(p) >= 4:
                     sample_id = p
                     break
                 if p not in ["uid", "chunk", "sample"]:
                     source_parts.append(p)
-            
-            source_rel_path = os.path.join(*source_parts)
-            sample_key = os.path.join(source_rel_path, sample_id)
-            
-            # 롤아웃 구분 없이 일단 샘플별로 인덱스를 다 모음
-            sample_groups[sample_key].append(i)
+            source_rel_path = os.path.join(*source_parts) if source_parts else "unknown"
+            sample_keys.append(os.path.join(source_rel_path, sample_id))
 
-        # 2. 그룹별 저장 (enumerate를 사용하여 강제로 0, 1, 2... 번호 부여)
-        for sample_rel_path, indices in sample_groups.items():
-            # sample_dir = os.path.join(step_dir, sample_rel_path)
-            # os.makedirs(sample_dir, exist_ok=True)
+        # Group rows by (sample_key, source_ver, trajectory_id) → [(row_idx, turn_idx), ...]
+        traj_groups: dict = defaultdict(list)
+        for i in range(n):
+            key = (sample_keys[i], _vers[i], _trajs[i])
+            traj_groups[key].append((i, _turns[i]))
 
-            first_idx = indices[0]
-            source_ver = sample_versions[first_idx]
+        # Cluster trajectory groups by sample for the cross-trajectory summary
+        sample_to_traj_keys: dict = defaultdict(list)
+        for key in traj_groups:
+            sample_key, source_ver, _ = key
+            sample_to_traj_keys[(sample_key, source_ver)].append(key)
 
-            sample_dir = os.path.join(step_dir, f"rollouter_source_v{source_ver}", sample_rel_path)
+        # Write per-trajectory/per-turn directory structure
+        for (sample_key, source_ver), traj_keys in sample_to_traj_keys.items():
+            sample_dir = os.path.join(step_dir, f"rollouter_source_v{source_ver}", sample_key)
             os.makedirs(sample_dir, exist_ok=True)
-            
+
             summary_path = os.path.join(sample_dir, "comparison_summary.txt")
             summary_header = [
-                f"📋 GRPO COMPARISON SUMMARY | STEP: {self.current_param_version}",
+                f"📋 GRPO COMPARISON SUMMARY | STEP: {trainer_ver}",
                 f"Sample Path: {sample_dir}",
-                "=" * 205,
-                f"{'Rollout':<10} | {'Traj':<5} | {'Turn':<4} | {'T1':<5} | {'T2':<5} | {'T3':<5} | {'Total':<6} | {'OutSrc':<6} | {'Outcome':<7} | {'Gen Path (Initial)':<65} | {'Regen Path (Edited)'}",
-                "-" * 205
+                "=" * 200,
+                f"{'Traj':<5} | {'Turn':<4} | {'Branch':<7} | {'T1':<5} | {'T2':<5} | {'T3':<5} | {'Total':<6} | {'OutSrc':<6} | {'Outcome':<7} | {'A_T':<6} | {'IFb':<6} | {'Pb':<6} | {'T':<4} | {'Gen Path (Current)':<65} | {'Regen Path (Edited)'}",
+                "-" * 200,
             ]
             summary_rows = []
 
-            # ★ 핵심 수정: enumerate(indices)를 사용하여 중복 방지
-            for rollout_num, i in enumerate(indices):
-                r_idx = rollout_num # 무조건 0, 1, 2, 3... 으로 나감
-                rollout_dir = os.path.join(sample_dir, f"rollout_{r_idx}")
-                os.makedirs(rollout_dir, exist_ok=True)
+            for traj_key in sorted(traj_keys, key=lambda k: k[2]):  # sort by traj_id
+                _, _, traj_id = traj_key
+                row_turns = sorted(traj_groups[traj_key], key=lambda x: x[1])  # sort by turn_idx
 
-                # 이미지 저장
-                paths = self._save_images(rollout_dir, i, gen_imgs_pil_list, regen_imgs_pil_list, gts_imgs)
+                traj_dir = os.path.join(sample_dir, f"traj_{traj_id}")
+                os.makedirs(traj_dir, exist_ok=True)
+                turn_branch_total_counts: dict[tuple[int, int], int] = defaultdict(int)
+                for i, turn in row_turns:
+                    turn_branch_total_counts[(int(turn), int(_branches[i]))] += 1
+                turn_branch_seen_counts: dict[tuple[int, int], int] = defaultdict(int)
 
-                # 점수 계산
-                t1 = self._get_safe_val(scores, 'task1_scores', i, 0.0)
-                t2 = self._get_safe_val(scores, 'task2_scores', i, 0.0)
-                t3 = self._get_safe_val(scores, 'task3_scores', i, 0.0)
-                total = sum(v for v in [t1, t2, t3] if v > -100) # exclude -100
-                outcome = self._get_safe_val(scores, 'outcome_scores', i, 0.0)
-                out_src_raw = self._get_safe_val(scores, 'outcome_task_id', i, 0)
-                # 0 = missing (shouldn't happen after attach); render as '-'
-                out_src = f"t{int(out_src_raw)}" if out_src_raw else "-"
-                turn = int(turn_idxs[i]) if (turn_idxs is not None and i < len(turn_idxs)) else 0
-                traj_raw = trajectory_ids[i] if (trajectory_ids is not None and i < len(trajectory_ids)) else -1
-                traj = int(traj_raw) if traj_raw is not None else -1
+                # Per-trajectory turn summary
+                traj_summary_lines = [
+                    f"Trajectory {traj_id} | Sample: {sample_key} | Step: {trainer_ver}",
+                    "-" * 80,
+                    f"{'Turn':<5} | {'Branch':<7} | {'T1':<5} | {'T2':<5} | {'T3':<5} | {'Total':<6} | {'Outcome':<7} | {'A_T':<6} | {'IFb':<6} | {'Pb':<6} | {'T':<4}",
+                    "-" * 80,
+                ]
 
-                summary_rows.append(
-                    f"rollout_{r_idx:<3} | {traj:<5} | {turn:<4} | {t1:<5.2f} | {t2:<5.2f} | {t3:<5.2f} | {total:<6.2f} | "
-                    f"{out_src:<6} | {outcome:<7.2f} | {paths['gen']:<65} | {paths['regen']}"
-                )
+                for i, turn in row_turns:
+                    branch_id = _branches[i]
+                    turn_dir = os.path.join(traj_dir, f"turn_{turn}")
+                    branch_dir = os.path.join(turn_dir, f"branch_{branch_id}" if branch_id >= 0 else "branch_shared")
+                    pair = (int(turn), int(branch_id))
+                    dup_idx = turn_branch_seen_counts[pair]
+                    turn_branch_seen_counts[pair] += 1
+                    if turn_branch_total_counts[pair] > 1:
+                        row_dir = os.path.join(branch_dir, f"sample_{dup_idx}")
+                    else:
+                        row_dir = branch_dir
+                    os.makedirs(row_dir, exist_ok=True)
 
-                # 개별 리포트 생성
-                item = {'rollout_idx': r_idx, 'uid': uid[i], 'turn_idx': turn, 'trajectory_id': traj}
-                self._write_detailed_report(rollout_dir, i, item, paths, prompt, feedback_texts, scores,
-                                        summarizes, gts_tuples, gts_vqas, reward_extra_infos_dict)
+                    paths = self._save_images(row_dir, i, gen_imgs_pil_list, regen_imgs_pil_list, gts_imgs)
+
+                    t1 = self._get_safe_val(scores, 'task1_scores', i, None)
+                    t2 = self._get_safe_val(scores, 'task2_scores', i, None)
+                    t3 = self._get_safe_val(scores, 'task3_scores', i, None)
+                    present_total_terms = [v for v in [t1, t2, t3] if v is not None and v > -100]
+                    total = sum(present_total_terms) if present_total_terms else None
+                    outcome = self._get_safe_val(scores, 'outcome_scores', i, None)
+                    out_src_raw = self._get_safe_val(scores, 'outcome_task_id', i, 0)
+                    out_src = f"t{int(out_src_raw)}" if out_src_raw else "-"
+                    out_a_t = self._get_safe_val(scores, 'outcome_A_T', i, None)
+                    out_if = self._get_safe_val(scores, 'outcome_IF_bar', i, None)
+                    out_p = self._get_safe_val(scores, 'outcome_P_bar', i, None)
+                    out_t = self._get_safe_val(scores, 'outcome_T', i, None)
+                    if _phases[i] == 2:
+                        outcome = None
+                        out_src = "-"
+                        out_a_t = None
+                        out_if = None
+                        out_p = None
+                        out_t = None
+
+                    traj_summary_lines.append(
+                        f"turn_{turn:<3} | {branch_id:<7} | {self._fmt_metric(t1, 2):<5} | "
+                        f"{self._fmt_metric(t2, 2):<5} | {self._fmt_metric(t3, 2):<5} | "
+                        f"{self._fmt_metric(total, 2):<6} | {self._fmt_metric(outcome, 2):<7} | "
+                        f"{self._fmt_metric(out_a_t, 2):<6} | {self._fmt_metric(out_if, 2):<6} | "
+                        f"{self._fmt_metric(out_p, 2):<6} | {self._fmt_metric(out_t, 1):<4}"
+                    )
+                    summary_rows.append(
+                        f"{traj_id:<5} | {turn:<4} | {branch_id:<7} | {self._fmt_metric(t1, 2):<5} | "
+                        f"{self._fmt_metric(t2, 2):<5} | {self._fmt_metric(t3, 2):<5} | {self._fmt_metric(total, 2):<6} | "
+                        f"{out_src:<6} | {self._fmt_metric(outcome, 2):<7} | {self._fmt_metric(out_a_t, 2):<6} | "
+                        f"{self._fmt_metric(out_if, 2):<6} | {self._fmt_metric(out_p, 2):<6} | {self._fmt_metric(out_t, 1):<4} | "
+                        f"{paths['gen']:<65} | {paths['regen']}"
+                    )
+
+                    item = {
+                        'rollout_idx': turn,
+                        'uid': uid[i],
+                        'turn_idx': turn,
+                        'trajectory_id': traj_id,
+                        'phase': _phases[i],
+                        'branch_id': branch_id,
+                    }
+                    item['sample_idx_within_branch'] = dup_idx
+                    self._write_detailed_report(row_dir, i, item, paths, prompt, feedback_texts, scores,
+                                               summarizes, gts_tuples, gts_vqas, reward_extra_infos_dict)
+
+                traj_summary_path = os.path.join(traj_dir, "traj_summary.txt")
+                with open(traj_summary_path, 'w', encoding='utf-8') as f:
+                    f.write("\n".join(traj_summary_lines) + "\n")
 
             with open(summary_path, 'w', encoding='utf-8') as f:
                 f.write("\n".join(summary_header + summary_rows) + "\n")
@@ -479,8 +610,36 @@ class RayImageGenerationTrainer(RayPPOTrainer):
         if key in data and (isinstance(data[key], list) or isinstance(data[key], np.ndarray)):
             if len(data[key]) > idx:
                 val = data[key][idx]
-                return float(val) if isinstance(default, float) else val
+                if val is None:
+                    return default
+                try:
+                    if np.isscalar(val):
+                        num = float(val)
+                        if not np.isfinite(num):
+                            return default
+                except Exception:
+                    pass
+                if isinstance(default, float) or default is None:
+                    try:
+                        num = float(val)
+                    except Exception:
+                        return default
+                    if not np.isfinite(num):
+                        return default
+                    return num
+                return val
         return default
+
+    def _fmt_metric(self, val, precision=2, na="N/A"):
+        if val is None:
+            return na
+        try:
+            num = float(val)
+        except Exception:
+            return na
+        if not np.isfinite(num):
+            return na
+        return f"{num:.{precision}f}"
 
     def _get_safe_response(self, data, key, idx, default="N/A"):
         """딕셔너리에서 안전하게 값을 가져오고 response text 기록"""
@@ -489,6 +648,33 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                 response = data[key][idx]
                 return response
         return default
+
+    def _pixel_values_to_pil_list(self, pixel_values):
+        if pixel_values is None:
+            return None
+        if isinstance(pixel_values, np.ndarray):
+            pixel_values = torch.from_numpy(pixel_values)
+        if not torch.is_tensor(pixel_values):
+            return None
+        imgs = pixel_values.detach().cpu().float()
+        if imgs.ndim == 3:
+            imgs = imgs.unsqueeze(0)
+        if imgs.ndim != 4:
+            return None
+
+        image_processor = getattr(getattr(self, "processor", None), "image_processor", None)
+        image_mean = getattr(image_processor, "image_mean", [0.5, 0.5, 0.5])
+        image_std = getattr(image_processor, "image_std", [0.5, 0.5, 0.5])
+        rescale_factor = getattr(image_processor, "rescale_factor", 1.0 / 255.0)
+
+        mean_t = torch.tensor(image_mean, dtype=imgs.dtype).view(1, -1, 1, 1)
+        std_t = torch.tensor(image_std, dtype=imgs.dtype).view(1, -1, 1, 1)
+        imgs = imgs * std_t + mean_t
+        if rescale_factor not in (None, 0):
+            imgs = imgs / float(rescale_factor)
+        imgs = imgs.clamp(0, 255).round().to(torch.uint8)
+        imgs = imgs.permute(0, 2, 3, 1).contiguous().numpy()
+        return np.array([PIL.Image.fromarray(img) for img in imgs], dtype=object)
 
     def _save_images(self, rollout_dir, i, gen_imgs, regen_imgs, gts_imgs):
         """이미지 저장 후 절대 경로 딕셔너리 반환"""
@@ -533,7 +719,9 @@ class RayImageGenerationTrainer(RayPPOTrainer):
         with open(txt_path, 'w', encoding='utf-8') as f:
             turn_part = f" | TURN: {item['turn_idx']}" if 'turn_idx' in item else ""
             traj_part = f" | TRAJ: {item['trajectory_id']}" if 'trajectory_id' in item else ""
-            f.write(f"📊 ROLLOUT REPORT | STEP: {self.global_steps} | ROLLOUT: {item['rollout_idx']}{traj_part}{turn_part}\n")
+            phase_part = f" | PHASE: {item['phase']}" if 'phase' in item else ""
+            branch_part = f" | BRANCH: {item['branch_id']}" if 'branch_id' in item else ""
+            f.write(f"📊 ROLLOUT REPORT | STEP: {self.global_steps} | ROLLOUT: {item['rollout_idx']}{traj_part}{turn_part}{phase_part}{branch_part}\n")
             f.write(f"Location: {os.path.abspath(rollout_dir)}\n")
             f.write("=" * 100 + "\n")
             f.write(f"📝 [PROMPT]\n{prompt[i]}\n")
@@ -602,11 +790,40 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             # Source = 1 means trajectory terminated at task2 (outcome = task1
             # reward); 3 means trajectory completed task3 (outcome = mean of
             # task3 rewards across turns the trajectory reached task3).
+            phase_val = item.get("phase", 1)
             out_src_raw = self._get_safe_val(scores, 'outcome_task_id', i, 0)
-            if out_src_raw:
+            if phase_val == 2:
+                f.write(f"🎯 [OUTCOME]\n")
+                f.write("  - Source Task: N/A\n")
+                f.write("  - Outcome Reward: N/A (phase2 local-only)\n")
+                f.write("\n")
+            elif out_src_raw:
+                eta = float(getattr(self.config.algorithm, "outcome_eta", 0.0))
+                beta = float(getattr(self.config.algorithm, "outcome_beta", 0.0))
+                lambda_ = float(getattr(self.config.algorithm, "outcome_lambda", 0.0))
+                out_val = self._get_safe_val(scores, 'outcome_scores', i, None)
+                out_a_t = self._get_safe_val(scores, 'outcome_A_T', i, None)
+                out_if = self._get_safe_val(scores, 'outcome_IF_bar', i, None)
+                out_p = self._get_safe_val(scores, 'outcome_P_bar', i, None)
+                out_t = self._get_safe_val(scores, 'outcome_T', i, None)
                 f.write(f"🎯 [OUTCOME]\n")
                 f.write(f"  - Source Task: task{int(out_src_raw)}\n")
-                f.write(f"  - Outcome Reward: {self._get_safe_val(scores, 'outcome_scores', i, 0.0):.4f}\n")
+                f.write(f"  - Outcome Reward: {self._fmt_metric(out_val, 4)}\n")
+                f.write("  - Formula: R_out = A_T + eta * IF_bar + beta * P_bar - lambda * (T - 1)\n")
+                f.write(
+                    f"  - Components: A_T={self._fmt_metric(out_a_t, 4)}, "
+                    f"IF_bar={self._fmt_metric(out_if, 4)}, "
+                    f"P_bar={self._fmt_metric(out_p, 4)}, "
+                    f"T={self._fmt_metric(out_t, 4)}\n"
+                )
+                f.write(f"  - Coefficients: eta={eta:.4f}, beta={beta:.4f}, lambda={lambda_:.4f}\n")
+                if None not in (out_val, out_a_t, out_if, out_p, out_t):
+                    f.write(
+                        f"  - Expanded: {out_a_t:.4f} + {eta:.4f}*{out_if:.4f} + {beta:.4f}*{out_p:.4f} - "
+                        f"{lambda_:.4f}*({out_t:.4f} - 1) = {out_val:.4f}\n"
+                    )
+                else:
+                    f.write("  - Expanded: N/A\n")
                 f.write("\n")
 
             f.write(f"📚 [GROUND TRUTH REFERENCE]\n")
@@ -631,8 +848,22 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             uid = batch.non_tensor_batch["uid"].tolist()
             prompt = batch.non_tensor_batch['prompt'].tolist()
             task_ids = list(self.config.actor_rollout_ref.actor.multi_task.get("task_ids", [1]))
-            # task1 gen images: direct key for task1 batch; cross-task alias for task2/3 replay batch
-            gen_imgs_pil_list = batch.non_tensor_batch.get('task1_gen_imgs_pil_list')
+            # Prefer the current image seen by the policy at this row/turn.
+            gen_imgs_pil_list = None
+            def _maybe_get_tensor(key: str):
+                return batch.batch[key] if key in batch.batch.keys() else None
+            current_img_sources = [
+                _maybe_get_tensor("current_imgs_pixel_values"),
+                _maybe_get_tensor("task2_task1_gen_imgs_pixel_values"),
+                _maybe_get_tensor("task3_task1_gen_imgs_pixel_values"),
+                _maybe_get_tensor("task1_gen_imgs_pixel_values"),
+            ]
+            for src in current_img_sources:
+                gen_imgs_pil_list = self._pixel_values_to_pil_list(src)
+                if gen_imgs_pil_list is not None:
+                    break
+            if gen_imgs_pil_list is None:
+                gen_imgs_pil_list = batch.non_tensor_batch.get('task1_gen_imgs_pil_list')
             if gen_imgs_pil_list is None:
                 for host_tid in task_ids:
                     gen_imgs_pil_list = batch.non_tensor_batch.get(f'task{host_tid}_task1_gen_imgs_pil_list')
@@ -684,6 +915,20 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             else:
                 trajectory_ids = [-1] * len(batch)
 
+            phases = None
+            if 'phase' in batch.non_tensor_batch:
+                ph = batch.non_tensor_batch['phase']
+                phases = ph.tolist() if hasattr(ph, 'tolist') else list(ph)
+            else:
+                phases = [1] * len(batch)
+
+            branch_ids = None
+            if 'branch_id' in batch.non_tensor_batch:
+                bid = batch.non_tensor_batch['branch_id']
+                branch_ids = bid.tolist() if hasattr(bid, 'tolist') else list(bid)
+            else:
+                branch_ids = [-1] * len(batch)
+
             scores = {}
             # Add all task scores; for replay task_batch use cross-task aliases as fallback
             for tid in [1, 2, 3]:
@@ -704,8 +949,21 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                 scores["outcome_scores"] = batch.batch["outcome_token_level_scores"].sum(-1).cpu().tolist()
             if "outcome_task_id" in batch.batch:
                 scores["outcome_task_id"] = batch.batch["outcome_task_id"].cpu().tolist()
+            for key in ("outcome_A_T", "outcome_IF_bar", "outcome_P_bar", "outcome_T"):
+                if key in batch.non_tensor_batch:
+                    vals = batch.non_tensor_batch[key]
+                    scores[key] = vals.tolist() if hasattr(vals, "tolist") else list(vals)
 
-            reward_extra_infos_to_dump = reward_extra_infos_dict.copy()
+            reward_extra_infos_to_dump = dict(reward_extra_infos_dict)
+            # Merge nested reward-extra dicts directly here so replay/fresh dump
+            # rendering does not depend on trainer-side flattening alone.
+            for key, nested in list(reward_extra_infos_dict.items()):
+                if not (isinstance(key, str) and key.startswith("task") and key.endswith("_reward_extra_info")):
+                    continue
+                if not isinstance(nested, dict) or not nested:
+                    continue
+                for sub_key, sub_vals in nested.items():
+                    reward_extra_infos_to_dump.setdefault(sub_key, sub_vals)
 
             dump_path = rollout_data_dir
             os.makedirs(dump_path, exist_ok=True)
@@ -726,6 +984,8 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                 sample_versions=sample_versions,
                 turn_idxs=turn_idxs,
                 trajectory_ids=trajectory_ids,
+                phases=phases,
+                branch_ids=branch_ids,
                 dump_path=dump_path,
             )
 
@@ -1117,7 +1377,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                         if self.config.trainer.rollout_freq > 0 and (
                             self.global_steps % self.config.trainer.rollout_freq == 0 and rollout_data_dir
                         ):
-                            self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
+                            self._submit_rollout_dump(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
 
                         # Remove task-specific attention_mask and task_id for next iteration
                         batch.pop(batch_keys=["attention_mask", "task_id"])
@@ -1230,6 +1490,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                     )
 
                 if is_last_step:
+                    self._shutdown_rollout_dump_executor(wait=True)
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
                     return
@@ -1239,3 +1500,5 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                 if hasattr(self.train_dataset, "on_batch_end"):
                     # The dataset may be changed after each training batch
                     self.train_dataset.on_batch_end(batch=batch)
+
+        self._shutdown_rollout_dump_executor(wait=True)

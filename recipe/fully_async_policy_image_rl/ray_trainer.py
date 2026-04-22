@@ -112,6 +112,9 @@ def _compute_grpo_group_index(data: DataProto) -> np.ndarray:
 
     Falls back to raw `uid` if `turn_idx` is missing (single-turn legacy).
     """
+    if "grpo_group_id" in data.non_tensor_batch:
+        return np.asarray(data.non_tensor_batch["grpo_group_id"], dtype=object)
+
     uids = data.non_tensor_batch["uid"]
     turn_idx_arr = None
     if "turn_idx" in data.batch:
@@ -172,6 +175,25 @@ def compute_advantage(
 
 
 class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
+    def _restore_reward_extra_infos_for_logging(self, batch: DataProto, task_id: int) -> dict:
+        """Expose nested task reward extras as legacy flat fields so existing
+        metric collectors and rollout dump code can see them.
+
+        Returns the nested reward-extra dict for convenience.
+        """
+        reward_extra_infos_dict = batch.meta_info.get(f"task{task_id}_reward_extra_info", {})
+        for key, nested in list(batch.meta_info.items()):
+            if not (key.startswith("task") and key.endswith("_reward_extra_info")):
+                continue
+            if not isinstance(nested, dict) or not nested:
+                continue
+            batch.non_tensor_batch.update(
+                {k: np.array(v, dtype=object) for k, v in nested.items()}
+            )
+            for k, v in nested.items():
+                batch.meta_info[k] = v
+        return reward_extra_infos_dict
+
     def init_workers(self):
         """Initialize distributed training workers using Ray backend.
 
@@ -676,6 +698,9 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                             if feedback_texts_to_dump is not None and hasattr(feedback_texts_to_dump, 'tolist'):
                                 feedback_texts_to_dump = feedback_texts_to_dump.tolist()
                         regen_imgs_to_dump = result_batch.non_tensor_batch.get('task3_regen_imgs_pil_list') if 3 in task_ids else None
+                        phases_to_dump = result_batch.non_tensor_batch.get("phase")
+                        if phases_to_dump is not None and hasattr(phases_to_dump, "tolist"):
+                            phases_to_dump = phases_to_dump.tolist()
                         self._dump_generations(
                             uid=result_batch.non_tensor_batch["uid"].tolist(),
                             prompt_id=result_batch.non_tensor_batch["prompt_id"].tolist(),
@@ -690,6 +715,7 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                             scores=batch_scores,
                             reward_extra_infos_dict=batch_reward_extra_infos,
                             sample_versions=v_list,
+                            phases=phases_to_dump,
                             dump_path=val_data_dir
                             )
 
@@ -898,8 +924,18 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                     # Get reward_extra_infos_dict from meta_info if available
                     reward_extra_infos_dict = batch.meta_info.get(f"task{task_id}_reward_extra_info", {})
 
-                    # if reward_extra_infos_dict: # remove reward extra info to non_tensor_batch for logging
-                    #     batch.non_tensor_batch.update({k: np.array(v, dtype=object) for k, v in reward_extra_infos_dict.items()})
+                    # Restore reward extras onto the batch so the existing
+                    # logging/metric collectors can see them again.
+                    if reward_extra_infos_dict:
+                        batch.non_tensor_batch.update(
+                            {k: np.array(v, dtype=object) for k, v in reward_extra_infos_dict.items()}
+                        )
+                        # `compute_data_metrics` / `compute_group_reward_metrics`
+                        # read scalar reward extras from flattened `meta_info`
+                        # keys such as `task1_vqa_reward`, not from the nested
+                        # `task{id}_reward_extra_info` dict.
+                        for k, v in reward_extra_infos_dict.items():
+                            batch.meta_info[k] = v
 
                     # Log rollout generations if enabled (per task)
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
@@ -1120,33 +1156,97 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                     index=_compute_grpo_group_index(batch),
                     norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                 )
-                batch.batch[adv_key] = (
-                    batch.batch[adv_key]
-                    + outcome_gamma * outcome_advantages.to(batch.batch[adv_key].dtype)
-                )
+                outcome_term = outcome_gamma * outcome_advantages.to(batch.batch[adv_key].dtype)
+                if "phase" in batch.non_tensor_batch:
+                    phase_arr = np.asarray(batch.non_tensor_batch["phase"])
+                    phase1_mask = torch.as_tensor(
+                        phase_arr == 1,
+                        device=batch.batch[adv_key].device,
+                        dtype=torch.bool,
+                    )
+                    phase2_mask = torch.as_tensor(
+                        phase_arr == 2,
+                        device=batch.batch[adv_key].device,
+                        dtype=torch.bool,
+                    )
+                    updated_adv = batch.batch[adv_key].clone()
+                    if int(phase1_mask.sum().item()) > 0:
+                        updated_adv[phase1_mask] = outcome_term[phase1_mask]
+                    if int(phase2_mask.sum().item()) > 0:
+                        updated_adv[phase2_mask] = batch.batch[adv_key][phase2_mask]
+                    batch.batch[adv_key] = updated_adv
+                else:
+                    batch.batch[adv_key] = (
+                        batch.batch[adv_key]
+                        + outcome_term
+                    )
                 metrics[f"actor/task{task_id}_outcome_gamma"] = outcome_gamma
 
                 # Outcome reward + advantage diagnostics so operators can tell
                 # at a glance how much signal the outcome term contributes
                 # vs the task's own reward.
                 with torch.no_grad():
-                    outcome_rew = batch.batch[outcome_key].clamp(min=0).sum(dim=-1).float()
-                    metrics[f"actor/task{task_id}_outcome_reward_mean"] = float(outcome_rew.mean().item())
-                    metrics[f"actor/task{task_id}_outcome_reward_std"] = float(outcome_rew.std().item())
-                    outcome_adv_scalar = outcome_advantages.float().sum(dim=-1)
-                    valid = outcome_adv_scalar[outcome_adv_scalar.abs() > 0]
-                    if valid.numel() > 0:
-                        metrics[f"actor/task{task_id}_outcome_adv_mean"] = float(valid.mean().item())
-                        metrics[f"actor/task{task_id}_outcome_adv_std"] = float(valid.std().item())
-                    # Outcome-task distribution: fraction of rows whose outcome
-                    # came from task1 (early-term) vs task3 (full turn). Helps
-                    # diagnose when training is dominated by early-terminated
-                    # trajectories.
-                    if "outcome_task_id" in batch.batch:
-                        otid = batch.batch["outcome_task_id"]
-                        total = max(int(otid.numel()), 1)
-                        metrics[f"actor/task{task_id}_outcome_from_task1_frac"] = float((otid == 1).sum().item()) / total
-                        metrics[f"actor/task{task_id}_outcome_from_task3_frac"] = float((otid == 3).sum().item()) / total
+                    phase1_mask = None
+                    phase1_count = None
+                    if "phase" in batch.non_tensor_batch:
+                        phase1_mask = torch.as_tensor(
+                            np.asarray(batch.non_tensor_batch["phase"]) == 1,
+                            device=batch.batch[outcome_key].device,
+                        )
+                        phase1_count = int(phase1_mask.sum().item())
+                    if phase1_mask is not None and phase1_count == 0:
+                        pass
+                    else:
+                        outcome_rew = batch.batch[outcome_key].clamp(min=0).sum(dim=-1).float()
+                        if phase1_mask is not None and phase1_count > 0:
+                            outcome_rew = outcome_rew[phase1_mask]
+                        metrics[f"actor/task{task_id}_outcome_reward_mean"] = float(outcome_rew.mean().item())
+                        metrics[f"actor/task{task_id}_outcome_reward_std"] = float(outcome_rew.std().item())
+                        outcome_adv_scalar = outcome_advantages.float().sum(dim=-1)
+                        if phase1_mask is not None and phase1_count > 0:
+                            outcome_adv_scalar = outcome_adv_scalar[phase1_mask]
+                        valid = outcome_adv_scalar[outcome_adv_scalar.abs() > 0]
+                        if valid.numel() > 0:
+                            metrics[f"actor/task{task_id}_outcome_adv_mean"] = float(valid.mean().item())
+                            metrics[f"actor/task{task_id}_outcome_adv_std"] = float(valid.std().item())
+                        # Outcome-task distribution: fraction of rows whose outcome
+                        # came from task1 (early-term) vs task3 (full turn). Helps
+                        # diagnose when training is dominated by early-terminated
+                        # trajectories.
+                        if "outcome_task_id" in batch.batch:
+                            otid = batch.batch["outcome_task_id"]
+                            if phase1_mask is not None and phase1_count > 0:
+                                otid = otid[phase1_mask]
+                            total = max(int(otid.numel()), 1)
+                            metrics[f"actor/task{task_id}_outcome_from_task1_frac"] = float((otid == 1).sum().item()) / total
+                            metrics[f"actor/task{task_id}_outcome_from_task2_frac"] = float((otid == 2).sum().item()) / total
+                            metrics[f"actor/task{task_id}_outcome_from_task3_frac"] = float((otid == 3).sum().item()) / total
+
+                    # Outcome formula component diagnostics (logged once, on task1).
+                    # outcome_A_T / outcome_IF_bar / outcome_P_bar / outcome_T are
+                    # per-row arrays stamped by _attach_outcome_per_row.
+                    if task_id == 1:
+                        ntb = getattr(batch, "non_tensor_batch", {}) or {}
+                        phase1_np_mask = None
+                        if "phase" in ntb:
+                            phase1_np_mask = np.asarray(ntb["phase"]) == 1
+                        for comp_key, metric_suffix in (
+                            ("outcome_A_T",   "outcome_A_T_mean"),
+                            ("outcome_IF_bar", "outcome_IF_bar_mean"),
+                            ("outcome_P_bar", "outcome_P_bar_mean"),
+                            ("outcome_T",     "outcome_T_mean"),
+                        ):
+                            if comp_key in ntb:
+                                arr = np.asarray(ntb[comp_key], dtype=np.float32)
+                                if phase1_np_mask is not None and phase1_np_mask.any():
+                                    arr = arr[phase1_np_mask]
+                                metrics[f"actor/{metric_suffix}"] = float(arr.mean())
+                        # Early-stop rate = fraction of trajectories that never ran task3
+                        if "outcome_T" in ntb:
+                            t_arr = np.asarray(ntb["outcome_T"], dtype=np.float32)
+                            if phase1_np_mask is not None and phase1_np_mask.any():
+                                t_arr = t_arr[phase1_np_mask]
+                            metrics["actor/outcome_early_stop_rate"] = float((t_arr <= 1.0).mean())
 
         return batch
 

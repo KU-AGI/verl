@@ -41,6 +41,40 @@ def safe_json_loads(text):
     except:
         return None
 
+
+def _extract_group_keys(batch: DataProto) -> np.ndarray:
+    uids = np.asarray(batch.non_tensor_batch["uid"], dtype=object)
+    turn_idx_arr = None
+    if "turn_idx" in batch.batch:
+        turn_idx = batch.batch["turn_idx"]
+        turn_idx_arr = turn_idx.detach().cpu().numpy() if hasattr(turn_idx, "detach") else np.asarray(turn_idx)
+    elif "turn_idx" in batch.non_tensor_batch:
+        turn_idx_arr = np.asarray(batch.non_tensor_batch["turn_idx"])
+    if turn_idx_arr is None:
+        return uids
+    return np.array([f"{u}_t{int(t)}" for u, t in zip(uids, turn_idx_arr)], dtype=object)
+
+
+def _pick_legacy_full_batch_from_task_batches(task_batches: Optional[dict[int, Any]]) -> Optional[DataProto]:
+    if not task_batches:
+        return None
+
+    fallback = None
+    for tid in (2, 3, 1):
+        candidate = task_batches.get(tid)
+        if candidate is None or len(candidate) == 0:
+            continue
+        if fallback is None:
+            fallback = candidate
+        if "phase" in candidate.non_tensor_batch:
+            phase_arr = np.asarray(candidate.non_tensor_batch["phase"])
+            phase1_idx = np.where(phase_arr == 1)[0].tolist()
+            if phase1_idx:
+                return _slice_dataproto_with_meta(candidate, phase1_idx)
+            continue
+        return candidate
+    return fallback
+
 def postprocess_agent_loop_outputs(rs_or_list: Union["RolloutSample", list], tokenizer, config, processor) -> DataProto:
     """Optimized postprocessing of AgentLoopOutput list into DataProto with dynamic task_id handling"""
     if isinstance(rs_or_list, list):
@@ -374,6 +408,11 @@ def merge_rollout_sample(config, tokenizer, rs: RolloutSample, processor):
     # Step 6: Filtering logic
     if not config.algorithm.filter_groups.enable:
         return rs
+    if getattr(rs, "task_batches", None) is not None:
+        # Multi-turn / phase-aware filtering is handled earlier in the rollouter
+        # directly on task_batches. Do not re-run the legacy full_batch-only
+        # filter here.
+        return rs
     else:
         metric_name = config.algorithm.filter_groups.metric
 
@@ -510,44 +549,37 @@ def merge_rollout_sample(config, tokenizer, rs: RolloutSample, processor):
     return rs
 
 def expand_rollout_sample(rs: RolloutSample) -> list[RolloutSample]:
-    uids = rs.full_batch.non_tensor_batch['uid']
-    original_batch_size = len(uids)
+    full_group_keys = _extract_group_keys(rs.full_batch)
+    original_batch_size = len(full_group_keys)
 
-    uid_to_indices = {}
-    for i, uid in enumerate(uids):
-        if uid not in uid_to_indices:
-            uid_to_indices[uid] = []
-        uid_to_indices[uid].append(i)
+    group_to_full_indices = {}
+    ordered_group_keys: dict[str, None] = {}
+    for i, group_key in enumerate(full_group_keys):
+        ordered_group_keys.setdefault(group_key, None)
+        if group_key not in group_to_full_indices:
+            group_to_full_indices[group_key] = []
+        group_to_full_indices[group_key].append(i)
 
-    # Per-task uid-index maps so we can slice each `task_batches[tid]` to the
-    # rows belonging to this uid. task2/task3 DPs may have more rows than
-    # `full_batch` (e.g. multi-turn concat), so indices here differ from the
-    # full_batch indices above.
+    # Per-task group-index maps so we can slice each `task_batches[tid]` to the
+    # rows belonging to this `(uid, turn_idx)` group. task2/task3 DPs may have
+    # more rows than `full_batch` (e.g. phase2 rows sharing the same group), so
+    # indices here differ from the full_batch indices above.
     src_task_batches = getattr(rs, "task_batches", None)
-    per_task_uid_indices: dict[int, dict] = {}
-    per_task_sizes: dict[int, int] = {}
+    per_task_group_indices: dict[int, dict] = {}
     if src_task_batches is not None:
         for tid, tdp in src_task_batches.items():
             if tdp is None or "uid" not in tdp.non_tensor_batch:
                 continue
-            per_task_sizes[tid] = len(tdp)
             m: dict = {}
-            for i, u in enumerate(tdp.non_tensor_batch["uid"]):
-                m.setdefault(u, []).append(i)
-            per_task_uid_indices[tid] = m
+            for i, group_key in enumerate(_extract_group_keys(tdp)):
+                ordered_group_keys.setdefault(group_key, None)
+                m.setdefault(group_key, []).append(i)
+            per_task_group_indices[tid] = m
 
     individual_samples = []
 
-    for uid, indices in uid_to_indices.items():
-        group_batch = rs.full_batch[indices]
-
-        if getattr(rs.full_batch, "meta_info", None) is not None:
-            group_batch.meta_info = deep_slice_meta(rs.full_batch.meta_info, indices, original_batch_size)
-
-        # Slice each task_batches[tid] by this uid's rows in THAT DP, so the
-        # trainer's BufferFeeder sees per-task DPs with `taskN_token_level_scores`
-        # present — otherwise it falls back to `full_batch` (a single task's
-        # DP) and task3/task2 pushes miss their score key.
+    for group_key in ordered_group_keys.keys():
+        indices = group_to_full_indices.get(group_key, [])
         group_task_batches: Optional[dict[int, Any]] = None
         if src_task_batches is not None:
             group_task_batches = {}
@@ -555,14 +587,29 @@ def expand_rollout_sample(rs: RolloutSample) -> list[RolloutSample]:
                 if tdp is None:
                     group_task_batches[tid] = None
                     continue
-                uid_idx = per_task_uid_indices.get(tid, {}).get(uid, [])
-                if not uid_idx:
+                group_idx = per_task_group_indices.get(tid, {}).get(group_key, [])
+                if not group_idx:
                     group_task_batches[tid] = None
                     continue
-                sub = _slice_dataproto_with_meta(tdp, uid_idx)
+                sub = _slice_dataproto_with_meta(tdp, group_idx)
                 group_task_batches[tid] = sub
 
-        group_sample_id = f"{rs.sample_id}_{uid}"
+        if indices:
+            group_batch = rs.full_batch[indices]
+            if getattr(rs.full_batch, "meta_info", None) is not None:
+                group_batch.meta_info = deep_slice_meta(rs.full_batch.meta_info, indices, original_batch_size)
+            group_param_version_start = [rs.param_version_start[i] for i in indices] if isinstance(rs.param_version_start, list) else rs.param_version_start
+            group_param_version_end = [rs.param_version_end[i] for i in indices] if isinstance(rs.param_version_end, list) else rs.param_version_end
+            group_processing_times = [rs.processing_times[i] for i in indices] if rs.processing_times else [0.0]
+        else:
+            group_batch = _pick_legacy_full_batch_from_task_batches(group_task_batches)
+            if group_batch is None or len(group_batch) == 0:
+                continue
+            group_param_version_start = [rs.param_version] * len(group_batch)
+            group_param_version_end = [rs.param_version] * len(group_batch)
+            group_processing_times = [0.0] * len(group_batch)
+
+        group_sample_id = f"{rs.sample_id}_{group_key}"
         individual_sample = RolloutSample(
             full_batch=group_batch,
             agent_loop_output_list=[],
@@ -570,9 +617,9 @@ def expand_rollout_sample(rs: RolloutSample) -> list[RolloutSample]:
             epoch=rs.epoch,
             tool_calls=rs.tool_calls,
             param_version=rs.param_version,
-            param_version_start=[rs.param_version_start[i] for i in indices] if isinstance(rs.param_version_start, list) else rs.param_version_start,
-            param_version_end=[rs.param_version_end[i] for i in indices] if isinstance(rs.param_version_end, list) else rs.param_version_end,
-            processing_times=[rs.processing_times[i] for i in indices] if rs.processing_times else [0.0],
+            param_version_start=group_param_version_start,
+            param_version_end=group_param_version_end,
+            processing_times=group_processing_times,
             rollout_status=rs.rollout_status,
             task_batches=group_task_batches,
         )
@@ -642,11 +689,23 @@ def assemble_batch_from_rollout_samples(
         total_groups_all = sum(rs.full_batch.meta_info.get("fully_async/filter_groups/total_groups", 0) for rs in rollout_samples)
         kept_groups_all = sum(rs.full_batch.meta_info.get("fully_async/filter_groups/kept_groups", 0) for rs in rollout_samples)
         filtered_groups_all = total_groups_all - kept_groups_all
+        phase1_total_groups_all = sum(rs.full_batch.meta_info.get("fully_async/filter_groups/phase1_total_groups", 0) for rs in rollout_samples)
+        phase1_kept_groups_all = sum(rs.full_batch.meta_info.get("fully_async/filter_groups/phase1_kept_groups", 0) for rs in rollout_samples)
+        phase1_filtered_groups_all = sum(rs.full_batch.meta_info.get("fully_async/filter_groups/phase1_filtered_groups", 0) for rs in rollout_samples)
+        phase2_total_groups_all = sum(rs.full_batch.meta_info.get("fully_async/filter_groups/phase2_total_groups", 0) for rs in rollout_samples)
+        phase2_kept_groups_all = sum(rs.full_batch.meta_info.get("fully_async/filter_groups/phase2_kept_groups", 0) for rs in rollout_samples)
+        phase2_filtered_groups_all = sum(rs.full_batch.meta_info.get("fully_async/filter_groups/phase2_filtered_groups", 0) for rs in rollout_samples)
 
         filter_stats["fully_async/filter_groups/total_groups"] = total_groups_all
         filter_stats["fully_async/filter_groups/kept_groups"] = kept_groups_all
         filter_stats["fully_async/filter_groups/filtered_groups"] = filtered_groups_all
         filter_stats["fully_async/filter_groups/filter_ratio"] = filtered_groups_all / total_groups_all if total_groups_all > 0 else 0.0
+        filter_stats["fully_async/filter_groups/phase1_total_groups"] = phase1_total_groups_all
+        filter_stats["fully_async/filter_groups/phase1_kept_groups"] = phase1_kept_groups_all
+        filter_stats["fully_async/filter_groups/phase1_filtered_groups"] = phase1_filtered_groups_all
+        filter_stats["fully_async/filter_groups/phase2_total_groups"] = phase2_total_groups_all
+        filter_stats["fully_async/filter_groups/phase2_kept_groups"] = phase2_kept_groups_all
+        filter_stats["fully_async/filter_groups/phase2_filtered_groups"] = phase2_filtered_groups_all
 
         # Collect all task IDs from all rollout samples
         all_task_ids = set()
@@ -1039,14 +1098,14 @@ def _select_diverse_candidates(
 def _slice_rollout_sample(rs: RolloutSample, indices: list) -> RolloutSample:
     """Return a new RolloutSample containing only *indices* rows from rs.full_batch.
 
-    `task_batches` is passed through unchanged (each task DP still has rows for
-    all uids). Downstream `expand_rollout_sample` selects per-uid rows from
-    each task DP based on the sliced `full_batch`'s uids, so carrying the
-    full task DPs here is correct and lets the trainer's BufferFeeder find
-    `taskN_token_level_scores` in its task-specific batch.
+    Filtering decisions are made over composite `(uid, turn_idx)` groups, so
+    `task_batches` must be sliced by the same composite key set. Otherwise
+    rows from filtered turns can leak back into task-specific batches even
+    though the corresponding legacy `full_batch` rows were removed.
     """
     original_size = len(rs.full_batch)
     sub_batch = rs.full_batch[indices]
+    kept_group_keys = set(_extract_group_keys(sub_batch).tolist())
 
     if getattr(rs.full_batch, "meta_info", None) is not None:
         sub_batch.meta_info = deep_slice_meta(rs.full_batch.meta_info, indices, original_size)
@@ -1057,6 +1116,20 @@ def _slice_rollout_sample(rs: RolloutSample, indices: list) -> RolloutSample:
                 if isinstance(rs.param_version_end, list) else rs.param_version_end)
     ptimes   = ([rs.processing_times[i] for i in indices]
                 if rs.processing_times else [0.0] * len(indices))
+    src_task_batches = getattr(rs, "task_batches", None)
+    sliced_task_batches: Optional[dict[int, Any]] = None
+    if src_task_batches is not None:
+        sliced_task_batches = {}
+        for tid, tdp in src_task_batches.items():
+            if tdp is None or "uid" not in tdp.non_tensor_batch:
+                sliced_task_batches[tid] = None
+                continue
+            tdp_group_keys = _extract_group_keys(tdp)
+            keep_idx = [i for i, key in enumerate(tdp_group_keys) if key in kept_group_keys]
+            if not keep_idx:
+                sliced_task_batches[tid] = None
+                continue
+            sliced_task_batches[tid] = _slice_dataproto_with_meta(tdp, keep_idx)
 
     return RolloutSample(
         full_batch=sub_batch,
@@ -1070,7 +1143,7 @@ def _slice_rollout_sample(rs: RolloutSample, indices: list) -> RolloutSample:
         param_version_end=pv_end,
         rollout_status=rs.rollout_status,
         original_prompt_batch=rs.original_prompt_batch,
-        task_batches=getattr(rs, "task_batches", None),
+        task_batches=sliced_task_batches,
     )
 
 
@@ -1126,216 +1199,173 @@ def quality_filter_rollout_sample(
     use_salvage: bool = True,
     task1_salvage_threshold: float = 1.0,
 ) -> tuple:
-    """Per-UID quality filter over `rollout_sample.full_batch`.
+    """Task-batch-native phase-aware std filter over `rollout_sample.task_batches`.
 
-    NOTE (multi-turn): when the orchestrator produces `rollout_sample.task_batches`,
-    `full_batch` is a legacy-compat view equal to `task_batches[2]` (task2 DP
-    across all turns) — not a single-turn batch. Consequences:
-      * Each UID has `max_turns * group_size` rows instead of `group_size`,
-        so the task1-salvage `n_group >= group_size` check still fires but
-        the subsequent `slice(..., range(group_size))` takes the first
-        `group_size` rows arbitrarily (task2-turn ordering).
-      * `task3_token_level_scores` is not present on task2_dp rows, so the
-        `== -100` bad-check always skips (cannot mark task3-failed rows bad).
-    For proper per-task filtering in multi-turn mode, call this function
-    on each `task_batches[task_id]` individually with task-specific
-    thresholds. That refactor is out of scope for this patch.
+    - phase1 rows are filtered by outcome reward std
+    - phase2 rows are filtered by task-local reward std
+
+    salvage / assembled / retry behavior is intentionally disabled.
+    The filter mutates `rollout_sample.task_batches` directly, then rebuilds a
+    legacy `full_batch` view from the filtered task batches.
     """
-    current_batch = rollout_sample.full_batch
-    uids = current_batch.non_tensor_batch["uid"]
-    is_retry = rollout_sample.retry_count > 0
-
-    uid_to_indices: dict = {}
-    for i, uid in enumerate(uids):
-        if uid not in uid_to_indices:
-            uid_to_indices[uid] = []
-        uid_to_indices[uid].append(i)
+    src_task_batches = getattr(rollout_sample, "task_batches", None) or {}
+    if not src_task_batches:
+        return list(range(len(rollout_sample.full_batch))), [], [], 0, 0
 
     good_indices: list = []
     assembled_groups: list = []
     retry_samples: list = []
-    retry_uid_accumulations: dict = {}
     n_dropped: int = 0
     n_salvaged: int = 0
+    phase1_group_keys: dict[str, None] = {}
+    phase2_group_keys: dict[str, None] = {}
+    original_phase1_rows = len(rollout_sample.full_batch) if getattr(rollout_sample, "full_batch", None) is not None else 0
 
-    for uid, indices in uid_to_indices.items():
-        # ① 수정: meta_info 보존
-        group_batch = _slice_dataproto_with_meta(current_batch, indices)
-        n_group = len(indices)
-
-        bad_mask = [_is_sample_bad(group_batch, local_i, task2_threshold) for local_i in range(n_group)]
-
-        if not any(bad_mask) and not is_retry:
-            good_indices.extend(indices)
+    for task_batch in src_task_batches.values():
+        if task_batch is None or "uid" not in task_batch.non_tensor_batch:
             continue
+        task_group_keys = _extract_group_keys(task_batch)
+        if "phase" in task_batch.non_tensor_batch:
+            phase_arr = np.asarray(task_batch.non_tensor_batch["phase"])
+            for key in task_group_keys[phase_arr == 1]:
+                phase1_group_keys.setdefault(str(key), None)
+            for key in task_group_keys[phase_arr == 2]:
+                phase2_group_keys.setdefault(str(key), None)
+        else:
+            for key in task_group_keys:
+                phase1_group_keys.setdefault(str(key), None)
 
-        # task1 max=1인 샘플이 그룹 내 있으면 task3 -100 있어도 retry 없이 바로 전송 (salvage/replay buffer 사용 시에만)
-        if use_salvage and "task1_token_level_scores" in group_batch.batch and n_group >= group_size:
-            t1_scores = _get_task_rewards(group_batch, 1)
-            t1_above = (t1_scores >= task1_salvage_threshold - 1e-6).sum().item()
-            if t1_above >= group_size / 2:
-                final_batch = _slice_dataproto_with_meta(group_batch, list(range(group_size)))
-                has_t3_minus100 = False
-                if "task3_token_level_scores" in final_batch.batch:
-                    if (final_batch.batch["task3_token_level_scores"] == -100).any():
-                        final_batch.batch["task3_token_level_scores"] = torch.full_like(
-                            final_batch.batch["task3_token_level_scores"], -100
-                        )
-                        has_t3_minus100 = True
-                assembled_groups.append((final_batch, uid))
-                print(
-                    f"[QualityFilter] task1 salvage early send uid={uid}: "
-                    f"t1_above={t1_above}/{group_size}, task3_normalized={has_t3_minus100}"
-                )
+    kept_phase1_keys: set[str] = set()
+    for group_key in phase1_group_keys.keys():
+        phase1_rewards: list[float] = []
+        for task_batch in src_task_batches.values():
+            if task_batch is None or "uid" not in task_batch.non_tensor_batch:
                 continue
-
-        good_local = [i for i, bad in enumerate(bad_mask) if not bad]
-        # ② 수정: meta_info 보존
-        new_good_batch = _slice_dataproto_with_meta(group_batch, good_local) if good_local else None
-
-        prev_accumulated_raw = rollout_sample.accumulated_good_batch if is_retry else None
-        if prev_accumulated_raw is not None:
-            acc_uids = prev_accumulated_raw.non_tensor_batch["uid"]
-            uid_acc_idx = [i for i, u in enumerate(acc_uids) if u == uid]
-            prev_accumulated = _slice_dataproto_with_meta(prev_accumulated_raw, uid_acc_idx) if uid_acc_idx else None
-        else:
-            prev_accumulated = None
-
-        # ③ 수정: meta_info 보존
-        if new_good_batch is not None and prev_accumulated is not None:
-            accumulated = _concat_dataprotos_with_meta([prev_accumulated, new_good_batch])
-        elif new_good_batch is not None:
-            accumulated = new_good_batch
-        else:
-            accumulated = prev_accumulated
-
-        n_acc = len(accumulated) if accumulated is not None else 0
-        current_retry_count = rollout_sample.retry_count
-
-        if n_acc >= group_size:
-            n_prev = len(prev_accumulated) if prev_accumulated is not None else 0
-            if prev_accumulated is not None and new_good_batch is not None and n_prev < group_size:
-                needed = group_size - n_prev
-                diverse_idx = _select_diverse_candidates(prev_accumulated, new_good_batch, needed, task_ids)
-                selected_new = _slice_dataproto_with_meta(new_good_batch, diverse_idx)
-                final_batch = _concat_dataprotos_with_meta([prev_accumulated, selected_new])
-            elif prev_accumulated is not None and new_good_batch is not None and n_prev >= group_size:
-                # 기존 샘플 중 일부를 새 diverse 샘플로 교체
-                diverse_idx = _select_diverse_candidates(prev_accumulated, new_good_batch, len(new_good_batch), task_ids)
-                if diverse_idx:
-                    selected_new = _slice_dataproto_with_meta(new_good_batch, diverse_idx)
-                    # prev에서 교체할 개수만큼 뒤쪽을 잘라내고 new로 대체
-                    keep_count = group_size - len(diverse_idx)
-                    kept_prev = _slice_dataproto_with_meta(prev_accumulated, list(range(keep_count)))
-                    final_batch = _concat_dataprotos_with_meta([kept_prev, selected_new])
-                else:
-                    final_batch = _slice_dataproto_with_meta(accumulated, list(range(group_size)))
-            else:
-                final_batch = _slice_dataproto_with_meta(accumulated, list(range(group_size)))
-            assembled_groups.append((final_batch, uid))
-            continue
-
-        if current_retry_count < max_retries:
-            retry_uid_accumulations[uid] = accumulated
-        else:
-            # max_retries 초과: task2만 기준으로 valid 샘플 추출해 salvage 시도
-            # good_local 샘플은 이미 accumulated에 포함되어 있으므로 제외 (중복 방지)
-            good_local_set = set(good_local)
-            t2_valid_local = [i for i in range(n_group)
-                              if not _is_sample_bad_task2_only(group_batch, i, task2_threshold)
-                              and i not in good_local_set]
-            t2_valid_batch = _slice_dataproto_with_meta(group_batch, t2_valid_local) if t2_valid_local else None
-
-            needed = group_size - n_acc
-            salvageable = use_salvage and t2_valid_batch is not None and len(t2_valid_batch) >= needed
-
-            if salvageable:
-                # task3 제외하고 task1/task2 기준으로만 diversity 선택
-                salvage_task_ids = [tid for tid in task_ids if tid != 3]
-                if accumulated is not None:
-                    diverse_idx = _select_diverse_candidates(accumulated, t2_valid_batch, needed, salvage_task_ids)
-                    selected = _slice_dataproto_with_meta(t2_valid_batch, diverse_idx)
-                    final_batch = _concat_dataprotos_with_meta([accumulated, selected])
-                else:
-                    final_batch = _slice_dataproto_with_meta(t2_valid_batch, list(range(group_size)))
-
-                # 그룹 내 task3 -100 하나라도 있으면 전체 task3 -100으로 통일
-                if "task3_token_level_scores" in final_batch.batch:
-                    if (final_batch.batch["task3_token_level_scores"] == -100).any():
-                        final_batch.batch["task3_token_level_scores"] = torch.full_like(
-                            final_batch.batch["task3_token_level_scores"], -100
-                        )
-
-                assembled_groups.append((final_batch, uid))
-                n_salvaged += 1  # prompt 단위
-                print(
-                    f"[QualityFilter] Salvaging uid={uid}: "
-                    f"max retries ({max_retries}) reached, task1/task2 only "
-                    f"(acc={n_acc}, t2_valid={len(t2_valid_batch)}, group_size={group_size})"
-                )
-            else:
-                print(
-                    f"[QualityFilter] Dropping uid={uid}: "
-                    f"max retries ({max_retries}) reached, "
-                    f"insufficient salvageable samples "
-                    f"(acc={n_acc}, t2_valid={len(t2_valid_batch) if t2_valid_batch else 0}/{group_size})"
-                )
-                n_dropped += n_group
-
-    if retry_uid_accumulations:
-        orig_prompt = rollout_sample.original_prompt_batch
-        current_retry_count = rollout_sample.retry_count
-        orig_uids = orig_prompt.non_tensor_batch["uid"]
-        all_uids_in_batch = list(dict.fromkeys(orig_uids))
-        retry_uids = set(retry_uid_accumulations.keys())
-        
-        if retry_uids == set(all_uids_in_batch):
-            # Case 1: 모든 uid retry → 두 uid 묶어서 하나의 rollout (no repeat)
-            combined_accumulated = None
-            acc_list = [acc for acc in retry_uid_accumulations.values() if acc is not None]
-            if acc_list:
-                combined_accumulated = _concat_dataprotos_with_meta(acc_list) if len(acc_list) > 1 else acc_list[0]
-            retry_rs = RolloutSample(
-                full_batch=orig_prompt,
-                agent_loop_output_list=[],
-                sample_id=f"{rollout_sample.sample_id}_r{current_retry_count + 1}",
-                epoch=rollout_sample.epoch,
-                processing_times=[0.0] * len(orig_prompt),
-                tool_calls=rollout_sample.tool_calls,
-                param_version=rollout_sample.param_version,
-                param_version_start=[rollout_sample.param_version] * len(orig_prompt),
-                param_version_end=[rollout_sample.param_version] * len(orig_prompt),
-                rollout_status=rollout_sample.rollout_status,
-                original_prompt_batch=orig_prompt,
-                accumulated_good_batch=combined_accumulated,
-                retry_count=current_retry_count + 1,
+            if "outcome_token_level_scores" not in task_batch.batch:
+                continue
+            task_group_keys = _extract_group_keys(task_batch)
+            group_mask = (task_group_keys == group_key)
+            if "phase" in task_batch.non_tensor_batch:
+                phase_arr = np.asarray(task_batch.non_tensor_batch["phase"])
+                group_mask = group_mask & (phase_arr == 1)
+            if not np.any(group_mask):
+                continue
+            group_task_batch = _slice_dataproto_with_meta(task_batch, np.where(group_mask)[0].tolist())
+            outcome_scores = group_task_batch.batch["outcome_token_level_scores"]
+            rewards = (
+                torch.where(outcome_scores >= 0, outcome_scores, torch.zeros_like(outcome_scores))
+                .sum(dim=-1)
+                .detach()
+                .cpu()
+                .numpy()
+                .tolist()
             )
-            retry_samples.append(retry_rs)
-        else:
-            # Case 2: 일부 uid만 retry → 해당 uid만 슬라이스 후 2x repeat
-            for uid, accumulated in retry_uid_accumulations.items():
-                uid_prompt_idx = [i for i, u in enumerate(orig_uids) if u == uid]
-                uid_prompt = _slice_dataproto_with_meta(orig_prompt, uid_prompt_idx)
-                n_orig = len(orig_prompt)
-                n_uid = len(uid_prompt)
-                if n_uid < n_orig:
-                    repeat_factor = n_orig // n_uid
-                    uid_prompt = uid_prompt.repeat(repeat_times=repeat_factor, interleave=True)
-                retry_rs = RolloutSample(
-                    full_batch=uid_prompt,
-                    agent_loop_output_list=[],
-                    sample_id=f"{rollout_sample.sample_id}_{uid}_r{current_retry_count + 1}",
-                    epoch=rollout_sample.epoch,
-                    processing_times=[0.0] * len(uid_prompt),
-                    tool_calls=rollout_sample.tool_calls,
-                    param_version=rollout_sample.param_version,
-                    param_version_start=[rollout_sample.param_version] * len(uid_prompt),
-                    param_version_end=[rollout_sample.param_version] * len(uid_prompt),
-                    rollout_status=rollout_sample.rollout_status,
-                    original_prompt_batch=uid_prompt,
-                    accumulated_good_batch=accumulated,
-                    retry_count=current_retry_count + 1,
-                )
-                retry_samples.append(retry_rs)
+            phase1_rewards.extend(float(r) for r in rewards)
 
+        if phase1_rewards and len(phase1_rewards) >= 2 and np.std(phase1_rewards) > 1e-8:
+            kept_phase1_keys.add(group_key)
+
+    kept_phase2_keys: set[str] = set()
+    for group_key in phase2_group_keys.keys():
+        keep_group = True
+        saw_valid_local_reward = False
+        for task_id in task_ids:
+            task_batch = src_task_batches.get(task_id)
+            score_key = f"task{task_id}_token_level_scores"
+            if task_batch is None or score_key not in task_batch.batch or "uid" not in task_batch.non_tensor_batch:
+                continue
+            task_group_keys = _extract_group_keys(task_batch)
+            group_mask = (task_group_keys == group_key)
+            if "phase" in task_batch.non_tensor_batch:
+                phase_arr = np.asarray(task_batch.non_tensor_batch["phase"])
+                group_mask = group_mask & (phase_arr == 2)
+            else:
+                group_mask = np.zeros_like(group_mask, dtype=bool)
+            if not np.any(group_mask):
+                continue
+            group_task_batch = _slice_dataproto_with_meta(task_batch, np.where(group_mask)[0].tolist())
+            task_scores = group_task_batch.batch[score_key]
+            valid_mask = ~(task_scores == -100).any(dim=1)
+            valid_rewards = (
+                torch.where(task_scores >= 0, task_scores, torch.zeros_like(task_scores))
+                .sum(dim=-1)[valid_mask]
+                .detach()
+                .cpu()
+                .numpy()
+            )
+            if len(valid_rewards) == 0:
+                continue
+            saw_valid_local_reward = True
+            if len(valid_rewards) < 2 or np.std(valid_rewards) <= 1e-8:
+                keep_group = False
+                break
+        if keep_group and saw_valid_local_reward:
+            kept_phase2_keys.add(group_key)
+
+    filtered_task_batches: dict[int, Any] = {}
+    for tid, tdp in src_task_batches.items():
+        if tdp is None or "uid" not in tdp.non_tensor_batch:
+            filtered_task_batches[tid] = None
+            continue
+        task_group_keys = _extract_group_keys(tdp)
+        if "phase" in tdp.non_tensor_batch:
+            phase_arr = np.asarray(tdp.non_tensor_batch["phase"])
+            keep_mask = np.zeros(len(tdp), dtype=bool)
+            keep_mask |= (phase_arr == 1) & np.isin(task_group_keys, list(kept_phase1_keys))
+            keep_mask |= (phase_arr == 2) & np.isin(task_group_keys, list(kept_phase2_keys))
+        else:
+            keep_mask = np.isin(task_group_keys, list(kept_phase1_keys))
+        keep_idx = np.where(keep_mask)[0].tolist()
+        filtered_task_batches[tid] = _slice_dataproto_with_meta(tdp, keep_idx) if keep_idx else None
+
+    rollout_sample.task_batches = filtered_task_batches
+    rebuilt_full_batch = _pick_legacy_full_batch_from_task_batches(filtered_task_batches)
+    phase1_total_groups = len(phase1_group_keys)
+    phase1_kept_groups = len(kept_phase1_keys)
+    phase1_filtered_groups = max(0, phase1_total_groups - phase1_kept_groups)
+    phase2_total_groups = len(phase2_group_keys)
+    phase2_kept_groups = len(kept_phase2_keys)
+    phase2_filtered_groups = max(0, phase2_total_groups - phase2_kept_groups)
+    if rebuilt_full_batch is None:
+        rollout_sample.full_batch = rollout_sample.full_batch[:0]
+        rollout_sample.full_batch.meta_info = dict(getattr(rollout_sample.full_batch, "meta_info", {}) or {})
+        rollout_sample.full_batch.meta_info.update({
+            "fully_async/filter_groups/total_groups": phase1_total_groups + phase2_total_groups,
+            "fully_async/filter_groups/kept_groups": phase1_kept_groups + phase2_kept_groups,
+            "fully_async/filter_groups/filtered_groups": phase1_filtered_groups + phase2_filtered_groups,
+            "fully_async/filter_groups/phase1_total_groups": phase1_total_groups,
+            "fully_async/filter_groups/phase1_kept_groups": phase1_kept_groups,
+            "fully_async/filter_groups/phase1_filtered_groups": phase1_filtered_groups,
+            "fully_async/filter_groups/phase2_total_groups": phase2_total_groups,
+            "fully_async/filter_groups/phase2_kept_groups": phase2_kept_groups,
+            "fully_async/filter_groups/phase2_filtered_groups": phase2_filtered_groups,
+        })
+        rollout_sample.processing_times = []
+        rollout_sample.param_version_start = []
+        rollout_sample.param_version_end = []
+        return [], assembled_groups, retry_samples, original_phase1_rows, n_salvaged
+
+    rollout_sample.full_batch = rebuilt_full_batch
+    rollout_sample.full_batch.meta_info = dict(getattr(rollout_sample.full_batch, "meta_info", {}) or {})
+    rollout_sample.full_batch.meta_info.update({
+        "fully_async/filter_groups/total_groups": phase1_total_groups + phase2_total_groups,
+        "fully_async/filter_groups/kept_groups": phase1_kept_groups + phase2_kept_groups,
+        "fully_async/filter_groups/filtered_groups": phase1_filtered_groups + phase2_filtered_groups,
+        "fully_async/filter_groups/phase1_total_groups": phase1_total_groups,
+        "fully_async/filter_groups/phase1_kept_groups": phase1_kept_groups,
+        "fully_async/filter_groups/phase1_filtered_groups": phase1_filtered_groups,
+        "fully_async/filter_groups/phase2_total_groups": phase2_total_groups,
+        "fully_async/filter_groups/phase2_kept_groups": phase2_kept_groups,
+        "fully_async/filter_groups/phase2_filtered_groups": phase2_filtered_groups,
+    })
+    kept_phase1_rows = len(rebuilt_full_batch)
+    if rollout_sample.processing_times:
+        rollout_sample.processing_times = [rollout_sample.processing_times[0]] * kept_phase1_rows
+    if isinstance(rollout_sample.param_version_start, list) and rollout_sample.param_version_start:
+        rollout_sample.param_version_start = [rollout_sample.param_version_start[0]] * kept_phase1_rows
+    if isinstance(rollout_sample.param_version_end, list) and rollout_sample.param_version_end:
+        rollout_sample.param_version_end = [rollout_sample.param_version_end[0]] * kept_phase1_rows
+
+    n_dropped = max(0, original_phase1_rows - kept_phase1_rows)
+    good_indices = list(range(len(rollout_sample.full_batch)))
     return good_indices, assembled_groups, retry_samples, n_dropped, n_salvaged

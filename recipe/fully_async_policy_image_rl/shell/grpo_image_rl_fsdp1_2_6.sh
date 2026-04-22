@@ -14,7 +14,7 @@ exec 2>&1
 #                         EXPERIMENT CONFIGURATION
 ###############################################################################
 project_name='mllm_reasoning'
-exp_name="0420_debug2"
+exp_name="0423_nipa_adaptive_filtering_mean_constant_cfg_2_adjust_loss_weight_clip_high_lr_1e_6_train_wo_focusdiff_aug_outcome_reward_v3"
 # exp_name='testest'
 task_ids='[1,2,3]'
 
@@ -107,9 +107,18 @@ max_turns=2
 
 # Outcome-advantage weighting: each task's advantage is folded with
 # `outcome_gamma * outcome_advantages` where `outcome_advantages` is the
-# GRPO-normalized trajectory outcome (task3 reward if the turn completed,
-# task1 reward on early-terminated turns). Set to 0.0 to disable.
-outcome_gamma=0.95
+# GRPO-normalized trajectory outcome computed by the new formula:
+#   R_out(τ) = A_T + eta·IF_bar + beta·P̄ - lambda·(T-1)
+# Set outcome_gamma=0.0 to disable the outcome signal entirely.
+outcome_gamma=1.00
+
+# Outcome reward formula hyperparameters
+# eta   : mean edit instruction-following weight
+# beta  : process-quality weight
+# lambda: per-extra-turn cost penalty
+outcome_eta=0.1
+outcome_beta=0.1
+outcome_lambda=0.12
 
 # KL Divergence
 use_kl_in_reward=False
@@ -128,11 +137,8 @@ adaptive_entropy_coeff_task1_target_entropy=5.0
 adaptive_entropy_coeff_task2_target_entropy=0.3
 adaptive_entropy_coeff_task3_target_entropy=5.0
 
-# Group Filtering — quality_filter_rollout_sample is per-UID/per-task and
-# assumes single-turn group sizes (`rollout.n` rows per UID). Under multi-turn
-# each UID has `turn_count * rollout.n` rows in task2/task3 DPs, so the filter's
-# group-size assumptions no longer hold. Disable until a per-task filter exists.
-enable_filter_groups=False
+# Group Filtering
+enable_filter_groups=True
 filter_groups_metric=reward
 norm_adv_by_std_in_grpo=True
 
@@ -192,7 +198,7 @@ loss_agg_mode="token-mean"
 ###############################################################################
 #                          OPTIMIZER SETTINGS
 ###############################################################################
-lr=5e-7
+lr=1e-6
 lr_scheduler_type=constant
 lr_warmup_steps=10
 weight_decay=0.01
@@ -204,7 +210,7 @@ weight_decay=0.01
 total_rollout_steps=$(((512*100*3*10)))
 staleness_threshold=2.0
 trigger_parameter_sync_step=1
-require_batches=2
+require_batches=1
 partial_rollout=False
 use_rollout_log_probs=True
 compute_prox_log_prob=False
@@ -219,13 +225,13 @@ replay_buffer_enable=True
 replay_buffer_max_version_gap=-1
 replay_buffer_max_size_per_task=64
 replay_buffer_max_use_count=-1
-replay_buffer_filter_mode=mean
-replay_buffer_score_threshold_1=-1e9
-replay_buffer_score_threshold_2=-1e9
-replay_buffer_score_threshold_3=-1e9
-replay_buffer_score_std_threshold_1=0.0
-replay_buffer_score_std_threshold_2=0.0
-replay_buffer_score_std_threshold_3=0.0
+replay_buffer_filter_mode=max_and_std_constant      # "mean", "std", or "max", "max_and_std_constant"
+replay_buffer_score_threshold_1=0.8
+replay_buffer_score_threshold_2=0.8 # 3점 만점 
+replay_buffer_score_threshold_3=0.8 # 2점 만점
+replay_buffer_score_std_threshold_1=0.1
+replay_buffer_score_std_threshold_2=0.1
+replay_buffer_score_std_threshold_3=0.1
 replay_buffer_reward_history_size=100
 replay_buffer_max_quantile=0.50
 replay_buffer_std_quantile=0.25
@@ -289,6 +295,9 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     algorithm.filter_groups.metric=${filter_groups_metric} \
     algorithm.norm_adv_by_std_in_grpo=${norm_adv_by_std_in_grpo} \
     +algorithm.outcome_gamma=${outcome_gamma} \
+    +algorithm.outcome_eta=${outcome_eta} \
+    +algorithm.outcome_beta=${outcome_beta} \
+    +algorithm.outcome_lambda=${outcome_lambda} \
     algorithm.rollout_correction.rollout_is=${rollout_is} \
     algorithm.rollout_correction.rollout_is_threshold=${rollout_is_threshold} \
     algorithm.rollout_correction.bypass_mode=${bypass_mode} \
@@ -345,7 +354,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     actor_rollout_ref.ref.ulysses_sequence_parallel_size=${sp_size} \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
-    trainer.val_before_train=True \
+    trainer.val_before_train=False \
     trainer.balance_batch=False \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
@@ -400,7 +409,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     +reward_model.reward_kwargs.rm_llm_model_path="${rm_llm_model_path}" \
     +actor_rollout_ref.actor.multi_task.enable=True \
     +actor_rollout_ref.actor.multi_task.task_ids="${task_ids}" \
-    +actor_rollout_ref.actor.multi_task.task_weights='[0.3,0.3,0.4]' \
+    +actor_rollout_ref.actor.multi_task.task_weights='[0.3,0.3,0.3]' \
     actor_rollout_ref.actor.adaptive_entropy_coeff.enable=${adaptive_entropy_coeff_enable} \
     actor_rollout_ref.actor.adaptive_entropy_coeff.task1.target_entropy=${adaptive_entropy_coeff_task1_target_entropy} \
     actor_rollout_ref.actor.adaptive_entropy_coeff.task2.target_entropy=${adaptive_entropy_coeff_task2_target_entropy} \

@@ -18,6 +18,7 @@ from datetime import datetime
 from pprint import pprint
 from typing import Any, Optional
 import threading
+import copy
 import queue
 
 import ray
@@ -397,16 +398,60 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             f"Dropped sample: {dropped_rows}"
         )
 
+        balance_fn = self._balance_batch if self.config.trainer.balance_batch else None
         if self.config.trainer.balance_batch:
             batch = assemble_batch_from_rollout_samples(queue_samples, self.tokenizer, self.config, self._balance_batch)
         else:
             batch = assemble_batch_from_rollout_samples(queue_samples, self.tokenizer, self.config, None)
 
+        assembled_task_batches = self._assemble_task_batches_from_samples(queue_samples, balance_fn)
+
         batch.meta_info["fully_async/total_wait_time"] = total_wait_time
         batch.meta_info["fully_async/total_sample_count"] = current_rows
         batch.meta_info["fully_async/batch_size"] = current_rows
 
-        return 0, batch
+        return 0, batch, assembled_task_batches
+
+    @staticmethod
+    def _clone_dataproto(dp: DataProto) -> DataProto:
+        return DataProto(
+            batch=dp.batch.clone() if getattr(dp, "batch", None) is not None else None,
+            non_tensor_batch=copy.deepcopy(getattr(dp, "non_tensor_batch", None)),
+            meta_info=copy.deepcopy(getattr(dp, "meta_info", None)),
+        )
+
+    def _assemble_task_batches_from_samples(self, rollout_samples: list, balance_fn=None) -> dict[int, DataProto]:
+        task_ids = list(self.config.actor_rollout_ref.actor.multi_task.get("task_ids", [1]))
+        assembled: dict[int, DataProto] = {}
+
+        for tid in task_ids:
+            selected_samples = []
+            originals = []
+            for rs in rollout_samples:
+                task_batches = getattr(rs, "task_batches", None)
+                if task_batches is None:
+                    continue
+                task_dp = task_batches.get(tid)
+                if task_dp is None:
+                    continue
+                originals.append((rs, rs.full_batch))
+                rs.full_batch = task_dp
+                selected_samples.append(rs)
+
+            if not selected_samples:
+                for rs, original_full in originals:
+                    rs.full_batch = original_full
+                continue
+
+            try:
+                assembled[tid] = assemble_batch_from_rollout_samples(
+                    selected_samples, self.tokenizer, self.config, balance_fn
+                )
+            finally:
+                for rs, original_full in originals:
+                    rs.full_batch = original_full
+
+        return assembled
 
     def _create_actor_rollout_classes(self):
         # create actor
@@ -535,16 +580,17 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                             task_batch = self._process_batch_common(
                                 task_batch, metrics, task_timing, self.local_trigger_step if self.compute_prox_log_prob else None, task_id
                             )
+                            self._restore_reward_extra_infos_for_logging(task_batch, task_id)
                             task_batches[task_id] = task_batch
                             task_timings[task_id] = task_timing
 
                             if should_log_rollout:
                                 task_reward_extra = {k: v for k, v in task_batch.meta_info.items()}
                                 task_rollout_dir = os.path.join(rollout_data_dir, f"task{task_id}")
-                                self._log_rollout_data(task_batch, task_reward_extra, task_timing, task_rollout_dir)
+                                self._submit_rollout_dump(task_batch, task_reward_extra, task_timing, task_rollout_dir)
                     else:
                         # ---- Non-replay path: collect from queue (original behavior) ----
-                        epoch, batch = self._get_samples_from_queue()
+                        epoch, batch, queued_task_batches = self._get_samples_from_queue()
                         if batch is None:
                             break
 
@@ -554,18 +600,22 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                             timing_raw['reward'] = batch.meta_info['reward']
 
                         for task_id in task_ids:
-                            task_batch = batch
+                            if queued_task_batches and task_id in queued_task_batches:
+                                task_batch = self._clone_dataproto(queued_task_batches[task_id])
+                            else:
+                                task_batch = self._clone_dataproto(batch)
 
                             task_batch.batch["task_id"] = torch.tensor([task_id for _ in range(len(task_batch))], dtype=int)
                             task_batch = self._process_batch_common(
                                 task_batch, metrics, timing_raw, self.local_trigger_step if self.compute_prox_log_prob else None, task_id
                             )
+                            self._restore_reward_extra_infos_for_logging(task_batch, task_id)
                             task_batches[task_id] = task_batch
 
                             if should_log_rollout:
                                 task_reward_extra = {k: v for k, v in task_batch.meta_info.items()}
                                 task_rollout_dir = os.path.join(rollout_data_dir, f"task{task_id}")
-                                self._log_rollout_data(task_batch, task_reward_extra, timing_raw, task_rollout_dir)
+                                self._submit_rollout_dump(task_batch, task_reward_extra, timing_raw, task_rollout_dir)
 
                     if not task_batches:
                         break
@@ -662,6 +712,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             print("[FullyAsyncTrainer] Buffer feeder thread stopped.")
 
         self._check_save_checkpoint(timing_raw)
+        self._shutdown_rollout_dump_executor(wait=True)
 
     def _check_save_checkpoint(self, timing_raw):
         if self.current_param_version == self.last_ckpt_version:

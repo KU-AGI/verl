@@ -98,12 +98,15 @@ class ReplayBuffer:
 
     def push(self, batch: DataProto, task_id: int) -> int:
         score_key = f"task{task_id}_token_level_scores"
-        if score_key not in batch.batch:
+        outcome_key = "outcome_token_level_scores"
+        if score_key not in batch.batch and outcome_key not in batch.batch:
             return 0
 
-        scores = batch.batch[score_key].sum(-1)
         uids = batch.non_tensor_batch["uid"]
         param_versions = batch.non_tensor_batch["param_version"]
+        phase_arr = None
+        if "phase" in batch.non_tensor_batch:
+            phase_arr = np.asarray(batch.non_tensor_batch["phase"])
 
         # Per-turn grouping: rows are keyed by (uid, turn_idx) so each turn's
         # rollout of the same prompt lives in its own group entry. turn_idx
@@ -126,11 +129,51 @@ class ReplayBuffer:
         entries_to_add: list[BufferEntry] = []
 
         allowed_prefixes = tuple(f"task{t}_" for t in range(1, task_id + 1))
-        base_ntb = {"uid", "turn_idx", "trajectory_id", "param_version", "data_source", "prompt_id", "prompt", "reward_model"}
+        base_ntb = {
+            "uid",
+            "turn_idx",
+            "trajectory_id",
+            "branch_id",
+            "parent_branch_id",
+            "param_version",
+            "data_source",
+            "prompt_id",
+            "prompt",
+            "reward_model",
+            "phase",
+            "grpo_group_id",
+            "outcome_A_T",
+            "outcome_IF_bar",
+            "outcome_P_bar",
+            "outcome_T",
+        }
 
         for (uid, turn_idx), idxs in key_idxs.items():
-            uid_scores = [scores[i].item() for i in idxs]
-            if any(s < 0 for s in uid_scores):
+            phases = None
+            if phase_arr is not None:
+                phases = {int(phase_arr[i]) for i in idxs}
+                if len(phases) != 1:
+                    # Mixed-phase groups indicate an upstream grouping bug.
+                    # Skip rather than storing semantically inconsistent stats.
+                    continue
+                phase_id = next(iter(phases))
+            else:
+                # Legacy fallback: treat missing phase as local-reward path.
+                phase_id = 0
+
+            stats_key = outcome_key if phase_id == 1 else score_key
+            if stats_key not in batch.batch:
+                # Phase-aware metric is unavailable; skip this entry rather than
+                # silently mixing local/outcome semantics.
+                continue
+
+            score_tensor = batch.batch[stats_key].sum(-1)
+            uid_scores = [float(score_tensor[i].item()) for i in idxs]
+            if (
+                not uid_scores
+                or not np.all(np.isfinite(uid_scores))
+                or any(s == -100 for s in uid_scores)
+            ):
                 continue
             mean_reward = sum(uid_scores) / len(uid_scores)
             max_reward = max(uid_scores)
@@ -159,6 +202,13 @@ class ReplayBuffer:
                 if "task1_token_level_scores" in filtered.batch.keys():
                     cross_task_vals["task2_task1_token_level_scores"] = filtered.batch["task1_token_level_scores"]
             elif task_id == 3:
+                img_src = (
+                    "current_imgs_pixel_values"
+                    if "current_imgs_pixel_values" in filtered.batch.keys()
+                    else "task1_gen_imgs_pixel_values"
+                )
+                if img_src in filtered.batch.keys():
+                    cross_task_vals["task3_task1_gen_imgs_pixel_values"] = filtered.batch[img_src]
                 tok_src = (
                     "current_img_tokens"
                     if "current_img_tokens" in filtered.batch.keys()

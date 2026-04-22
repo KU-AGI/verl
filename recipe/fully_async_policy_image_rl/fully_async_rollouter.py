@@ -200,8 +200,10 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         # (task1 = early-terminated vs task3 = completed regen) and the
         # outcome reward mean split by origin.
         self._version_outcome_task1_rows = []
+        self._version_outcome_task2_rows = []
         self._version_outcome_task3_rows = []
         self._version_outcome_task1_reward_sum = []
+        self._version_outcome_task2_reward_sum = []
         self._version_outcome_task3_reward_sum = []
 
         self._version_start_sample_count = 0
@@ -375,14 +377,20 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
 
             # Outcome attribution (trajectory-level when task1 is used as source)
             total_outcome_t1 = sum(self._version_outcome_task1_rows)
+            total_outcome_t2 = sum(self._version_outcome_task2_rows)
             total_outcome_t3 = sum(self._version_outcome_task3_rows)
-            total_outcome    = total_outcome_t1 + total_outcome_t3
+            total_outcome    = total_outcome_t1 + total_outcome_t2 + total_outcome_t3
             if total_outcome > 0:
                 timing_raw["rollouter/outcome_from_task1_frac"] = total_outcome_t1 / total_outcome
+                timing_raw["rollouter/outcome_from_task2_frac"] = total_outcome_t2 / total_outcome
                 timing_raw["rollouter/outcome_from_task3_frac"] = total_outcome_t3 / total_outcome
             if total_outcome_t1 > 0:
                 timing_raw["rollouter/outcome_task1_reward_mean"] = (
                     sum(self._version_outcome_task1_reward_sum) / total_outcome_t1
+                )
+            if total_outcome_t2 > 0:
+                timing_raw["rollouter/outcome_task2_reward_mean"] = (
+                    sum(self._version_outcome_task2_reward_sum) / total_outcome_t2
                 )
             if total_outcome_t3 > 0:
                 timing_raw["rollouter/outcome_task3_reward_mean"] = (
@@ -406,8 +414,10 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             self._version_task_reward_sum = {1: [], 2: [], 3: []}
             self._version_task_reward_rows = {1: [], 2: [], 3: []}
             self._version_outcome_task1_rows = []
+            self._version_outcome_task2_rows = []
             self._version_outcome_task3_rows = []
             self._version_outcome_task1_reward_sum = []
+            self._version_outcome_task2_reward_sum = []
             self._version_outcome_task3_reward_sum = []
             self._version_start_sample_count = self.total_generated_samples
             self._version_start_time = current_time
@@ -883,6 +893,12 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             or task_batches.get(2)
             or task_batches.get(3)
         )
+        if outcome_dp is not None and "phase" in outcome_dp.non_tensor_batch:
+            from recipe.fully_async_policy_image_rl.detach_utils import _slice_dataproto_with_meta
+            phase_arr = np.asarray(outcome_dp.non_tensor_batch["phase"])
+            phase1_idx = np.where(phase_arr == 1)[0].tolist()
+            if phase1_idx:
+                outcome_dp = _slice_dataproto_with_meta(outcome_dp, phase1_idx)
         if (
             outcome_dp is None
             or getattr(outcome_dp, "batch", None) is None
@@ -895,13 +911,19 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             outcome_rew = outcome_dp.batch["outcome_token_level_scores"].clamp(min=0).sum(dim=-1).float()
             otid = outcome_dp.batch["outcome_task_id"]
             m1 = (otid == 1)
+            m2 = (otid == 2)
             m3 = (otid == 3)
             n1 = int(m1.sum().item())
+            n2 = int(m2.sum().item())
             n3 = int(m3.sum().item())
         self._version_outcome_task1_rows.append(n1)
+        self._version_outcome_task2_rows.append(n2)
         self._version_outcome_task3_rows.append(n3)
         self._version_outcome_task1_reward_sum.append(
             float(outcome_rew[m1].sum().item()) if n1 > 0 else 0.0
+        )
+        self._version_outcome_task2_reward_sum.append(
+            float(outcome_rew[m2].sum().item()) if n2 > 0 else 0.0
         )
         self._version_outcome_task3_reward_sum.append(
             float(outcome_rew[m3].sum().item()) if n3 > 0 else 0.0
@@ -1001,10 +1023,20 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             # consumers that read `rollout_sample.full_batch` still work.
             task_batches: dict[int, Any] = result if isinstance(result, dict) else {1: result}
             legacy_full_batch = None
+            from recipe.fully_async_policy_image_rl.detach_utils import _slice_dataproto_with_meta
             for tid in (2, 3, 1):
-                if task_batches.get(tid) is not None:
-                    legacy_full_batch = task_batches[tid]
-                    break
+                candidate = task_batches.get(tid)
+                if candidate is None:
+                    continue
+                if "phase" in candidate.non_tensor_batch:
+                    phase_arr = np.asarray(candidate.non_tensor_batch["phase"])
+                    phase1_idx = np.where(phase_arr == 1)[0].tolist()
+                    if phase1_idx:
+                        legacy_full_batch = _slice_dataproto_with_meta(candidate, phase1_idx)
+                        break
+                    continue
+                legacy_full_batch = candidate
+                break
             if legacy_full_batch is None:
                 raise RuntimeError("[Rollouter] generate_sequences returned empty task_batches dict")
 
@@ -1168,7 +1200,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
 
                 # 4. 정상 그룹: merge → expand → send
                 if good_indices:
-                    good_rs = _slice_rollout_sample(rollout_sample, good_indices)
+                    good_rs = rollout_sample if self.config.algorithm.filter_groups.enable else _slice_rollout_sample(rollout_sample, good_indices)
                     merged_rs = merge_rollout_sample(self.config, self.tokenizer, good_rs, self.processor)
                     for ind_sample in expand_rollout_sample(merged_rs):
                         if len(ind_sample.full_batch) == 0:
