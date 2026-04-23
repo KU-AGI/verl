@@ -399,6 +399,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             if total_outcome > 0:
                 timing_raw["rollouter/outcome_reward_mean"] = (
                     sum(self._version_outcome_task1_reward_sum)
+                    + sum(self._version_outcome_task2_reward_sum)
                     + sum(self._version_outcome_task3_reward_sum)
                 ) / total_outcome
 
