@@ -748,10 +748,17 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
         #     sample_task3_scores
         # ))
 
+        def _flatten_validation_infos(obj, out):
+            for key, value in obj.items():
+                if isinstance(value, dict):
+                    _flatten_validation_infos(value, out)
+                else:
+                    out[key] = value
+
         # Flatten batched reward_extra_infos. Some entries are nested logging
         # aliases such as `task3_task2_reward_extra_info -> {task2_*: [...]}`.
         # Validation metric aggregation expects scalar/list-like values per key,
-        # so flatten nested dicts before merging across batches.
+        # so recursively flatten nested dicts before merging across batches.
         reward_extra_infos_dict = {}
         if all_reward_extra_infos_batches:
             flattened_batches = []
@@ -759,12 +766,7 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
 
             for batch_infos in all_reward_extra_infos_batches:
                 flat_infos = {}
-                for key, value in batch_infos.items():
-                    if isinstance(value, dict):
-                        for sub_key, sub_vals in value.items():
-                            flat_infos[sub_key] = sub_vals
-                    else:
-                        flat_infos[key] = value
+                _flatten_validation_infos(batch_infos, flat_infos)
                 flattened_batches.append(flat_infos)
                 all_keys.update(flat_infos.keys())
 

@@ -622,6 +622,9 @@ def process_validation_metrics(
         >>> result = process_validation_metrics(data_sources, sample_uids, infos_dict)
         >>> # result will contain statistics for each data source and variable
     """
+    def _is_numeric_scalar(val) -> bool:
+        return isinstance(val, (int, float, np.integer, np.floating, np.bool_)) and not isinstance(val, bool) or isinstance(val, bool)
+
     # Group metrics by data source, prompt and variable
     data_src2uid2var2vals = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
     for sample_idx, data_source in enumerate(data_sources):
@@ -635,8 +638,13 @@ def process_validation_metrics(
     for data_source, uid2var2vals in data_src2uid2var2vals.items():
         for uid, var2vals in uid2var2vals.items():
             for var_name, var_vals in var2vals.items():
-                # Filter out -100, None, and string values (e.g. _response keys padded with None)
-                valid_indices = [i for i, val in enumerate(var_vals) if val != -100 and val is not None and not isinstance(val, str)]
+                # Validation metrics should only aggregate scalar numeric values.
+                # Skip nested dict/list logging payloads, responses, and sentinels.
+                valid_indices = [
+                    i
+                    for i, val in enumerate(var_vals)
+                    if val is not None and val != -100 and _is_numeric_scalar(val)
+                ]
                 if len(valid_indices) == 0:
                     continue  # Skip if all values are invalid
 
