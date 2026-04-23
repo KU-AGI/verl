@@ -388,6 +388,22 @@ def _add_index_to_vqa_lines(text: str) -> str:
     return '\n'.join(f'{i + 1} | {line}' for i, line in enumerate(lines))
 
 
+def _add_index_to_vqa_entries(text: str) -> str:
+    """Add 'N | ' index prefix to each VQA result entry.
+
+    Unlike `_add_index_to_vqa_lines`, this respects the actual task2 answer
+    structure where one tuple result may span multiple lines but terminates with
+    `Answer: Yes/No`. This keeps Stage3/4 inputs aligned 1:1 with PRED_TUPLES.
+    """
+    if not text:
+        return ''
+    formatting_evaluator = FormattingEvaluatorV2()
+    entries = formatting_evaluator._extract_answer_paragraphs(text)
+    if not entries:
+        return ''
+    return '\n\n'.join(f'{i + 1} | {entry.strip()}' for i, entry in enumerate(entries))
+
+
 # --- Task-2 stage message builders ---
 
 def get_messages_task2_stage1(prompt: str, predicted_summarize: str):
@@ -433,8 +449,6 @@ def get_messages_task2_stage3(gen_img, tuple_raw: str, vqa_raw: str):
 def get_messages_task2_stage4(prompt: str, predicted_summarize: str, tuple_raw: str, vqa_raw: str, predicted_feedback: str):
     """Stage 4: VQA -> FEEDBACK reward judge (text-only)."""
     user_content = (
-        f"PROMPT:\n{prompt or ''}\n\n"
-        f"SUMMARY:\n{predicted_summarize or ''}\n\n"
         f"PRED_TUPLES:\n{tuple_raw or ''}\n\n"
         f"VQA_RESULTS:\n{vqa_raw or ''}\n\n"
         f"FEEDBACK:\n{predicted_feedback or 'No need to generate feedback.'}"
@@ -874,8 +888,9 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
         reward_extra_info["task2_rule_based_feedback_format_ok"] = int(feedback_step_format_ok)
         reward_extra_info["task2_no_feedback_needed"] = int(no_feedback_needed)
         # Prepare normalized inputs for stage judges
-        tuple_raw = _normalize_tuple_lines(predicted_tuple or '')
-        vqa_raw = _add_index_to_vqa_lines(predicted_answer or '')
+        # tuple_raw = _normalize_tuple_lines(predicted_tuple or '')
+        tuple_raw = predicted_tuple or ''
+        vqa_raw = _add_index_to_vqa_entries(predicted_answer or '')
 
         # Format gates: wrong format → skip judge (saves API call), _safe_stage_score maps None → 0.0
         tuple_format_ok = formatting_evaluator.check_tuple_schema_ok(predict_parsed_tuple)
