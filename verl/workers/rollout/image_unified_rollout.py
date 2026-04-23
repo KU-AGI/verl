@@ -704,6 +704,11 @@ class ImageUnifiedRollout(BaseRollout):
         if dist.get_rank() == 0:
             print(f"[REGEN] Processing regen for {batch_size} images in batch")
 
+        # Preserve the exact image shown to task3 before regeneration so dump
+        # code can log the true task3 input image instead of the post-regen
+        # rolled-forward current image.
+        data_proto.batch["task3_input_imgs_pixel_values"] = gen_imgs_pixel_values.detach().cpu().clone()
+
         # Parse feedback texts
         prompts = data_proto.non_tensor_batch['prompt']
         feedback_texts = [self.formatter._split_text_into_parts(feedback)[-1] for feedback in data_proto.non_tensor_batch['task2_feedback_texts']]

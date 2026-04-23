@@ -848,16 +848,30 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             uid = batch.non_tensor_batch["uid"].tolist()
             prompt = batch.non_tensor_batch['prompt'].tolist()
             task_ids = list(self.config.actor_rollout_ref.actor.multi_task.get("task_ids", [1]))
+            host_task_id = 0
+            if "task_id" in batch.batch:
+                try:
+                    host_task_id = int(batch.batch["task_id"].view(-1)[0].item())
+                except Exception:
+                    host_task_id = 0
             # Prefer the current image seen by the policy at this row/turn.
             gen_imgs_pil_list = None
             def _maybe_get_tensor(key: str):
                 return batch.batch[key] if key in batch.batch.keys() else None
-            current_img_sources = [
-                _maybe_get_tensor("current_imgs_pixel_values"),
-                _maybe_get_tensor("task2_task1_gen_imgs_pixel_values"),
-                _maybe_get_tensor("task3_task1_gen_imgs_pixel_values"),
-                _maybe_get_tensor("task1_gen_imgs_pixel_values"),
-            ]
+            if host_task_id == 3:
+                current_img_sources = [
+                    _maybe_get_tensor("task3_input_imgs_pixel_values"),
+                    _maybe_get_tensor("task3_task1_gen_imgs_pixel_values"),
+                    _maybe_get_tensor("task1_gen_imgs_pixel_values"),
+                    _maybe_get_tensor("current_imgs_pixel_values"),
+                ]
+            else:
+                current_img_sources = [
+                    _maybe_get_tensor("current_imgs_pixel_values"),
+                    _maybe_get_tensor("task2_task1_gen_imgs_pixel_values"),
+                    _maybe_get_tensor("task3_task1_gen_imgs_pixel_values"),
+                    _maybe_get_tensor("task1_gen_imgs_pixel_values"),
+                ]
             for src in current_img_sources:
                 gen_imgs_pil_list = self._pixel_values_to_pil_list(src)
                 if gen_imgs_pil_list is not None:
