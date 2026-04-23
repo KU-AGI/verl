@@ -748,22 +748,32 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
         #     sample_task3_scores
         # ))
 
-        # Flatten batched reward_extra_infos
+        # Flatten batched reward_extra_infos. Some entries are nested logging
+        # aliases such as `task3_task2_reward_extra_info -> {task2_*: [...]}`.
+        # Validation metric aggregation expects scalar/list-like values per key,
+        # so flatten nested dicts before merging across batches.
         reward_extra_infos_dict = {}
         if all_reward_extra_infos_batches:
-            # Get all keys from first batch
+            flattened_batches = []
             all_keys = set()
+
             for batch_infos in all_reward_extra_infos_batches:
-                all_keys.update(batch_infos.keys())
-            
-            # Flatten each key
+                flat_infos = {}
+                for key, value in batch_infos.items():
+                    if isinstance(value, dict):
+                        for sub_key, sub_vals in value.items():
+                            flat_infos[sub_key] = sub_vals
+                    else:
+                        flat_infos[key] = value
+                flattened_batches.append(flat_infos)
+                all_keys.update(flat_infos.keys())
+
             for key in all_keys:
                 values = []
-                for batch_infos in all_reward_extra_infos_batches:
+                for batch_infos in flattened_batches:
                     v = batch_infos.get(key, [])
                     if not isinstance(v, list):
-                        # Single value - need to expand based on batch size
-                        # This shouldn't happen if rewards are computed correctly
+                        # Single value - need to expand based on batch size.
                         values.append(v)
                     else:
                         values.extend(v)
