@@ -38,7 +38,7 @@ from pathlib import Path
 from torch.distributed.device_mesh import DeviceMesh
 from verl.workers.config import HFModelConfig, RolloutConfig
 from recipe.image_rl.config import ImageGenerationHFModelConfig
-from recipe.image_rl.utils import FormattingEvaluatorV2
+from recipe.image_rl.utils import FormattingEvaluatorV3, build_segment_response_mask
 import asyncio
 import logging
 import time
@@ -245,7 +245,7 @@ class ImageUnifiedRollout(BaseRollout):
         self.feedback_system_prompt = getattr(config, "feedback_system_prompt", "")
         # self.regen_system_prompt = getattr(config, "regen_system_prompt", "")
         self.regen_system_prompt = EDIT_TEMPLATE
-        self.formatter = FormattingEvaluatorV2()
+        self.formatter_v3 = FormattingEvaluatorV3()
 
         self.image_token_num_per_image = getattr(config, "image_token_num_per_image", 576)
 
@@ -628,7 +628,7 @@ class ImageUnifiedRollout(BaseRollout):
         input_format = []
         for prompt in data_proto.non_tensor_batch['prompt']:
             _prompt = self.get_sft_format(prompt)
-            input_format.append(_prompt + self.image_tag + self.image_end_tag + "\nFirst, summarize the input prompt by keeping only explicitly stated visual facts\n")
+            input_format.append(_prompt + self.image_tag + self.image_end_tag + "\nFirst, summarize the input prompt by keeping only explicitly stated visual facts\nExclude subjective, inferential, or non-verifiable content.\n")
 
         self.processor.tokenizer.pad_token_id = self.processor.pad_id
         
@@ -660,8 +660,8 @@ class ImageUnifiedRollout(BaseRollout):
 
         feedback_texts, gen_sequences, log_probs = self.generate_text(merged_embeds, batched_attention_mask)
 
-        # pad_id로 패딩 위치 마스킹 (eos/image_start_id 모두 response에 포함됨)
-        response_mask = (gen_sequences != self.processor.pad_id).long()
+        # Segment mask: 0=pad, 2=Decompose, 3=Verify, 4=Feedback
+        response_mask = build_segment_response_mask(gen_sequences, self.processor.tokenizer)
 
         # For computing logits: output
         data_proto.non_tensor_batch["task2_feedback_texts"] = np.array(feedback_texts, dtype=object)
@@ -711,7 +711,7 @@ class ImageUnifiedRollout(BaseRollout):
 
         # Parse feedback texts
         prompts = data_proto.non_tensor_batch['prompt']
-        feedback_texts = [self.formatter._split_text_into_parts(feedback)[-1] for feedback in data_proto.non_tensor_batch['task2_feedback_texts']]
+        feedback_texts = [self.formatter_v3._split_text_into_parts(feedback)[-1] for feedback in data_proto.non_tensor_batch['task2_feedback_texts']]
 
         # Prepare messages for all images
         input_format = []

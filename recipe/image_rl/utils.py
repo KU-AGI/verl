@@ -178,6 +178,194 @@ class FormattingEvaluatorV2:
         return normalized
 
 
+class FormattingEvaluatorV3:
+    """
+    V3 format evaluator.
+
+    Response structure (no summarize step):
+      <N | tuple lines>
+      Second, Verify that the decomposed elements align with the image.
+      <verification paragraphs ending with Answer: Yes/No>
+      Third, Generate corrective feedback.
+      <step-by-step feedback or 'No need to generate feedback.'>
+    """
+
+    SECOND_PATTERN = "Second, Verify that the decomposed elements align with the image."
+    THIRD_PATTERN = "Third, Generate corrective feedback."
+
+    def __init__(self):
+        self.nlp = spacy.load("en_core_web_sm", disable=["parser", "ner"])
+
+    def _split_text_into_parts(self, text: str):
+        """Returns (decompose, verify, feedback) or (None, None, None) if structure is missing."""
+        m2 = re.search(re.escape(self.SECOND_PATTERN), text)
+        m3 = re.search(re.escape(self.THIRD_PATTERN), text)
+        if not (m2 and m3 and m2.start() < m3.start()):
+            return None, None, None
+        decompose = text[:m2.start()].strip()
+        verify = text[m2.end():m3.start()].strip()
+        feedback = text[m3.end():].strip()
+        return decompose, verify, feedback
+
+    def _parse_tuples(self, text_block: str) -> list:
+        """Parse 'N | content' lines → [(int, str), ...]"""
+        if not text_block:
+            return []
+        parsed = []
+        for line in text_block.split('\n'):
+            if not line.strip():
+                continue
+            try:
+                num, content = line.split('|', 1)
+                parsed.append((int(num.strip()), content.strip()))
+            except (ValueError, IndexError):
+                continue
+        return parsed
+
+    def _extract_verify_paragraphs(self, text_block: str) -> list:
+        """Extract paragraphs ending with 'Answer: Yes/No'."""
+        if not text_block:
+            return []
+        paragraphs = re.findall(r'.*?Answer: (?:Yes|No)', text_block, re.DOTALL)
+        return [p.strip() for p in paragraphs]
+
+    def _get_answer(self, paragraph: str):
+        m = re.search(r'Answer: (Yes|No)$', paragraph)
+        return m.group(1) if m else None
+
+    def check_all_answers_positive(self, paragraphs: list) -> float:
+        answers = [self._get_answer(p) for p in paragraphs]
+        valid = [1 if a and a.lower() == "yes" else 0 for a in answers if a is not None]
+        return 1.0 if valid and all(v == 1 for v in valid) else 0.0
+
+    def check_tuple_schema_ok(self, parsed_tuples: list) -> bool:
+        if not parsed_tuples:
+            return False
+        return all(
+            any(p.match(content) for p in _TUPLE_SCHEMA_PATTERNS)
+            for _, content in parsed_tuples
+        )
+
+    def check_feedback_step_format(self, feedback_text: str) -> bool:
+        """Valid if lines follow 'Step N:' (consecutive from 1) or text signals no correction needed."""
+        if not feedback_text or not feedback_text.strip():
+            return False
+        normalized = feedback_text.strip().lower()
+        if "no need" in normalized or "no correction" in normalized:
+            return True
+        lines = [l.strip() for l in feedback_text.split('\n') if l.strip()]
+        step_re = re.compile(r'^Step\s*(\d+)\s*:', re.IGNORECASE)
+        step_numbers = []
+        for line in lines:
+            m = step_re.match(line)
+            if not m:
+                return False
+            step_numbers.append(int(m.group(1)))
+        return step_numbers == list(range(1, len(step_numbers) + 1))
+
+    def _normalize_content(self, nlp, text: str) -> str:
+        if not text:
+            return ""
+        doc = nlp(text.lower())
+        return "".join(token.lemma_.strip() for token in doc if not token.is_space)
+
+    def _calculate_metrics(self, gt_tuples, pred_tuples, gt_verify_paragraphs, pred_verify_paragraphs):
+        """Full metrics for offline evaluation."""
+        metrics = {}
+        gt_contents = {self._normalize_content(self.nlp, c) for _, c in gt_tuples}
+        pred_contents = {self._normalize_content(self.nlp, c) for _, c in pred_tuples}
+        correct_matches = len(gt_contents & pred_contents)
+        total_gt = len(gt_tuples)
+
+        metrics['part1_accuracy'] = correct_matches / total_gt if total_gt > 0 else 0.0
+
+        correct_answers = 0
+        pred_content_to_index = {c: i for i, (_, c) in enumerate(pred_tuples)}
+        for gt_idx, (_, gt_content) in enumerate(gt_tuples):
+            pred_idx = pred_content_to_index.get(gt_content)
+            if pred_idx is not None and pred_idx < len(pred_verify_paragraphs) and gt_idx < len(gt_verify_paragraphs):
+                gt_ans = self._get_answer(gt_verify_paragraphs[gt_idx])
+                pred_ans = self._get_answer(pred_verify_paragraphs[pred_idx])
+                if gt_ans and gt_ans == pred_ans:
+                    correct_answers += 1
+
+        metrics['part2_accuracy'] = correct_answers / total_gt if total_gt > 0 else 0.0
+        metrics['part2_accuracy_only_matching'] = correct_answers / correct_matches if correct_matches > 0 else 0.0
+        metrics['internal_consistency_ok'] = 1 if len(pred_tuples) == len(pred_verify_paragraphs) else 0
+        metrics['part1_length_match_ok'] = 1 if len(gt_tuples) == len(pred_tuples) else 0
+
+        return {k: v.item() if isinstance(v, torch.Tensor) else v for k, v in metrics.items()}
+
+    def _calculate_metrics_for_reward(self, gt_tuples, pred_tuples, pred_verify_paragraphs):
+        """F1 and consistency metrics for RL reward computation."""
+        metrics = {}
+        gt_contents = {self._normalize_content(self.nlp, c) for _, c in gt_tuples}
+        pred_contents = {self._normalize_content(self.nlp, c) for _, c in pred_tuples}
+        correct_matches = len(gt_contents & pred_contents)
+        total_gt = len(gt_tuples)
+
+        precision = correct_matches / len(pred_tuples) if pred_tuples else 0.0
+        recall = correct_matches / total_gt if total_gt > 0 else 0.0
+        f1 = (2 * precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+
+        metrics['task2_part2_accuracy'] = f1
+        metrics['task2_internal_consistency_ok'] = (
+            1 if len(pred_tuples) == len(pred_verify_paragraphs) and len(pred_tuples) > 0 else 0
+        )
+
+        return {k: v.item() if isinstance(v, torch.Tensor) else v for k, v in metrics.items()}
+
+
+def _find_subsequence(haystack: list, needle: list) -> int:
+    """Return start index of first occurrence of needle in haystack, or -1 if not found."""
+    n, m = len(haystack), len(needle)
+    if m == 0:
+        return 0
+    for i in range(n - m + 1):
+        if haystack[i:i + m] == needle:
+            return i
+    return -1
+
+
+def build_segment_response_mask(
+    response_ids: torch.Tensor,
+    tokenizer,
+    second_pattern: str = FormattingEvaluatorV3.SECOND_PATTERN,
+    third_pattern: str = FormattingEvaluatorV3.THIRD_PATTERN,
+) -> torch.Tensor:
+    """
+    Build a per-token segment mask for V3 format responses.
+
+    Returns [B, T] tensor with values:
+        0 = padding (pad_token_id positions)
+        2 = Decompose segment (tuple lines)
+        3 = Verify segment
+        4 = Feedback segment
+
+    Falls back to all-2 (Decompose) when boundary markers are absent.
+    """
+    pad_id = tokenizer.pad_token_id
+    second_toks = tokenizer.encode(second_pattern, add_special_tokens=False)
+    third_toks = tokenizer.encode(third_pattern, add_special_tokens=False)
+
+    B, T = response_ids.shape
+    seg_mask = torch.full((B, T), 2, dtype=torch.long, device=response_ids.device)
+
+    for b in range(B):
+        ids = response_ids[b].tolist()
+        second_pos = _find_subsequence(ids, second_toks)
+        third_pos = _find_subsequence(ids, third_toks)
+
+        for t in range(T):
+            if ids[t] == pad_id:
+                seg_mask[b, t] = 0
+            elif second_pos >= 0 and t >= second_pos:
+                seg_mask[b, t] = 4 if (third_pos >= 0 and t >= third_pos) else 3
+            # else remains 2 (Decompose)
+
+    return seg_mask
+
+
 def filter_entity_questions(feedback_tuple: str, vqa_question: str) -> str:
     """Remove vqa questions whose corresponding feedback_tuple entry is entity-type.
 
