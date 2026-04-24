@@ -1201,7 +1201,7 @@ def quality_filter_rollout_sample(
 ) -> tuple:
     """Task-batch-native phase-aware std filter over `rollout_sample.task_batches`.
 
-    - phase1 rows are filtered by outcome reward std
+    - phase1 rows are filtered by MDP local-return reward std
     - phase2 rows are filtered by task-local reward std
 
     salvage / assembled / retry behavior is intentionally disabled.
@@ -1238,10 +1238,11 @@ def quality_filter_rollout_sample(
     kept_phase1_keys: set[str] = set()
     for group_key in phase1_group_keys.keys():
         phase1_rewards: list[float] = []
-        for task_batch in src_task_batches.values():
+        for task_id, task_batch in src_task_batches.items():
+            score_key = f"task{task_id}_token_level_scores"
             if task_batch is None or "uid" not in task_batch.non_tensor_batch:
                 continue
-            if "outcome_token_level_scores" not in task_batch.batch:
+            if score_key not in task_batch.batch:
                 continue
             task_group_keys = _extract_group_keys(task_batch)
             group_mask = (task_group_keys == group_key)
@@ -1251,9 +1252,9 @@ def quality_filter_rollout_sample(
             if not np.any(group_mask):
                 continue
             group_task_batch = _slice_dataproto_with_meta(task_batch, np.where(group_mask)[0].tolist())
-            outcome_scores = group_task_batch.batch["outcome_token_level_scores"]
+            task_scores = group_task_batch.batch[score_key]
             rewards = (
-                torch.where(outcome_scores >= 0, outcome_scores, torch.zeros_like(outcome_scores))
+                torch.where(task_scores >= 0, task_scores, torch.zeros_like(task_scores))
                 .sum(dim=-1)
                 .detach()
                 .cpu()

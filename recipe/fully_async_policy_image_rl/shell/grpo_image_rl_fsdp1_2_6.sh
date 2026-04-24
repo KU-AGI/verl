@@ -14,14 +14,14 @@ exec 2>&1
 #                         EXPERIMENT CONFIGURATION
 ###############################################################################
 project_name='mllm_reasoning'
-exp_name="0423_nipa_adaptive_filtering_mean_constant_cfg_2_adjust_loss_weight_clip_high_lr_1e_6_train_wo_focusdiff_aug_outcome_reward_v3"
-# exp_name='testest'
+exp_name="0425_nipa_adaptive_filtering_mean_constant_cfg_2_adjust_loss_weight_clip_high_lr_1e_6_train_wo_focusdiff_aug_GAE"
+# exp_name='testesttestest'
 task_ids='[1,2,3]'
 
-# NOTE(multi-turn + outcome_gamma): task3 weight was previously 0.0 because
-# single-turn task3 rollouts were often malformed. With `max_turns>1` and
-# `outcome_gamma>0`, task3 now receives real trajectories and outcome-folded
-# advantages, so its weight should be > 0. Consider bumping
+# NOTE(multi-turn + MDP return): task3 weight was previously 0.0 because
+# single-turn task3 rollouts were often malformed. With `max_turns>1`, task3
+# now receives real trajectories and MDP discounted-return advantages, so its
+# weight should be > 0. Consider bumping
 # `actor_rollout_ref.actor.multi_task.task_weights` below (e.g.
 # `[0.3, 0.3, 0.4]`) once the task3 signal is healthy.
 
@@ -56,7 +56,7 @@ RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/recipe/fully_async_policy_image_rl/sh
 # Model & Checkpoint Paths
 HOME="/data"
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
-MODEL_PATH="/data/mllm/ckpt/step=014000.ckpt/hf_model"
+MODEL_PATH="/data/mllm/experements/ckpt/janus_sft/0423_v10_sft_no_summarize/version_0/step=014000.ckpt/hf_model"
 # MODEL_PATH="/data/verl/ckpts/mllm_reasoning/0303_our_model_our_dataset_task2_naive_total_reward/global_step_50/hf"
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
 
@@ -105,14 +105,24 @@ rollout_mode=async
 # per-turn rollouts, task1 DP holds unique rollouts.
 max_turns=2
 
-# Outcome-advantage weighting: each task's advantage is folded with
-# `outcome_gamma * outcome_advantages` where `outcome_advantages` is the
-# GRPO-normalized trajectory outcome computed by the new formula:
-#   R_out(τ) = A_T + eta·IF_bar + beta·P̄ - lambda·(T-1)
-# Set outcome_gamma=0.0 to disable the outcome signal entirely.
-outcome_gamma=1.00
+###############################################################################
+#                              MDP REWARD
+###############################################################################
+# Return discount used when backing up phase1 step rewards:
+#   G_h = r_h + mdp_gamma * G_{h+1}
+mdp_gamma=1.0
 
-# Outcome reward formula hyperparameters
+# Task2 reasoning reward shaping:
+#   r_reason = mdp_reasoning_reward_weight * (judge_score / 2) - mdp_reasoning_reward_cost
+mdp_reasoning_reward_weight=0.03
+mdp_reasoning_reward_cost=0.02
+
+# Task3 edit reward:
+#   r_step5 = S_next - S_prev + mdp_edit_if_weight * edit_if - mdp_edit_cost
+mdp_edit_if_weight=0.03
+mdp_edit_cost=0.05
+
+# Legacy outcome formula hyperparameters, kept only for reports/debug fields.
 # eta   : mean edit instruction-following weight
 # beta  : process-quality weight
 # lambda: per-extra-turn cost penalty
@@ -294,7 +304,11 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     algorithm.filter_groups.enable=${enable_filter_groups} \
     algorithm.filter_groups.metric=${filter_groups_metric} \
     algorithm.norm_adv_by_std_in_grpo=${norm_adv_by_std_in_grpo} \
-    +algorithm.outcome_gamma=${outcome_gamma} \
+    +algorithm.mdp_gamma=${mdp_gamma} \
+    +algorithm.mdp_reasoning_reward_weight=${mdp_reasoning_reward_weight} \
+    +algorithm.mdp_reasoning_reward_cost=${mdp_reasoning_reward_cost} \
+    +algorithm.mdp_edit_if_weight=${mdp_edit_if_weight} \
+    +algorithm.mdp_edit_cost=${mdp_edit_cost} \
     +algorithm.outcome_eta=${outcome_eta} \
     +algorithm.outcome_beta=${outcome_beta} \
     +algorithm.outcome_lambda=${outcome_lambda} \
@@ -354,7 +368,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     actor_rollout_ref.ref.ulysses_sequence_parallel_size=${sp_size} \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
-    trainer.val_before_train=False \
+    trainer.val_before_train=True \
     trainer.balance_batch=False \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
@@ -400,6 +414,8 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     reward_model.reward_manager=image_generation \
     custom_reward_function.path=recipe/image_rl/reward_function_fine_grained.py \
     custom_reward_function.name=compute_score_batch \
+    +custom_reward_function.reward_kwargs.mdp_reasoning_reward_weight=${mdp_reasoning_reward_weight} \
+    +custom_reward_function.reward_kwargs.mdp_reasoning_reward_cost=${mdp_reasoning_reward_cost} \
     +reward_model.reward_kwargs.overlong_buffer_cfg.enable=${enable_overlong_buffer} \
     +reward_model.reward_kwargs.overlong_buffer_cfg.len=${overlong_buffer_len} \
     +reward_model.reward_kwargs.overlong_buffer_cfg.penalty_factor=${overlong_penalty_factor} \

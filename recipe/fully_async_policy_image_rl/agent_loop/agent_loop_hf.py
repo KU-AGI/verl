@@ -844,13 +844,14 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         score_key: str,
         target_len: int,
         row_map: dict[int, int],
+        fill_value: float = float("nan"),
     ) -> Optional[torch.Tensor]:
         if source_batch is None or getattr(source_batch, "batch", None) is None or score_key not in source_batch.batch:
             return None
         src = source_batch.batch[score_key]
         fill = torch.full(
             (target_len, *src.shape[1:]),
-            float("nan"),
+            fill_value,
             dtype=src.dtype,
             device=src.device,
         )
@@ -915,6 +916,7 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         source_task_id: int,
         row_map: dict[int, int],
         include_feedback: bool = False,
+        include_segment_mask: bool = False,
     ) -> Optional[DataProto]:
         if target_batch is None or source_batch is None:
             return target_batch
@@ -928,6 +930,17 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         )
         if alias_score is not None:
             target_batch.batch[f"{alias_prefix}_token_level_scores"] = alias_score
+
+        if include_segment_mask and source_task_id == 2:
+            alias_segment_mask = FullyAsyncAgentLoopManager._build_alias_score_tensor(
+                source_batch,
+                "task2_segment_mask",
+                target_len,
+                row_map,
+                fill_value=0,
+            )
+            if alias_segment_mask is not None:
+                target_batch.batch[f"{alias_prefix}_segment_mask"] = alias_segment_mask
 
         alias_extras = FullyAsyncAgentLoopManager._build_alias_extra_dict(
             source_batch,
@@ -1004,6 +1017,7 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
                 source_task_id=2,
                 row_map=row_map,
                 include_feedback=True,
+                include_segment_mask=True,
             )
 
     @staticmethod
@@ -1055,6 +1069,366 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             except Exception:
                 pass
         return float(np.mean(row_vals)) if row_vals else default
+
+    @staticmethod
+    def _read_reward_extra_value(extras: dict, field: str, row: int, default=None):
+        vals = extras.get(field) if isinstance(extras, dict) else None
+        if vals is None:
+            return default
+        try:
+            return vals[row]
+        except Exception:
+            return default
+
+    @staticmethod
+    def _ensure_reward_extra_list(extras: dict, field: str, length: int) -> list:
+        vals = extras.get(field)
+        if isinstance(vals, np.ndarray):
+            vals = vals.tolist()
+        elif vals is None:
+            vals = []
+        elif not isinstance(vals, list):
+            try:
+                vals = list(vals)
+            except Exception:
+                vals = []
+        if len(vals) < length:
+            vals.extend([None] * (length - len(vals)))
+        extras[field] = vals
+        return vals
+
+    def _attach_phase1_task3_mdp_step5_rewards(
+        self,
+        task1_batch: Optional[DataProto],
+        pre_task3_batches_per_turn: list[DataProto],
+        task3_batches_per_turn: list[DataProto],
+    ) -> None:
+        """Attach phase1 MDP Step5 rewards after task1/task3 rewards land.
+
+        Step5 reward uses the image-score transition:
+            (S_next - S_prev) + 0.03 * edit_if - 0.05
+        where S_prev is task1_image_score for root branches, or the parent
+        branch's previous task3_image_score for edited branches.
+        """
+        if not task3_batches_per_turn:
+            return
+
+        algo_cfg = getattr(getattr(self, "config", None), "algorithm", None) or {}
+        _get_hp = algo_cfg.get if hasattr(algo_cfg, "get") else lambda k, d: getattr(algo_cfg, k, d)
+        edit_if_weight = float(_get_hp("mdp_edit_if_weight", 0.03))
+        edit_cost = float(_get_hp("mdp_edit_cost", 0.05))
+
+        task1_image_by_tid: dict[int, float] = {}
+        if task1_batch is not None:
+            t1_meta = getattr(task1_batch, "meta_info", None) or {}
+            t1_extras = t1_meta.get("task1_reward_extra_info", {}) or {}
+            tids = (getattr(task1_batch, "non_tensor_batch", None) or {}).get("trajectory_id")
+            if tids is not None:
+                for row, tid in enumerate(tids):
+                    val = self._read_reward_extra_value(t1_extras, "task1_image_score", row, None)
+                    if val is None:
+                        val = self._read_reward_extra_value(t1_extras, "task1_align", row, None)
+                    try:
+                        task1_image_by_tid[int(tid)] = float(val)
+                    except Exception:
+                        pass
+
+        task3_image_by_branch: dict[int, float] = {}
+        for t3_b in task3_batches_per_turn:
+            if t3_b is None:
+                continue
+            t3_meta = getattr(t3_b, "meta_info", None) or {}
+            t3_extras = t3_meta.get("task3_reward_extra_info", {}) or {}
+            bids = (getattr(t3_b, "non_tensor_batch", None) or {}).get("branch_id")
+            if bids is None:
+                continue
+            for row, bid in enumerate(bids):
+                val = self._read_reward_extra_value(t3_extras, "task3_image_score", row, None)
+                if val is None:
+                    val = self._read_reward_extra_value(t3_extras, "task3_align", row, None)
+                try:
+                    task3_image_by_branch[int(bid)] = float(val)
+                except Exception:
+                    pass
+
+        for pre_b, t3_b in zip(pre_task3_batches_per_turn, task3_batches_per_turn):
+            if t3_b is None:
+                continue
+            if getattr(t3_b, "meta_info", None) is None:
+                t3_b.meta_info = {}
+            t3_extras = t3_b.meta_info.setdefault("task3_reward_extra_info", {})
+            if not isinstance(t3_extras, dict):
+                continue
+
+            n = len(t3_b)
+            ntb = getattr(t3_b, "non_tensor_batch", None) or {}
+            pre_ntb = getattr(pre_b, "non_tensor_batch", None) or {}
+            tids = ntb.get("trajectory_id", pre_ntb.get("trajectory_id"))
+            parents = ntb.get("parent_branch_id", pre_ntb.get("parent_branch_id"))
+            if tids is None or parents is None:
+                continue
+
+            prev_vals = self._ensure_reward_extra_list(t3_extras, "task3_prev_image_score", n)
+            next_vals = self._ensure_reward_extra_list(t3_extras, "task3_next_image_score", n)
+            gain_vals = self._ensure_reward_extra_list(t3_extras, "task3_image_score_gain", n)
+            step5_vals = self._ensure_reward_extra_list(t3_extras, "task3_step5_reward", n)
+
+            for row in range(n):
+                next_s = self._read_reward_extra_value(t3_extras, "task3_image_score", row, None)
+                if next_s is None:
+                    next_s = self._read_reward_extra_value(t3_extras, "task3_align", row, None)
+                edit_if = self._read_reward_extra_value(t3_extras, "task3_edit_if_reward", row, None)
+                if edit_if is None:
+                    edit_if = self._read_reward_extra_value(t3_extras, "task3_if", row, None)
+                try:
+                    tid = int(tids[row])
+                    parent_bid = int(parents[row])
+                except Exception:
+                    continue
+
+                prev_s = task3_image_by_branch.get(parent_bid) if parent_bid >= 0 else task1_image_by_tid.get(tid)
+                try:
+                    prev_s = float(prev_s)
+                    next_s = float(next_s)
+                    edit_if = float(edit_if)
+                except Exception:
+                    continue
+
+                gain = next_s - prev_s
+                step5_reward = gain + edit_if_weight * edit_if - edit_cost
+                prev_vals[row] = prev_s
+                next_vals[row] = next_s
+                gain_vals[row] = gain
+                step5_vals[row] = step5_reward
+
+    @staticmethod
+    def _event_return_key(dp: DataProto, row: int, event_name: str) -> tuple[int, int, str]:
+        return (id(dp), int(row), event_name)
+
+    @staticmethod
+    def _mean_return(return_map: dict, dp: DataProto, row: int, event_name: str, default: float = 0.0) -> float:
+        vals = return_map.get(FullyAsyncAgentLoopManager._event_return_key(dp, row, event_name))
+        if not vals:
+            return default
+        return float(np.mean(vals))
+
+    @staticmethod
+    def _put_scalar_on_last_mask_token(score_tensor: torch.Tensor, mask_tensor: torch.Tensor, row: int, scalar: float) -> None:
+        if row < 0 or row >= score_tensor.shape[0]:
+            return
+        valid = torch.nonzero(mask_tensor[row] > 0, as_tuple=False).flatten()
+        if valid.numel() == 0:
+            return
+        score_tensor[row, int(valid[-1].item())] = float(scalar)
+
+    @staticmethod
+    def _put_scalar_on_last_segment_token(score_tensor: torch.Tensor, mask_tensor: torch.Tensor, row: int, segment_id: int, scalar: float) -> None:
+        if row < 0 or row >= score_tensor.shape[0]:
+            return
+        valid = torch.nonzero(mask_tensor[row] == int(segment_id), as_tuple=False).flatten()
+        if valid.numel() == 0:
+            return
+        score_tensor[row, int(valid[-1].item())] = float(scalar)
+
+    def _attach_phase1_mdp_discounted_token_scores(
+        self,
+        all_tids,
+        task1_batch: Optional[DataProto],
+        task2_batches: list[DataProto],
+        task3_batches: list[DataProto],
+    ) -> None:
+        """Replace phase1 local token scores with discounted MDP returns.
+
+        The token-score tensors remain task-shaped:
+          * task1: one return on the final response token.
+          * task2: step2/3/4 returns on the last token of segment masks 2/3/4.
+          * task3: step5 return on the final response token.
+        Shared-prefix rows that feed multiple terminal branches receive the
+        mean return over descendant branches, mirroring existing outcome logic.
+        """
+        algo_cfg = getattr(getattr(self, "config", None), "algorithm", None) or {}
+        _get_hp = algo_cfg.get if hasattr(algo_cfg, "get") else lambda k, d: getattr(algo_cfg, k, d)
+        gamma = float(_get_hp("mdp_gamma", _get_hp("gamma", 1.0)))
+
+        _ex = self._get_outcome_extra_scalar
+        returns_by_event: dict[tuple[int, int, str], list[float]] = {}
+
+        def _append_return(dp: DataProto, row: int, event_name: str, value: float) -> None:
+            returns_by_event.setdefault(self._event_return_key(dp, row, event_name), []).append(float(value))
+
+        # task1 lookup ---------------------------------------------------------
+        t1_index: dict[int, int] = {}
+        if task1_batch is not None and "trajectory_id" in task1_batch.non_tensor_batch:
+            for i, tid in enumerate(task1_batch.non_tensor_batch["trajectory_id"]):
+                t1_index.setdefault(int(tid), i)
+
+        # task2/task3 rows grouped by shared prefix vs branch path -------------
+        branch_parent: dict[int, int] = {}
+        branch_tid: dict[int, int] = {}
+        shared_t2_rows: dict[int, list[tuple]] = {}
+        shared_t3_rows: dict[int, list[tuple]] = {}
+        branch_t2_rows: dict[int, list[tuple]] = {}
+        branch_t3_rows: dict[int, list[tuple]] = {}
+
+        for turn_i, t2_b in enumerate(task2_batches):
+            if t2_b is None or "trajectory_id" not in t2_b.non_tensor_batch:
+                continue
+            self._ensure_branch_metadata(t2_b)
+            tids = np.asarray(t2_b.non_tensor_batch["trajectory_id"], dtype=np.int64)
+            bids = np.asarray(t2_b.non_tensor_batch["branch_id"], dtype=np.int64)
+            parents = np.asarray(t2_b.non_tensor_batch["parent_branch_id"], dtype=np.int64)
+            for row in range(len(t2_b)):
+                tid = int(tids[row])
+                bid = int(bids[row])
+                item = (turn_i, t2_b, row)
+                if bid >= 0:
+                    branch_parent.setdefault(bid, int(parents[row]))
+                    branch_tid.setdefault(bid, tid)
+                    branch_t2_rows.setdefault(bid, []).append(item)
+                else:
+                    shared_t2_rows.setdefault(tid, []).append(item)
+
+        for turn_i, t3_b in enumerate(task3_batches):
+            if t3_b is None or "trajectory_id" not in t3_b.non_tensor_batch:
+                continue
+            self._ensure_branch_metadata(t3_b)
+            tids = np.asarray(t3_b.non_tensor_batch["trajectory_id"], dtype=np.int64)
+            bids = np.asarray(t3_b.non_tensor_batch["branch_id"], dtype=np.int64)
+            parents = np.asarray(t3_b.non_tensor_batch["parent_branch_id"], dtype=np.int64)
+            for row in range(len(t3_b)):
+                tid = int(tids[row])
+                bid = int(bids[row])
+                item = (turn_i, t3_b, row)
+                if bid >= 0:
+                    branch_parent.setdefault(bid, int(parents[row]))
+                    branch_tid.setdefault(bid, tid)
+                    branch_t3_rows.setdefault(bid, []).append(item)
+                else:
+                    shared_t3_rows.setdefault(tid, []).append(item)
+
+        all_branch_ids = set(branch_parent.keys())
+        branch_children: dict[int, list[int]] = {}
+        for bid, parent in branch_parent.items():
+            if parent >= 0:
+                branch_children.setdefault(parent, []).append(bid)
+        terminal_branch_ids = sorted(all_branch_ids - set(branch_children.keys()))
+
+        def _dedupe_sorted(rows: list[tuple]) -> list[tuple]:
+            rows = sorted(rows, key=lambda x: (x[0], x[2]))
+            out = []
+            seen = set()
+            for turn_i, dp, row in rows:
+                key = (turn_i, id(dp), row)
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append((turn_i, dp, row))
+            return out
+
+        def _branch_chain(bid: int) -> list[int]:
+            chain = []
+            cur = bid
+            while cur >= 0:
+                chain.append(cur)
+                cur = int(branch_parent.get(cur, -1))
+            return list(reversed(chain))
+
+        def _collect_branch_rows(bid: int) -> tuple[list[tuple], list[tuple]]:
+            tid = int(branch_tid[bid])
+            t2_rows = list(shared_t2_rows.get(tid, []))
+            t3_rows = list(shared_t3_rows.get(tid, []))
+            for seg_bid in _branch_chain(bid):
+                t2_rows.extend(branch_t2_rows.get(seg_bid, []))
+                t3_rows.extend(branch_t3_rows.get(seg_bid, []))
+            return _dedupe_sorted(t2_rows), _dedupe_sorted(t3_rows)
+
+        def _build_events(tid: int, t2_rows: list[tuple], t3_rows: list[tuple]) -> list[tuple]:
+            events: list[tuple[float, DataProto, int, str, float]] = []
+            if task1_batch is not None and tid in t1_index:
+                row = t1_index[tid]
+                reward = _ex(task1_batch, 1, "task1_mdp_reward", [row], default=_ex(task1_batch, 1, "task1_image_score", [row], 0.0))
+                events.append((0.0, task1_batch, row, "step1", reward))
+
+            for turn_i, t2_b, row in t2_rows:
+                base = 1.0 + 4.0 * float(turn_i)
+                events.append((base + 0.0, t2_b, row, "step2", _ex(t2_b, 2, "task2_step2_reward", [row], 0.0)))
+                events.append((base + 1.0, t2_b, row, "step3", _ex(t2_b, 2, "task2_step3_reward", [row], 0.0)))
+                events.append((base + 2.0, t2_b, row, "step4", _ex(t2_b, 2, "task2_step4_reward", [row], 0.0)))
+
+            for turn_i, t3_b, row in t3_rows:
+                base = 1.0 + 4.0 * float(turn_i)
+                events.append((base + 3.0, t3_b, row, "step5", _ex(t3_b, 3, "task3_step5_reward", [row], 0.0)))
+
+            return sorted(events, key=lambda x: x[0])
+
+        def _accumulate_discounted_returns(events: list[tuple]) -> None:
+            running = 0.0
+            for _, dp, row, event_name, reward in reversed(events):
+                running = float(reward) + gamma * running
+                _append_return(dp, row, event_name, running)
+
+        for bid in terminal_branch_ids:
+            tid = int(branch_tid[bid])
+            t2_rows, t3_rows = _collect_branch_rows(bid)
+            _accumulate_discounted_returns(_build_events(tid, t2_rows, t3_rows))
+
+        tids_with_branch = {int(branch_tid[bid]) for bid in all_branch_ids}
+        for raw_tid in all_tids if all_tids is not None else []:
+            tid = int(raw_tid)
+            if tid in tids_with_branch:
+                continue
+            t2_rows = _dedupe_sorted(shared_t2_rows.get(tid, []))
+            t3_rows = _dedupe_sorted(shared_t3_rows.get(tid, []))
+            _accumulate_discounted_returns(_build_events(tid, t2_rows, t3_rows))
+
+        # Write discounted returns back to task token-level score tensors -------
+        if task1_batch is not None and "task1_response_mask" in task1_batch.batch:
+            scores = torch.zeros_like(task1_batch.batch["task1_response_mask"], dtype=torch.float32)
+            for tid, row in t1_index.items():
+                value = self._mean_return(returns_by_event, task1_batch, row, "step1", 0.0)
+                self._put_scalar_on_last_mask_token(scores, task1_batch.batch["task1_response_mask"], row, value)
+            task1_batch.batch["task1_token_level_scores"] = scores
+            if getattr(task1_batch, "meta_info", None) is None:
+                task1_batch.meta_info = {}
+            task1_batch.meta_info["task1_token_level_scores"] = scores
+
+        for t2_b in task2_batches:
+            if t2_b is None or "task2_response_mask" not in t2_b.batch:
+                continue
+            response_mask = t2_b.batch["task2_response_mask"]
+            segment_mask = t2_b.batch.get("task2_segment_mask", response_mask)
+            scores = torch.zeros_like(response_mask, dtype=torch.float32)
+            if getattr(t2_b, "meta_info", None) is None:
+                t2_b.meta_info = {}
+            task2_extras = t2_b.meta_info.setdefault("task2_reward_extra_info", {})
+            step2_return_vals = self._ensure_reward_extra_list(task2_extras, "task2_step2_return_score", len(t2_b))
+            step3_return_vals = self._ensure_reward_extra_list(task2_extras, "task2_step3_return_score", len(t2_b))
+            step4_return_vals = self._ensure_reward_extra_list(task2_extras, "task2_step4_return_score", len(t2_b))
+            for row in range(len(t2_b)):
+                step2_return = self._mean_return(returns_by_event, t2_b, row, "step2", 0.0)
+                step3_return = self._mean_return(returns_by_event, t2_b, row, "step3", 0.0)
+                step4_return = self._mean_return(returns_by_event, t2_b, row, "step4", 0.0)
+                step2_return_vals[row] = step2_return
+                step3_return_vals[row] = step3_return
+                step4_return_vals[row] = step4_return
+                self._put_scalar_on_last_segment_token(scores, segment_mask, row, 2, step2_return)
+                self._put_scalar_on_last_segment_token(scores, segment_mask, row, 3, step3_return)
+                self._put_scalar_on_last_segment_token(scores, segment_mask, row, 4, step4_return)
+            t2_b.batch["task2_token_level_scores"] = scores
+            t2_b.meta_info["task2_token_level_scores"] = scores
+
+        for t3_b in task3_batches:
+            if t3_b is None or "task3_response_mask" not in t3_b.batch:
+                continue
+            mask = t3_b.batch["task3_response_mask"]
+            scores = torch.zeros_like(mask, dtype=torch.float32)
+            for row in range(len(t3_b)):
+                value = self._mean_return(returns_by_event, t3_b, row, "step5", 0.0)
+                self._put_scalar_on_last_mask_token(scores, mask, row, value)
+            t3_b.batch["task3_token_level_scores"] = scores
+            if getattr(t3_b, "meta_info", None) is None:
+                t3_b.meta_info = {}
+            t3_b.meta_info["task3_token_level_scores"] = scores
 
     @staticmethod
     def _inject_task2_decision_signal(
@@ -1143,6 +1517,10 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         extra_info = dict((getattr(batch, "meta_info", None) or {}).get("extra_info", {}) or {})
         decision_vals = extra_info.get("task2_decision_vqa_reward", [0.0] * len(batch))
         decision_srcs = extra_info.get("task2_decision_vqa_source", ["missing"] * len(batch))
+        algo_cfg = getattr(getattr(self, "config", None), "algorithm", None) or {}
+        _get_hp = algo_cfg.get if hasattr(algo_cfg, "get") else lambda k, d: getattr(algo_cfg, k, d)
+        mdp_reasoning_reward_weight = float(_get_hp("mdp_reasoning_reward_weight", 0.03))
+        mdp_reasoning_reward_cost = float(_get_hp("mdp_reasoning_reward_cost", 0.02))
 
         finalized_extras: dict[str, list[Any]] = {}
         rewards: list[float] = []
@@ -1158,6 +1536,8 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
                 row_stage,
                 decision_vqa=decision_vqa,
                 decision_source=decision_source,
+                mdp_reasoning_reward_weight=mdp_reasoning_reward_weight,
+                mdp_reasoning_reward_cost=mdp_reasoning_reward_cost,
             )
             rewards.append(float(finalized_row.get("task2_total_reward", vlm_reward)))
             for key, value in finalized_row.items():
@@ -1724,8 +2104,11 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         Keep: non-task-prefixed keys (common), task1_* (always needed as reference
         even for task2/task3 trainer compound-key logic), and task{target_task_id}_*.
         Drop: other tasks' prefixed keys.
-        For task3: additionally keep task2_token_level_scores and task2_feedback_texts
-        so that per-turn logging shows T2 score + feedback paired with T3 regen.
+        For task3: additionally keep task2_feedback_texts so that per-turn
+        logging shows the feedback paired with T3 regen. Do not keep
+        task2_token_level_scores here: those are task2 local/context scores,
+        not task3-row MDP returns, and they make rollout summaries look like
+        task2 return was attached to the task3 action.
         """
         drop_prefixes = {"task1_", "task2_", "task3_"}
         # task1_dp keeps only task1_* (as its own task); others keep task1_* too.
@@ -1734,10 +2117,10 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         elif target_task_id == 2:
             drop_prefixes = {"task3_"}
         elif target_task_id == 3:
-            # Keep T2 score + feedback texts alongside T3 for per-turn logging.
+            # Keep T2 feedback text alongside T3 for per-turn logging.
             # All other task2_* tensor keys (input_ids, log_probs, etc.) are dropped
             # to avoid contaminating the training batch.
-            _TASK2_LOG_KEYS = {"task2_token_level_scores", "task2_feedback_texts"}
+            _TASK2_LOG_KEYS = {"task2_feedback_texts"}
             return [
                 k for k in all_keys
                 if k in _TASK2_LOG_KEYS or not k.startswith("task2_")
@@ -2109,9 +2492,8 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         on_task_complete,
     ) -> Optional[DataProto]:
         """Run task3 on `task2_batch`'s edit-worthy subset so Step 2 regen
-        rows earn their own r3. Without this, regen rows inherit the
-        original tid's outcome and their task2 advantage gets cancelled
-        under outcome_gamma > 0."""
+        rows earn their own MDP edit return instead of inheriting only the
+        original branch prefix signal."""
         if task2_batch is None or len(task2_batch) == 0:
             return None
 
@@ -2275,9 +2657,9 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         Returns a `{1: task1_dp, 2: task2_dp, 3: task3_dp}` dict so that each
         task is flushed independently to training: task1_dp carries only
         unique task1 rollouts (turn 0), while task2_dp / task3_dp carry
-        per-turn rollouts concatenated. Each row has `turn_idx`,
-        `outcome_token_level_scores` (task3 reward if completed, task1 reward
-        if early-terminated), and `outcome_task_id` stamped.
+        per-turn rollouts concatenated. Each row has `turn_idx`; phase1 local
+        token scores are overwritten with MDP discounted returns before the
+        dict is returned.
 
         Early-termination: if every sample in a turn's task2 output contains
         the `No need to feedback` marker, the turn loop stops; per-turn
@@ -2419,17 +2801,16 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
 
         await self._await_and_attach_reward_entries(pending_task1_rewards)
         await self._await_and_attach_reward_entries(pending_task3_rewards)
+        self._attach_phase1_task3_mdp_step5_rewards(
+            task1_batch,
+            pre_task3_batches_per_turn,
+            task3_batches_per_turn,
+        )
         await self._await_and_finalize_task2_entries(
             pending_task2_raw_rewards,
             pre_task2_batches_per_turn,
             task2_batches_per_turn,
         )
-        self._propagate_logging_context(
-            task1_batch,
-            task2_batches_per_turn,
-            task3_batches_per_turn,
-        )
-
         # Compute Phase1 trajectory outcomes over the surviving build_edit_batch
         # branch tree. Terminal leaves are final task2(no-edit) rows or final
         # task3 rows; shared-prefix rows receive descendant means and post-
@@ -2443,6 +2824,17 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             outcomes = self._compute_outcomes_with_avg(
                 all_tids, task1_batch, task2_batches_per_turn, task3_batches_per_turn
             )
+            self._attach_phase1_mdp_discounted_token_scores(
+                all_tids,
+                task1_batch,
+                task2_batches_per_turn,
+                task3_batches_per_turn,
+            )
+        self._propagate_logging_context(
+            task1_batch,
+            task2_batches_per_turn,
+            task3_batches_per_turn,
+        )
 
         phase1_task_dict = self._build_task_dict_per_sample(
             task1_batch,
@@ -2593,17 +2985,16 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
 
         await self._await_and_attach_reward_entries(pending_task1_rewards)
         await self._await_and_attach_reward_entries(pending_task3_rewards)
+        self._attach_phase1_task3_mdp_step5_rewards(
+            task1_batch,
+            pre_task3_batches_per_turn,
+            task3_batches_per_turn,
+        )
         await self._await_and_finalize_task2_entries(
             pending_task2_raw_rewards,
             pre_task2_batches_per_turn,
             task2_batches_per_turn,
         )
-        self._propagate_logging_context(
-            task1_batch,
-            task2_batches_per_turn,
-            task3_batches_per_turn,
-        )
-
         # Compute Phase1 trajectory outcomes over the surviving build_edit_batch
         # branch tree. Terminal leaves are final task2(no-edit) rows or final
         # task3 rows; shared-prefix rows receive descendant means and post-
@@ -2617,6 +3008,17 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             outcomes = self._compute_outcomes_with_avg(
                 all_tids, task1_batch, task2_batches_per_turn, task3_batches_per_turn
             )
+            self._attach_phase1_mdp_discounted_token_scores(
+                all_tids,
+                task1_batch,
+                task2_batches_per_turn,
+                task3_batches_per_turn,
+            )
+        self._propagate_logging_context(
+            task1_batch,
+            task2_batches_per_turn,
+            task3_batches_per_turn,
+        )
 
         phase1_task_dict = self._build_task_dict_per_sample(
             task1_batch,

@@ -509,8 +509,9 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             summary_header = [
                 f"📋 GRPO COMPARISON SUMMARY | STEP: {trainer_ver}",
                 f"Sample Path: {sample_dir}",
+                "T1/T2/T3 are token-level score sums; phase1 training dumps use MDP discounted returns.",
                 "=" * 200,
-                f"{'Traj':<5} | {'Turn':<4} | {'Branch':<7} | {'T1':<5} | {'T2':<5} | {'T3':<5} | {'Total':<6} | {'OutSrc':<6} | {'Outcome':<7} | {'A_T':<6} | {'IFb':<6} | {'Pb':<6} | {'T':<4} | {'Gen Path (Current)':<65} | {'Regen Path (Edited)'}",
+                f"{'Traj':<5} | {'Turn':<4} | {'Branch':<7} | {'T1Ret':<5} | {'T2Ret':<5} | {'T3Ret':<5} | {'MDPΣ':<6} | {'Gen Path (Current)':<65} | {'Regen Path (Edited)'}",
                 "-" * 200,
             ]
             summary_rows = []
@@ -529,8 +530,9 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                 # Per-trajectory turn summary
                 traj_summary_lines = [
                     f"Trajectory {traj_id} | Sample: {sample_key} | Step: {trainer_ver}",
+                    "T1/T2/T3 are token-level score sums; phase1 training dumps use MDP discounted returns.",
                     "-" * 80,
-                    f"{'Turn':<5} | {'Branch':<7} | {'T1':<5} | {'T2':<5} | {'T3':<5} | {'Total':<6} | {'Outcome':<7} | {'A_T':<6} | {'IFb':<6} | {'Pb':<6} | {'T':<4}",
+                    f"{'Turn':<5} | {'Branch':<7} | {'T1Ret':<5} | {'T2Ret':<5} | {'T3Ret':<5} | {'MDPΣ':<6}",
                     "-" * 80,
                 ]
 
@@ -554,33 +556,15 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                     t3 = self._get_safe_val(scores, 'task3_scores', i, None)
                     present_total_terms = [v for v in [t1, t2, t3] if v is not None and v > -100]
                     total = sum(present_total_terms) if present_total_terms else None
-                    outcome = self._get_safe_val(scores, 'outcome_scores', i, None)
-                    out_src_raw = self._get_safe_val(scores, 'outcome_task_id', i, 0)
-                    out_src = f"t{int(out_src_raw)}" if out_src_raw else "-"
-                    out_a_t = self._get_safe_val(scores, 'outcome_A_T', i, None)
-                    out_if = self._get_safe_val(scores, 'outcome_IF_bar', i, None)
-                    out_p = self._get_safe_val(scores, 'outcome_P_bar', i, None)
-                    out_t = self._get_safe_val(scores, 'outcome_T', i, None)
-                    if _phases[i] == 2:
-                        outcome = None
-                        out_src = "-"
-                        out_a_t = None
-                        out_if = None
-                        out_p = None
-                        out_t = None
 
                     traj_summary_lines.append(
                         f"turn_{turn:<3} | {branch_id:<7} | {self._fmt_metric(t1, 2):<5} | "
                         f"{self._fmt_metric(t2, 2):<5} | {self._fmt_metric(t3, 2):<5} | "
-                        f"{self._fmt_metric(total, 2):<6} | {self._fmt_metric(outcome, 2):<7} | "
-                        f"{self._fmt_metric(out_a_t, 2):<6} | {self._fmt_metric(out_if, 2):<6} | "
-                        f"{self._fmt_metric(out_p, 2):<6} | {self._fmt_metric(out_t, 1):<4}"
+                        f"{self._fmt_metric(total, 2):<6}"
                     )
                     summary_rows.append(
                         f"{traj_id:<5} | {turn:<4} | {branch_id:<7} | {self._fmt_metric(t1, 2):<5} | "
                         f"{self._fmt_metric(t2, 2):<5} | {self._fmt_metric(t3, 2):<5} | {self._fmt_metric(total, 2):<6} | "
-                        f"{out_src:<6} | {self._fmt_metric(outcome, 2):<7} | {self._fmt_metric(out_a_t, 2):<6} | "
-                        f"{self._fmt_metric(out_if, 2):<6} | {self._fmt_metric(out_p, 2):<6} | {self._fmt_metric(out_t, 1):<4} | "
                         f"{paths['gen']:<65} | {paths['regen']}"
                     )
 
@@ -729,7 +713,9 @@ class RayImageGenerationTrainer(RayPPOTrainer):
 
             # Task 1
             f.write(f"🖼️ [TASK 1] INITIAL GEN\n")
-            f.write(f"  - Total Score: {self._get_safe_val(scores, 'task1_scores', i)}\n")
+            f.write(f"  - Token Score Sum (MDP return in phase1 train): {self._get_safe_val(scores, 'task1_scores', i)}\n")
+            f.write(f"  - Image Score S1: {self._get_safe_val(reward_extra_infos_dict, 'task1_image_score', i)}\n")
+            f.write(f"  - MDP Step1 Reward r1: {self._get_safe_val(reward_extra_infos_dict, 'task1_mdp_reward', i)}\n")
             f.write(f"  - VQA Reward: {self._get_safe_val(reward_extra_infos_dict, 'task1_vqa_reward', i)}\n")
             f.write(f"  - Detector Reward (bonus): {self._get_safe_val(reward_extra_infos_dict, 'task1_detector_reward', i)}\n")
             f.write(f"  - Path: {paths['gen']}\n")
@@ -746,31 +732,49 @@ class RayImageGenerationTrainer(RayPPOTrainer):
 
             # Log Task 2 if feedback_texts exist (even if task_id != 2)
             if feedback_texts and i < len(feedback_texts) and feedback_texts[i] is not None:
+                step2_return = self._get_safe_val(scores, 'task2_step2_return_scores', i)
+                if step2_return == "N/A":
+                    step2_return = self._get_safe_val(reward_extra_infos_dict, 'task2_step2_return_score', i)
+                step3_return = self._get_safe_val(scores, 'task2_step3_return_scores', i)
+                if step3_return == "N/A":
+                    step3_return = self._get_safe_val(reward_extra_infos_dict, 'task2_step3_return_score', i)
+                step4_return = self._get_safe_val(scores, 'task2_step4_return_scores', i)
+                if step4_return == "N/A":
+                    step4_return = self._get_safe_val(reward_extra_infos_dict, 'task2_step4_return_score', i)
                 f.write(f"💬 [TASK 2] FEEDBACK GENERATION\n")
-                f.write(f"  - Total Score: {self._get_safe_val(scores, 'task2_scores', i)}\n")
+                f.write(f"  - Token Score Sum (G_step2 + G_step3 + G_step4 in phase1 train): {self._get_safe_val(scores, 'task2_scores', i)}\n")
+                f.write(f"  - MDP Step2 Return G_step2: {step2_return}\n")
+                f.write(f"  - MDP Step3 Return G_step3: {step3_return}\n")
+                f.write(f"  - MDP Step4 Return G_step4: {step4_return}\n")
+                f.write(f"  - MDP Step2 Reward r_step2: {self._get_safe_val(reward_extra_infos_dict, 'task2_step2_reward', i)}\n")
+                f.write(f"  - MDP Step3 Reward r_step3: {self._get_safe_val(reward_extra_infos_dict, 'task2_step3_reward', i)}\n")
+                f.write(f"  - MDP Step4 Reward r_step4: {self._get_safe_val(reward_extra_infos_dict, 'task2_step4_reward', i)}\n")
                 f.write(f"  - Format Reward (rule-based) (add score): {self._get_safe_val(reward_extra_infos_dict, 'task2_rule_based_format_reward', i)}\n")
                 f.write(f"  - Decompose Reward (rule-based) (add score): {self._get_safe_val(reward_extra_infos_dict, 'task2_rule_based_decompose_reward', i)}\n")
                 f.write(f"  - Internal Consistency OK (gating decompose): {self._get_safe_val(reward_extra_infos_dict, 'task2_internal_consistency_ok', i)}\n")
-                f.write(f"  - Tuple Format OK (gating s2): {self._get_safe_val(reward_extra_infos_dict, 'task2_tuple_format_ok', i)}\n")
-                f.write(f"  - VQA Format OK (gating s3): {self._get_safe_val(reward_extra_infos_dict, 'task2_vqa_format_ok', i)}\n")
-                f.write(f"  - Feedback Format OK (rule-based) (gating s4): {self._get_safe_val(reward_extra_infos_dict, 'task2_rule_based_feedback_format_ok', i)}\n")
-                f.write(f"  - No Feedback Needed (rule-based) (gating s4): {self._get_safe_val(reward_extra_infos_dict, 'task2_no_feedback_needed', i)}\n")
-                f.write(f"  - Stage1 Prompt→Summary Reward: {self._get_safe_val(reward_extra_infos_dict, 'task2_prompt_to_summary_reward', i)}\n")
-                f.write(f"  - Stage2 Summary→Tuple Reward: {self._get_safe_val(reward_extra_infos_dict, 'task2_summary_to_tuple_reward', i)}\n")
-                f.write(f"  - Stage3 Tuple→VQA Reward: {self._get_safe_val(reward_extra_infos_dict, 'task2_tuple_to_vqa_reward', i)}\n")
-                f.write(f"  - Stage4 VQA→Feedback Reward: {self._get_safe_val(reward_extra_infos_dict, 'task2_vqa_to_feedback_reward', i)}\n")
+                f.write(f"  - Tuple Format OK (gating prompt→tuple / tuple→vqa): {self._get_safe_val(reward_extra_infos_dict, 'task2_tuple_format_ok', i)}\n")
+                f.write(f"  - VQA Format OK (gating tuple→vqa / vqa→feedback): {self._get_safe_val(reward_extra_infos_dict, 'task2_vqa_format_ok', i)}\n")
+                f.write(f"  - Feedback Format OK (rule-based) (gating vqa→feedback): {self._get_safe_val(reward_extra_infos_dict, 'task2_rule_based_feedback_format_ok', i)}\n")
+                f.write(f"  - No Feedback Needed (rule-based) (gating vqa→feedback): {self._get_safe_val(reward_extra_infos_dict, 'task2_no_feedback_needed', i)}\n")
+                f.write(f"  - Stage1 Prompt→Tuple Reward: {self._get_safe_val(reward_extra_infos_dict, 'task2_prompt_to_tuple_reward', i)}\n")
+                f.write(f"  - Stage2 Tuple→VQA Reward: {self._get_safe_val(reward_extra_infos_dict, 'task2_tuple_to_vqa_reward', i)}\n")
+                f.write(f"  - Stage3 VQA→Feedback Reward: {self._get_safe_val(reward_extra_infos_dict, 'task2_vqa_to_feedback_reward', i)}\n")
                 f.write(f"  - Total VLM Reward: {self._get_safe_val(reward_extra_infos_dict, 'task2_vlm_reward', i)}\n")
                 f.write(f"  - Model Feedback:\n{feedback_texts[i]}\n")
-                f.write(f"  - Stage1 Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task2_prompt_to_summary_response', i)}\n")
-                f.write(f"  - Stage2 Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task2_summary_to_tuple_response', i)}\n")
-                f.write(f"  - Stage3 Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task2_tuple_to_vqa_response', i)}\n")
-                f.write(f"  - Stage4 Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task2_vqa_to_feedback_response', i)}\n")
+                f.write(f"  - Stage1 Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task2_prompt_to_tuple_response', i)}\n")
+                f.write(f"  - Stage2 Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task2_tuple_to_vqa_response', i)}\n")
+                f.write(f"  - Stage3 Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task2_vqa_to_feedback_response', i)}\n")
                 f.write("\n")
 
             # Log Task 3 if regen images exist (even if task_id != 3)
             if 3 in _report_task_ids:
                 f.write(f"🔄 [TASK 3] RE-GENERATION\n")
-                f.write(f"  - Total Score: {self._get_safe_val(scores, 'task3_scores', i)}\n")
+                f.write(f"  - Token Score Sum (MDP Step5 return in phase1 train): {self._get_safe_val(scores, 'task3_scores', i)}\n")
+                f.write(f"  - Previous Image Score S_t: {self._get_safe_val(reward_extra_infos_dict, 'task3_prev_image_score', i)}\n")
+                f.write(f"  - Next Image Score S_t+1: {self._get_safe_val(reward_extra_infos_dict, 'task3_next_image_score', i)}\n")
+                f.write(f"  - Image Score Gain: {self._get_safe_val(reward_extra_infos_dict, 'task3_image_score_gain', i)}\n")
+                f.write(f"  - Edit IF Reward e_t: {self._get_safe_val(reward_extra_infos_dict, 'task3_edit_if_reward', i)}\n")
+                f.write(f"  - MDP Step5 Reward r_step5: {self._get_safe_val(reward_extra_infos_dict, 'task3_step5_reward', i)}\n")
                 f.write(f"  - VQA Reward: {self._get_safe_val(reward_extra_infos_dict, 'task3_vqa_reward', i)}\n")
                 f.write(f"  - Edit Instruction Following Reward: {self._get_safe_val(reward_extra_infos_dict, 'task3_edit_reward', i)}\n")
                 f.write(f"  - Detector Reward (bonus): {self._get_safe_val(reward_extra_infos_dict, 'task3_detector_reward', i)}\n")
@@ -783,47 +787,6 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                     for d in det_details_3:
                         f.write(f"    [{d.get('tuple_idx','?')}] {d.get('det_info',{})}\n")
                         f.write(f"         judge={d.get('det_judge')} | reason={d.get('det_reason','')}\n")
-                f.write("\n")
-
-            # Trajectory-level outcome (same value across all rows of a uid
-            # group because outcomes are attributed per trajectory_id).
-            # Source = 1 means trajectory terminated at task2 (outcome = task1
-            # reward); 3 means trajectory completed task3 (outcome = mean of
-            # task3 rewards across turns the trajectory reached task3).
-            phase_val = item.get("phase", 1)
-            out_src_raw = self._get_safe_val(scores, 'outcome_task_id', i, 0)
-            if phase_val == 2:
-                f.write(f"🎯 [OUTCOME]\n")
-                f.write("  - Source Task: N/A\n")
-                f.write("  - Outcome Reward: N/A (phase2 local-only)\n")
-                f.write("\n")
-            elif out_src_raw:
-                eta = float(getattr(self.config.algorithm, "outcome_eta", 0.0))
-                beta = float(getattr(self.config.algorithm, "outcome_beta", 0.0))
-                lambda_ = float(getattr(self.config.algorithm, "outcome_lambda", 0.0))
-                out_val = self._get_safe_val(scores, 'outcome_scores', i, None)
-                out_a_t = self._get_safe_val(scores, 'outcome_A_T', i, None)
-                out_if = self._get_safe_val(scores, 'outcome_IF_bar', i, None)
-                out_p = self._get_safe_val(scores, 'outcome_P_bar', i, None)
-                out_t = self._get_safe_val(scores, 'outcome_T', i, None)
-                f.write(f"🎯 [OUTCOME]\n")
-                f.write(f"  - Source Task: task{int(out_src_raw)}\n")
-                f.write(f"  - Outcome Reward: {self._fmt_metric(out_val, 4)}\n")
-                f.write("  - Formula: R_out = A_T + eta * IF_bar + beta * P_bar - lambda * (T - 1)\n")
-                f.write(
-                    f"  - Components: A_T={self._fmt_metric(out_a_t, 4)}, "
-                    f"IF_bar={self._fmt_metric(out_if, 4)}, "
-                    f"P_bar={self._fmt_metric(out_p, 4)}, "
-                    f"T={self._fmt_metric(out_t, 4)}\n"
-                )
-                f.write(f"  - Coefficients: eta={eta:.4f}, beta={beta:.4f}, lambda={lambda_:.4f}\n")
-                if None not in (out_val, out_a_t, out_if, out_p, out_t):
-                    f.write(
-                        f"  - Expanded: {out_a_t:.4f} + {eta:.4f}*{out_if:.4f} + {beta:.4f}*{out_p:.4f} - "
-                        f"{lambda_:.4f}*({out_t:.4f} - 1) = {out_val:.4f}\n"
-                    )
-                else:
-                    f.write("  - Expanded: N/A\n")
                 f.write("\n")
 
             f.write(f"📚 [GROUND TRUTH REFERENCE]\n")
@@ -956,17 +919,36 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                             scores[f"task{tid}_scores"] = batch.batch[cross_key].sum(-1).cpu().tolist()
                             break
 
-            # Outcome reward (per-row trajectory outcome) + source task id
-            # (1 = early-terminated at task2, 3 = completed task3). Stamped by
-            # the orchestrator in `_attach_outcome_per_row`.
-            if "outcome_token_level_scores" in batch.batch:
-                scores["outcome_scores"] = batch.batch["outcome_token_level_scores"].sum(-1).cpu().tolist()
-            if "outcome_task_id" in batch.batch:
-                scores["outcome_task_id"] = batch.batch["outcome_task_id"].cpu().tolist()
-            for key in ("outcome_A_T", "outcome_IF_bar", "outcome_P_bar", "outcome_T"):
-                if key in batch.non_tensor_batch:
-                    vals = batch.non_tensor_batch[key]
-                    scores[key] = vals.tolist() if hasattr(vals, "tolist") else list(vals)
+            # Task2 is one text forward pass, but MDP training treats the
+            # decompose / verify / feedback spans as three separate decisions.
+            # Dump the per-decision return sums so `task2_scores` is not an
+            # opaque aggregate.
+            task2_score_tensor = None
+            if "task2_token_level_scores" in batch.batch:
+                task2_score_tensor = batch.batch["task2_token_level_scores"]
+            else:
+                for host_tid in task_ids:
+                    cross_key = f"task{host_tid}_task2_token_level_scores"
+                    if cross_key in batch.batch:
+                        task2_score_tensor = batch.batch[cross_key]
+                        break
+
+            task2_segment_mask = None
+            if "task2_segment_mask" in batch.batch:
+                task2_segment_mask = batch.batch["task2_segment_mask"]
+            else:
+                for host_tid in task_ids:
+                    cross_key = f"task{host_tid}_task2_segment_mask"
+                    if cross_key in batch.batch:
+                        task2_segment_mask = batch.batch[cross_key]
+                        break
+
+            if task2_score_tensor is not None and task2_segment_mask is not None:
+                for seg, name in ((2, "step2"), (3, "step3"), (4, "step4")):
+                    seg_mask = (task2_segment_mask == seg).to(task2_score_tensor.dtype)
+                    scores[f"task2_{name}_return_scores"] = (
+                        task2_score_tensor * seg_mask
+                    ).sum(-1).cpu().tolist()
 
             reward_extra_infos_to_dump = dict(reward_extra_infos_dict)
             # Merge nested reward-extra dicts directly here so replay/fresh dump

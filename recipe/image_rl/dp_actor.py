@@ -396,6 +396,8 @@ class DataParallelImageGenerationActor(BasePPOActor):
                 "task2_input_ids", "task2_attention_mask", "task2_feedback_ids",
                 "task2_response_mask",
             ]
+            if "task2_segment_mask" in available_keys:
+                select_batch_keys.append("task2_segment_mask")
             if "task_id" in available_keys:
                 select_batch_keys.append("task_id")
             if "task2_task1_gen_imgs_pixel_values" in available_keys:
@@ -571,6 +573,8 @@ class DataParallelImageGenerationActor(BasePPOActor):
             elif task_id == 2:
                 task_keys.extend([f"task{task_id}_feedback_ids",
                                 "task1_gen_imgs_pixel_values"])  # Task 2 needs task1 pixel values
+                if "task2_segment_mask" in available_keys:
+                    task_keys.append("task2_segment_mask")
                 # Aliased key for replay: correct task1 context from task2's trajectory
                 if "task2_task1_gen_imgs_pixel_values" in available_keys:
                     task_keys.append("task2_task1_gen_imgs_pixel_values")
@@ -645,6 +649,17 @@ class DataParallelImageGenerationActor(BasePPOActor):
                         old_log_prob = model_inputs[f"task{task_id}_old_log_probs"]
                         advantages = model_inputs[f"task{task_id}_advantages"]
                         response_mask = model_inputs[f"task{task_id}_response_mask"]
+                        loss_mask = response_mask
+                        if task_id == 2 and "task2_segment_mask" in model_inputs:
+                            segment_mask = model_inputs["task2_segment_mask"].to(device=response_mask.device)
+                            valid_mask = response_mask > 0
+                            weighted_mask = torch.zeros_like(response_mask, dtype=torch.float32)
+                            for seg_id in (2, 3, 4):
+                                seg_mask = ((segment_mask == seg_id) & valid_mask).to(dtype=torch.float32)
+                                seg_len = seg_mask.sum(dim=-1, keepdim=True).clamp(min=1.0)
+                                weighted_mask = weighted_mask + seg_mask / seg_len
+                            if weighted_mask.sum() > 0:
+                                loss_mask = weighted_mask
 
                         if self.use_adaptive_entropy_coeff:
                             entropy_coeff = -self.adaptive_entropy_coeffs[task_id].get_alpha().item()
@@ -685,14 +700,14 @@ class DataParallelImageGenerationActor(BasePPOActor):
                             old_log_prob=old_log_prob,
                             log_prob=log_prob,
                             advantages=advantages,
-                            response_mask=response_mask,
+                            response_mask=loss_mask,
                             loss_agg_mode=loss_agg_mode,
                             config=self.config,
                             rollout_is_weights=rollout_is_weights,
                         )
 
                         if calculate_entropy:
-                            entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                            entropy_loss = agg_loss(loss_mat=entropy, loss_mask=loss_mask, loss_agg_mode=loss_agg_mode)
                             # Update adaptive coeff after computing entropy
                             if self.use_adaptive_entropy_coeff:
                                 self.adaptive_entropy_coeffs[task_id].update(entropy=entropy_loss.detach())
@@ -709,7 +724,7 @@ class DataParallelImageGenerationActor(BasePPOActor):
                                 logprob=log_prob, ref_logprob=ref_log_prob,
                                 kl_penalty=self.config.kl_loss_type
                             )
-                            kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask,
+                            kl_loss = agg_loss(loss_mat=kld, loss_mask=loss_mask,
                                             loss_agg_mode=loss_agg_mode)
                             policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
                             micro_batch_metrics[f"actor/task{task_id}_kl"] = kl_loss.detach().item()

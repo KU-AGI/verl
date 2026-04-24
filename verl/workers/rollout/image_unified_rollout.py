@@ -344,7 +344,7 @@ class ImageUnifiedRollout(BaseRollout):
 
         # Task 2 - Text Generation (outputs)
         output_tensors_task2 = [
-            "task2_feedback_ids", "task2_response_mask", "task2_rollout_log_probs"
+            "task2_feedback_ids", "task2_response_mask", "task2_segment_mask", "task2_rollout_log_probs"
         ]
         for key in output_tensors_task2:
             if key in data_proto.batch:
@@ -628,7 +628,7 @@ class ImageUnifiedRollout(BaseRollout):
         input_format = []
         for prompt in data_proto.non_tensor_batch['prompt']:
             _prompt = self.get_sft_format(prompt)
-            input_format.append(_prompt + self.image_tag + self.image_end_tag + "\nFirst, summarize the input prompt by keeping only explicitly stated visual facts\nExclude subjective, inferential, or non-verifiable content.\n")
+            input_format.append(_prompt + self.image_tag + self.image_end_tag + "\nFirst, decompose the input prompt into explicit prompt contents that are visually verifiable.\nExclude subjective, inferential, or non-verifiable content.\n")
 
         self.processor.tokenizer.pad_token_id = self.processor.pad_id
         
@@ -660,8 +660,10 @@ class ImageUnifiedRollout(BaseRollout):
 
         feedback_texts, gen_sequences, log_probs = self.generate_text(merged_embeds, batched_attention_mask)
 
-        # Segment mask: 0=pad, 2=Decompose, 3=Verify, 4=Feedback
-        response_mask = build_segment_response_mask(gen_sequences, self.processor.tokenizer)
+        # Segment mask: 0=pad, 2=Decompose, 3=Verify, 4=Feedback.
+        # Keep task2_response_mask as a binary valid-token mask for loss/KL.
+        segment_mask = build_segment_response_mask(gen_sequences, self.processor.tokenizer)
+        response_mask = (segment_mask > 0).long()
 
         # For computing logits: output
         data_proto.non_tensor_batch["task2_feedback_texts"] = np.array(feedback_texts, dtype=object)
@@ -672,6 +674,7 @@ class ImageUnifiedRollout(BaseRollout):
             data_proto.batch['task2_rollout_log_probs'] = log_probs.detach().cpu()
 
         data_proto.batch["task2_response_mask"] = response_mask.detach().cpu()
+        data_proto.batch["task2_segment_mask"] = segment_mask.detach().cpu()
 
         if dist.get_rank() == 0:
             print(f"[TEXT_GEN] Completed feedback generation")
