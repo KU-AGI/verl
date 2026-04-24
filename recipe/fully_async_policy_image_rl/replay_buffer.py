@@ -161,10 +161,14 @@ class ReplayBuffer:
                 # Legacy fallback: treat missing phase as local-reward path.
                 phase_id = 0
 
-            stats_key = outcome_key if phase_id == 1 else score_key
+            stats_key = score_key
             if stats_key not in batch.batch:
-                # Phase-aware metric is unavailable; skip this entry rather than
-                # silently mixing local/outcome semantics.
+                # Legacy fallback for older batches. New MDP training stores
+                # discounted returns directly in task{id}_token_level_scores,
+                # so replay filtering should rank by the same task score that
+                # the actor loss will consume.
+                stats_key = outcome_key if outcome_key in batch.batch else None
+            if stats_key is None:
                 continue
 
             score_tensor = batch.batch[stats_key].sum(-1)
@@ -220,11 +224,9 @@ class ReplayBuffer:
                     cross_task_vals["task3_task1_token_level_scores"] = filtered.batch["task1_token_level_scores"]
                 if "task2_token_level_scores" in filtered.batch.keys():
                     cross_task_vals["task3_task2_token_level_scores"] = filtered.batch["task2_token_level_scores"]
-            # Preserve trajectory-level outcome fields (stamped per-row by the
-            # orchestrator in `_attach_outcome_per_row`) and `turn_idx` (per-
-            # row turn origin). They don't carry a `taskN_` prefix so the
-            # strip-below would drop them — trainer's GRPO outcome advantage,
-            # rollout logging, and per-turn diagnostics all read these.
+            # Preserve legacy outcome fields and `turn_idx` for diagnostics /
+            # backward-compatible dumps. MDP training and replay filtering use
+            # task{id}_token_level_scores as the source of truth.
             keep_non_task_prefix = {
                 "outcome_token_level_scores",
                 "outcome_task_id",
