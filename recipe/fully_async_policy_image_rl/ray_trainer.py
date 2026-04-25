@@ -228,6 +228,18 @@ def compute_advantage(
             index=group_index,
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
         )
+        local_adv_weight = 0.0
+        if config is not None:
+            local_adv_weight = float(config.get("task2_local_adv_weight", 0.0))
+        if local_adv_weight != 0.0 and "task2_local_token_level_scores" in data.batch:
+            local_advantages, _ = _compute_task2_segmentwise_grpo_advantage(
+                token_level_rewards=data.batch["task2_local_token_level_scores"],
+                response_mask=grpo_calculation_mask,
+                segment_mask=data.batch["task2_segment_mask"],
+                index=group_index,
+                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            )
+            advantages = advantages + local_adv_weight * local_advantages
     else:
         advantages, returns = core_algos.compute_grpo_outcome_advantage(
             token_level_rewards=data.batch[f"task{task_id}_token_level_rewards"],

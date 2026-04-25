@@ -1171,6 +1171,7 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             prev_vals = self._ensure_reward_extra_list(t3_extras, "task3_prev_image_score", n)
             next_vals = self._ensure_reward_extra_list(t3_extras, "task3_next_image_score", n)
             gain_vals = self._ensure_reward_extra_list(t3_extras, "task3_image_score_gain", n)
+            gain_score_vals = self._ensure_reward_extra_list(t3_extras, "task3_image_gain_score", n)
             step5_vals = self._ensure_reward_extra_list(t3_extras, "task3_step5_reward", n)
 
             for row in range(n):
@@ -1199,6 +1200,7 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
                 prev_vals[row] = prev_s
                 next_vals[row] = next_s
                 gain_vals[row] = gain
+                gain_score_vals[row] = gain
                 step5_vals[row] = step5_reward
 
     @staticmethod
@@ -1398,6 +1400,7 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             response_mask = t2_b.batch["task2_response_mask"]
             segment_mask = t2_b.batch.get("task2_segment_mask", response_mask)
             scores = torch.zeros_like(response_mask, dtype=torch.float32)
+            local_scores = torch.zeros_like(response_mask, dtype=torch.float32)
             if getattr(t2_b, "meta_info", None) is None:
                 t2_b.meta_info = {}
             task2_extras = t2_b.meta_info.setdefault("task2_reward_extra_info", {})
@@ -1414,8 +1417,31 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
                 self._put_scalar_on_last_segment_token(scores, segment_mask, row, 2, step2_return)
                 self._put_scalar_on_last_segment_token(scores, segment_mask, row, 3, step3_return)
                 self._put_scalar_on_last_segment_token(scores, segment_mask, row, 4, step4_return)
+                self._put_scalar_on_last_segment_token(
+                    local_scores,
+                    segment_mask,
+                    row,
+                    2,
+                    _ex(t2_b, 2, "task2_prompt_to_tuple_reward", [row], 0.0),
+                )
+                self._put_scalar_on_last_segment_token(
+                    local_scores,
+                    segment_mask,
+                    row,
+                    3,
+                    _ex(t2_b, 2, "task2_tuple_to_vqa_reward", [row], 0.0),
+                )
+                self._put_scalar_on_last_segment_token(
+                    local_scores,
+                    segment_mask,
+                    row,
+                    4,
+                    _ex(t2_b, 2, "task2_vqa_to_feedback_reward", [row], 0.0),
+                )
             t2_b.batch["task2_token_level_scores"] = scores
+            t2_b.batch["task2_local_token_level_scores"] = local_scores
             t2_b.meta_info["task2_token_level_scores"] = scores
+            t2_b.meta_info["task2_local_token_level_scores"] = local_scores
 
         for t3_b in task3_batches:
             if t3_b is None or "task3_response_mask" not in t3_b.batch:
