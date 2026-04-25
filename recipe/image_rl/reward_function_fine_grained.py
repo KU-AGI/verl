@@ -869,6 +869,8 @@ async def compute_score_single_async(
         reward_extra_info[f"task{task_id}_detector_details"] = detector_response.get("details", [])
         reward_extra_info[f"task{task_id}_detector_active"] = int(bool(detection_results))
         reward_extra_info[f"task{task_id}_detector_count"] = len(detection_results)
+        reward_extra_info[f"task{task_id}_detector_active_score"] = int(bool(detection_results))
+        reward_extra_info[f"task{task_id}_detector_active_only_reward"] = detector_bonus if detection_results else None
 
         # Outcome-ready summary: alignment in [0,1]
         task1_image_score = vqa_score + DETECTOR_ALIGN_BONUS_WEIGHT * detector_bonus
@@ -889,6 +891,7 @@ async def compute_score_single_async(
             reward_extra_info["task2_rule_based_decompose_reward"] = 0.0
             reward_extra_info["task2_rule_based_feedback_format_ok"] = 0
             reward_extra_info["task2_no_feedback_needed"] = 0
+            reward_extra_info["task2_no_feedback_needed_score"] = 0
             reward_extra_info["task2_tuple_format_ok"] = 0
             reward_extra_info["task2_vqa_format_ok"] = 0
             reward_extra_info["task2_stage_raw_only"] = int(raw_stage_only)
@@ -933,6 +936,7 @@ async def compute_score_single_async(
         no_feedback_needed = predicted_feedback is not None and "no need to generate feedback" in predicted_feedback.lower()
         reward_extra_info["task2_rule_based_feedback_format_ok"] = int(feedback_step_format_ok)
         reward_extra_info["task2_no_feedback_needed"] = int(no_feedback_needed)
+        reward_extra_info["task2_no_feedback_needed_score"] = int(no_feedback_needed)
         # Prepare normalized inputs for stage judges
         # tuple_raw = _normalize_tuple_lines(predicted_tuple or '')
         tuple_raw = predicted_tuple or ''
@@ -1060,6 +1064,8 @@ async def compute_score_single_async(
         reward_extra_info[f"task{task_id}_detector_details"] = detector_response.get("details", []) if detector_response else []
         reward_extra_info[f"task{task_id}_detector_active"] = int(bool(detection_results))
         reward_extra_info[f"task{task_id}_detector_count"] = len(detection_results)
+        reward_extra_info[f"task{task_id}_detector_active_score"] = int(bool(detection_results))
+        reward_extra_info[f"task{task_id}_detector_active_only_reward"] = detector_bonus if detection_results else None
 
         # Outcome-ready summaries: alignment and instruction-following in [0,1]
         task3_image_score = vqa_score + DETECTOR_ALIGN_BONUS_WEIGHT * detector_bonus
@@ -1281,6 +1287,8 @@ def finalize_task2_reward_extra_info(
     finalized["task2_decision_vqa_reward"] = float(decision_vqa)
     finalized["task2_decision_vqa_source"] = decision_source
     finalized["task2_target_no_edit"] = int(target_no_edit)
+    finalized["task2_target_no_edit_score"] = int(target_no_edit)
+    finalized["task2_no_feedback_needed_score"] = int(model_no_edit)
     finalized["task2_vqa_to_feedback_reward"] = feedback_total
     finalized["task2_step2_reward"] = _shape_mdp_reasoning_reward(
         prompt_to_tuple,
