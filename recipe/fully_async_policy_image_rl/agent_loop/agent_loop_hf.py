@@ -1232,6 +1232,124 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             return
         score_tensor[row, int(valid[-1].item())] = float(scalar)
 
+    @staticmethod
+    def _as_float(value, default: float = 0.0) -> float:
+        try:
+            if value is None:
+                return default
+            return float(value)
+        except Exception:
+            return default
+
+    def _attach_phase1_mdp_token_scores(
+        self,
+        all_tids,
+        task1_batch: Optional[DataProto],
+        task2_batches: list[DataProto],
+        task3_batches: list[DataProto],
+    ) -> None:
+        """Attach phase1 token scores according to `algorithm.mdp_reward_version`.
+
+        Default `gae` preserves the existing discounted-return backup. The
+        `multi_step` variant writes immediate per-step rewards only.
+        """
+        algo_cfg = getattr(getattr(self, "config", None), "algorithm", None) or {}
+        _get_hp = algo_cfg.get if hasattr(algo_cfg, "get") else lambda k, d: getattr(algo_cfg, k, d)
+        version = str(_get_hp("mdp_reward_version", "gae")).lower()
+        if version in {"multi_step", "multistep"}:
+            self._attach_phase1_mdp_multistep_token_scores(
+                task1_batch,
+                task2_batches,
+                task3_batches,
+            )
+            return
+        if version not in {"gae", "discounted", "discounted_return"}:
+            logger.warning(
+                "[AgentLoop] Unknown algorithm.mdp_reward_version=%s; falling back to gae",
+                version,
+            )
+        self._attach_phase1_mdp_discounted_token_scores(
+            all_tids,
+            task1_batch,
+            task2_batches,
+            task3_batches,
+        )
+
+    def _attach_phase1_mdp_multistep_token_scores(
+        self,
+        task1_batch: Optional[DataProto],
+        task2_batches: list[DataProto],
+        task3_batches: list[DataProto],
+    ) -> None:
+        """Replace phase1 token scores with immediate multi-step rewards.
+
+        Rewards are intentionally built from raw components, not `*_image_score`
+        or `*_align`, because those fields include a 0.2 detector weight.
+        """
+        if task1_batch is not None and "task1_response_mask" in task1_batch.batch:
+            mask = task1_batch.batch["task1_response_mask"]
+            scores = torch.zeros_like(mask, dtype=torch.float32)
+            if getattr(task1_batch, "meta_info", None) is None:
+                task1_batch.meta_info = {}
+            task1_extras = task1_batch.meta_info.setdefault("task1_reward_extra_info", {})
+            multi_vals = self._ensure_reward_extra_list(task1_extras, "task1_multi_step_score", len(task1_batch))
+            for row in range(len(task1_batch)):
+                vqa = self._as_float(self._read_reward_extra_value(task1_extras, "task1_vqa_reward", row, 0.0))
+                detector = self._as_float(self._read_reward_extra_value(task1_extras, "task1_detector_reward", row, 0.0))
+                value = vqa + detector
+                multi_vals[row] = value
+                self._put_scalar_on_last_mask_token(scores, mask, row, value)
+            task1_batch.batch["task1_token_level_scores"] = scores
+            task1_batch.meta_info["task1_token_level_scores"] = scores
+
+        for t2_b in task2_batches:
+            if t2_b is None or "task2_response_mask" not in t2_b.batch:
+                continue
+            response_mask = t2_b.batch["task2_response_mask"]
+            segment_mask = t2_b.batch.get("task2_segment_mask", response_mask)
+            scores = torch.zeros_like(response_mask, dtype=torch.float32)
+            if getattr(t2_b, "meta_info", None) is None:
+                t2_b.meta_info = {}
+            task2_extras = t2_b.meta_info.setdefault("task2_reward_extra_info", {})
+            step2_vals = self._ensure_reward_extra_list(task2_extras, "task2_step2_multi_step_score", len(t2_b))
+            step3_vals = self._ensure_reward_extra_list(task2_extras, "task2_step3_multi_step_score", len(t2_b))
+            step4_vals = self._ensure_reward_extra_list(task2_extras, "task2_step4_multi_step_score", len(t2_b))
+            for row in range(len(t2_b)):
+                step2 = self._as_float(self._read_reward_extra_value(task2_extras, "task2_step2_reward", row, 0.0))
+                step3 = self._as_float(self._read_reward_extra_value(task2_extras, "task2_step3_reward", row, 0.0))
+                step4 = self._as_float(self._read_reward_extra_value(task2_extras, "task2_step4_reward", row, 0.0))
+                step2_vals[row] = step2
+                step3_vals[row] = step3
+                step4_vals[row] = step4
+                self._put_scalar_on_last_segment_token(scores, segment_mask, row, 2, step2)
+                self._put_scalar_on_last_segment_token(scores, segment_mask, row, 3, step3)
+                self._put_scalar_on_last_segment_token(scores, segment_mask, row, 4, step4)
+            t2_b.batch["task2_token_level_scores"] = scores
+            t2_b.batch["task2_local_token_level_scores"] = scores.clone()
+            t2_b.meta_info["task2_token_level_scores"] = scores
+            t2_b.meta_info["task2_local_token_level_scores"] = scores.clone()
+
+        for t3_b in task3_batches:
+            if t3_b is None or "task3_response_mask" not in t3_b.batch:
+                continue
+            mask = t3_b.batch["task3_response_mask"]
+            scores = torch.zeros_like(mask, dtype=torch.float32)
+            if getattr(t3_b, "meta_info", None) is None:
+                t3_b.meta_info = {}
+            task3_extras = t3_b.meta_info.setdefault("task3_reward_extra_info", {})
+            multi_vals = self._ensure_reward_extra_list(task3_extras, "task3_multi_step_score", len(t3_b))
+            for row in range(len(t3_b)):
+                vqa = self._as_float(self._read_reward_extra_value(task3_extras, "task3_vqa_reward", row, 0.0))
+                detector = self._as_float(self._read_reward_extra_value(task3_extras, "task3_detector_reward", row, 0.0))
+                edit_if = self._read_reward_extra_value(task3_extras, "task3_edit_if_reward", row, None)
+                if edit_if is None:
+                    edit_if = self._read_reward_extra_value(task3_extras, "task3_if", row, 0.0)
+                value = vqa + detector + self._as_float(edit_if)
+                multi_vals[row] = value
+                self._put_scalar_on_last_mask_token(scores, mask, row, value)
+            t3_b.batch["task3_token_level_scores"] = scores
+            t3_b.meta_info["task3_token_level_scores"] = scores
+
     def _attach_phase1_mdp_discounted_token_scores(
         self,
         all_tids,
@@ -2850,7 +2968,7 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             outcomes = self._compute_outcomes_with_avg(
                 all_tids, task1_batch, task2_batches_per_turn, task3_batches_per_turn
             )
-            self._attach_phase1_mdp_discounted_token_scores(
+            self._attach_phase1_mdp_token_scores(
                 all_tids,
                 task1_batch,
                 task2_batches_per_turn,
@@ -3034,7 +3152,7 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             outcomes = self._compute_outcomes_with_avg(
                 all_tids, task1_batch, task2_batches_per_turn, task3_batches_per_turn
             )
-            self._attach_phase1_mdp_discounted_token_scores(
+            self._attach_phase1_mdp_token_scores(
                 all_tids,
                 task1_batch,
                 task2_batches_per_turn,
