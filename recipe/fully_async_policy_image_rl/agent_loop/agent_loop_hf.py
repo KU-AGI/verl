@@ -1115,8 +1115,11 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
 
         algo_cfg = getattr(getattr(self, "config", None), "algorithm", None) or {}
         _get_hp = algo_cfg.get if hasattr(algo_cfg, "get") else lambda k, d: getattr(algo_cfg, k, d)
+        task3_reward_mode = str(_get_hp("task3_reward_mode", "step5"))
         edit_if_weight = float(_get_hp("mdp_edit_if_weight", 0.03))
         edit_cost = float(_get_hp("mdp_edit_cost", 0.05))
+
+        prefer_vqa_reward = task3_reward_mode == "absolute"
 
         task1_image_by_tid: dict[int, float] = {}
         if task1_batch is not None:
@@ -1125,7 +1128,11 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             tids = (getattr(task1_batch, "non_tensor_batch", None) or {}).get("trajectory_id")
             if tids is not None:
                 for row, tid in enumerate(tids):
-                    val = self._read_reward_extra_value(t1_extras, "task1_image_score", row, None)
+                    val = None
+                    if prefer_vqa_reward:
+                        val = self._read_reward_extra_value(t1_extras, "task1_vqa_reward", row, None)
+                    if val is None:
+                        val = self._read_reward_extra_value(t1_extras, "task1_image_score", row, None)
                     if val is None:
                         val = self._read_reward_extra_value(t1_extras, "task1_align", row, None)
                     try:
@@ -1143,7 +1150,11 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             if bids is None:
                 continue
             for row, bid in enumerate(bids):
-                val = self._read_reward_extra_value(t3_extras, "task3_image_score", row, None)
+                val = None
+                if prefer_vqa_reward:
+                    val = self._read_reward_extra_value(t3_extras, "task3_vqa_reward", row, None)
+                if val is None:
+                    val = self._read_reward_extra_value(t3_extras, "task3_image_score", row, None)
                 if val is None:
                     val = self._read_reward_extra_value(t3_extras, "task3_align", row, None)
                 try:
@@ -1174,7 +1185,11 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             step5_vals = self._ensure_reward_extra_list(t3_extras, "task3_step5_reward", n)
 
             for row in range(n):
-                next_s = self._read_reward_extra_value(t3_extras, "task3_image_score", row, None)
+                next_s = None
+                if prefer_vqa_reward:
+                    next_s = self._read_reward_extra_value(t3_extras, "task3_vqa_reward", row, None)
+                if next_s is None:
+                    next_s = self._read_reward_extra_value(t3_extras, "task3_image_score", row, None)
                 if next_s is None:
                     next_s = self._read_reward_extra_value(t3_extras, "task3_align", row, None)
                 edit_if = self._read_reward_extra_value(t3_extras, "task3_edit_if_reward", row, None)
@@ -1195,7 +1210,10 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
                     continue
 
                 gain = next_s - prev_s
-                step5_reward = gain + edit_if_weight * edit_if - edit_cost
+                if task3_reward_mode == "absolute":
+                    step5_reward = next_s
+                else:
+                    step5_reward = gain + edit_if_weight * edit_if - edit_cost
                 prev_vals[row] = prev_s
                 next_vals[row] = next_s
                 gain_vals[row] = gain
@@ -1249,6 +1267,18 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         algo_cfg = getattr(getattr(self, "config", None), "algorithm", None) or {}
         _get_hp = algo_cfg.get if hasattr(algo_cfg, "get") else lambda k, d: getattr(algo_cfg, k, d)
         gamma = float(_get_hp("mdp_gamma", _get_hp("gamma", 1.0)))
+
+        task3_reward_mode = str(_get_hp("task3_reward_mode", "step5"))
+        prefer_vqa_reward = task3_reward_mode == "absolute"
+
+        # Janus-Pro-R1 multi-round weighting flags. In this recipe,
+        # rollout.max_turns is the number of possible regenerations after the
+        # initial task1 image, so the paper's image-round budget is T=1+max_turns.
+        janus_comp_turn_norm = bool(_get_hp("janus_comp_turn_norm", False))
+        janus_final_image_weight = bool(_get_hp("janus_final_image_weight", False))
+        _rollout_cfg = getattr(getattr(getattr(self, "config", None), "actor_rollout_ref", None), "rollout", None)
+        max_regen_turns = int(getattr(_rollout_cfg, "max_turns", None) or _get_hp("max_turns", 2))
+        max_image_rounds_T = max(1, max_regen_turns + 1)
 
         _ex = self._get_outcome_extra_scalar
         returns_by_event: dict[tuple[int, int, str], list[float]] = {}
@@ -1344,20 +1374,38 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
 
         def _build_events(tid: int, t2_rows: list[tuple], t3_rows: list[tuple]) -> list[tuple]:
             events: list[tuple[float, DataProto, int, str, float]] = []
+            t2_turns = set(turn_i for turn_i, _, _ in t2_rows)
+            t3_turns = set(turn_i for turn_i, _, _ in t3_rows)
+            # K_i in Janus-Pro-R1 is the number of images actually produced.
+            # Normally every image has a task2 self-evaluation row; fall back to
+            # task1 + task3 count for older rollouts that lack final eval rows.
+            ki = max(1, len(t2_turns) if t2_turns else 1 + len(t3_turns))
+
             if task1_batch is not None and tid in t1_index:
                 row = t1_index[tid]
-                reward = _ex(task1_batch, 1, "task1_mdp_reward", [row], default=_ex(task1_batch, 1, "task1_image_score", [row], 0.0))
+                if prefer_vqa_reward:
+                    reward = _ex(task1_batch, 1, "task1_vqa_reward", [row], default=_ex(task1_batch, 1, "task1_mdp_reward", [row], 0.0))
+                else:
+                    reward = _ex(task1_batch, 1, "task1_mdp_reward", [row], default=_ex(task1_batch, 1, "task1_image_score", [row], 0.0))
+                if janus_final_image_weight and not t3_rows:
+                    reward *= float(max_image_rounds_T - ki + 1)
                 events.append((0.0, task1_batch, row, "step1", reward))
 
+            # Janus-Pro-R1 RComp: scale each turn's task2 reward by T/K_i
+            turn_scale = (float(max_image_rounds_T) / float(ki)) if janus_comp_turn_norm else 1.0
             for turn_i, t2_b, row in t2_rows:
                 base = 1.0 + 4.0 * float(turn_i)
-                events.append((base + 0.0, t2_b, row, "step2", _ex(t2_b, 2, "task2_step2_reward", [row], 0.0)))
-                events.append((base + 1.0, t2_b, row, "step3", _ex(t2_b, 2, "task2_step3_reward", [row], 0.0)))
-                events.append((base + 2.0, t2_b, row, "step4", _ex(t2_b, 2, "task2_step4_reward", [row], 0.0)))
+                events.append((base + 0.0, t2_b, row, "step2", turn_scale * _ex(t2_b, 2, "task2_step2_reward", [row], 0.0)))
+                events.append((base + 1.0, t2_b, row, "step3", turn_scale * _ex(t2_b, 2, "task2_step3_reward", [row], 0.0)))
+                events.append((base + 2.0, t2_b, row, "step4", turn_scale * _ex(t2_b, 2, "task2_step4_reward", [row], 0.0)))
 
+            # Janus-Pro-R1 RGen: final image gets weight (T - K_i + 1)
+            last_turn_i = max((ti for ti, _, _ in t3_rows), default=-1) if t3_rows else -1
             for turn_i, t3_b, row in t3_rows:
                 base = 1.0 + 4.0 * float(turn_i)
-                events.append((base + 3.0, t3_b, row, "step5", _ex(t3_b, 3, "task3_step5_reward", [row], 0.0)))
+                is_final = janus_final_image_weight and (turn_i == last_turn_i)
+                final_w = float(max_image_rounds_T - ki + 1) if is_final else 1.0
+                events.append((base + 3.0, t3_b, row, "step5", final_w * _ex(t3_b, 3, "task3_step5_reward", [row], 0.0)))
 
             return sorted(events, key=lambda x: x[0])
 
@@ -1512,15 +1560,25 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         if not raw_extras:
             return batch
 
-        from recipe.image_rl.reward_function_fine_grained import finalize_task2_reward_extra_info
+        algo_cfg = getattr(getattr(self, "config", None), "algorithm", None) or {}
+        _get_hp = algo_cfg.get if hasattr(algo_cfg, "get") else lambda k, d: getattr(algo_cfg, k, d)
+        task2_reward_mode = str(_get_hp("task2_reward_mode", "segmentwise"))
+
+        if task2_reward_mode == "calibration":
+            from recipe.image_rl.reward_function_janus_pro_r1 import finalize_task2_calibration_reward_extra_info
+            finalize_fn = finalize_task2_calibration_reward_extra_info
+            finalize_kwargs: dict = {}
+        else:
+            from recipe.image_rl.reward_function_fine_grained import finalize_task2_reward_extra_info
+            finalize_fn = finalize_task2_reward_extra_info
+            finalize_kwargs = {
+                "mdp_reasoning_reward_weight": float(_get_hp("mdp_reasoning_reward_weight", 0.03)),
+                "mdp_reasoning_reward_cost": float(_get_hp("mdp_reasoning_reward_cost", 0.02)),
+            }
 
         extra_info = dict((getattr(batch, "meta_info", None) or {}).get("extra_info", {}) or {})
         decision_vals = extra_info.get("task2_decision_vqa_reward", [0.0] * len(batch))
         decision_srcs = extra_info.get("task2_decision_vqa_source", ["missing"] * len(batch))
-        algo_cfg = getattr(getattr(self, "config", None), "algorithm", None) or {}
-        _get_hp = algo_cfg.get if hasattr(algo_cfg, "get") else lambda k, d: getattr(algo_cfg, k, d)
-        mdp_reasoning_reward_weight = float(_get_hp("mdp_reasoning_reward_weight", 0.03))
-        mdp_reasoning_reward_cost = float(_get_hp("mdp_reasoning_reward_cost", 0.02))
 
         finalized_extras: dict[str, list[Any]] = {}
         rewards: list[float] = []
@@ -1532,12 +1590,11 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             }
             decision_vqa = float(decision_vals[row]) if row < len(decision_vals) and decision_vals[row] is not None else 0.0
             decision_source = decision_srcs[row] if row < len(decision_srcs) and decision_srcs[row] is not None else "missing"
-            vlm_reward, finalized_row = finalize_task2_reward_extra_info(
+            vlm_reward, finalized_row = finalize_fn(
                 row_stage,
                 decision_vqa=decision_vqa,
                 decision_source=decision_source,
-                mdp_reasoning_reward_weight=mdp_reasoning_reward_weight,
-                mdp_reasoning_reward_cost=mdp_reasoning_reward_cost,
+                **finalize_kwargs,
             )
             rewards.append(float(finalized_row.get("task2_total_reward", vlm_reward)))
             for key, value in finalized_row.items():

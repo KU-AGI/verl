@@ -15,7 +15,7 @@ exec 2>&1
 ###############################################################################
 project_name='mllm_reasoning'
 exp_name="0425_nipa_adaptive_filtering_mean_constant_cfg_2_adjust_loss_weight_clip_high_lr_1e_6_train_wo_focusdiff_aug_GAE"
-# exp_name='testesttestest'
+exp_name="0425_nipa_janus_pro_r1"
 task_ids='[1,2,3]'
 
 # NOTE(multi-turn + MDP return): task3 weight was previously 0.0 because
@@ -112,15 +112,61 @@ max_turns=2
 #   G_h = r_h + mdp_gamma * G_{h+1}
 mdp_gamma=1.0
 
-# Task2 reasoning reward shaping:
+# ---------------------------------------------------------------------------
+# Task2 reward mode
+#   "segmentwise" [OUR MODEL — default]
+#       VLM scores each reasoning step (step2/3/4) independently via LLM judge.
+#       r_step{2,3,4} shaped with mdp_reasoning_reward_weight / mdp_reasoning_reward_cost.
+#       Advantage: _compute_task2_segmentwise_grpo_advantage (per-segment group norm).
+#
+#   "calibration"  [JANUS-PRO-R1 STYLE]
+#       No per-step VLM judge. Rewards the correctness of the edit/no-edit decision:
+#           r2 = 1 - |task1_score - is_no_edit_binary|
+#       task1_score comes from _inject_task2_decision_signal (already available at
+#       finalization time). Advantage: plain compute_grpo_outcome_advantage.
+# ---------------------------------------------------------------------------
+task2_reward_mode=calibration   # "segmentwise" | "calibration"
+
+# Task2 reasoning reward shaping (only used when task2_reward_mode=segmentwise):
 #   r_reason = mdp_reasoning_reward_weight * (judge_score / 2) - mdp_reasoning_reward_cost
 mdp_reasoning_reward_weight=0.03
 mdp_reasoning_reward_cost=0.02
 
-# Task3 edit reward:
+# ---------------------------------------------------------------------------
+# Task3 reward mode
+#   "step5"    [OUR MODEL — default]
+#       Full MDP step5 formula with instruction-following bonus and edit cost:
+#           r_step5 = (S_next - S_prev) + mdp_edit_if_weight * edit_if - mdp_edit_cost
+#
+#   "absolute" [ABLATION]
+#       Raw output quality only:
+#           r3 = task3_score
+# ---------------------------------------------------------------------------
+task3_reward_mode=absolute         # "step5" | "absolute"
+
+# Task3 edit reward (only used when task3_reward_mode=step5):
 #   r_step5 = S_next - S_prev + mdp_edit_if_weight * edit_if - mdp_edit_cost
 mdp_edit_if_weight=0.03
 mdp_edit_cost=0.05
+
+# ---------------------------------------------------------------------------
+# Janus-Pro-R1 multi-turn weighting  (independent ablation flags)
+#
+#   janus_comp_turn_norm=True  [RComp T/K_i scaling]
+#       Scale each turn's task2 reward by T/K_i, where K_i = actual turns taken.
+#       Rewards finishing early: fewer turns → larger per-turn comprehension reward.
+#           r2_turn_j *= T / K_i
+#
+#   janus_final_image_weight=True  [RGen (T-K_i+1) final-image bonus]
+#       Multiply the LAST task3 image's step5 reward by (T - K_i + 1).
+#       Larger bonus when the model stops early (K_i < T), emphasising the
+#       final output's quality.
+#           r3_final *= (T - K_i + 1)
+#
+#   All four combinations of the two flags are valid ablation points.
+# ---------------------------------------------------------------------------
+janus_comp_turn_norm=True        # True | False
+janus_final_image_weight=True    # True | False
 
 # Legacy outcome formula hyperparameters, kept only for reports/debug fields.
 # eta   : mean edit instruction-following weight
@@ -133,8 +179,8 @@ outcome_lambda=0.12
 # KL Divergence
 use_kl_in_reward=False
 kl_coef=0.0
-use_kl_loss=False
-kl_loss_coef=0.0
+use_kl_loss=True # Janus-Pro-R1
+kl_loss_coef=0.05 # Janus-Pro-R1
 
 # PPO Clipping
 clip_ratio_low=0.2
@@ -142,7 +188,7 @@ clip_ratio_high=0.28
 entropy_coeff=0.0
 
 # Adaptive Entropy Coefficient (per-task)
-adaptive_entropy_coeff_enable=True
+adaptive_entropy_coeff_enable=False
 adaptive_entropy_coeff_task1_target_entropy=5.0
 adaptive_entropy_coeff_task2_target_entropy=0.3
 adaptive_entropy_coeff_task3_target_entropy=5.0
@@ -208,7 +254,7 @@ loss_agg_mode="token-mean"
 ###############################################################################
 #                          OPTIMIZER SETTINGS
 ###############################################################################
-lr=1e-6
+lr=2e-6 # Janus-Pro-R1
 lr_scheduler_type=constant
 lr_warmup_steps=10
 weight_decay=0.01
@@ -304,6 +350,11 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     algorithm.filter_groups.enable=${enable_filter_groups} \
     algorithm.filter_groups.metric=${filter_groups_metric} \
     algorithm.norm_adv_by_std_in_grpo=${norm_adv_by_std_in_grpo} \
+    +algorithm.task2_reward_mode=${task2_reward_mode} \
+    +algorithm.task3_reward_mode=${task3_reward_mode} \
+    +algorithm.janus_comp_turn_norm=${janus_comp_turn_norm} \
+    +algorithm.janus_final_image_weight=${janus_final_image_weight} \
+    +algorithm.max_turns=${max_turns} \
     +algorithm.mdp_gamma=${mdp_gamma} \
     +algorithm.mdp_reasoning_reward_weight=${mdp_reasoning_reward_weight} \
     +algorithm.mdp_reasoning_reward_cost=${mdp_reasoning_reward_cost} \
@@ -368,7 +419,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     actor_rollout_ref.ref.ulysses_sequence_parallel_size=${sp_size} \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
-    trainer.val_before_train=True \
+    trainer.val_before_train=False \
     trainer.balance_batch=False \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
@@ -412,7 +463,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     async_training.replay_buffer.max_quantile=${replay_buffer_max_quantile} \
     async_training.replay_buffer.std_quantile=${replay_buffer_std_quantile} \
     reward_model.reward_manager=image_generation \
-    custom_reward_function.path=recipe/image_rl/reward_function_fine_grained.py \
+    custom_reward_function.path=recipe/image_rl/reward_function_janus_pro_r1.py \
     custom_reward_function.name=compute_score_batch \
     +custom_reward_function.reward_kwargs.mdp_reasoning_reward_weight=${mdp_reasoning_reward_weight} \
     +custom_reward_function.reward_kwargs.mdp_reasoning_reward_cost=${mdp_reasoning_reward_cost} \

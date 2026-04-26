@@ -58,6 +58,7 @@ from recipe.image_rl import core_algos
 import asyncio
 import uuid
 from collections import defaultdict
+import os
 
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl", task_id: int = 1):
@@ -220,14 +221,28 @@ def compute_advantage(
 
     grpo_calculation_mask = data.batch[f"task{task_id}_response_mask"]
     group_index = _compute_grpo_group_index(data)
-    if task_id == 2 and "task2_segment_mask" in data.batch:
-        advantages, returns = _compute_task2_segmentwise_grpo_advantage(
-            token_level_rewards=data.batch[f"task{task_id}_token_level_rewards"],
-            response_mask=grpo_calculation_mask,
-            segment_mask=data.batch["task2_segment_mask"],
-            index=group_index,
-            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+
+    if task_id == 2:
+        task2_reward_mode = getattr(config, "task2_reward_mode", "segmentwise") if config else "segmentwise"
+        use_segmentwise = (
+            task2_reward_mode != "calibration"
+            and "task2_segment_mask" in data.batch
         )
+        if use_segmentwise:
+            advantages, returns = _compute_task2_segmentwise_grpo_advantage(
+                token_level_rewards=data.batch[f"task{task_id}_token_level_rewards"],
+                response_mask=grpo_calculation_mask,
+                segment_mask=data.batch["task2_segment_mask"],
+                index=group_index,
+                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            )
+        else:
+            advantages, returns = core_algos.compute_grpo_outcome_advantage(
+                token_level_rewards=data.batch[f"task{task_id}_token_level_rewards"],
+                response_mask=grpo_calculation_mask,
+                index=group_index,
+                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            )
     else:
         advantages, returns = core_algos.compute_grpo_outcome_advantage(
             token_level_rewards=data.batch[f"task{task_id}_token_level_rewards"],
@@ -242,6 +257,49 @@ def compute_advantage(
 
 
 class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
+    @staticmethod
+    def _as_list_for_len(value, n: int):
+        if isinstance(value, np.ndarray):
+            value = value.tolist()
+        elif torch.is_tensor(value):
+            value = value.detach().cpu().tolist()
+        elif not isinstance(value, list):
+            value = [value]
+        if len(value) < n:
+            value = list(value) + [None] * (n - len(value))
+        return value
+
+    def _augment_janus_reward_extra_infos(self, batch: DataProto, extras: dict) -> dict:
+        """Add compact Janus-Pro-R1 aliases for rollout reports/metrics.
+
+        Existing dump code already logs generic task fields. These aliases make
+        the paper-specific quantities explicit without changing the base dumper.
+        """
+        if not isinstance(extras, dict):
+            return extras
+        n = len(batch) if batch is not None else 0
+        if n <= 0:
+            return extras
+
+        def _copy(src: str, dst: str):
+            if src in extras and dst not in extras:
+                extras[dst] = self._as_list_for_len(extras[src], n)
+
+        _copy("task1_vqa_reward", "janus_task1_rqa")
+        _copy("task1_vqa_yes_prob_raw", "janus_task1_yes_prob_raw")
+        _copy("task1_vqa_no_prob_raw", "janus_task1_no_prob_raw")
+        _copy("task1_vqa_score_source", "janus_task1_score_source")
+        _copy("task2_decision_vqa_reward", "janus_task2_rqa")
+        _copy("task2_model_no_edit", "janus_task2_self_eval")
+        _copy("task2_calibration_reward", "janus_task2_rcomp")
+        _copy("task2_decision_vqa_source", "janus_task2_rqa_source")
+        _copy("task3_vqa_reward", "janus_task3_rqa")
+        _copy("task3_vqa_yes_prob_raw", "janus_task3_yes_prob_raw")
+        _copy("task3_vqa_no_prob_raw", "janus_task3_no_prob_raw")
+        _copy("task3_vqa_score_source", "janus_task3_score_source")
+        _copy("task3_step5_reward", "janus_task3_rgen")
+        return extras
+
     def _restore_reward_extra_infos_for_logging(self, batch: DataProto, task_id: int) -> dict:
         """Expose nested task reward extras as legacy flat fields so existing
         metric collectors and rollout dump code can see them.
@@ -254,12 +312,57 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                 continue
             if not isinstance(nested, dict) or not nested:
                 continue
+            self._augment_janus_reward_extra_infos(batch, nested)
             batch.non_tensor_batch.update(
                 {k: np.array(v, dtype=object) for k, v in nested.items()}
             )
             for k, v in nested.items():
                 batch.meta_info[k] = v
+        self._augment_janus_reward_extra_infos(batch, reward_extra_infos_dict)
         return reward_extra_infos_dict
+
+    def _write_detailed_report(
+        self,
+        rollout_dir,
+        i,
+        item,
+        paths,
+        prompt,
+        feedback_texts,
+        scores,
+        summarizes,
+        gts_tuples,
+        gts_vqas,
+        reward_extra_infos_dict,
+    ):
+        super()._write_detailed_report(
+            rollout_dir,
+            i,
+            item,
+            paths,
+            prompt,
+            feedback_texts,
+            scores,
+            summarizes,
+            gts_tuples,
+            gts_vqas,
+            reward_extra_infos_dict,
+        )
+        txt_path = os.path.join(rollout_dir, "txt.txt")
+        with open(txt_path, "a", encoding="utf-8") as f:
+            f.write("\n")
+            f.write("🧮 [JANUS-PRO-R1 REWARD]\n")
+            f.write(f"  - Task1 R_QA: {self._get_safe_val(reward_extra_infos_dict, 'janus_task1_rqa', i)}\n")
+            f.write(f"  - Task1 yes/no raw prob: {self._get_safe_val(reward_extra_infos_dict, 'janus_task1_yes_prob_raw', i)} / {self._get_safe_val(reward_extra_infos_dict, 'janus_task1_no_prob_raw', i)}\n")
+            f.write(f"  - Task1 score source: {self._get_safe_val(reward_extra_infos_dict, 'janus_task1_score_source', i)}\n")
+            f.write(f"  - Task2 R_QA target: {self._get_safe_val(reward_extra_infos_dict, 'janus_task2_rqa', i)}\n")
+            f.write(f"  - Task2 SE(I) no-edit: {self._get_safe_val(reward_extra_infos_dict, 'janus_task2_self_eval', i)}\n")
+            f.write(f"  - Task2 RComp: {self._get_safe_val(reward_extra_infos_dict, 'janus_task2_rcomp', i)}\n")
+            f.write(f"  - Task2 R_QA source: {self._get_safe_val(reward_extra_infos_dict, 'janus_task2_rqa_source', i)}\n")
+            f.write(f"  - Task3 R_QA: {self._get_safe_val(reward_extra_infos_dict, 'janus_task3_rqa', i)}\n")
+            f.write(f"  - Task3 yes/no raw prob: {self._get_safe_val(reward_extra_infos_dict, 'janus_task3_yes_prob_raw', i)} / {self._get_safe_val(reward_extra_infos_dict, 'janus_task3_no_prob_raw', i)}\n")
+            f.write(f"  - Task3 score source: {self._get_safe_val(reward_extra_infos_dict, 'janus_task3_score_source', i)}\n")
+            f.write(f"  - Task3 RGen contribution: {self._get_safe_val(reward_extra_infos_dict, 'janus_task3_rgen', i)}\n")
 
     def init_workers(self):
         """Initialize distributed training workers using Ray backend.
