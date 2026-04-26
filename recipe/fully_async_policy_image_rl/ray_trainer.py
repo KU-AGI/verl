@@ -432,6 +432,22 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
         rollout_task_ids = list(range(1, max_rollout_task + 1))
         # When task_ids=[3], also compute reward for task2 (intermediate step needed for logging)
         reward_task_ids = [2, 3] if task_ids == [3] else task_ids
+        reward_mode = str(self.config.algorithm.get("reward_mode", "")).lower()
+        reward_style = str(self.config.algorithm.get("reward_style", "")).lower()
+        reward_path = str(self.config.custom_reward_function.get("path", "")).lower()
+        use_janus_r1 = (
+            reward_mode in {"janus", "janus_r1", "janus-r1"}
+            or reward_style in {"janus", "janus_r1", "janus-r1"}
+            or "reward_function_janus_r1" in reward_path
+        )
+        reward_compute_task_ids = list(reward_task_ids)
+        if use_janus_r1 and 2 in reward_compute_task_ids:
+            # task2 validation reward is synthesized from task1 yes/no score
+            # and task2 self-check text, so avoid the legacy fine-grained
+            # task2 reward worker. Ensure task1 is computed as a dependency.
+            reward_compute_task_ids = [tid for tid in reward_compute_task_ids if tid != 2]
+            if 1 not in reward_compute_task_ids:
+                reward_compute_task_ids.insert(0, 1)
 
         # Limit finalize backlog (memory protection)
         max_val_finalize_backlog = self.config.async_training.get("max_val_finalize_backlog_samples", None)
@@ -577,8 +593,10 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                 reward_tasks = []
 
                 def on_task_complete(task_id: int, batch_result: DataProto):
-                    # Only compute rewards for tasks we train on (task2 also computed when task_ids=[3])
-                    if int(task_id) not in reward_task_ids:
+                    # Only compute rewards needed for validation metrics. In
+                    # Janus-R1 mode task2 is synthesized in finalize, not sent
+                    # through the legacy task2 reward function.
+                    if int(task_id) not in reward_compute_task_ids:
                         return None
                     # Launch reward task immediately when stage completes
                     reward_task = asyncio.create_task(
@@ -612,6 +630,65 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                         pass
                 if not enqueued:
                     await _release_finalize_budget(budget_n)
+
+        def _synthesize_janus_r1_val_task2_reward(result_batch: DataProto, reward_tensor_dict: dict, reward_extra_infos: dict):
+            if not use_janus_r1 or 2 not in reward_task_ids:
+                return
+            if "task2_response_mask" not in result_batch.batch:
+                return
+
+            response_mask = result_batch.batch["task2_response_mask"]
+            n = len(result_batch)
+
+            prev_scores = [0.0] * n
+            task1_scores = reward_tensor_dict.get(1)
+            if task1_scores is not None and len(task1_scores) == n:
+                prev_scores = task1_scores.float().sum(dim=-1).detach().cpu().tolist()
+            elif "task1_token_level_scores" in result_batch.batch and len(result_batch.batch["task1_token_level_scores"]) == n:
+                prev_scores = result_batch.batch["task1_token_level_scores"].float().sum(dim=-1).detach().cpu().tolist()
+
+            feedback_texts = result_batch.non_tensor_batch.get("task2_feedback_texts", [None] * n)
+            if hasattr(feedback_texts, "tolist"):
+                feedback_texts = feedback_texts.tolist()
+
+            from recipe.fully_async_policy_image_rl.agent_loop.agent_loop_hf import _is_edit_sample
+
+            rewards = []
+            extras = defaultdict(list)
+            reward_tensor = torch.zeros_like(response_mask, dtype=torch.float32)
+            for i in range(n):
+                feedback = feedback_texts[i] if i < len(feedback_texts) else None
+                selfcheck = 0 if _is_edit_sample(feedback) else 1
+                prev_score = float(prev_scores[i]) if i < len(prev_scores) else 0.0
+                reward = 1.0 - abs(prev_score - float(selfcheck))
+                reward = float(max(0.0, min(1.0, reward)))
+                rewards.append(reward)
+
+                valid_response_length = int(response_mask[i].sum().item())
+                if valid_response_length > 0:
+                    reward_tensor[i, valid_response_length - 1] = reward
+
+                extras["task2_prev_image_score"].append(prev_score)
+                extras["task2_selfcheck"].append(int(selfcheck))
+                extras["task2_janus_consistency_reward"].append(reward)
+                extras["task2_total_reward"].append(reward)
+                extras["task2_process"].append(reward)
+                extras["task2_decision_vqa_reward"].append(prev_score)
+                extras["task2_decision_vqa_source"].append("janus_prev_image_score")
+                extras["task2_no_feedback_needed"].append(int(selfcheck))
+                extras["task2_no_feedback_needed_score"].append(int(selfcheck))
+                target_no_edit = int(prev_score >= 1.0 - 1e-6)
+                extras["task2_target_no_edit"].append(target_no_edit)
+                extras["task2_target_no_edit_score"].append(target_no_edit)
+
+            reward_tensor_dict[2] = reward_tensor
+            reward_extra_infos[2] = dict(extras)
+            valid_rewards = [r for r, m in zip(rewards, response_mask) if int(m.sum().item()) > 0]
+            mean_reward = sum(valid_rewards) / len(valid_rewards) if valid_rewards else 0.0
+            print(
+                f"[REWARD][Janus-R1] Computed task2 {len(rewards)} validation rewards, "
+                f"valid={len(valid_rewards)}, mean={mean_reward:.4f}"
+            )
 
         async def _val_processor():
             """Read from prepared_q and continuously create generation tasks."""
@@ -662,6 +739,7 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
 
                     # Wait for all reward tasks
                     results = await asyncio.gather(*reward_tasks, return_exceptions=True)
+                    _synthesize_janus_r1_val_task2_reward(result_batch, reward_tensor_dict, reward_extra_infos)
                     
                     # Collect data
                     batch_size = len(result_batch.non_tensor_batch['prompt'])
