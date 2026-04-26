@@ -1097,6 +1097,188 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         extras[field] = vals
         return vals
 
+    def _use_janus_r1_reward_mode(self) -> bool:
+        cfg = getattr(self, "config", None)
+        algo_cfg = getattr(cfg, "algorithm", None) or {}
+        _get_hp = algo_cfg.get if hasattr(algo_cfg, "get") else lambda k, d=None: getattr(algo_cfg, k, d)
+        mode = str(_get_hp("reward_mode", "") or _get_hp("reward_style", "") or "").lower()
+        if mode in {"janus", "janus_r1", "janus-r1"}:
+            return True
+
+        custom_cfg = getattr(cfg, "custom_reward_function", None) or {}
+        if hasattr(custom_cfg, "get"):
+            reward_path = str(custom_cfg.get("path", "") or "")
+        else:
+            reward_path = str(getattr(custom_cfg, "path", "") or "")
+        return "reward_function_janus_r1" in reward_path
+
+    def _read_image_score_from_extras(
+        self,
+        batch: Optional[DataProto],
+        task_id: int,
+        row: int,
+        default: float = 0.0,
+    ) -> float:
+        if batch is None:
+            return default
+        fields = (
+            f"task{task_id}_image_score",
+            f"task{task_id}_align",
+            f"task{task_id}_vqa_reward",
+        )
+        for field in fields:
+            value = self._get_outcome_extra_scalar(batch, task_id, field, [row], default=None)
+            if value is None:
+                continue
+            try:
+                return float(value)
+            except Exception:
+                pass
+        return default
+
+    def _read_prev_janus_image_score(
+        self,
+        prefix_batch: Optional[DataProto],
+        row: int,
+        default: float = 0.0,
+    ) -> float:
+        if prefix_batch is None:
+            return default
+        prev_t3 = self._read_image_score_from_extras(prefix_batch, 3, row, default=None)
+        if prev_t3 is not None:
+            return float(prev_t3)
+        return self._read_image_score_from_extras(prefix_batch, 1, row, default=default)
+
+    @staticmethod
+    def _janus_selfcheck_from_feedback(feedback_text) -> int:
+        # In this loop, "No need to generate feedback." means the model judged
+        # the current image as matching the prompt, equivalent to Janus selfcheck=True.
+        return 0 if _is_edit_sample(feedback_text) else 1
+
+    def _attach_janus_r1_token_scores(
+        self,
+        task1_batch: Optional[DataProto],
+        pre_task2_batches_per_turn: list[DataProto],
+        task2_batches_per_turn: list[DataProto],
+        pre_task3_batches_per_turn: list[DataProto],
+        task3_batches_per_turn: list[DataProto],
+    ) -> None:
+        """Attach Janus-R1 local rewards:
+
+        task1 = first image yes/no score
+        task2 = 1 - abs(previous image score - selfcheck)
+        task3 = regenerated image yes/no score
+        """
+        if task1_batch is not None and "task1_response_mask" in task1_batch.batch:
+            rewards = [
+                self._read_image_score_from_extras(task1_batch, 1, row, default=0.0)
+                for row in range(len(task1_batch))
+            ]
+            scores = self._build_terminal_reward_tensor(task1_batch.batch["task1_response_mask"], rewards)
+            task1_batch.batch["task1_token_level_scores"] = scores
+            if getattr(task1_batch, "meta_info", None) is None:
+                task1_batch.meta_info = {}
+            task1_batch.meta_info["task1_token_level_scores"] = scores
+
+        for pre_b, t2_b in zip(pre_task2_batches_per_turn, task2_batches_per_turn):
+            if t2_b is None or "task2_response_mask" not in t2_b.batch:
+                continue
+            if getattr(t2_b, "meta_info", None) is None:
+                t2_b.meta_info = {}
+            extras = t2_b.meta_info.setdefault("task2_reward_extra_info", {})
+            if not isinstance(extras, dict):
+                extras = {}
+                t2_b.meta_info["task2_reward_extra_info"] = extras
+
+            n = len(t2_b)
+            feedback_texts = t2_b.non_tensor_batch.get("task2_feedback_texts", None)
+            prev_vals = self._ensure_reward_extra_list(extras, "task2_prev_image_score", n)
+            selfcheck_vals = self._ensure_reward_extra_list(extras, "task2_selfcheck", n)
+            reward_vals = self._ensure_reward_extra_list(extras, "task2_janus_consistency_reward", n)
+            total_vals = self._ensure_reward_extra_list(extras, "task2_total_reward", n)
+            process_vals = self._ensure_reward_extra_list(extras, "task2_process", n)
+            decision_vals = self._ensure_reward_extra_list(extras, "task2_decision_vqa_reward", n)
+            decision_src_vals = self._ensure_reward_extra_list(extras, "task2_decision_vqa_source", n)
+            no_feedback_vals = self._ensure_reward_extra_list(extras, "task2_no_feedback_needed", n)
+            no_feedback_score_vals = self._ensure_reward_extra_list(extras, "task2_no_feedback_needed_score", n)
+            target_no_edit_vals = self._ensure_reward_extra_list(extras, "task2_target_no_edit", n)
+            target_no_edit_score_vals = self._ensure_reward_extra_list(extras, "task2_target_no_edit_score", n)
+
+            rewards = []
+            for row in range(n):
+                feedback = feedback_texts[row] if feedback_texts is not None and row < len(feedback_texts) else None
+                selfcheck = self._janus_selfcheck_from_feedback(feedback)
+                prev_score = self._read_prev_janus_image_score(pre_b, row, default=0.0)
+                reward = 1.0 - abs(float(prev_score) - float(selfcheck))
+                reward = float(max(0.0, min(1.0, reward)))
+                rewards.append(reward)
+
+                prev_vals[row] = float(prev_score)
+                selfcheck_vals[row] = int(selfcheck)
+                reward_vals[row] = reward
+                total_vals[row] = reward
+                process_vals[row] = reward
+                decision_vals[row] = float(prev_score)
+                decision_src_vals[row] = "janus_prev_image_score"
+                no_feedback_vals[row] = int(selfcheck)
+                no_feedback_score_vals[row] = int(selfcheck)
+                target_no_edit_vals[row] = int(float(prev_score) >= 1.0 - 1e-6)
+                target_no_edit_score_vals[row] = target_no_edit_vals[row]
+
+            scores = self._build_terminal_reward_tensor(t2_b.batch["task2_response_mask"], rewards)
+            t2_b.batch["task2_token_level_scores"] = scores
+            t2_b.batch["task2_local_token_level_scores"] = scores.clone()
+            t2_b.meta_info["task2_token_level_scores"] = scores
+            t2_b.meta_info["task2_local_token_level_scores"] = t2_b.batch["task2_local_token_level_scores"]
+
+        for pre_b, t3_b in zip(pre_task3_batches_per_turn, task3_batches_per_turn):
+            if t3_b is None or "task3_response_mask" not in t3_b.batch:
+                continue
+            if getattr(t3_b, "meta_info", None) is None:
+                t3_b.meta_info = {}
+            extras = t3_b.meta_info.setdefault("task3_reward_extra_info", {})
+            if not isinstance(extras, dict):
+                extras = {}
+                t3_b.meta_info["task3_reward_extra_info"] = extras
+
+            n = len(t3_b)
+            step_vals = self._ensure_reward_extra_list(extras, "task3_step5_reward", n)
+            prev_vals = self._ensure_reward_extra_list(extras, "task3_prev_image_score", n)
+            next_vals = self._ensure_reward_extra_list(extras, "task3_next_image_score", n)
+            gain_vals = self._ensure_reward_extra_list(extras, "task3_image_score_gain", n)
+            gain_score_vals = self._ensure_reward_extra_list(extras, "task3_image_gain_score", n)
+            if_vals = self._ensure_reward_extra_list(extras, "task3_if", n)
+            edit_if_vals = self._ensure_reward_extra_list(extras, "task3_edit_if_reward", n)
+
+            rewards = []
+            for row in range(n):
+                score = self._read_image_score_from_extras(t3_b, 3, row, default=0.0)
+                prev_score = self._read_prev_janus_image_score(pre_b, row, default=0.0)
+                rewards.append(float(score))
+                step_vals[row] = float(score)
+                prev_vals[row] = float(prev_score)
+                next_vals[row] = float(score)
+                gain_vals[row] = float(score) - float(prev_score)
+                gain_score_vals[row] = float(score) - float(prev_score)
+                if_vals[row] = 0.0 if if_vals[row] is None else if_vals[row]
+                edit_if_vals[row] = 0.0 if edit_if_vals[row] is None else edit_if_vals[row]
+
+            scores = self._build_terminal_reward_tensor(t3_b.batch["task3_response_mask"], rewards)
+            t3_b.batch["task3_token_level_scores"] = scores
+            t3_b.meta_info["task3_token_level_scores"] = scores
+
+    @staticmethod
+    def _build_zero_outcomes(all_tids) -> tuple[dict, dict]:
+        tid_outcomes = {}
+        for raw_tid in all_tids if all_tids is not None else []:
+            tid = int(raw_tid)
+            tid_outcomes[tid] = (
+                0.0,
+                0,
+                {"A_T": 0.0, "IF_bar": 0.0, "P_bar": 0.0, "T": 1.0},
+            )
+        return tid_outcomes, {}
+
     def _attach_phase1_task3_mdp_step5_rewards(
         self,
         task1_batch: Optional[DataProto],
@@ -2431,6 +2613,9 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         Selected candidates are replayed exactly once from their saved prefix,
         expanded to `rollout.n` samples, and trained with local reward only.
         """
+        if self._use_janus_r1_reward_mode():
+            return {2: None, 3: None}
+
         algo_cfg = getattr(getattr(self, "config", None), "algorithm", None) or {}
         _get_hp = algo_cfg.get if hasattr(algo_cfg, "get") else lambda k, d: getattr(algo_cfg, k, d)
         top_k = int(_get_hp("phase2_topk", 0))
@@ -2695,6 +2880,7 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
 
         max_turns = int(getattr(self.config.actor_rollout_ref.rollout, "max_turns", 1))
         is_validate = bool(prompts.meta_info.get("validate", False))
+        use_janus_r1 = self._use_janus_r1_reward_mode()
 
         # Caller-pinned single task (no turn loop).
         task_id_tensor = prompts.batch.get("task_id", None)
@@ -2781,7 +2967,11 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             accumulated_batch.non_tensor_batch["source_task2_row_idx"] = np.arange(
                 len(accumulated_batch), dtype=np.int64
             )
-            task2_reward_task = on_task_complete(2, accumulated_batch) if on_task_complete is not None else None
+            task2_reward_task = (
+                on_task_complete(2, accumulated_batch)
+                if (on_task_complete is not None and not use_janus_r1)
+                else None
+            )
             if task2_reward_task is not None:
                 pending_task2_raw_rewards.append((accumulated_batch, task2_reward_task))
             task2_batches_per_turn.append(accumulated_batch)
@@ -2827,16 +3017,25 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
 
         await self._await_and_attach_reward_entries(pending_task1_rewards)
         await self._await_and_attach_reward_entries(pending_task3_rewards)
-        self._attach_phase1_task3_mdp_step5_rewards(
-            task1_batch,
-            pre_task3_batches_per_turn,
-            task3_batches_per_turn,
-        )
-        await self._await_and_finalize_task2_entries(
-            pending_task2_raw_rewards,
-            pre_task2_batches_per_turn,
-            task2_batches_per_turn,
-        )
+        if use_janus_r1:
+            self._attach_janus_r1_token_scores(
+                task1_batch,
+                pre_task2_batches_per_turn,
+                task2_batches_per_turn,
+                pre_task3_batches_per_turn,
+                task3_batches_per_turn,
+            )
+        else:
+            self._attach_phase1_task3_mdp_step5_rewards(
+                task1_batch,
+                pre_task3_batches_per_turn,
+                task3_batches_per_turn,
+            )
+            await self._await_and_finalize_task2_entries(
+                pending_task2_raw_rewards,
+                pre_task2_batches_per_turn,
+                task2_batches_per_turn,
+            )
         # Compute Phase1 trajectory outcomes over the surviving build_edit_batch
         # branch tree. Terminal leaves are final task2(no-edit) rows or final
         # task3 rows; shared-prefix rows receive descendant means and post-
@@ -2847,15 +3046,18 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         elif task2_batches_per_turn and "trajectory_id" in task2_batches_per_turn[0].non_tensor_batch:
             all_tids = task2_batches_per_turn[0].non_tensor_batch["trajectory_id"]
         if all_tids is not None:
-            outcomes = self._compute_outcomes_with_avg(
-                all_tids, task1_batch, task2_batches_per_turn, task3_batches_per_turn
-            )
-            self._attach_phase1_mdp_discounted_token_scores(
-                all_tids,
-                task1_batch,
-                task2_batches_per_turn,
-                task3_batches_per_turn,
-            )
+            if use_janus_r1:
+                outcomes = self._build_zero_outcomes(all_tids)
+            else:
+                outcomes = self._compute_outcomes_with_avg(
+                    all_tids, task1_batch, task2_batches_per_turn, task3_batches_per_turn
+                )
+                self._attach_phase1_mdp_discounted_token_scores(
+                    all_tids,
+                    task1_batch,
+                    task2_batches_per_turn,
+                    task3_batches_per_turn,
+                )
         self._propagate_logging_context(
             task1_batch,
             task2_batches_per_turn,
@@ -2889,6 +3091,7 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         Returns the same `{1, 2, 3}`-keyed dict."""
         max_turns = int(getattr(self.config.actor_rollout_ref.rollout, "max_turns", 1))
         is_validate = bool(prompts.meta_info.get("validate", False))
+        use_janus_r1 = self._use_janus_r1_reward_mode()
 
         rollout_task_ids_in_meta = prompts.meta_info.get("rollout_task_ids", None)
         task_id_tensor = prompts.batch.get("task_id", None)
@@ -2970,7 +3173,11 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             accumulated_batch.non_tensor_batch["source_task2_row_idx"] = np.arange(
                 len(accumulated_batch), dtype=np.int64
             )
-            task2_reward_task = on_task_complete(2, accumulated_batch) if on_task_complete is not None else None
+            task2_reward_task = (
+                on_task_complete(2, accumulated_batch)
+                if (on_task_complete is not None and not use_janus_r1)
+                else None
+            )
             if task2_reward_task is not None:
                 pending_task2_raw_rewards.append((accumulated_batch, task2_reward_task))
             task2_batches_per_turn.append(accumulated_batch)
@@ -3011,16 +3218,25 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
 
         await self._await_and_attach_reward_entries(pending_task1_rewards)
         await self._await_and_attach_reward_entries(pending_task3_rewards)
-        self._attach_phase1_task3_mdp_step5_rewards(
-            task1_batch,
-            pre_task3_batches_per_turn,
-            task3_batches_per_turn,
-        )
-        await self._await_and_finalize_task2_entries(
-            pending_task2_raw_rewards,
-            pre_task2_batches_per_turn,
-            task2_batches_per_turn,
-        )
+        if use_janus_r1:
+            self._attach_janus_r1_token_scores(
+                task1_batch,
+                pre_task2_batches_per_turn,
+                task2_batches_per_turn,
+                pre_task3_batches_per_turn,
+                task3_batches_per_turn,
+            )
+        else:
+            self._attach_phase1_task3_mdp_step5_rewards(
+                task1_batch,
+                pre_task3_batches_per_turn,
+                task3_batches_per_turn,
+            )
+            await self._await_and_finalize_task2_entries(
+                pending_task2_raw_rewards,
+                pre_task2_batches_per_turn,
+                task2_batches_per_turn,
+            )
         # Compute Phase1 trajectory outcomes over the surviving build_edit_batch
         # branch tree. Terminal leaves are final task2(no-edit) rows or final
         # task3 rows; shared-prefix rows receive descendant means and post-
@@ -3031,15 +3247,18 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         elif task2_batches_per_turn and "trajectory_id" in task2_batches_per_turn[0].non_tensor_batch:
             all_tids = task2_batches_per_turn[0].non_tensor_batch["trajectory_id"]
         if all_tids is not None:
-            outcomes = self._compute_outcomes_with_avg(
-                all_tids, task1_batch, task2_batches_per_turn, task3_batches_per_turn
-            )
-            self._attach_phase1_mdp_discounted_token_scores(
-                all_tids,
-                task1_batch,
-                task2_batches_per_turn,
-                task3_batches_per_turn,
-            )
+            if use_janus_r1:
+                outcomes = self._build_zero_outcomes(all_tids)
+            else:
+                outcomes = self._compute_outcomes_with_avg(
+                    all_tids, task1_batch, task2_batches_per_turn, task3_batches_per_turn
+                )
+                self._attach_phase1_mdp_discounted_token_scores(
+                    all_tids,
+                    task1_batch,
+                    task2_batches_per_turn,
+                    task3_batches_per_turn,
+                )
         self._propagate_logging_context(
             task1_batch,
             task2_batches_per_turn,

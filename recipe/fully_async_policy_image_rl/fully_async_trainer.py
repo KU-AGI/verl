@@ -565,6 +565,22 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                             print("[FullyAsyncTrainer] Buffer feeder terminated and buffer insufficient, stopping.")
                             break
 
+                        replay_ready_after_evict = True
+                        for task_id in task_ids:
+                            can_sample, buf_size = self.replay_buffer.can_sample_task(
+                                task_id, self.required_samples, self.current_param_version
+                            )
+                            if not can_sample:
+                                print(
+                                    f"[FullyAsyncTrainer] task{task_id}: insufficient replay rows after stale eviction "
+                                    f"({buf_size}/{self.required_samples}); waiting for more samples"
+                                )
+                                replay_ready_after_evict = False
+                                break
+                        if not replay_ready_after_evict:
+                            time.sleep(0.5)
+                            continue
+
                         for task_id in task_ids:
                             task_timing = {}
                             with marked_timer("replay/sample_from_buffer", task_timing):
@@ -572,8 +588,15 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                                     task_id, self.required_samples, self.current_param_version
                                 )
                             if task_batch is None:
-                                print(f"[FullyAsyncTrainer] task{task_id}: buffer empty after sample, skipping")
-                                continue
+                                buf_size = self.replay_buffer.task_size(task_id)
+                                print(
+                                    f"[FullyAsyncTrainer] task{task_id}: insufficient replay rows during sampling "
+                                    f"({buf_size}/{self.required_samples}); waiting for more samples"
+                                )
+                                task_batches.clear()
+                                task_timings.clear()
+                                time.sleep(0.5)
+                                break
 
                             buf_size = self.replay_buffer.task_size(task_id)
                             print(
@@ -598,6 +621,8 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                                 task_reward_extra = {k: v for k, v in task_batch.meta_info.items()}
                                 task_rollout_dir = os.path.join(rollout_data_dir, f"task{task_id}")
                                 self._submit_rollout_dump(task_batch, task_reward_extra, task_timing, task_rollout_dir)
+                        if len(task_batches) != len(task_ids):
+                            continue
                     else:
                         # ---- Non-replay path: collect from queue (original behavior) ----
                         epoch, batch, queued_task_batches = self._get_samples_from_queue()

@@ -14,7 +14,7 @@ exec 2>&1
 #                         EXPERIMENT CONFIGURATION
 ###############################################################################
 project_name='mllm_reasoning'
-exp_name="0425_nipa_adaptive_filtering_mean_constant_cfg_2_adjust_loss_weight_clip_high_lr_1e_6_train_wo_focusdiff_aug_GAE"
+exp_name="0425_nipa_adaptive_filtering_mean_constant_cfg_2_adjust_loss_weight_clip_high_lr_1e_6_train_wo_focusdiff_aug_janus_r1_reward_v2"
 # exp_name='testesttestest'
 task_ids='[1,2,3]'
 
@@ -49,7 +49,8 @@ export HYDRA_FULL_ERROR=1
 #                               PATH SETTINGS
 ###############################################################################
 # Ray Configuration
-RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
+RAY_HEAD_IP=${RAY_HEAD_IP:-$(hostname -I | awk '{print $1}')}
+RAY_ADDRESS=${RAY_ADDRESS:-"http://${RAY_HEAD_IP}:8266"}
 WORKING_DIR=${WORKING_DIR:-"${PWD}"}
 RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/recipe/fully_async_policy_image_rl/shell/runtime_env.yaml"}
 
@@ -122,6 +123,11 @@ mdp_reasoning_reward_cost=0.02
 mdp_edit_if_weight=0.03
 mdp_edit_cost=0.05
 
+# Task2 segment advantage:
+#   A_step{k} = GRPO(G_step{k}) + task2_local_adv_weight * GRPO(R_step{k})
+# where R_step2/3/4 are raw stage judge rewards.
+task2_local_adv_weight=0.0
+
 # Legacy outcome formula hyperparameters, kept only for reports/debug fields.
 # eta   : mean edit instruction-following weight
 # beta  : process-quality weight
@@ -143,9 +149,9 @@ entropy_coeff=0.0
 
 # Adaptive Entropy Coefficient (per-task)
 adaptive_entropy_coeff_enable=True
-adaptive_entropy_coeff_task1_target_entropy=5.0
-adaptive_entropy_coeff_task2_target_entropy=0.3
-adaptive_entropy_coeff_task3_target_entropy=5.0
+adaptive_entropy_coeff_task1_target_entropy=4.5
+adaptive_entropy_coeff_task2_target_entropy=0.2
+adaptive_entropy_coeff_task3_target_entropy=2.0
 
 # Group Filtering
 enable_filter_groups=True
@@ -220,7 +226,7 @@ weight_decay=0.01
 total_rollout_steps=$(((512*100*3*10)))
 staleness_threshold=2.0
 trigger_parameter_sync_step=1
-require_batches=1
+require_batches=2
 partial_rollout=False
 use_rollout_log_probs=True
 compute_prox_log_prob=False
@@ -232,7 +238,7 @@ max_regen_retries=3
 # to count toward training). Thresholds below are set to effectively always
 # pass; `filter_mode=mean` is the cheapest mode.
 replay_buffer_enable=True
-replay_buffer_max_version_gap=-1
+replay_buffer_max_version_gap=4
 replay_buffer_max_size_per_task=64
 replay_buffer_max_use_count=-1
 replay_buffer_filter_mode=max_and_std_constant      # "mean", "std", or "max", "max_and_std_constant"
@@ -263,7 +269,7 @@ rollout_freq=1
 # total_training_steps=3000
 # log_val_generations=20
 
-ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
+ray job submit --address="${RAY_ADDRESS}" --no-wait --runtime-env="${RUNTIME_ENV}" \
     --working-dir "${WORKING_DIR}" \
     -- python -m recipe.fully_async_policy_image_rl.fully_async_main \
     --config-name="fully_async_ppo_trainer.yaml" \
@@ -304,11 +310,13 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     algorithm.filter_groups.enable=${enable_filter_groups} \
     algorithm.filter_groups.metric=${filter_groups_metric} \
     algorithm.norm_adv_by_std_in_grpo=${norm_adv_by_std_in_grpo} \
+    +algorithm.reward_mode=janus_r1 \
     +algorithm.mdp_gamma=${mdp_gamma} \
     +algorithm.mdp_reasoning_reward_weight=${mdp_reasoning_reward_weight} \
     +algorithm.mdp_reasoning_reward_cost=${mdp_reasoning_reward_cost} \
     +algorithm.mdp_edit_if_weight=${mdp_edit_if_weight} \
     +algorithm.mdp_edit_cost=${mdp_edit_cost} \
+    +algorithm.task2_local_adv_weight=${task2_local_adv_weight} \
     +algorithm.outcome_eta=${outcome_eta} \
     +algorithm.outcome_beta=${outcome_beta} \
     +algorithm.outcome_lambda=${outcome_lambda} \
@@ -412,7 +420,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     async_training.replay_buffer.max_quantile=${replay_buffer_max_quantile} \
     async_training.replay_buffer.std_quantile=${replay_buffer_std_quantile} \
     reward_model.reward_manager=image_generation \
-    custom_reward_function.path=recipe/image_rl/reward_function_fine_grained.py \
+    custom_reward_function.path=recipe/image_rl/reward_function_janus_r1.py \
     custom_reward_function.name=compute_score_batch \
     +custom_reward_function.reward_kwargs.mdp_reasoning_reward_weight=${mdp_reasoning_reward_weight} \
     +custom_reward_function.reward_kwargs.mdp_reasoning_reward_cost=${mdp_reasoning_reward_cost} \

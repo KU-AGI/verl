@@ -310,7 +310,7 @@ class ReplayBuffer:
                 selected_indices.append(idx)
                 collected += len(buf[idx].data)
 
-            if not selected_indices:
+            if not selected_indices or collected < n_samples:
                 return None
 
             for idx in selected_indices:
@@ -324,6 +324,14 @@ class ReplayBuffer:
             if len(result) > n_samples:
                 result = _slice_dataproto_with_meta(result, list(range(n_samples)))
             return result
+
+    def can_sample_task(self, task_id: int, n_samples: int, current_version: int = -1) -> tuple[bool, int]:
+        """Return whether task_id has enough rows after stale eviction."""
+        with self._lock:
+            if self.max_version_gap >= 0 and current_version >= 0:
+                self._evict_stale(task_id, current_version)
+            size = sum(len(e.data) for e in self.buffers[task_id])
+            return size >= n_samples, size
 
     # ------------------------------------------------------------------
     # Post-use eviction
