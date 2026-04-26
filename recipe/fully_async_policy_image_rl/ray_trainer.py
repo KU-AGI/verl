@@ -434,7 +434,7 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
         reward_task_ids = [2, 3] if task_ids == [3] else task_ids
         reward_mode = str(self.config.algorithm.get("reward_mode", "")).lower()
         reward_style = str(self.config.algorithm.get("reward_style", "")).lower()
-        reward_path = str(self.config.custom_reward_function.get("path", "")).lower()
+        reward_path = str(OmegaConf.select(self.config, "custom_reward_function.path", default="")).lower()
         use_janus_r1 = (
             reward_mode in {"janus", "janus_r1", "janus-r1"}
             or reward_style in {"janus", "janus_r1", "janus-r1"}
