@@ -110,16 +110,24 @@ max_turns=2
 ###############################################################################
 # Return discount used when backing up phase1 step rewards:
 #   G_h = r_h + mdp_gamma * G_{h+1}
-mdp_gamma=1.0
+mdp_reward_version=gae # gae | multi_step
+mdp_gamma=0.95
+
+# Initial image reward weight:
+#   r_step1 = mdp_init_reward_weight * S_1
+mdp_init_reward_weight=1.2
 
 # Task2 reasoning reward shaping:
-#   r_reason = mdp_reasoning_reward_weight * (judge_score / 2) - mdp_reasoning_reward_cost
-mdp_reasoning_reward_weight=0.03
-mdp_reasoning_reward_cost=0.02
+#   r_reason = (judge_score / 2 - 1) / 3
+#
+# Task2 segment advantage:
+#   A_step{k} = GRPO(G_step{k}) + task2_local_adv_weight * GRPO(R_step{k})
+# where R_step2/3/4 are raw stage judge rewards.
+task2_local_adv_weight=0.0
 
 # Task3 edit reward:
-#   r_step5 = S_next - S_prev + mdp_edit_if_weight * edit_if - mdp_edit_cost
-mdp_edit_if_weight=0.03
+#   r_step5 = S_next - S_prev + mdp_edit_if_weight * edit_if * 1[S_next > S_prev] - mdp_edit_cost
+mdp_edit_if_weight=0.1
 mdp_edit_cost=0.05
 
 # Legacy outcome formula hyperparameters, kept only for reports/debug fields.
@@ -236,8 +244,8 @@ replay_buffer_max_version_gap=-1
 replay_buffer_max_size_per_task=64
 replay_buffer_max_use_count=-1
 replay_buffer_filter_mode=max_and_std_constant      # "mean", "std", or "max", "max_and_std_constant"
-replay_buffer_score_threshold_1=0.2
-replay_buffer_score_threshold_2=0.0 # 3점 만점 
+replay_buffer_score_threshold_1=0.7
+replay_buffer_score_threshold_2=-0.8
 replay_buffer_score_threshold_3=0.0 # 2점 만점
 replay_buffer_score_std_threshold_1=0.03
 replay_buffer_score_std_threshold_2=0.02
@@ -304,9 +312,10 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     algorithm.filter_groups.enable=${enable_filter_groups} \
     algorithm.filter_groups.metric=${filter_groups_metric} \
     algorithm.norm_adv_by_std_in_grpo=${norm_adv_by_std_in_grpo} \
+    +algorithm.mdp_reward_version=${mdp_reward_version} \
     +algorithm.mdp_gamma=${mdp_gamma} \
-    +algorithm.mdp_reasoning_reward_weight=${mdp_reasoning_reward_weight} \
-    +algorithm.mdp_reasoning_reward_cost=${mdp_reasoning_reward_cost} \
+    +algorithm.mdp_init_reward_weight=${mdp_init_reward_weight} \
+    +algorithm.task2_local_adv_weight=${task2_local_adv_weight} \
     +algorithm.mdp_edit_if_weight=${mdp_edit_if_weight} \
     +algorithm.mdp_edit_cost=${mdp_edit_cost} \
     +algorithm.outcome_eta=${outcome_eta} \
@@ -414,8 +423,6 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     reward_model.reward_manager=image_generation \
     custom_reward_function.path=recipe/image_rl/reward_function_fine_grained.py \
     custom_reward_function.name=compute_score_batch \
-    +custom_reward_function.reward_kwargs.mdp_reasoning_reward_weight=${mdp_reasoning_reward_weight} \
-    +custom_reward_function.reward_kwargs.mdp_reasoning_reward_cost=${mdp_reasoning_reward_cost} \
     +reward_model.reward_kwargs.overlong_buffer_cfg.enable=${enable_overlong_buffer} \
     +reward_model.reward_kwargs.overlong_buffer_cfg.len=${overlong_buffer_len} \
     +reward_model.reward_kwargs.overlong_buffer_cfg.penalty_factor=${overlong_penalty_factor} \

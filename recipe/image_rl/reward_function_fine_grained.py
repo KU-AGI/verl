@@ -799,14 +799,18 @@ def _shape_mdp_reasoning_reward(
     reward_weight: Optional[float] = None,
     reward_cost: Optional[float] = None,
 ) -> float:
-    """Shape a [0, 2] reasoning RM score into the small MDP auxiliary reward."""
+    """Shape a [0, 2] reasoning RM score into penalty-only MDP reward.
+
+    New formulation:
+        r = ((raw_reward / 2) - 1) / 3
+    so a perfect reasoning step receives 0 and failures receive a penalty in
+    [-1/3, 0]. The weight/cost arguments are kept for config compatibility.
+    """
     try:
-        normalized = float(raw_reward) / 2.0
+        normalized = max(0.0, min(float(raw_reward) / 2.0, 1.0))
     except (TypeError, ValueError):
         normalized = 0.0
-    weight = MDP_REASONING_REWARD_WEIGHT if reward_weight is None else float(reward_weight)
-    cost = MDP_REASONING_REWARD_COST if reward_cost is None else float(reward_cost)
-    return weight * normalized - cost
+    return (normalized - 1.0) / 3.0
 
 
 async def compute_score_single_async(

@@ -1172,6 +1172,7 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             next_vals = self._ensure_reward_extra_list(t3_extras, "task3_next_image_score", n)
             gain_vals = self._ensure_reward_extra_list(t3_extras, "task3_image_score_gain", n)
             gain_score_vals = self._ensure_reward_extra_list(t3_extras, "task3_image_gain_score", n)
+            gain_positive_vals = self._ensure_reward_extra_list(t3_extras, "task3_image_gain_positive_score", n)
             step5_vals = self._ensure_reward_extra_list(t3_extras, "task3_step5_reward", n)
 
             for row in range(n):
@@ -1196,11 +1197,13 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
                     continue
 
                 gain = next_s - prev_s
-                step5_reward = gain + edit_if_weight * edit_if - edit_cost
+                gain_positive = 1.0 if gain > 0.0 else 0.0
+                step5_reward = gain + edit_if_weight * edit_if * gain_positive - edit_cost
                 prev_vals[row] = prev_s
                 next_vals[row] = next_s
                 gain_vals[row] = gain
                 gain_score_vals[row] = gain
+                gain_positive_vals[row] = gain_positive
                 step5_vals[row] = step5_reward
 
     @staticmethod
@@ -1369,6 +1372,7 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         algo_cfg = getattr(getattr(self, "config", None), "algorithm", None) or {}
         _get_hp = algo_cfg.get if hasattr(algo_cfg, "get") else lambda k, d: getattr(algo_cfg, k, d)
         gamma = float(_get_hp("mdp_gamma", _get_hp("gamma", 1.0)))
+        init_reward_weight = float(_get_hp("mdp_init_reward_weight", 1.0))
 
         _ex = self._get_outcome_extra_scalar
         returns_by_event: dict[tuple[int, int, str], list[float]] = {}
@@ -1466,7 +1470,14 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             events: list[tuple[float, DataProto, int, str, float]] = []
             if task1_batch is not None and tid in t1_index:
                 row = t1_index[tid]
-                reward = _ex(task1_batch, 1, "task1_mdp_reward", [row], default=_ex(task1_batch, 1, "task1_image_score", [row], 0.0))
+                base_reward = _ex(
+                    task1_batch,
+                    1,
+                    "task1_mdp_reward",
+                    [row],
+                    default=_ex(task1_batch, 1, "task1_image_score", [row], 0.0),
+                )
+                reward = init_reward_weight * base_reward
                 events.append((0.0, task1_batch, row, "step1", reward))
 
             for turn_i, t2_b, row in t2_rows:
@@ -1661,10 +1672,6 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         extra_info = dict((getattr(batch, "meta_info", None) or {}).get("extra_info", {}) or {})
         decision_vals = extra_info.get("task2_decision_vqa_reward", [0.0] * len(batch))
         decision_srcs = extra_info.get("task2_decision_vqa_source", ["missing"] * len(batch))
-        algo_cfg = getattr(getattr(self, "config", None), "algorithm", None) or {}
-        _get_hp = algo_cfg.get if hasattr(algo_cfg, "get") else lambda k, d: getattr(algo_cfg, k, d)
-        mdp_reasoning_reward_weight = float(_get_hp("mdp_reasoning_reward_weight", 0.03))
-        mdp_reasoning_reward_cost = float(_get_hp("mdp_reasoning_reward_cost", 0.02))
 
         finalized_extras: dict[str, list[Any]] = {}
         rewards: list[float] = []
@@ -1680,8 +1687,6 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
                 row_stage,
                 decision_vqa=decision_vqa,
                 decision_source=decision_source,
-                mdp_reasoning_reward_weight=mdp_reasoning_reward_weight,
-                mdp_reasoning_reward_cost=mdp_reasoning_reward_cost,
             )
             rewards.append(float(finalized_row.get("task2_total_reward", vlm_reward)))
             for key, value in finalized_row.items():
