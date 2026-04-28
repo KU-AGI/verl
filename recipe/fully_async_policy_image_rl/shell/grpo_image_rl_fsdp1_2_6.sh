@@ -14,7 +14,7 @@ exec 2>&1
 #                         EXPERIMENT CONFIGURATION
 ###############################################################################
 project_name='mllm_reasoning'
-exp_name="0425_nipa_adaptive_filtering_mean_constant_cfg_2_adjust_loss_weight_clip_high_lr_1e_6_train_wo_focusdiff_aug_GAE"
+exp_name="0428_nipa_lr_1e_6_train_multi_step_fine_grained"
 # exp_name='testesttestest'
 task_ids='[1,2,3]'
 
@@ -110,7 +110,7 @@ max_turns=2
 ###############################################################################
 # Return discount used when backing up phase1 step rewards:
 #   G_h = r_h + mdp_gamma * G_{h+1}
-mdp_reward_version=gae # gae | multi_step
+mdp_reward_version=multi_step # gae | multi_step
 mdp_gamma=0.95
 
 # Initial image reward weight:
@@ -151,9 +151,9 @@ entropy_coeff=0.0
 
 # Adaptive Entropy Coefficient (per-task)
 adaptive_entropy_coeff_enable=True
-adaptive_entropy_coeff_task1_target_entropy=5.0
-adaptive_entropy_coeff_task2_target_entropy=0.3
-adaptive_entropy_coeff_task3_target_entropy=5.0
+adaptive_entropy_coeff_task1_target_entropy=4.5
+adaptive_entropy_coeff_task2_target_entropy=0.2
+adaptive_entropy_coeff_task3_target_entropy=2.0
 
 # Group Filtering
 enable_filter_groups=True

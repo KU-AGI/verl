@@ -1105,20 +1105,21 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
     ) -> None:
         """Attach phase1 MDP Step5 rewards after task1/task3 rewards land.
 
-        Step5 reward uses the image-score transition:
-            (S_next - S_prev) + 0.03 * edit_if - 0.05
-        where S_prev is task1_image_score for root branches, or the parent
-        branch's previous task3_image_score for edited branches.
+        Step5 reward uses relative image-score gain:
+            1 + g, where g normalizes improvement by remaining headroom and
+            degradation by the previous score.
+        S_prev is task1_image_score for root branches, or the parent branch's
+        previous task3_image_score for edited branches.
         """
         if not task3_batches_per_turn:
             return
 
         algo_cfg = getattr(getattr(self, "config", None), "algorithm", None) or {}
         _get_hp = algo_cfg.get if hasattr(algo_cfg, "get") else lambda k, d: getattr(algo_cfg, k, d)
-        edit_if_weight = float(_get_hp("mdp_edit_if_weight", 0.03))
-        edit_cost = float(_get_hp("mdp_edit_cost", 0.05))
+        eps = float(_get_hp("mdp_score_eps", 1e-6))
 
         task1_image_by_tid: dict[int, float] = {}
+        task1_image_max_by_tid: dict[int, float] = {}
         if task1_batch is not None:
             t1_meta = getattr(task1_batch, "meta_info", None) or {}
             t1_extras = t1_meta.get("task1_reward_extra_info", {}) or {}
@@ -1130,10 +1131,15 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
                         val = self._read_reward_extra_value(t1_extras, "task1_align", row, None)
                     try:
                         task1_image_by_tid[int(tid)] = float(val)
+                        task1_image_max_by_tid[int(tid)] = self._as_float(
+                            self._read_reward_extra_value(t1_extras, "task1_image_score_max", row, 1.0),
+                            1.0,
+                        )
                     except Exception:
                         pass
 
         task3_image_by_branch: dict[int, float] = {}
+        task3_image_max_by_branch: dict[int, float] = {}
         for t3_b in task3_batches_per_turn:
             if t3_b is None:
                 continue
@@ -1148,6 +1154,10 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
                     val = self._read_reward_extra_value(t3_extras, "task3_align", row, None)
                 try:
                     task3_image_by_branch[int(bid)] = float(val)
+                    task3_image_max_by_branch[int(bid)] = self._as_float(
+                        self._read_reward_extra_value(t3_extras, "task3_image_score_max", row, 1.0),
+                        1.0,
+                    )
                 except Exception:
                     pass
 
@@ -1170,18 +1180,17 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
 
             prev_vals = self._ensure_reward_extra_list(t3_extras, "task3_prev_image_score", n)
             next_vals = self._ensure_reward_extra_list(t3_extras, "task3_next_image_score", n)
+            max_vals = self._ensure_reward_extra_list(t3_extras, "task3_image_score_max", n)
             gain_vals = self._ensure_reward_extra_list(t3_extras, "task3_image_score_gain", n)
             gain_score_vals = self._ensure_reward_extra_list(t3_extras, "task3_image_gain_score", n)
             gain_positive_vals = self._ensure_reward_extra_list(t3_extras, "task3_image_gain_positive_score", n)
+            relative_gain_vals = self._ensure_reward_extra_list(t3_extras, "task3_relative_image_gain", n)
             step5_vals = self._ensure_reward_extra_list(t3_extras, "task3_step5_reward", n)
 
             for row in range(n):
                 next_s = self._read_reward_extra_value(t3_extras, "task3_image_score", row, None)
                 if next_s is None:
                     next_s = self._read_reward_extra_value(t3_extras, "task3_align", row, None)
-                edit_if = self._read_reward_extra_value(t3_extras, "task3_edit_if_reward", row, None)
-                if edit_if is None:
-                    edit_if = self._read_reward_extra_value(t3_extras, "task3_if", row, None)
                 try:
                     tid = int(tids[row])
                     parent_bid = int(parents[row])
@@ -1189,21 +1198,31 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
                     continue
 
                 prev_s = task3_image_by_branch.get(parent_bid) if parent_bid >= 0 else task1_image_by_tid.get(tid)
+                s_max = task3_image_max_by_branch.get(parent_bid) if parent_bid >= 0 else task1_image_max_by_tid.get(tid)
+                if s_max is None:
+                    s_max = self._read_reward_extra_value(t3_extras, "task3_image_score_max", row, 1.0)
                 try:
                     prev_s = float(prev_s)
                     next_s = float(next_s)
-                    edit_if = float(edit_if)
+                    s_max = float(s_max)
                 except Exception:
                     continue
 
                 gain = next_s - prev_s
                 gain_positive = 1.0 if gain > 0.0 else 0.0
-                step5_reward = gain + edit_if_weight * edit_if * gain_positive - edit_cost
+                if gain >= 0.0:
+                    denom = max(s_max - prev_s, eps)
+                else:
+                    denom = max(prev_s, eps)
+                relative_gain = max(-1.0, min(1.0, gain / denom))
+                step5_reward = 1.0 + relative_gain
                 prev_vals[row] = prev_s
                 next_vals[row] = next_s
+                max_vals[row] = s_max
                 gain_vals[row] = gain
                 gain_score_vals[row] = gain
                 gain_positive_vals[row] = gain_positive
+                relative_gain_vals[row] = relative_gain
                 step5_vals[row] = step5_reward
 
     @staticmethod
@@ -1318,9 +1337,9 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             step3_vals = self._ensure_reward_extra_list(task2_extras, "task2_step3_multi_step_score", len(t2_b))
             step4_vals = self._ensure_reward_extra_list(task2_extras, "task2_step4_multi_step_score", len(t2_b))
             for row in range(len(t2_b)):
-                step2 = self._as_float(self._read_reward_extra_value(task2_extras, "task2_step2_reward", row, 0.0))
-                step3 = self._as_float(self._read_reward_extra_value(task2_extras, "task2_step3_reward", row, 0.0))
-                step4 = self._as_float(self._read_reward_extra_value(task2_extras, "task2_step4_reward", row, 0.0))
+                step2 = self._as_float(self._read_reward_extra_value(task2_extras, "task2_prompt_to_tuple_reward", row, 0.0))
+                step3 = self._as_float(self._read_reward_extra_value(task2_extras, "task2_tuple_to_vqa_reward", row, 0.0))
+                step4 = self._as_float(self._read_reward_extra_value(task2_extras, "task2_vqa_to_feedback_reward", row, 0.0))
                 step2_vals[row] = step2
                 step3_vals[row] = step3
                 step4_vals[row] = step4
@@ -1372,7 +1391,7 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         algo_cfg = getattr(getattr(self, "config", None), "algorithm", None) or {}
         _get_hp = algo_cfg.get if hasattr(algo_cfg, "get") else lambda k, d: getattr(algo_cfg, k, d)
         gamma = float(_get_hp("mdp_gamma", _get_hp("gamma", 1.0)))
-        init_reward_weight = float(_get_hp("mdp_init_reward_weight", 1.0))
+        eps = float(_get_hp("mdp_score_eps", 1e-6))
 
         _ex = self._get_outcome_extra_scalar
         returns_by_event: dict[tuple[int, int, str], list[float]] = {}
@@ -1470,21 +1489,22 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             events: list[tuple[float, DataProto, int, str, float]] = []
             if task1_batch is not None and tid in t1_index:
                 row = t1_index[tid]
-                base_reward = _ex(
+                image_score = _ex(
                     task1_batch,
                     1,
-                    "task1_mdp_reward",
+                    "task1_image_score",
                     [row],
-                    default=_ex(task1_batch, 1, "task1_image_score", [row], 0.0),
+                    default=_ex(task1_batch, 1, "task1_mdp_reward", [row], 0.0),
                 )
-                reward = init_reward_weight * base_reward
+                image_score_max = _ex(task1_batch, 1, "task1_image_score_max", [row], 1.0)
+                reward = 2.0 * float(image_score) / max(float(image_score_max), eps)
                 events.append((0.0, task1_batch, row, "step1", reward))
 
             for turn_i, t2_b, row in t2_rows:
                 base = 1.0 + 4.0 * float(turn_i)
-                events.append((base + 0.0, t2_b, row, "step2", _ex(t2_b, 2, "task2_step2_reward", [row], 0.0)))
-                events.append((base + 1.0, t2_b, row, "step3", _ex(t2_b, 2, "task2_step3_reward", [row], 0.0)))
-                events.append((base + 2.0, t2_b, row, "step4", _ex(t2_b, 2, "task2_step4_reward", [row], 0.0)))
+                events.append((base + 0.0, t2_b, row, "step2", _ex(t2_b, 2, "task2_prompt_to_tuple_reward", [row], 0.0)))
+                events.append((base + 1.0, t2_b, row, "step3", _ex(t2_b, 2, "task2_tuple_to_vqa_reward", [row], 0.0)))
+                events.append((base + 2.0, t2_b, row, "step4", _ex(t2_b, 2, "task2_vqa_to_feedback_reward", [row], 0.0)))
 
             for turn_i, t3_b, row in t3_rows:
                 base = 1.0 + 4.0 * float(turn_i)
@@ -1493,10 +1513,12 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             return sorted(events, key=lambda x: x[0])
 
         def _accumulate_discounted_returns(events: list[tuple]) -> None:
-            running = 0.0
+            running_sum = 0.0
+            running_weight = 0.0
             for _, dp, row, event_name, reward in reversed(events):
-                running = float(reward) + gamma * running
-                _append_return(dp, row, event_name, running)
+                running_sum = float(reward) + gamma * running_sum
+                running_weight = 1.0 + gamma * running_weight
+                _append_return(dp, row, event_name, running_sum / max(running_weight, eps))
 
         for bid in terminal_branch_ids:
             tid = int(branch_tid[bid])

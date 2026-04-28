@@ -876,10 +876,13 @@ async def compute_score_single_async(
         reward_extra_info[f"task{task_id}_detector_active_score"] = int(bool(detection_results))
         reward_extra_info[f"task{task_id}_detector_active_only_reward"] = detector_bonus if detection_results else None
 
-        # Outcome-ready summary: alignment in [0,1]
-        task1_image_score = vqa_score + DETECTOR_ALIGN_BONUS_WEIGHT * detector_bonus
+        # MDP image score: V_t + m_x D_t, with max score 1 + m_x.
+        detector_active = float(bool(detection_results))
+        task1_image_score = vqa_score + detector_active * detector_bonus
+        task1_image_score_max = 1.0 + detector_active
         reward_extra_info["task1_align"] = task1_image_score
         reward_extra_info["task1_image_score"] = task1_image_score
+        reward_extra_info["task1_image_score_max"] = task1_image_score_max
         reward_extra_info["task1_mdp_reward"] = task1_image_score
 
     elif task_id == 2: # Total score: post-hoc finalized from stage scores
@@ -970,7 +973,7 @@ async def compute_score_single_async(
             if resp is None or isinstance(resp, Exception):
                 return 0.0
             try:
-                return _parse_json_score(resp)
+                return max(0.0, min(2.0, _parse_json_score(resp)))
             except Exception:
                 return 0.0
 
@@ -1071,11 +1074,14 @@ async def compute_score_single_async(
         reward_extra_info[f"task{task_id}_detector_active_score"] = int(bool(detection_results))
         reward_extra_info[f"task{task_id}_detector_active_only_reward"] = detector_bonus if detection_results else None
 
-        # Outcome-ready summaries: alignment and instruction-following in [0,1]
-        task3_image_score = vqa_score + DETECTOR_ALIGN_BONUS_WEIGHT * detector_bonus
+        # MDP image score: V_t + m_x D_t, with max score 1 + m_x.
+        detector_active = float(bool(detection_results))
+        task3_image_score = vqa_score + detector_active * detector_bonus
+        task3_image_score_max = 1.0 + detector_active
         task3_edit_if_reward = edit_score / 2.0
         reward_extra_info["task3_align"] = task3_image_score
         reward_extra_info["task3_image_score"] = task3_image_score
+        reward_extra_info["task3_image_score_max"] = task3_image_score_max
         reward_extra_info["task3_if"] = task3_edit_if_reward
         reward_extra_info["task3_edit_if_reward"] = task3_edit_if_reward
 
