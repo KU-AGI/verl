@@ -961,6 +961,10 @@ class ImageUnifiedRollout(BaseRollout):
 
     @torch.no_grad()
     def generate_text(self, inputs_embeds: torch.Tensor, attention_masks: torch.Tensor):
+        pad_id = self.processor.tokenizer.pad_token_id
+        eos_id = self.processor.tokenizer.eos_token_id
+        bad_words_ids = [[pad_id]] if pad_id is not None and pad_id != eos_id else None
+
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             outputs = self.module.language_model.generate(
                 inputs_embeds=inputs_embeds,
@@ -971,9 +975,10 @@ class ImageUnifiedRollout(BaseRollout):
                 temperature=self.temperature,
                 top_k=self.txt_top_k,
                 top_p=self.txt_top_p,    
-                pad_token_id=self.processor.tokenizer.pad_token_id,
-                eos_token_id=self.processor.tokenizer.eos_token_id,
+                pad_token_id=pad_id,
+                eos_token_id=eos_id,
                 bos_token_id=self.processor.tokenizer.bos_token_id,
+                bad_words_ids=bad_words_ids,
                 return_dict_in_generate=True,
                 output_logits=not self.is_validate, 
             )
