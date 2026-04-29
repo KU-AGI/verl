@@ -1105,9 +1105,14 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
     ) -> None:
         """Attach phase1 MDP Step5 rewards after task1/task3 rewards land.
 
-        Step5 reward uses relative image-score gain:
-            1 + g, where g normalizes improvement by remaining headroom and
-            degradation by the previous score.
+        Step5 reward uses the edited image quality and edit-instruction
+        following score:
+            2 * (S_next + E_t) / (S_max + 1)
+        where S_next = V_{t+1} + m_x D_{t+1}, S_max = 1 + m_x, and
+        E_t is the edit instruction following score in [0, 1].
+
+        Relative image-score gain is still logged for diagnostics, but it is
+        no longer the Step5 training reward.
         S_prev is task1_image_score for root branches, or the parent branch's
         previous task3_image_score for edited branches.
         """
@@ -1185,6 +1190,7 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             gain_score_vals = self._ensure_reward_extra_list(t3_extras, "task3_image_gain_score", n)
             gain_positive_vals = self._ensure_reward_extra_list(t3_extras, "task3_image_gain_positive_score", n)
             relative_gain_vals = self._ensure_reward_extra_list(t3_extras, "task3_relative_image_gain", n)
+            edit_if_vals = self._ensure_reward_extra_list(t3_extras, "task3_step5_edit_if_score", n)
             step5_vals = self._ensure_reward_extra_list(t3_extras, "task3_step5_reward", n)
 
             for row in range(n):
@@ -1215,7 +1221,20 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
                 else:
                     denom = max(prev_s, eps)
                 relative_gain = max(-1.0, min(1.0, gain / denom))
-                step5_reward = 1.0 + relative_gain
+
+                edit_if = self._read_reward_extra_value(t3_extras, "task3_edit_if_reward", row, None)
+                if edit_if is None:
+                    edit_if = self._read_reward_extra_value(t3_extras, "task3_if", row, 0.0)
+                try:
+                    edit_if = max(0.0, min(1.0, float(edit_if)))
+                except Exception:
+                    edit_if = 0.0
+
+                # S_max = 1 + m_x, so S_max + 1 = 2 + m_x.
+                # No detector: r5 = V_{t+1} + E_t.
+                # Detector active: r5 = 2/3 * (V_{t+1} + D_{t+1} + E_t).
+                step5_reward = 2.0 * (next_s + edit_if) / max(s_max + 1.0, eps)
+                step5_reward = max(0.0, min(2.0, step5_reward))
                 prev_vals[row] = prev_s
                 next_vals[row] = next_s
                 max_vals[row] = s_max
@@ -1223,6 +1242,7 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
                 gain_score_vals[row] = gain
                 gain_positive_vals[row] = gain_positive
                 relative_gain_vals[row] = relative_gain
+                edit_if_vals[row] = edit_if
                 step5_vals[row] = step5_reward
 
     @staticmethod
