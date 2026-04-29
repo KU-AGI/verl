@@ -184,6 +184,14 @@ def _compute_task2_segmentwise_grpo_advantage(
     return advantages, returns
 
 
+def _use_janus_r1_reward_mode(config: Optional[AlgoConfig]) -> bool:
+    if config is None:
+        return False
+    _get = config.get if hasattr(config, "get") else lambda k, d=None: getattr(config, k, d)
+    mode = str(_get("reward_mode", "") or _get("reward_style", "") or "").lower()
+    return mode in {"janus", "janus_r1", "janus-r1"}
+
+
 def compute_advantage(
     data: DataProto,
     adv_estimator: AdvantageEstimator,
@@ -220,7 +228,8 @@ def compute_advantage(
 
     grpo_calculation_mask = data.batch[f"task{task_id}_response_mask"]
     group_index = _compute_grpo_group_index(data)
-    if task_id == 2 and "task2_segment_mask" in data.batch:
+    use_janus_r1 = _use_janus_r1_reward_mode(config)
+    if task_id == 2 and "task2_segment_mask" in data.batch and not use_janus_r1:
         advantages, returns = _compute_task2_segmentwise_grpo_advantage(
             token_level_rewards=data.batch[f"task{task_id}_token_level_rewards"],
             response_mask=grpo_calculation_mask,

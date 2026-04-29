@@ -1163,109 +1163,267 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         pre_task3_batches_per_turn: list[DataProto],
         task3_batches_per_turn: list[DataProto],
     ) -> None:
-        """Attach Janus-R1 local rewards:
+        """Attach Janus-R1 trajectory rewards.
 
-        task1 = first image yes/no score
-        task2 = 1 - abs(previous image score - selfcheck)
-        task3 = regenerated image yes/no score
+        For each terminal path:
+          R_gen  = sum_{j=1}^{K-1} RQA(I_j) + (T - K + 1) * RQA(I_K)
+          R_comp = sum_{j=1}^{K} (1 - |RQA(I_j) - SE(I_j)|) * T / K
+          R      = R_gen + R_comp
+
+        The resulting trajectory scalar is assigned to every task row on that
+        path. Shared prefix rows receive the mean over descendant terminal
+        paths, matching the branch attribution used by the MDP-return path.
         """
-        if task1_batch is not None and "task1_response_mask" in task1_batch.batch:
-            rewards = [
-                self._read_image_score_from_extras(task1_batch, 1, row, default=0.0)
-                for row in range(len(task1_batch))
-            ]
-            scores = self._build_terminal_reward_tensor(task1_batch.batch["task1_response_mask"], rewards)
-            task1_batch.batch["task1_token_level_scores"] = scores
-            if getattr(task1_batch, "meta_info", None) is None:
-                task1_batch.meta_info = {}
-            task1_batch.meta_info["task1_token_level_scores"] = scores
+        max_turns = int(getattr(self.config.actor_rollout_ref.rollout, "max_turns", 1))
+        total_rounds = max_turns + 1
 
-        for pre_b, t2_b in zip(pre_task2_batches_per_turn, task2_batches_per_turn):
-            if t2_b is None or "task2_response_mask" not in t2_b.batch:
+        def _row_tid(dp: Optional[DataProto], row: int, default: int = -1) -> int:
+            try:
+                return int(dp.non_tensor_batch["trajectory_id"][row])
+            except Exception:
+                return default
+
+        def _row_bid(dp: Optional[DataProto], row: int, default: int = -1) -> int:
+            try:
+                self._ensure_branch_metadata(dp)
+                return int(dp.non_tensor_batch["branch_id"][row])
+            except Exception:
+                return default
+
+        def _row_parent(dp: Optional[DataProto], row: int, default: int = -1) -> int:
+            try:
+                self._ensure_branch_metadata(dp)
+                return int(dp.non_tensor_batch["parent_branch_id"][row])
+            except Exception:
+                return default
+
+        def _row_feedback(dp: Optional[DataProto], row: int):
+            try:
+                vals = dp.non_tensor_batch.get("task2_feedback_texts", None)
+                return vals[row] if vals is not None and row < len(vals) else None
+            except Exception:
+                return None
+
+        def _source_task2_row(t3_b: DataProto, row: int) -> Optional[int]:
+            vals = t3_b.non_tensor_batch.get("source_task2_row_idx", None)
+            if vals is None:
+                return None
+            try:
+                return int(vals[row])
+            except Exception:
+                return None
+
+        t1_index: dict[int, int] = {}
+        if task1_batch is not None and "trajectory_id" in task1_batch.non_tensor_batch:
+            for row, tid in enumerate(task1_batch.non_tensor_batch["trajectory_id"]):
+                t1_index.setdefault(int(tid), row)
+
+        branch_parent: dict[int, int] = {}
+        branch_tid: dict[int, int] = {}
+        t3_by_branch: dict[int, tuple[int, DataProto, int, Optional[int]]] = {}
+        for turn_i, t3_b in enumerate(task3_batches_per_turn):
+            if t3_b is None or "trajectory_id" not in t3_b.non_tensor_batch:
                 continue
-            if getattr(t2_b, "meta_info", None) is None:
-                t2_b.meta_info = {}
-            extras = t2_b.meta_info.setdefault("task2_reward_extra_info", {})
+            self._ensure_branch_metadata(t3_b)
+            for row in range(len(t3_b)):
+                bid = _row_bid(t3_b, row)
+                if bid < 0:
+                    continue
+                branch_parent.setdefault(bid, _row_parent(t3_b, row))
+                branch_tid.setdefault(bid, _row_tid(t3_b, row))
+                t3_by_branch.setdefault(bid, (turn_i, t3_b, row, _source_task2_row(t3_b, row)))
+
+        def _branch_chain(bid: int) -> list[int]:
+            chain = []
+            seen = set()
+            cur = int(bid)
+            while cur >= 0 and cur not in seen:
+                seen.add(cur)
+                chain.append(cur)
+                cur = int(branch_parent.get(cur, -1))
+            return list(reversed(chain))
+
+        def _get_task2_item(turn_i: int, row: Optional[int]) -> Optional[tuple[int, DataProto, int]]:
+            if row is None or turn_i < 0 or turn_i >= len(task2_batches_per_turn):
+                return None
+            t2_b = task2_batches_per_turn[turn_i]
+            if t2_b is None or row < 0 or row >= len(t2_b):
+                return None
+            return (turn_i, t2_b, int(row))
+
+        def _find_task2_item(turn_i: int, tid: int, bid: int) -> Optional[tuple[int, DataProto, int]]:
+            if turn_i < 0 or turn_i >= len(task2_batches_per_turn):
+                return None
+            t2_b = task2_batches_per_turn[turn_i]
+            if t2_b is None:
+                return None
+            self._ensure_branch_metadata(t2_b)
+            for row in range(len(t2_b)):
+                if _row_tid(t2_b, row) == int(tid) and _row_bid(t2_b, row) == int(bid):
+                    return (turn_i, t2_b, row)
+            return None
+
+        terminal_task2_rows: list[tuple[int, DataProto, int]] = []
+        for turn_i, t2_b in enumerate(task2_batches_per_turn):
+            if t2_b is None:
+                continue
+            self._ensure_branch_metadata(t2_b)
+            for row in range(len(t2_b)):
+                selfcheck = self._janus_selfcheck_from_feedback(_row_feedback(t2_b, row))
+                if selfcheck == 1 or turn_i >= max_turns:
+                    terminal_task2_rows.append((turn_i, t2_b, row))
+
+        row_stats: dict[tuple[int, int], dict[str, list[float]]] = {}
+
+        def _append_row_stats(dp: Optional[DataProto], row: int, stats: dict[str, float]) -> None:
+            if dp is None or row < 0 or row >= len(dp):
+                return
+            key = (id(dp), int(row))
+            dst = row_stats.setdefault(key, {})
+            for k, v in stats.items():
+                dst.setdefault(k, []).append(float(v))
+
+        def _mean_row_stat(dp: DataProto, row: int, field: str, default: float = 0.0) -> float:
+            vals = row_stats.get((id(dp), int(row)), {}).get(field)
+            return float(np.mean(vals)) if vals else default
+
+        def _dedupe_action_rows(rows: list[tuple[DataProto, int]]) -> list[tuple[DataProto, int]]:
+            out = []
+            seen = set()
+            for dp, row in rows:
+                key = (id(dp), int(row))
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append((dp, int(row)))
+            return out
+
+        for term_turn, term_t2_b, term_row in terminal_task2_rows:
+            tid = _row_tid(term_t2_b, term_row)
+            if tid < 0 or tid not in t1_index or task1_batch is None:
+                continue
+            terminal_bid = _row_bid(term_t2_b, term_row)
+            chain = _branch_chain(terminal_bid) if terminal_bid >= 0 else []
+
+            image_rows: list[tuple[int, DataProto, int, float]] = []
+            t1_row = t1_index[tid]
+            image_rows.append((1, task1_batch, t1_row, self._read_image_score_from_extras(task1_batch, 1, t1_row, 0.0)))
+            missing_branch = False
+            for bid in chain:
+                t3_item = t3_by_branch.get(bid)
+                if t3_item is None:
+                    missing_branch = True
+                    break
+                _turn_i, t3_b, t3_row, _src_row = t3_item
+                image_rows.append((3, t3_b, t3_row, self._read_image_score_from_extras(t3_b, 3, t3_row, 0.0)))
+            if missing_branch:
+                continue
+
+            k_rounds = max(1, min(len(image_rows), total_rounds))
+            image_scores = [float(x[3]) for x in image_rows[:k_rounds]]
+            final_weight = max(float(total_rounds - k_rounds + 1), 1.0)
+            r_gen = float(sum(image_scores[:-1]) + final_weight * image_scores[-1])
+
+            comp_items: list[Optional[tuple[int, DataProto, int]]] = []
+            if chain:
+                first_t3_turn, _first_t3_b, _first_t3_row, first_src_row = t3_by_branch[chain[0]]
+                first_parent = int(branch_parent.get(chain[0], -1))
+                comp_items.append(
+                    _get_task2_item(first_t3_turn, first_src_row)
+                    or _find_task2_item(first_t3_turn, tid, first_parent)
+                )
+            else:
+                comp_items.append((term_turn, term_t2_b, term_row))
+
+            for pos, _bid in enumerate(chain):
+                if pos + 1 < len(chain):
+                    next_t3_turn, _next_t3_b, _next_t3_row, next_src_row = t3_by_branch[chain[pos + 1]]
+                    comp_items.append(
+                        _get_task2_item(next_t3_turn, next_src_row)
+                        or _find_task2_item(next_t3_turn, tid, chain[pos])
+                    )
+                else:
+                    comp_items.append((term_turn, term_t2_b, term_row))
+
+            comp_vals: list[float] = []
+            action_rows: list[tuple[DataProto, int]] = [(task1_batch, t1_row)]
+            for task_id, img_dp, img_row, _score in image_rows[:k_rounds]:
+                if task_id == 3:
+                    action_rows.append((img_dp, img_row))
+            for idx in range(k_rounds):
+                comp_item = comp_items[idx] if idx < len(comp_items) else None
+                if comp_item is None:
+                    comp_vals.append(0.0)
+                    continue
+                _comp_turn, comp_dp, comp_row = comp_item
+                selfcheck = self._janus_selfcheck_from_feedback(_row_feedback(comp_dp, comp_row))
+                comp = 1.0 - abs(float(image_scores[idx]) - float(selfcheck))
+                comp_vals.append(float(max(0.0, min(1.0, comp))))
+                action_rows.append((comp_dp, comp_row))
+
+            r_comp = float(sum(comp_vals) * float(total_rounds) / float(k_rounds))
+            r_total = float(r_gen + r_comp)
+            stats = {
+                "janus_rgen": r_gen,
+                "janus_rcomp": r_comp,
+                "janus_rtotal": r_total,
+                "janus_k": float(k_rounds),
+                "janus_t": float(total_rounds),
+            }
+            for dp, row in _dedupe_action_rows(action_rows):
+                _append_row_stats(dp, row, stats)
+
+        def _write_task_scores(dp: Optional[DataProto], task_id: int) -> None:
+            if dp is None or getattr(dp, "batch", None) is None:
+                return
+            mask_key = f"task{task_id}_response_mask"
+            if mask_key not in dp.batch:
+                return
+            scores = torch.zeros_like(dp.batch[mask_key], dtype=torch.float32)
+            for row in range(len(dp)):
+                self._put_scalar_on_last_mask_token(scores, dp.batch[mask_key], row, _mean_row_stat(dp, row, "janus_rtotal", 0.0))
+            score_key = f"task{task_id}_token_level_scores"
+            dp.batch[score_key] = scores
+            if task_id == 2:
+                dp.batch["task2_local_token_level_scores"] = scores.clone()
+            if getattr(dp, "meta_info", None) is None:
+                dp.meta_info = {}
+            dp.meta_info[score_key] = scores
+            if task_id == 2:
+                dp.meta_info["task2_local_token_level_scores"] = dp.batch["task2_local_token_level_scores"]
+
+            extras = dp.meta_info.setdefault(f"task{task_id}_reward_extra_info", {})
             if not isinstance(extras, dict):
                 extras = {}
-                t2_b.meta_info["task2_reward_extra_info"] = extras
+                dp.meta_info[f"task{task_id}_reward_extra_info"] = extras
+            field_prefix = f"task{task_id}"
+            rgen_vals = self._ensure_reward_extra_list(extras, f"{field_prefix}_janus_rgen", len(dp))
+            rcomp_vals = self._ensure_reward_extra_list(extras, f"{field_prefix}_janus_rcomp", len(dp))
+            rtotal_vals = self._ensure_reward_extra_list(extras, f"{field_prefix}_janus_rtotal", len(dp))
+            k_vals = self._ensure_reward_extra_list(extras, f"{field_prefix}_janus_k", len(dp))
+            t_vals = self._ensure_reward_extra_list(extras, f"{field_prefix}_janus_t", len(dp))
+            total_vals = self._ensure_reward_extra_list(extras, f"{field_prefix}_total_reward", len(dp))
+            for row in range(len(dp)):
+                rgen_vals[row] = _mean_row_stat(dp, row, "janus_rgen", 0.0)
+                rcomp_vals[row] = _mean_row_stat(dp, row, "janus_rcomp", 0.0)
+                rtotal_vals[row] = _mean_row_stat(dp, row, "janus_rtotal", 0.0)
+                k_vals[row] = _mean_row_stat(dp, row, "janus_k", 0.0)
+                t_vals[row] = _mean_row_stat(dp, row, "janus_t", float(total_rounds))
+                total_vals[row] = rtotal_vals[row]
+            if task_id == 2:
+                process_vals = self._ensure_reward_extra_list(extras, "task2_process", len(dp))
+                for row in range(len(dp)):
+                    process_vals[row] = rtotal_vals[row]
+            elif task_id == 3:
+                step_vals = self._ensure_reward_extra_list(extras, "task3_step5_reward", len(dp))
+                for row in range(len(dp)):
+                    step_vals[row] = rtotal_vals[row]
 
-            n = len(t2_b)
-            feedback_texts = t2_b.non_tensor_batch.get("task2_feedback_texts", None)
-            prev_vals = self._ensure_reward_extra_list(extras, "task2_prev_image_score", n)
-            selfcheck_vals = self._ensure_reward_extra_list(extras, "task2_selfcheck", n)
-            reward_vals = self._ensure_reward_extra_list(extras, "task2_janus_consistency_reward", n)
-            total_vals = self._ensure_reward_extra_list(extras, "task2_total_reward", n)
-            process_vals = self._ensure_reward_extra_list(extras, "task2_process", n)
-            decision_vals = self._ensure_reward_extra_list(extras, "task2_decision_vqa_reward", n)
-            decision_src_vals = self._ensure_reward_extra_list(extras, "task2_decision_vqa_source", n)
-            no_feedback_vals = self._ensure_reward_extra_list(extras, "task2_no_feedback_needed", n)
-            no_feedback_score_vals = self._ensure_reward_extra_list(extras, "task2_no_feedback_needed_score", n)
-            target_no_edit_vals = self._ensure_reward_extra_list(extras, "task2_target_no_edit", n)
-            target_no_edit_score_vals = self._ensure_reward_extra_list(extras, "task2_target_no_edit_score", n)
-
-            rewards = []
-            for row in range(n):
-                feedback = feedback_texts[row] if feedback_texts is not None and row < len(feedback_texts) else None
-                selfcheck = self._janus_selfcheck_from_feedback(feedback)
-                prev_score = self._read_prev_janus_image_score(pre_b, row, default=0.0)
-                reward = 1.0 - abs(float(prev_score) - float(selfcheck))
-                reward = float(max(0.0, min(1.0, reward)))
-                rewards.append(reward)
-
-                prev_vals[row] = float(prev_score)
-                selfcheck_vals[row] = int(selfcheck)
-                reward_vals[row] = reward
-                total_vals[row] = reward
-                process_vals[row] = reward
-                decision_vals[row] = float(prev_score)
-                decision_src_vals[row] = "janus_prev_image_score"
-                no_feedback_vals[row] = int(selfcheck)
-                no_feedback_score_vals[row] = int(selfcheck)
-                target_no_edit_vals[row] = int(float(prev_score) >= 1.0 - 1e-6)
-                target_no_edit_score_vals[row] = target_no_edit_vals[row]
-
-            scores = self._build_terminal_reward_tensor(t2_b.batch["task2_response_mask"], rewards)
-            t2_b.batch["task2_token_level_scores"] = scores
-            t2_b.batch["task2_local_token_level_scores"] = scores.clone()
-            t2_b.meta_info["task2_token_level_scores"] = scores
-            t2_b.meta_info["task2_local_token_level_scores"] = t2_b.batch["task2_local_token_level_scores"]
-
-        for pre_b, t3_b in zip(pre_task3_batches_per_turn, task3_batches_per_turn):
-            if t3_b is None or "task3_response_mask" not in t3_b.batch:
-                continue
-            if getattr(t3_b, "meta_info", None) is None:
-                t3_b.meta_info = {}
-            extras = t3_b.meta_info.setdefault("task3_reward_extra_info", {})
-            if not isinstance(extras, dict):
-                extras = {}
-                t3_b.meta_info["task3_reward_extra_info"] = extras
-
-            n = len(t3_b)
-            step_vals = self._ensure_reward_extra_list(extras, "task3_step5_reward", n)
-            prev_vals = self._ensure_reward_extra_list(extras, "task3_prev_image_score", n)
-            next_vals = self._ensure_reward_extra_list(extras, "task3_next_image_score", n)
-            gain_vals = self._ensure_reward_extra_list(extras, "task3_image_score_gain", n)
-            gain_score_vals = self._ensure_reward_extra_list(extras, "task3_image_gain_score", n)
-            if_vals = self._ensure_reward_extra_list(extras, "task3_if", n)
-            edit_if_vals = self._ensure_reward_extra_list(extras, "task3_edit_if_reward", n)
-
-            rewards = []
-            for row in range(n):
-                score = self._read_image_score_from_extras(t3_b, 3, row, default=0.0)
-                prev_score = self._read_prev_janus_image_score(pre_b, row, default=0.0)
-                rewards.append(float(score))
-                step_vals[row] = float(score)
-                prev_vals[row] = float(prev_score)
-                next_vals[row] = float(score)
-                gain_vals[row] = float(score) - float(prev_score)
-                gain_score_vals[row] = float(score) - float(prev_score)
-                if_vals[row] = 0.0 if if_vals[row] is None else if_vals[row]
-                edit_if_vals[row] = 0.0 if edit_if_vals[row] is None else edit_if_vals[row]
-
-            scores = self._build_terminal_reward_tensor(t3_b.batch["task3_response_mask"], rewards)
-            t3_b.batch["task3_token_level_scores"] = scores
-            t3_b.meta_info["task3_token_level_scores"] = scores
+        _write_task_scores(task1_batch, 1)
+        for t2_b in task2_batches_per_turn:
+            _write_task_scores(t2_b, 2)
+        for t3_b in task3_batches_per_turn:
+            _write_task_scores(t3_b, 3)
 
     @staticmethod
     def _build_zero_outcomes(all_tids) -> tuple[dict, dict]:
@@ -2695,6 +2853,24 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             await self._await_reward_task(rt, output, task_id=task_id)
         return output
 
+    async def _run_janus_final_task2_eval(
+        self,
+        input_batch: DataProto,
+        turn_idx: int,
+        server_index: Optional[int],
+    ) -> DataProto:
+        """Run the extra Janus-R1 self-eval for the final generated image."""
+        input_batch = self._set_task_id_on_batch(input_batch, 2)
+        worker = self._select_best_worker()
+        if server_index is None:
+            output = await worker.generate_sequences.remote(input_batch, on_task_complete=None)
+        else:
+            output = await worker.generate_sequences_on_server.remote(input_batch, server_index)
+        output = self._stamp_turn_idx(output, turn_idx)
+        output = self._mark_task2_raw_stage_only(output)
+        output.non_tensor_batch["source_task2_row_idx"] = np.arange(len(output), dtype=np.int64)
+        return output
+
     async def _run_task3_on_task2(
         self,
         task2_batch: DataProto,
@@ -3015,6 +3191,15 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
 
             task3_batches_per_turn.append(accumulated_batch)
 
+            if use_janus_r1 and turn_idx == max_turns - 1:
+                pre_task2_batches_per_turn.append(accumulated_batch)
+                accumulated_batch = await self._run_janus_final_task2_eval(
+                    input_batch=accumulated_batch,
+                    turn_idx=turn_idx + 1,
+                    server_index=None,
+                )
+                task2_batches_per_turn.append(accumulated_batch)
+
         await self._await_and_attach_reward_entries(pending_task1_rewards)
         await self._await_and_attach_reward_entries(pending_task3_rewards)
         if use_janus_r1:
@@ -3215,6 +3400,15 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
                     pending_task3_rewards.append((3, accumulated_batch, t3_rt))
 
             task3_batches_per_turn.append(accumulated_batch)
+
+            if use_janus_r1 and turn_idx == max_turns - 1:
+                pre_task2_batches_per_turn.append(accumulated_batch)
+                accumulated_batch = await self._run_janus_final_task2_eval(
+                    input_batch=accumulated_batch,
+                    turn_idx=turn_idx + 1,
+                    server_index=server_index,
+                )
+                task2_batches_per_turn.append(accumulated_batch)
 
         await self._await_and_attach_reward_entries(pending_task1_rewards)
         await self._await_and_attach_reward_entries(pending_task3_rewards)
