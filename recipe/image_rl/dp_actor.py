@@ -28,6 +28,71 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+def _response_mask_last_lengths(response_mask: torch.Tensor) -> List[int]:
+    """Return last nonzero position + 1 for each response mask row."""
+    lengths = []
+    for row in response_mask:
+        valid = row > 0
+        if valid.any():
+            lengths.append(int(valid.nonzero(as_tuple=False)[-1].item()) + 1)
+        else:
+            lengths.append(0)
+    return lengths
+
+
+def _format_logprob_shape_debug(
+    *,
+    task_id: int,
+    logits_seq_len: int,
+    output_starts: List[int],
+    output_lengths: List[int],
+    task_logits: torch.Tensor,
+    valid_output_tokens: torch.Tensor,
+    output_tokens: torch.Tensor,
+    response_mask: torch.Tensor,
+    micro_batch: Dict[str, Any],
+) -> str:
+    response_sums = response_mask.sum(dim=1).detach().cpu().to(torch.long).tolist()
+    response_last = _response_mask_last_lengths(response_mask.detach().cpu())
+    response_unique = torch.unique(response_mask.detach().cpu()).tolist()
+
+    segment_unique = None
+    if task_id == 2 and "task2_segment_mask" in micro_batch:
+        segment_unique = torch.unique(micro_batch["task2_segment_mask"].detach().cpu()).tolist()
+
+    row_infos = []
+    for i, (start, out_len) in enumerate(zip(output_starts, output_lengths)):
+        logit_start = int(start) - 1
+        logit_end = logit_start + int(out_len)
+        available = max(0, logits_seq_len - max(logit_start, 0))
+        row_infos.append(
+            {
+                "row": i,
+                "start": int(start),
+                "out_len": int(out_len),
+                "logit_start": int(logit_start),
+                "logit_end": int(logit_end),
+                "available_logits": int(available),
+                "mask_sum": int(response_sums[i]) if i < len(response_sums) else None,
+                "mask_last": int(response_last[i]) if i < len(response_last) else None,
+                "hole": int(response_last[i] - response_sums[i]) if i < len(response_sums) else None,
+            }
+        )
+
+    return (
+        "[LOGPROB SHAPE MISMATCH] "
+        f"task_id={task_id} "
+        f"logits_seq_len={logits_seq_len} "
+        f"task_logits_shape={tuple(task_logits.shape)} "
+        f"valid_output_tokens_shape={tuple(valid_output_tokens.shape)} "
+        f"output_tokens_shape={tuple(output_tokens.shape)} "
+        f"response_mask_shape={tuple(response_mask.shape)} "
+        f"response_mask_unique={response_unique} "
+        f"segment_mask_unique={segment_unique} "
+        f"rows={row_infos}"
+    )
+
+
 def extract_output_logits(
     logits: torch.Tensor,
     output_start_positions: List[int],
@@ -323,12 +388,28 @@ class DataParallelImageGenerationActor(BasePPOActor):
         output_starts = self.actor_module.get_output_starts()
 
         logits = output.logits
+        logits_seq_len = int(logits.size(1))
         task_logits = extract_output_logits(logits, output_starts, output_lengths)
 
         del logits
         del output
 
         # Compute log probabilities
+        if task_logits.shape[:2] != valid_output_tokens.shape:
+            print(
+                _format_logprob_shape_debug(
+                    task_id=task_id,
+                    logits_seq_len=logits_seq_len,
+                    output_starts=output_starts,
+                    output_lengths=output_lengths,
+                    task_logits=task_logits,
+                    valid_output_tokens=valid_output_tokens,
+                    output_tokens=output_tokens,
+                    response_mask=original_response_mask,
+                    micro_batch=micro_batch,
+                ),
+                flush=True,
+            )
         compact_log_probs = logprobs_from_logits(task_logits, valid_output_tokens)
         log_probs = self._restore_log_probs_to_original_length(compact_log_probs, original_response_mask)
 
