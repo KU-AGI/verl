@@ -874,9 +874,32 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                 replay_state = torch.load(replay_path, weights_only=False)
                 self.replay_buffer.load_state_dict(replay_state)
                 print(f"[FullyAsyncTrainer] Loaded replay buffer checkpoint from {replay_path}")
+                self._log_replay_buffer_stats(prefix="[FullyAsyncTrainer] Loaded replay buffer stats")
             else:
                 print(f"[FullyAsyncTrainer] No replay buffer checkpoint found at {replay_path}")
         return self.current_param_version
+
+    def _log_replay_buffer_stats(self, prefix: str = "[FullyAsyncTrainer] Replay buffer stats"):
+        if not self.use_replay_buffer:
+            return
+
+        stats = self.replay_buffer.stats_per_task()
+        entries = self.replay_buffer.entries_per_task()
+        max_entries = self.replay_buffer.max_size_per_task
+        entry_cap = str(max_entries) if max_entries > 0 else "unlimited"
+
+        parts = []
+        for task_id in sorted(stats):
+            rows, entry_count = stats[task_id]
+            row_ratio = rows / self.required_samples if self.required_samples > 0 else 0.0
+            parts.append(
+                f"task{task_id}: rows={rows}/{self.required_samples} "
+                f"({row_ratio:.1%}), entries={entry_count}/{entry_cap}"
+            )
+
+        total_rows = sum(rows for rows, _ in stats.values())
+        total_entries = sum(entries.values())
+        print(f"{prefix}: total_rows={total_rows}, total_entries={total_entries}; " + "; ".join(parts))
 
     def _merge_task_batches(self, task_batches: dict) -> DataProto:
         """Merge per-task DataProto objects into a single combined batch.
