@@ -96,6 +96,57 @@ class ReplayBuffer:
     # Push
     # ------------------------------------------------------------------
 
+    def state_dict(self) -> dict:
+        """Return a thread-safe snapshot suitable for torch.save."""
+        with self._lock:
+            return {
+                "task_ids": list(self.task_ids),
+                "score_thresholds": dict(self.score_thresholds),
+                "std_thresholds": dict(self.std_thresholds),
+                "max_size_per_task": self.max_size_per_task,
+                "max_version_gap": self.max_version_gap,
+                "max_use_count": self.max_use_count,
+                "filter_mode": self.filter_mode,
+                "reward_history_size": self.reward_history_size,
+                "max_quantile": self.max_quantile,
+                "std_quantile": self.std_quantile,
+                "buffers": self.buffers,
+                "max_reward_history": {
+                    tid: list(hist) for tid, hist in self.max_reward_history.items()
+                },
+                "std_history": {
+                    tid: list(hist) for tid, hist in self.std_history.items()
+                },
+            }
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore a replay-buffer snapshot created by state_dict."""
+        with self._lock:
+            self.task_ids = list(state.get("task_ids", self.task_ids))
+            self.score_thresholds = dict(state.get("score_thresholds", self.score_thresholds))
+            self.std_thresholds = dict(state.get("std_thresholds", self.std_thresholds))
+            self.max_size_per_task = state.get("max_size_per_task", self.max_size_per_task)
+            self.max_version_gap = state.get("max_version_gap", self.max_version_gap)
+            self.max_use_count = state.get("max_use_count", self.max_use_count)
+            self.filter_mode = state.get("filter_mode", self.filter_mode)
+            self.reward_history_size = state.get("reward_history_size", self.reward_history_size)
+            self.max_quantile = state.get("max_quantile", self.max_quantile)
+            self.std_quantile = state.get("std_quantile", self.std_quantile)
+
+            restored_buffers = state.get("buffers", {})
+            self.buffers = {tid: list(restored_buffers.get(tid, [])) for tid in self.task_ids}
+
+            restored_max_hist = state.get("max_reward_history", {})
+            restored_std_hist = state.get("std_history", {})
+            self.max_reward_history = {
+                tid: deque(restored_max_hist.get(tid, []), maxlen=self.reward_history_size)
+                for tid in self.task_ids
+            }
+            self.std_history = {
+                tid: deque(restored_std_hist.get(tid, []), maxlen=self.reward_history_size)
+                for tid in self.task_ids
+            }
+
     def push(self, batch: DataProto, task_id: int) -> int:
         score_key = f"task{task_id}_token_level_scores"
         outcome_key = "outcome_token_level_scores"

@@ -802,6 +802,10 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                 self.current_param_version,
                 max_ckpt_to_keep=max_critic_ckpt_to_keep,
             )
+        if self.use_replay_buffer:
+            replay_local_path = os.path.join(local_global_step_folder, "replay_buffer.pt")
+            torch.save(self.replay_buffer.state_dict(), replay_local_path)
+            print(f"[FullyAsyncTrainer] Saved replay buffer checkpoint to {replay_local_path}")
         ray.get(self.param_synchronizer.rollouter_save_checkpoint.remote(local_global_step_folder))
         # latest checkpointed iteration tracker (for atomic usage)
         local_latest_checkpointed_iteration = os.path.join(
@@ -864,6 +868,14 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             self.critic_wg.load_checkpoint(
                 critic_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
             )
+        if self.use_replay_buffer:
+            replay_path = os.path.join(global_step_folder, "replay_buffer.pt")
+            if os.path.exists(replay_path):
+                replay_state = torch.load(replay_path, weights_only=False)
+                self.replay_buffer.load_state_dict(replay_state)
+                print(f"[FullyAsyncTrainer] Loaded replay buffer checkpoint from {replay_path}")
+            else:
+                print(f"[FullyAsyncTrainer] No replay buffer checkpoint found at {replay_path}")
         return self.current_param_version
 
     def _merge_task_batches(self, task_batches: dict) -> DataProto:
