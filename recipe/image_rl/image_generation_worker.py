@@ -1029,6 +1029,14 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
         )
         dist.barrier()
 
+        if getattr(self.actor, "use_adaptive_entropy_coeff", False):
+            os.makedirs(local_path, exist_ok=True)
+            adaptive_entropy_path = os.path.join(local_path, f"adaptive_entropy_coeff_rank_{self.rank}.pt")
+            torch.save(self.actor.adaptive_entropy_state_dict(), adaptive_entropy_path)
+            if dist.get_rank() == 0:
+                print(f"[rank-{self.rank}]: Saved adaptive entropy coeff to: {adaptive_entropy_path}")
+            dist.barrier()
+
         if self._is_lora and hasattr(getattr(self, "actor_module", self.actor_module_fsdp), "peft_config"):
             lora_save_path = os.path.join(local_path, "lora_adapter")
             peft_model = getattr(self, "actor_module", self.actor_module_fsdp)
@@ -1076,6 +1084,20 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
         self.checkpoint_manager.load_checkpoint(
             local_path=local_path, hdfs_path=hdfs_path, del_local_after_load=del_local_after_load
         )
+
+        if (
+            self._is_actor
+            and local_path is not None
+            and getattr(self.actor, "use_adaptive_entropy_coeff", False)
+        ):
+            adaptive_entropy_path = os.path.join(local_path, f"adaptive_entropy_coeff_rank_{self.rank}.pt")
+            if os.path.exists(adaptive_entropy_path):
+                adaptive_entropy_state = torch.load(adaptive_entropy_path, map_location="cpu", weights_only=False)
+                self.actor.load_adaptive_entropy_state_dict(adaptive_entropy_state)
+                if dist.get_rank() == 0:
+                    print(f"[rank-{self.rank}]: Loaded adaptive entropy coeff from: {adaptive_entropy_path}")
+            elif dist.get_rank() == 0:
+                print(f"[rank-{self.rank}]: No adaptive entropy coeff checkpoint found at: {adaptive_entropy_path}")
 
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)

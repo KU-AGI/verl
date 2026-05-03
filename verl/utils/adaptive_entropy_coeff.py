@@ -26,6 +26,29 @@ class AdaptiveEntropyCoefficient:
         alpha = torch.clamp(alpha, min=self.min_coeff, max=self.max_coeff)
         return alpha.detach()
 
+    def state_dict(self):
+        return {
+            "psi": self.psi.detach().cpu(),
+            "optimizer": self.opt.state_dict(),
+            "target_entropy": self.target_entropy,
+            "max_coeff": self.max_coeff,
+            "min_coeff": self.min_coeff,
+        }
+
+    def load_state_dict(self, state):
+        device = self.psi.device
+        if "psi" in state:
+            self.psi.data.copy_(state["psi"].to(device=device, dtype=self.psi.dtype))
+        self.target_entropy = state.get("target_entropy", self.target_entropy)
+        self.max_coeff = state.get("max_coeff", self.max_coeff)
+        self.min_coeff = state.get("min_coeff", self.min_coeff)
+        if "optimizer" in state:
+            self.opt.load_state_dict(state["optimizer"])
+            for opt_state in self.opt.state.values():
+                for key, value in opt_state.items():
+                    if torch.is_tensor(value):
+                        opt_state[key] = value.to(device=device)
+
     def update(self, entropy):
         ent = entropy.detach()
         # loss = -α * (ent - target)  (so pushes α > 0 when ent < target, α < 0 when ent > target)

@@ -238,6 +238,22 @@ class DataParallelImageGenerationActor(BasePPOActor):
             # For FSDP wrapped models
             self.actor_module.module.set_processor(processor)
 
+    def adaptive_entropy_state_dict(self) -> Dict[str, Any]:
+        if not getattr(self, "use_adaptive_entropy_coeff", False):
+            return {}
+        return {
+            str(task_id): coeff.state_dict()
+            for task_id, coeff in self.adaptive_entropy_coeffs.items()
+        }
+
+    def load_adaptive_entropy_state_dict(self, state: Dict[str, Any]) -> None:
+        if not getattr(self, "use_adaptive_entropy_coeff", False) or not state:
+            return
+        for task_id, coeff in self.adaptive_entropy_coeffs.items():
+            task_state = state.get(str(task_id), state.get(task_id))
+            if task_state is not None:
+                coeff.load_state_dict(task_state)
+
     def _extract_valid_output_tokens(
         self,
         output_tokens: torch.Tensor,
