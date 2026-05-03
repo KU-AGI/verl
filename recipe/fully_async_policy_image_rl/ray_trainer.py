@@ -261,16 +261,20 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
         Returns the nested reward-extra dict for convenience.
         """
         reward_extra_infos_dict = batch.meta_info.get(f"task{task_id}_reward_extra_info", {})
+        batch_size = len(batch)
         for key, nested in list(batch.meta_info.items()):
             if not (key.startswith("task") and key.endswith("_reward_extra_info")):
                 continue
             if not isinstance(nested, dict) or not nested:
                 continue
-            batch.non_tensor_batch.update(
-                {k: np.array(v, dtype=object) for k, v in nested.items()}
-            )
             for k, v in nested.items():
                 batch.meta_info[k] = v
+                try:
+                    arr = np.array(v, dtype=object)
+                except Exception:
+                    continue
+                if arr.ndim >= 1 and arr.shape[0] == batch_size:
+                    batch.non_tensor_batch[k] = arr
         return reward_extra_infos_dict
 
     def init_workers(self):

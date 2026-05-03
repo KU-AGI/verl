@@ -273,6 +273,83 @@ class DataParallelImageGenerationActor(BasePPOActor):
 
         return padded_tokens
 
+    def _build_output_lengths(self, response_mask: torch.Tensor) -> List[int]:
+        # Match `_extract_valid_output_tokens`: length is last valid position + 1,
+        # not mask sum, so non-contiguous masks cannot desync labels/logits.
+        output_lengths = []
+        for i in range(response_mask.size(0)):
+            valid = (response_mask[i] == 1)
+            if valid.any():
+                output_lengths.append(int(valid.nonzero(as_tuple=False)[-1].item()) + 1)
+            else:
+                output_lengths.append(0)
+        return output_lengths
+
+    def _zero_missing_image_placeholder_rows(
+        self,
+        micro_batch: Dict[str, Any],
+        response_mask: torch.Tensor,
+        task_id: int,
+    ) -> torch.Tensor:
+        """Drop rows whose image-conditioned prompt lost its image placeholder."""
+        if task_id not in (2, 3):
+            return response_mask
+
+        input_key = f"task{task_id}_input_ids"
+        input_ids = micro_batch.get(input_key)
+        image_id = getattr(self.processor, "image_id", None)
+        if input_ids is None or image_id is None:
+            return response_mask
+
+        placeholder_counts = (input_ids == image_id).sum(dim=1)
+        bad_rows = placeholder_counts == 0
+        if not bool(bad_rows.any().item()):
+            return response_mask
+
+        response_mask = response_mask.clone()
+        response_mask[bad_rows] = 0
+        micro_batch[f"task{task_id}_response_mask"] = response_mask
+        print(
+            f"[DPActor] task{task_id}: zeroed rows with missing image placeholder "
+            f"indices={bad_rows.nonzero(as_tuple=False).view(-1).detach().cpu().tolist()}",
+            flush=True,
+        )
+        return response_mask
+
+    def _zero_rows_with_insufficient_logits(
+        self,
+        micro_batch: Dict[str, Any],
+        response_mask: torch.Tensor,
+        output_starts: List[int],
+        output_lengths: List[int],
+        logits_seq_len: int,
+        task_id: int,
+    ) -> tuple[torch.Tensor, List[int]]:
+        """Drop rows where model logits cannot cover the requested output span."""
+        bad = []
+        for i, (start, out_len) in enumerate(zip(output_starts, output_lengths)):
+            if out_len <= 0:
+                continue
+            logit_start = max(int(start) - 1, 0)
+            available = max(0, int(logits_seq_len) - logit_start)
+            if available < int(out_len):
+                bad.append((i, int(start), int(out_len), int(available)))
+
+        if not bad:
+            return response_mask, output_lengths
+
+        response_mask = response_mask.clone()
+        bad_indices = [item[0] for item in bad]
+        response_mask[bad_indices] = 0
+        micro_batch[f"task{task_id}_response_mask"] = response_mask
+        output_lengths = self._build_output_lengths(response_mask)
+        print(
+            f"[DPActor] task{task_id}: zeroed rows with insufficient logits "
+            f"logits_seq_len={logits_seq_len} rows={bad}",
+            flush=True,
+        )
+        return response_mask, output_lengths
+
     def _restore_log_probs_to_original_length(
         self,
         compact_log_probs: torch.Tensor,
@@ -334,6 +411,9 @@ class DataParallelImageGenerationActor(BasePPOActor):
         """
         # Get original response mask for length restoration
         original_response_mask = micro_batch[f"task{task_id}_response_mask"]
+        original_response_mask = self._zero_missing_image_placeholder_rows(
+            micro_batch, original_response_mask, task_id
+        )
 
         # Extract valid output tokens (remove right padding)
         if task_id == 1:
@@ -347,17 +427,8 @@ class DataParallelImageGenerationActor(BasePPOActor):
 
         valid_output_tokens = self._extract_valid_output_tokens(output_tokens, original_response_mask)
 
-        # `output_lengths` MUST match the per-row slice length used inside
-        # `_extract_valid_output_tokens` (= position of last 1 + 1). Using
-        # `sum(mask)` instead would mismatch when the mask has a hole, which
-        # triggers flash-attn's `labels.shape == (n_rows,)` assert.
-        output_lengths = []
-        for i in range(original_response_mask.size(0)):
-            valid = (original_response_mask[i] == 1)
-            if valid.any():
-                output_lengths.append(int(valid.nonzero(as_tuple=False)[-1].item()) + 1)
-            else:
-                output_lengths.append(0)
+        # Must match `_extract_valid_output_tokens` exactly.
+        output_lengths = self._build_output_lengths(original_response_mask)
         local_has_output = 1 if max(output_lengths) > 0 else 0
 
         # IMPORTANT: Always do forward pass even if no valid output
@@ -389,6 +460,22 @@ class DataParallelImageGenerationActor(BasePPOActor):
 
         logits = output.logits
         logits_seq_len = int(logits.size(1))
+        original_response_mask, output_lengths = self._zero_rows_with_insufficient_logits(
+            micro_batch,
+            original_response_mask,
+            output_starts,
+            output_lengths,
+            logits_seq_len,
+            task_id,
+        )
+        valid_output_tokens = self._extract_valid_output_tokens(output_tokens, original_response_mask)
+        if max(output_lengths) == 0:
+            dummy_scalar = logits.flatten()[0] * 0.0
+            log_probs = torch.zeros_like(original_response_mask, dtype=logits.dtype, device=logits.device) + dummy_scalar
+            entropy = None
+            if calculate_entropy:
+                entropy = torch.zeros_like(original_response_mask, dtype=logits.dtype, device=logits.device) + dummy_scalar
+            return entropy, log_probs
         task_logits = extract_output_logits(logits, output_starts, output_lengths)
 
         del logits

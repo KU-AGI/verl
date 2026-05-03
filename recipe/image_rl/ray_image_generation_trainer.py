@@ -319,9 +319,23 @@ class RayImageGenerationTrainer(RayPPOTrainer):
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
     def _clone_batch_for_rollout_dump(self, batch: DataProto) -> DataProto:
+        batch_size = len(batch)
+        non_tensor_batch = {}
+        for key, val in (getattr(batch, "non_tensor_batch", None) or {}).items():
+            if isinstance(val, np.ndarray) and val.ndim >= 1 and val.shape[0] == batch_size:
+                non_tensor_batch[key] = deepcopy(val)
+            else:
+                try:
+                    val_len = len(val)
+                except Exception:
+                    val_len = "unknown"
+                print(
+                    f"[RolloutDump] skip non_tensor key with mismatched length: "
+                    f"{key} len={val_len} batch_size={batch_size}"
+                )
         return DataProto(
             batch=batch.batch.clone() if getattr(batch, "batch", None) is not None else None,
-            non_tensor_batch=deepcopy(getattr(batch, "non_tensor_batch", None)),
+            non_tensor_batch=non_tensor_batch,
             meta_info=deepcopy(getattr(batch, "meta_info", None)),
         )
 
