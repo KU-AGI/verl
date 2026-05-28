@@ -254,6 +254,274 @@ def compute_advantage(
 
 
 class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
+    _TRAIN_RPC_META_KEYS = (
+        "temperature",
+        "cfg_weight",
+        "txt_top_k",
+        "txt_top_p",
+        "img_top_k",
+        "img_top_p",
+        "global_token_num",
+        "multi_turn",
+        "is_lora",
+        "_verl_auto_padding",
+    )
+
+    @staticmethod
+    def _present_keys(available_keys, keys):
+        seen = set()
+        selected = []
+        for key in keys:
+            if key in available_keys and key not in seen:
+                selected.append(key)
+                seen.add(key)
+        return selected
+
+    def _select_train_rpc_meta_keys(self, batch: DataProto) -> list[str]:
+        meta_info = getattr(batch, "meta_info", None) or {}
+        return [key for key in self._TRAIN_RPC_META_KEYS if key in meta_info]
+
+    @staticmethod
+    def _ensure_task_context_alias(batch: DataProto, task_id: int):
+        available = set(batch.batch.keys())
+        if task_id == 2 and "task2_task1_gen_imgs_pixel_values" not in available:
+            for src_key in ("current_imgs_pixel_values", "task1_gen_imgs_pixel_values"):
+                if src_key in batch.batch.keys():
+                    batch.batch["task2_task1_gen_imgs_pixel_values"] = batch.batch[src_key]
+                    break
+        elif task_id == 3:
+            if "task3_task1_gen_img_tokens" not in available:
+                if "task3_input_img_tokens" in batch.batch.keys():
+                    batch.batch["task3_task1_gen_img_tokens"] = batch.batch["task3_input_img_tokens"]
+
+    def _select_log_prob_rpc_batch(self, batch: DataProto, task_id: int) -> DataProto:
+        """Build a small DataProto for actor/ref log-prob RPCs."""
+        self._ensure_task_context_alias(batch, task_id)
+        available = set(batch.batch.keys())
+        keys = [
+            f"task{task_id}_input_ids",
+            f"task{task_id}_attention_mask",
+            f"task{task_id}_response_mask",
+            "task_id",
+        ]
+
+        non_tensor_keys = []
+        if task_id == 1:
+            keys.append("task1_gen_img_tokens")
+        elif task_id == 2:
+            keys.append("task2_feedback_ids")
+            if "task2_segment_mask" in available:
+                keys.append("task2_segment_mask")
+            if "task2_task1_gen_imgs_pixel_values" in available:
+                keys.append("task2_task1_gen_imgs_pixel_values")
+            else:
+                keys.append("task1_gen_imgs_pixel_values")
+            non_tensor_keys.append("task2_feedback_texts")
+        elif task_id == 3:
+            keys.append("task3_regen_img_tokens")
+            if "task3_task1_gen_img_tokens" in available:
+                keys.append("task3_task1_gen_img_tokens")
+        else:
+            raise ValueError(f"Invalid task_id: {task_id}")
+
+        available_non_tensor = set((getattr(batch, "non_tensor_batch", None) or {}).keys())
+        return batch.select(
+            batch_keys=self._present_keys(available, keys),
+            non_tensor_batch_keys=self._present_keys(available_non_tensor, non_tensor_keys),
+            meta_info_keys=self._select_train_rpc_meta_keys(batch),
+        )
+
+    def _select_actor_update_rpc_batch(self, batch: DataProto) -> DataProto:
+        """Build a small DataProto for update_actor RPC."""
+        available = set(batch.batch.keys())
+        actor_cfg = self.config.actor_rollout_ref.actor
+        multi_task_cfg = actor_cfg.get("multi_task", {})
+        task_ids = list(multi_task_cfg.get("task_ids", [1, 2, 3]))
+        task_ids = [task_id for task_id in task_ids if f"task{task_id}_advantages" in available]
+        for task_id in task_ids:
+            self._ensure_task_context_alias(batch, task_id)
+        available = set(batch.batch.keys())
+
+        keys = []
+        for task_id in task_ids:
+            keys.extend(
+                [
+                    f"task{task_id}_input_ids",
+                    f"task{task_id}_attention_mask",
+                    f"task{task_id}_response_mask",
+                    f"task{task_id}_old_log_probs",
+                    f"task{task_id}_advantages",
+                ]
+            )
+            if task_id == 1:
+                keys.append("task1_gen_img_tokens")
+            elif task_id == 2:
+                keys.append("task2_feedback_ids")
+                if "task2_segment_mask" in available:
+                    keys.append("task2_segment_mask")
+                if "task2_task1_gen_imgs_pixel_values" in available:
+                    keys.append("task2_task1_gen_imgs_pixel_values")
+                else:
+                    keys.append("task1_gen_imgs_pixel_values")
+            elif task_id == 3:
+                keys.append("task3_regen_img_tokens")
+                if "task3_task1_gen_img_tokens" in available:
+                    keys.append("task3_task1_gen_img_tokens")
+
+            if actor_cfg.get("use_kl_loss", False):
+                keys.append(f"task{task_id}_ref_log_prob")
+            if f"task{task_id}_rollout_is_weights" in available:
+                keys.append(f"task{task_id}_rollout_is_weights")
+
+        if "task_id" in available:
+            keys.append("task_id")
+
+        available_non_tensor = set((getattr(batch, "non_tensor_batch", None) or {}).keys())
+        return batch.select(
+            batch_keys=self._present_keys(available, keys),
+            non_tensor_batch_keys=self._present_keys(available_non_tensor, ["uid"]),
+            meta_info_keys=self._select_train_rpc_meta_keys(batch),
+        )
+
+    def _select_multi_log_prob_rpc_batch(self, task_batches: dict[int, DataProto]) -> DataProto:
+        tensors = {}
+        non_tensors = {}
+        meta_info = {}
+        task_ids = []
+
+        for task_id, batch in task_batches.items():
+            if f"task{task_id}_input_ids" not in batch.batch.keys():
+                continue
+            task_ids.append(task_id)
+            selected = self._select_log_prob_rpc_batch(batch, task_id)
+            for key, value in selected.batch.items():
+                if key == "task_id":
+                    continue
+                out_key = key
+                if task_id == 2 and key == "task1_gen_imgs_pixel_values":
+                    out_key = "task2_task1_gen_imgs_pixel_values"
+                tensors[out_key] = value
+            for key, value in selected.non_tensor_batch.items():
+                non_tensors[key] = value
+            for key, value in selected.meta_info.items():
+                meta_info.setdefault(key, value)
+
+        meta_info["multi_task_log_prob_task_ids"] = task_ids
+        return DataProto.from_dict(tensors=tensors, non_tensors=non_tensors, meta_info=meta_info)
+
+    def _apply_rollout_corr_to_existing_old_log_prob(self, batch, task_id, metrics):
+        rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
+        if not (rollout_corr_config and rollout_corr_config.get("rollout_is", None) is not None):
+            return batch
+
+        from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
+
+        batch.batch["old_log_probs"] = batch.batch[f"task{task_id}_old_log_probs"]
+        batch.batch["rollout_log_probs"] = batch.batch[f"task{task_id}_rollout_log_probs"]
+        batch.batch["response_mask"] = batch.batch[f"task{task_id}_response_mask"]
+
+        batch, corr_metrics = compute_rollout_correction_and_add_to_batch(batch, rollout_corr_config)
+
+        batch.batch[f"task{task_id}_response_mask"] = batch.batch.pop("response_mask")
+        batch.batch[f"task{task_id}_old_log_probs"] = batch.batch.pop("old_log_probs")
+        batch.batch.pop("rollout_log_probs")
+        if "rollout_is_weights" in batch.batch:
+            batch.batch[f"task{task_id}_rollout_is_weights"] = batch.batch.pop("rollout_is_weights")
+
+        metrics.update({f"rollout_corr/task{task_id}/{k}": v for k, v in corr_metrics.items()})
+        return batch
+
+    def _compute_old_log_probs_for_task_batches(self, task_batches, metrics, timing_raw, local_trigger_step=None):
+        task_ids = [task_id for task_id in task_batches if f"task{task_id}_response_mask" in task_batches[task_id].batch.keys()]
+        if not task_ids:
+            return task_batches
+
+        with marked_timer("old_log_prob", timing_raw, color="blue"):
+            async_training = self.config.get("async_training", None)
+            rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
+            use_rollout_log_probs = bool(async_training and async_training.use_rollout_log_probs)
+            needs_recompute = (
+                not use_rollout_log_probs
+                or local_trigger_step is not None
+                or bool(rollout_corr_config and rollout_corr_config.get("rollout_is", None) is not None)
+            )
+
+            if needs_recompute:
+                def compute_multi_old_log_prob():
+                    log_prob_batch = self._select_multi_log_prob_rpc_batch({tid: task_batches[tid] for tid in task_ids})
+                    return self.actor_rollout_wg.compute_multi_task_log_prob(log_prob_batch)
+
+                if use_rollout_log_probs and local_trigger_step == 1:
+                    self.actor_rollout_wg.save_model_to_cpu(1)
+                    old_log_prob = compute_multi_old_log_prob()
+                elif use_rollout_log_probs and local_trigger_step is not None:
+                    self.actor_rollout_wg.save_model_to_cpu(local_trigger_step)
+                    self.actor_rollout_wg.restore_model_from_cpu(1)
+                    old_log_prob = compute_multi_old_log_prob()
+                    self.actor_rollout_wg.restore_model_from_cpu(local_trigger_step)
+                    self.actor_rollout_wg.clear_cpu_model(local_trigger_step)
+                else:
+                    old_log_prob = compute_multi_old_log_prob()
+
+                gen_meta = {k: old_log_prob.meta_info[k] for k in old_log_prob.meta_info if k in self._TRAIN_RPC_META_KEYS}
+                for task_id in task_ids:
+                    old_key = f"task{task_id}_old_log_probs"
+                    entropy_key = f"task{task_id}_entropys"
+                    if old_key not in old_log_prob.batch.keys():
+                        continue
+
+                    task_batch = task_batches[task_id]
+                    if entropy_key in old_log_prob.batch.keys():
+                        entropys = old_log_prob.batch[entropy_key]
+                        response_masks = task_batch.batch[f"task{task_id}_response_mask"]
+                        loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
+                        entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
+                        metrics[f"actor/task{task_id}_old_entropy"] = entropy_agg.detach().item()
+
+                    task_old = DataProto.from_dict(tensors={old_key: old_log_prob.batch[old_key]}, meta_info=gen_meta)
+                    task_batch = task_batch.union(task_old)
+                    if use_rollout_log_probs:
+                        task_batch = self._apply_rollout_corr_to_existing_old_log_prob(task_batch, task_id, metrics)
+
+                    if f"task{task_id}_rollout_log_probs" in task_batch.batch.keys():
+                        from recipe.image_rl.debug_metrics import calculate_debug_metrics
+
+                        metrics.update(calculate_debug_metrics(task_batch, task_id=task_id))
+                    task_batches[task_id] = task_batch
+            else:
+                for task_id in task_ids:
+                    task_batch = task_batches[task_id]
+                    task_batch.batch[f"task{task_id}_old_log_probs"] = task_batch.batch[f"task{task_id}_rollout_log_probs"]
+                    task_batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+                    task_batch.meta_info["cfg_weight"] = getattr(self.config.actor_rollout_ref.rollout, "cfg_weight", 5.0)
+                    task_batches[task_id] = task_batch
+
+        return task_batches
+
+    def _compute_ref_log_probs_for_task_batches(self, task_batches, timing_raw):
+        if not self.use_reference_policy:
+            return task_batches
+
+        task_ids = [task_id for task_id in task_batches if f"task{task_id}_response_mask" in task_batches[task_id].batch.keys()]
+        if not task_ids:
+            return task_batches
+
+        with marked_timer("ref", timing_raw, color="olive"):
+            ref_batch = self._select_multi_log_prob_rpc_batch({tid: task_batches[tid] for tid in task_ids})
+            if not self.ref_in_actor:
+                ref_log_prob = self.ref_policy_wg.compute_multi_task_ref_log_prob(ref_batch)
+            else:
+                ref_log_prob = self.actor_rollout_wg.compute_multi_task_ref_log_prob(ref_batch)
+
+            for task_id in task_ids:
+                ref_key = f"task{task_id}_ref_log_prob"
+                if ref_key not in ref_log_prob.batch.keys():
+                    continue
+                task_ref = DataProto.from_dict(tensors={ref_key: ref_log_prob.batch[ref_key]})
+                task_batches[task_id] = task_batches[task_id].union(task_ref)
+
+        return task_batches
+
     def _restore_reward_extra_infos_for_logging(self, batch: DataProto, task_id: int) -> dict:
         """Expose nested task reward extras as legacy flat fields so existing
         metric collectors and rollout dump code can see them.
@@ -1117,69 +1385,87 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
 
         return batch
 
-    def _process_batch_common(self, batch, metrics, timing_raw, local_trigger_step=None, task_id: int = 1):
+    def _process_batch_common(
+        self,
+        batch,
+        metrics,
+        timing_raw,
+        local_trigger_step=None,
+        task_id: int = 1,
+        skip_old_log_prob: bool = False,
+        skip_reward: bool = False,
+        skip_ref_log_prob: bool = False,
+        skip_ref_values_adv: bool = False,
+    ):
         # Compute reward if using reward model worker (use_rm)
         # Otherwise reward is already computed in rollouter
-        with marked_timer("reward", timing_raw, color="yellow"):
-            if self.use_rm:
-                # Compute reward using reward model worker
-                reward_tensor = self.rm_wg.compute_rm_score(batch)
-                # Remove existing response_masks to allow overwriting with modified masks from reward computation
-                _task_ids_cfg = list(self.config.actor_rollout_ref.actor.multi_task.get("task_ids", [1]))
-                for tid in _task_ids_cfg:
-                    if f"task{tid}_response_mask" in batch.batch:
-                        batch.batch.pop(f"task{tid}_response_mask")
-                batch = batch.union(reward_tensor)
+        if not skip_reward:
+            with marked_timer("reward", timing_raw, color="yellow"):
+                if self.use_rm:
+                    # Compute reward using reward model worker
+                    reward_tensor = self.rm_wg.compute_rm_score(batch)
+                    # Remove existing response_masks to allow overwriting with modified masks from reward computation
+                    _task_ids_cfg = list(self.config.actor_rollout_ref.actor.multi_task.get("task_ids", [1]))
+                    for tid in _task_ids_cfg:
+                        if f"task{tid}_response_mask" in batch.batch:
+                            batch.batch.pop(f"task{tid}_response_mask")
+                    batch = batch.union(reward_tensor)
         
-        with marked_timer("old_log_prob", timing_raw, color="blue"):
+        if not skip_old_log_prob:
+            with marked_timer("old_log_prob", timing_raw, color="blue"):
 
-            def compute_old_log_prob(batch):
-                old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                entropys = old_log_prob.batch[f"task{task_id}_entropys"]
-                response_masks = batch.batch[f"task{task_id}_response_mask"]
-                loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
-                entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
-                old_log_prob_metrics = {f"actor/task{task_id}_old_entropy": entropy_agg.detach().item()}
-                metrics.update(old_log_prob_metrics)
-                old_log_prob.batch.pop(f"task{task_id}_entropys")
-                batch = batch.union(old_log_prob)
-                if f"task{task_id}_rollout_log_probs" in batch.batch.keys():
-                    # TODO: we may want to add diff of probs too.
-                    from recipe.image_rl.debug_metrics import calculate_debug_metrics
+                def compute_old_log_prob(batch):
+                    log_prob_batch = self._select_log_prob_rpc_batch(batch, task_id)
+                    old_log_prob = self.actor_rollout_wg.compute_log_prob(log_prob_batch)
+                    entropys = old_log_prob.batch[f"task{task_id}_entropys"]
+                    response_masks = batch.batch[f"task{task_id}_response_mask"]
+                    loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
+                    entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
+                    old_log_prob_metrics = {f"actor/task{task_id}_old_entropy": entropy_agg.detach().item()}
+                    metrics.update(old_log_prob_metrics)
+                    old_log_prob.batch.pop(f"task{task_id}_entropys")
+                    batch = batch.union(old_log_prob)
+                    if f"task{task_id}_rollout_log_probs" in batch.batch.keys():
+                        # TODO: we may want to add diff of probs too.
+                        from recipe.image_rl.debug_metrics import calculate_debug_metrics
 
-                    metrics.update(calculate_debug_metrics(batch, task_id=task_id))
-                return batch
+                        metrics.update(calculate_debug_metrics(batch, task_id=task_id))
+                    return batch
 
-            async_training = self.config.get("async_training", None)
-            if async_training and async_training.use_rollout_log_probs:
-                # If local_triger_step == 1, load the training engine's parameters to the CPU
-                #  and save a copy for subsequent MIS use.
-                # If local_trigger_step == 2, 3, ..., restore the parameters of version 1 to calculate the old_log_prob,
-                # then restore the parameters of the current version.
-                if local_trigger_step == 1:
-                    self.actor_rollout_wg.save_model_to_cpu(1)
-                    batch = compute_old_log_prob(batch)
-                elif local_trigger_step is not None:
-                    self.actor_rollout_wg.save_model_to_cpu(local_trigger_step)
-                    self.actor_rollout_wg.restore_model_from_cpu(1)
-                    batch = compute_old_log_prob(batch)
-                    self.actor_rollout_wg.restore_model_from_cpu(local_trigger_step)
-                    self.actor_rollout_wg.clear_cpu_model(local_trigger_step)
+                async_training = self.config.get("async_training", None)
+                if async_training and async_training.use_rollout_log_probs:
+                    # If local_triger_step == 1, load the training engine's parameters to the CPU
+                    #  and save a copy for subsequent MIS use.
+                    # If local_trigger_step == 2, 3, ..., restore the parameters of version 1 to calculate the old_log_prob,
+                    # then restore the parameters of the current version.
+                    if local_trigger_step == 1:
+                        self.actor_rollout_wg.save_model_to_cpu(1)
+                        batch = compute_old_log_prob(batch)
+                    elif local_trigger_step is not None:
+                        self.actor_rollout_wg.save_model_to_cpu(local_trigger_step)
+                        self.actor_rollout_wg.restore_model_from_cpu(1)
+                        batch = compute_old_log_prob(batch)
+                        self.actor_rollout_wg.restore_model_from_cpu(local_trigger_step)
+                        self.actor_rollout_wg.clear_cpu_model(local_trigger_step)
+                    else:
+                        batch = self._apply_old_log_probs_with_rollout_corr(
+                            batch, compute_old_log_prob, task_id, metrics
+                        )
+
                 else:
-                    batch = self._apply_old_log_probs_with_rollout_corr(
-                        batch, compute_old_log_prob, task_id, metrics
-                    )
+                    batch = compute_old_log_prob(batch)
 
-            else:
-                batch = compute_old_log_prob(batch)
+        if skip_ref_values_adv:
+            return batch
 
-        if self.use_reference_policy:
+        if self.use_reference_policy and not skip_ref_log_prob:
             # compute reference log_prob
             with marked_timer("ref", timing_raw, color="olive"):
+                ref_batch = self._select_log_prob_rpc_batch(batch, task_id)
                 if not self.ref_in_actor:
-                    ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                    ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(ref_batch)
                 else:
-                    ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
+                    ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(ref_batch)
                 batch = batch.union(ref_log_prob)
 
         # compute values

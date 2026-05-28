@@ -1067,7 +1067,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
 
             # 3) finalize 워커로 넘기고 즉시 종료
             await self.reward_finalize_queue.put(
-                (rollout_sample, sample_reward_tasks, used_version, finalize_budget, rollout_duration)
+                (rollout_sample, sample_reward_tasks, used_version, finalize_budget, rollout_duration, batch_size)
             )
             enqueued_to_finalize = True
             return  # 여기서 끝
@@ -1141,6 +1141,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         while True:
             item = await self.reward_finalize_queue.get()
             batch_size = 0
+            staleness_batch_size = 0
             is_retry = None  # None means unknown (exception before assignment)
             stats_updated = False
             try:
@@ -1148,7 +1149,14 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                     break
 
                 finalize_start_time = time.perf_counter()
-                rollout_sample, sample_reward_tasks, used_version, finalize_budget, rollout_duration = item
+                (
+                    rollout_sample,
+                    sample_reward_tasks,
+                    used_version,
+                    finalize_budget,
+                    rollout_duration,
+                    staleness_batch_size,
+                ) = item
                 batch_size = len(rollout_sample.full_batch)
                 is_retry = rollout_sample.retry_count > 0
 
@@ -1238,7 +1246,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                     self.total_generated_samples += success_count
                     # retry 아이템은 pending_queue에서 staleness 증가 안 했으므로 감소도 안 함
                     if not is_retry:
-                        self.staleness_samples -= batch_size
+                        self.staleness_samples -= staleness_batch_size
                         if self.paused:
                             self.condition.notify_all()
                     self.dropped_stale_samples += n_dropped
@@ -1270,9 +1278,9 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 if item != "DONE":
                     await self._release_finalize_budget(finalize_budget)
                     # 예외로 step 7이 실행되지 않은 경우 staleness 감소 보장
-                    if not stats_updated and is_retry is False and batch_size > 0:
+                    if not stats_updated and is_retry is False and staleness_batch_size > 0:
                         async with self.lock:
-                            self.staleness_samples -= batch_size
+                            self.staleness_samples -= staleness_batch_size
                             if self.paused:
                                 self.condition.notify_all()
                 self.reward_finalize_queue.task_done()

@@ -243,9 +243,7 @@ class ReplayBuffer:
 
             cross_task_vals = {}
             # Multi-turn: task2/task3 training should consume the image the
-            # policy actually saw at rollout time (`current_*` rolls forward
-            # per turn). Fall back to `task1_*` when `current_*` isn't
-            # stamped (single-turn legacy batches).
+            # policy actually saw at rollout time.
             if task_id == 2:
                 img_src = (
                     "current_imgs_pixel_values"
@@ -257,20 +255,8 @@ class ReplayBuffer:
                 if "task1_token_level_scores" in filtered.batch.keys():
                     cross_task_vals["task2_task1_token_level_scores"] = filtered.batch["task1_token_level_scores"]
             elif task_id == 3:
-                img_src = (
-                    "current_imgs_pixel_values"
-                    if "current_imgs_pixel_values" in filtered.batch.keys()
-                    else "task1_gen_imgs_pixel_values"
-                )
-                if img_src in filtered.batch.keys():
-                    cross_task_vals["task3_task1_gen_imgs_pixel_values"] = filtered.batch[img_src]
-                tok_src = (
-                    "current_img_tokens"
-                    if "current_img_tokens" in filtered.batch.keys()
-                    else "task1_gen_img_tokens"
-                )
-                if tok_src in filtered.batch.keys():
-                    cross_task_vals["task3_task1_gen_img_tokens"] = filtered.batch[tok_src]
+                if "task3_input_img_tokens" in filtered.batch.keys():
+                    cross_task_vals["task3_task1_gen_img_tokens"] = filtered.batch["task3_input_img_tokens"]
                 if "task1_token_level_scores" in filtered.batch.keys():
                     cross_task_vals["task3_task1_token_level_scores"] = filtered.batch["task1_token_level_scores"]
                 if "task2_token_level_scores" in filtered.batch.keys():

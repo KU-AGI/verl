@@ -754,6 +754,7 @@ class ImageUnifiedRollout(BaseRollout):
         if image_ids is None or len(image_ids) == 0:
             image_ids = data_proto.batch.get('task1_gen_img_tokens', [])
         image_ids = image_ids.to(self.device).long()
+        data_proto.batch["task3_input_img_tokens"] = image_ids.detach().cpu().clone()
 
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
             image_embeds = self.module.gen_aligner(self.module.gen_embed(image_ids))

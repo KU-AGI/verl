@@ -14,7 +14,7 @@ exec 2>&1
 #                         EXPERIMENT CONFIGURATION
 ###############################################################################
 project_name='mllm_reasoning'
-exp_name="0428_nipa_lr_1e_6_train_multi_step_fine_grained"
+exp_name="0528_nipa_trainer_idle_time_opt_debug_v3"
 # exp_name='testesttestest'
 task_ids='[1,2,3]'
 
@@ -110,8 +110,8 @@ max_turns=2
 ###############################################################################
 # Return discount used when backing up phase1 step rewards:
 #   G_h = r_h + mdp_gamma * G_{h+1}
-mdp_reward_version=multi_step # gae | multi_step
-mdp_gamma=0.95
+mdp_reward_version=gae # gae | multi_step | outcome | final_image_outcome
+mdp_gamma=1.00
 
 # Initial image reward weight:
 #   r_step1 = mdp_init_reward_weight * S_1
@@ -163,7 +163,7 @@ norm_adv_by_std_in_grpo=True
 ###############################################################################
 #                          SEQUENCE LENGTH SETTINGS
 ###############################################################################
-max_prompt_length=1000
+max_prompt_length=1576
 max_response_length=2800
 
 # Overlong Buffer Configuration
@@ -196,12 +196,12 @@ val_img_top_p=1.0
 # Prompt Batch Sizes
 train_prompt_bsz=0            # not used in async mode
 gen_prompt_bsz=1              # streaming generation, set to 1
-train_prompt_mini_bsz=16
-rollout_prompt_size=2         # prompts per actor per batch (async mode)
+train_prompt_mini_bsz=8
+rollout_prompt_size=1         # prompts per actor per batch (async mode)
 val_rollout_prompt_size=16
 
 # Response & Micro Batch
-n_resp_per_prompt=8
+n_resp_per_prompt=16
 ppo_micro_batch_size_per_gpu=4
 log_prob_micro_batch_size_per_gpu=4
 
@@ -228,7 +228,7 @@ weight_decay=0.01
 total_rollout_steps=$(((512*100*3*10)))
 staleness_threshold=2.0
 trigger_parameter_sync_step=1
-require_batches=1
+require_batches=2
 partial_rollout=False
 use_rollout_log_probs=True
 compute_prox_log_prob=False
@@ -244,12 +244,12 @@ replay_buffer_max_version_gap=-1
 replay_buffer_max_size_per_task=64
 replay_buffer_max_use_count=-1
 replay_buffer_filter_mode=max_and_std_constant      # "mean", "std", or "max", "max_and_std_constant"
-replay_buffer_score_threshold_1=0.7
-replay_buffer_score_threshold_2=-0.8
+replay_buffer_score_threshold_1=0.0
+replay_buffer_score_threshold_2=0.0
 replay_buffer_score_threshold_3=0.0 # 2점 만점
-replay_buffer_score_std_threshold_1=0.03
-replay_buffer_score_std_threshold_2=0.02
-replay_buffer_score_std_threshold_3=0.02
+replay_buffer_score_std_threshold_1=0.1
+replay_buffer_score_std_threshold_2=0.1
+replay_buffer_score_std_threshold_3=0.1
 replay_buffer_reward_history_size=100
 replay_buffer_max_quantile=0.50
 replay_buffer_std_quantile=0.25
@@ -265,9 +265,9 @@ bypass_mode=false
 #                         TRAINING SCHEDULE
 ###############################################################################
 total_epochs=10
-test_freq=10
+test_freq=20
 save_freq=50
-rollout_freq=1
+rollout_freq=20
 # total_training_steps=3000
 # log_val_generations=20
 
@@ -377,7 +377,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     actor_rollout_ref.ref.ulysses_sequence_parallel_size=${sp_size} \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
-    trainer.val_before_train=True \
+    trainer.val_before_train=False \
     trainer.balance_batch=False \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \

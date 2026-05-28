@@ -339,6 +339,64 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             meta_info=deepcopy(getattr(batch, "meta_info", None)),
         )
 
+    @staticmethod
+    def _present_keys(available_keys, keys):
+        seen = set()
+        selected = []
+        for key in keys:
+            if key in available_keys and key not in seen:
+                selected.append(key)
+                seen.add(key)
+        return selected
+
+    def _select_batch_for_rollout_dump(self, batch: DataProto) -> DataProto:
+        """Keep only fields read by _log_rollout_data.
+
+        The caller clones this selected DataProto before handing it to the dump
+        worker, so dump writes do not race with later trainer mutations.
+        """
+        batch_keys = [
+            "task_id",
+            "turn_idx",
+            "current_imgs_pixel_values",
+            "task1_gen_imgs_pixel_values",
+            "task2_task1_gen_imgs_pixel_values",
+            "task3_input_imgs_pixel_values",
+            "task2_segment_mask",
+        ]
+        for tid in (1, 2, 3):
+            batch_keys.append(f"task{tid}_token_level_scores")
+            for source_tid in (1, 2, 3):
+                batch_keys.append(f"task{tid}_task{source_tid}_token_level_scores")
+                batch_keys.append(f"task{tid}_task{source_tid}_segment_mask")
+
+        non_tensor_keys = [
+            "prompt_id",
+            "uid",
+            "prompt",
+            "reward_model",
+            "task1_gen_imgs_pil_list",
+            "task2_feedback_texts",
+            "task3_regen_imgs_pil_list",
+            "param_version",
+            "turn_idx",
+            "trajectory_id",
+            "phase",
+            "branch_id",
+        ]
+        task_ids = list(self.config.actor_rollout_ref.actor.multi_task.get("task_ids", [1]))
+        for host_tid in task_ids:
+            non_tensor_keys.append(f"task{host_tid}_task1_gen_imgs_pil_list")
+            non_tensor_keys.append(f"task{host_tid}_task2_feedback_texts")
+
+        available_batch = set(batch.batch.keys()) if getattr(batch, "batch", None) is not None else set()
+        available_non_tensor = set((getattr(batch, "non_tensor_batch", None) or {}).keys())
+        return batch.select(
+            batch_keys=self._present_keys(available_batch, batch_keys),
+            non_tensor_batch_keys=self._present_keys(available_non_tensor, non_tensor_keys),
+            meta_info_keys=[],
+        )
+
     def _reap_rollout_dump_futures(self, wait: bool = False):
         if not self._rollout_dump_futures:
             return
@@ -377,11 +435,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             )
 
         self._reap_rollout_dump_futures(wait=False)
-        if self._rollout_dump_max_pending > 0 and len(self._rollout_dump_futures) >= self._rollout_dump_max_pending:
-            oldest = self._rollout_dump_futures.pop(0)
-            oldest.result()
-
-        dump_batch = self._clone_batch_for_rollout_dump(batch)
+        dump_batch = self._clone_batch_for_rollout_dump(self._select_batch_for_rollout_dump(batch))
         dump_reward_extra = deepcopy(reward_extra_infos_dict)
         dump_timing = dict(timing_raw)
         fut = self._rollout_dump_executor.submit(
@@ -838,7 +892,6 @@ class RayImageGenerationTrainer(RayPPOTrainer):
             if host_task_id == 3:
                 current_img_sources = [
                     _maybe_get_tensor("task3_input_imgs_pixel_values"),
-                    _maybe_get_tensor("task3_task1_gen_imgs_pixel_values"),
                     _maybe_get_tensor("task1_gen_imgs_pixel_values"),
                     _maybe_get_tensor("current_imgs_pixel_values"),
                 ]
@@ -846,7 +899,6 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                 current_img_sources = [
                     _maybe_get_tensor("current_imgs_pixel_values"),
                     _maybe_get_tensor("task2_task1_gen_imgs_pixel_values"),
-                    _maybe_get_tensor("task3_task1_gen_imgs_pixel_values"),
                     _maybe_get_tensor("task1_gen_imgs_pixel_values"),
                 ]
             for src in current_img_sources:

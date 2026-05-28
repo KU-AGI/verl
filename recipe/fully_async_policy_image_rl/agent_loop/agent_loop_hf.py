@@ -1313,6 +1313,14 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
                 task3_batches,
             )
             return
+        if version in {"final_image_outcome", "final_image", "image_outcome"}:
+            self._attach_phase1_mdp_final_image_outcome_token_scores(
+                all_tids,
+                task1_batch,
+                task2_batches,
+                task3_batches,
+            )
+            return
         if version not in {"gae", "discounted", "discounted_return"}:
             logger.warning(
                 "[AgentLoop] Unknown algorithm.mdp_reward_version=%s; falling back to gae",
@@ -1631,6 +1639,249 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
                 t3_b.meta_info = {}
             task3_extras = t3_b.meta_info.setdefault("task3_reward_extra_info", {})
             outcome_vals = self._ensure_reward_extra_list(task3_extras, "task3_outcome_score", len(t3_b))
+            for row in range(len(t3_b)):
+                value = self._mean_return(outcomes_by_event, t3_b, row, "step5", 0.0)
+                outcome_vals[row] = value
+                self._put_scalar_on_last_mask_token(scores, mask, row, value)
+            t3_b.batch["task3_token_level_scores"] = scores
+            t3_b.meta_info["task3_token_level_scores"] = scores
+
+    def _attach_phase1_mdp_final_image_outcome_token_scores(
+        self,
+        all_tids,
+        task1_batch: Optional[DataProto],
+        task2_batches: list[DataProto],
+        task3_batches: list[DataProto],
+    ) -> None:
+        """Use the final generated image score as the whole-path outcome.
+
+        The final image is the last valid image generated on a terminal path:
+        task1's initial image if no edit image was generated, otherwise the
+        latest task3 edited image. A no-edit task2 turn does not create a new
+        image, so it inherits the previous image as the final image.
+        """
+        algo_cfg = getattr(getattr(self, "config", None), "algorithm", None) or {}
+        _get_hp = algo_cfg.get if hasattr(algo_cfg, "get") else lambda k, d: getattr(algo_cfg, k, d)
+        eps = float(_get_hp("mdp_score_eps", 1e-6))
+
+        _ex = self._get_outcome_extra_scalar
+        outcomes_by_event: dict[tuple[int, int, str], list[float]] = {}
+
+        def _append_outcome(dp: DataProto, row: int, event_name: str, value: float) -> None:
+            outcomes_by_event.setdefault(self._event_return_key(dp, row, event_name), []).append(float(value))
+
+        def _normalized_image_score(dp: DataProto, task_id: int, row: int) -> float:
+            score_field = f"task{task_id}_image_score"
+            max_field = f"task{task_id}_image_score_max"
+            align_field = f"task{task_id}_align"
+            score = _ex(dp, task_id, score_field, [row], default=_ex(dp, task_id, align_field, [row], 0.0))
+            s_max = _ex(dp, task_id, max_field, [row], 1.0)
+            return max(0.0, min(2.0, 2.0 * float(score) / max(float(s_max), eps)))
+
+        # task1 lookup ---------------------------------------------------------
+        t1_index: dict[int, int] = {}
+        if task1_batch is not None and "trajectory_id" in task1_batch.non_tensor_batch:
+            for i, tid in enumerate(task1_batch.non_tensor_batch["trajectory_id"]):
+                t1_index.setdefault(int(tid), i)
+
+        # task2/task3 rows grouped by shared prefix vs branch path -------------
+        branch_parent: dict[int, int] = {}
+        branch_tid: dict[int, int] = {}
+        shared_t2_rows: dict[int, list[tuple]] = {}
+        shared_t3_rows: dict[int, list[tuple]] = {}
+        branch_t2_rows: dict[int, list[tuple]] = {}
+        branch_t3_rows: dict[int, list[tuple]] = {}
+
+        for turn_i, t2_b in enumerate(task2_batches):
+            if t2_b is None or "trajectory_id" not in t2_b.non_tensor_batch:
+                continue
+            self._ensure_branch_metadata(t2_b)
+            tids = np.asarray(t2_b.non_tensor_batch["trajectory_id"], dtype=np.int64)
+            bids = np.asarray(t2_b.non_tensor_batch["branch_id"], dtype=np.int64)
+            parents = np.asarray(t2_b.non_tensor_batch["parent_branch_id"], dtype=np.int64)
+            for row in range(len(t2_b)):
+                tid = int(tids[row])
+                bid = int(bids[row])
+                item = (turn_i, t2_b, row)
+                if bid >= 0:
+                    branch_parent.setdefault(bid, int(parents[row]))
+                    branch_tid.setdefault(bid, tid)
+                    branch_t2_rows.setdefault(bid, []).append(item)
+                else:
+                    shared_t2_rows.setdefault(tid, []).append(item)
+
+        for turn_i, t3_b in enumerate(task3_batches):
+            if t3_b is None or "trajectory_id" not in t3_b.non_tensor_batch:
+                continue
+            self._ensure_branch_metadata(t3_b)
+            tids = np.asarray(t3_b.non_tensor_batch["trajectory_id"], dtype=np.int64)
+            bids = np.asarray(t3_b.non_tensor_batch["branch_id"], dtype=np.int64)
+            parents = np.asarray(t3_b.non_tensor_batch["parent_branch_id"], dtype=np.int64)
+            for row in range(len(t3_b)):
+                tid = int(tids[row])
+                bid = int(bids[row])
+                item = (turn_i, t3_b, row)
+                if bid >= 0:
+                    branch_parent.setdefault(bid, int(parents[row]))
+                    branch_tid.setdefault(bid, tid)
+                    branch_t3_rows.setdefault(bid, []).append(item)
+                else:
+                    shared_t3_rows.setdefault(tid, []).append(item)
+
+        all_branch_ids = set(branch_parent.keys())
+        branch_children: dict[int, list[int]] = {}
+        for bid, parent in branch_parent.items():
+            if parent >= 0:
+                branch_children.setdefault(parent, []).append(bid)
+        terminal_branch_ids = sorted(all_branch_ids - set(branch_children.keys()))
+
+        def _dedupe_sorted(rows: list[tuple]) -> list[tuple]:
+            rows = sorted(rows, key=lambda x: (x[0], x[2]))
+            out = []
+            seen = set()
+            for turn_i, dp, row in rows:
+                key = (turn_i, id(dp), row)
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append((turn_i, dp, row))
+            return out
+
+        def _branch_chain(bid: int) -> list[int]:
+            chain = []
+            cur = bid
+            while cur >= 0:
+                chain.append(cur)
+                cur = int(branch_parent.get(cur, -1))
+            return list(reversed(chain))
+
+        def _collect_branch_rows(bid: int) -> tuple[list[tuple], list[tuple]]:
+            tid = int(branch_tid[bid])
+            t2_rows = list(shared_t2_rows.get(tid, []))
+            t3_rows = list(shared_t3_rows.get(tid, []))
+            for seg_bid in _branch_chain(bid):
+                t2_rows.extend(branch_t2_rows.get(seg_bid, []))
+                t3_rows.extend(branch_t3_rows.get(seg_bid, []))
+            return _dedupe_sorted(t2_rows), _dedupe_sorted(t3_rows)
+
+        def _build_events(tid: int, t2_rows: list[tuple], t3_rows: list[tuple]) -> list[tuple]:
+            events: list[tuple[float, DataProto, int, str, Optional[float]]] = []
+            if task1_batch is not None and tid in t1_index:
+                row = t1_index[tid]
+                events.append((0.0, task1_batch, row, "step1", _normalized_image_score(task1_batch, 1, row)))
+
+            for turn_i, t2_b, row in t2_rows:
+                base = 1.0 + 4.0 * float(turn_i)
+                events.append((base + 0.0, t2_b, row, "step2", None))
+                events.append((base + 1.0, t2_b, row, "step3", None))
+                events.append((base + 2.0, t2_b, row, "step4", None))
+
+            for turn_i, t3_b, row in t3_rows:
+                base = 1.0 + 4.0 * float(turn_i)
+                events.append((base + 3.0, t3_b, row, "step5", _normalized_image_score(t3_b, 3, row)))
+
+            return sorted(events, key=lambda x: x[0])
+
+        def _accumulate_final_image_outcome(events: list[tuple]) -> None:
+            if not events:
+                return
+            image_events = [(pos, reward) for pos, _, _, _, reward in events if reward is not None]
+            if not image_events:
+                return
+            _, final_image_reward = max(image_events, key=lambda x: x[0])
+            for _, dp, row, event_name, _ in events:
+                _append_outcome(dp, row, event_name, float(final_image_reward))
+
+        for bid in terminal_branch_ids:
+            tid = int(branch_tid[bid])
+            t2_rows, t3_rows = _collect_branch_rows(bid)
+            _accumulate_final_image_outcome(_build_events(tid, t2_rows, t3_rows))
+
+        tids_with_branch = {int(branch_tid[bid]) for bid in all_branch_ids}
+        for raw_tid in all_tids if all_tids is not None else []:
+            tid = int(raw_tid)
+            if tid in tids_with_branch:
+                continue
+            t2_rows = _dedupe_sorted(shared_t2_rows.get(tid, []))
+            t3_rows = _dedupe_sorted(shared_t3_rows.get(tid, []))
+            _accumulate_final_image_outcome(_build_events(tid, t2_rows, t3_rows))
+
+        # Write final-image outcome rewards back to task token-level scores ----
+        if task1_batch is not None and "task1_response_mask" in task1_batch.batch:
+            scores = torch.zeros_like(task1_batch.batch["task1_response_mask"], dtype=torch.float32)
+            if getattr(task1_batch, "meta_info", None) is None:
+                task1_batch.meta_info = {}
+            task1_extras = task1_batch.meta_info.setdefault("task1_reward_extra_info", {})
+            outcome_vals = self._ensure_reward_extra_list(
+                task1_extras, "task1_final_image_outcome_score", len(task1_batch)
+            )
+            for tid, row in t1_index.items():
+                value = self._mean_return(outcomes_by_event, task1_batch, row, "step1", 0.0)
+                outcome_vals[row] = value
+                self._put_scalar_on_last_mask_token(scores, task1_batch.batch["task1_response_mask"], row, value)
+            task1_batch.batch["task1_token_level_scores"] = scores
+            task1_batch.meta_info["task1_token_level_scores"] = scores
+
+        for t2_b in task2_batches:
+            if t2_b is None or "task2_response_mask" not in t2_b.batch:
+                continue
+            response_mask = t2_b.batch["task2_response_mask"]
+            segment_mask = t2_b.batch.get("task2_segment_mask", response_mask)
+            scores = torch.zeros_like(response_mask, dtype=torch.float32)
+            local_scores = torch.zeros_like(response_mask, dtype=torch.float32)
+            if getattr(t2_b, "meta_info", None) is None:
+                t2_b.meta_info = {}
+            task2_extras = t2_b.meta_info.setdefault("task2_reward_extra_info", {})
+            step2_vals = self._ensure_reward_extra_list(task2_extras, "task2_step2_final_image_outcome_score", len(t2_b))
+            step3_vals = self._ensure_reward_extra_list(task2_extras, "task2_step3_final_image_outcome_score", len(t2_b))
+            step4_vals = self._ensure_reward_extra_list(task2_extras, "task2_step4_final_image_outcome_score", len(t2_b))
+            for row in range(len(t2_b)):
+                step2 = self._mean_return(outcomes_by_event, t2_b, row, "step2", 0.0)
+                step3 = self._mean_return(outcomes_by_event, t2_b, row, "step3", 0.0)
+                step4 = self._mean_return(outcomes_by_event, t2_b, row, "step4", 0.0)
+                step2_vals[row] = step2
+                step3_vals[row] = step3
+                step4_vals[row] = step4
+                self._put_scalar_on_last_segment_token(scores, segment_mask, row, 2, step2)
+                self._put_scalar_on_last_segment_token(scores, segment_mask, row, 3, step3)
+                self._put_scalar_on_last_segment_token(scores, segment_mask, row, 4, step4)
+                self._put_scalar_on_last_segment_token(
+                    local_scores,
+                    segment_mask,
+                    row,
+                    2,
+                    _ex(t2_b, 2, "task2_prompt_to_tuple_reward", [row], 0.0),
+                )
+                self._put_scalar_on_last_segment_token(
+                    local_scores,
+                    segment_mask,
+                    row,
+                    3,
+                    _ex(t2_b, 2, "task2_tuple_to_vqa_reward", [row], 0.0),
+                )
+                self._put_scalar_on_last_segment_token(
+                    local_scores,
+                    segment_mask,
+                    row,
+                    4,
+                    _ex(t2_b, 2, "task2_vqa_to_feedback_reward", [row], 0.0),
+                )
+            t2_b.batch["task2_token_level_scores"] = scores
+            t2_b.batch["task2_local_token_level_scores"] = local_scores
+            t2_b.meta_info["task2_token_level_scores"] = scores
+            t2_b.meta_info["task2_local_token_level_scores"] = local_scores
+
+        for t3_b in task3_batches:
+            if t3_b is None or "task3_response_mask" not in t3_b.batch:
+                continue
+            mask = t3_b.batch["task3_response_mask"]
+            scores = torch.zeros_like(mask, dtype=torch.float32)
+            if getattr(t3_b, "meta_info", None) is None:
+                t3_b.meta_info = {}
+            task3_extras = t3_b.meta_info.setdefault("task3_reward_extra_info", {})
+            outcome_vals = self._ensure_reward_extra_list(
+                task3_extras, "task3_final_image_outcome_score", len(t3_b)
+            )
             for row in range(len(t3_b)):
                 value = self._mean_return(outcomes_by_event, t3_b, row, "step5", 0.0)
                 outcome_vals[row] = value

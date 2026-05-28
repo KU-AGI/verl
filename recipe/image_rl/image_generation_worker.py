@@ -976,6 +976,56 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
         return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="blue", role="actor_compute_multi_task_log_prob")
+    def compute_multi_task_log_prob(self, data: DataProto):
+        assert self._is_actor
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        from contextlib import nullcontext
+
+        task_ids = list(data.meta_info.pop("multi_task_log_prob_task_ids", []))
+        if not task_ids:
+            task_ids = sorted(
+                int(key[len("task") : key.index("_input_ids")])
+                for key in data.batch.keys()
+                if key.startswith("task") and key.endswith("_input_ids")
+            )
+
+        is_lora = data.meta_info.pop("is_lora", False)
+        adapter_ctx = self.actor.actor_module.disable_adapter() if is_lora else nullcontext()
+        data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
+        data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
+        data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
+        if "temperature" not in data.meta_info:
+            data.meta_info["temperature"] = self.config.rollout.temperature
+        if "cfg_weight" not in data.meta_info:
+            data.meta_info["cfg_weight"] = getattr(self.config.rollout, "cfg_weight", 5.0)
+
+        tensors = {}
+        with self.ulysses_sharding_manager:
+            with adapter_ctx:
+                for task_id in task_ids:
+                    if f"task{task_id}_input_ids" not in data.batch.keys():
+                        continue
+                    data.batch["task_id"] = torch.full((len(data),), task_id, dtype=torch.long)
+                    output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+                    tensors[f"task{task_id}_old_log_probs"] = output
+                    tensors[f"task{task_id}_entropys"] = entropys
+
+        output = DataProto.from_dict(
+            tensors=tensors,
+            meta_info={k: data.meta_info[k] for k in self._GEN_PARAM_KEYS if k in data.meta_info},
+        )
+        output = output.to("cpu")
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            log_gpu_memory_usage("After offload actor model during compute_multi_task_log_prob", logger=logger)
+
+        return output
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")
     def compute_ref_log_prob(self, data: DataProto):
         if self._is_lora:
@@ -1011,6 +1061,47 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
         #         self.ref_policy.actor_module._handle.reshard(True)
         #     elif fsdp_version(self.ref_policy.actor_module) == 2:
         #         self.ref_policy.actor_module.reshard()
+
+        return output
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="olive", role="ref_compute_multi_task_log_prob")
+    def compute_multi_task_ref_log_prob(self, data: DataProto):
+        if self._is_lora:
+            data.meta_info["is_lora"] = True
+            output = self.compute_multi_task_log_prob(data)
+            tensors = {}
+            for key, value in output.batch.items():
+                if key.endswith("_old_log_probs"):
+                    tensors[key.replace("_old_log_probs", "_ref_log_prob")] = value
+            return DataProto.from_dict(tensors=tensors)
+
+        assert self._is_ref
+
+        task_ids = list(data.meta_info.pop("multi_task_log_prob_task_ids", []))
+        if not task_ids:
+            task_ids = sorted(
+                int(key[len("task") : key.index("_input_ids")])
+                for key in data.batch.keys()
+                if key.startswith("task") and key.endswith("_input_ids")
+            )
+
+        data.meta_info["micro_batch_size"] = self.config.ref.log_prob_micro_batch_size_per_gpu
+        data.meta_info["max_token_len"] = self.config.ref.log_prob_max_token_len_per_gpu
+        data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
+
+        tensors = {}
+        with self.ulysses_sharding_manager:
+            data = data.to("cpu")
+            for task_id in task_ids:
+                if f"task{task_id}_input_ids" not in data.batch.keys():
+                    continue
+                data.batch["task_id"] = torch.full((len(data),), task_id, dtype=torch.long)
+                output, _ = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
+                tensors[f"task{task_id}_ref_log_prob"] = output
+
+        output = DataProto.from_dict(tensors=tensors)
+        output = output.to("cpu")
 
         return output
 

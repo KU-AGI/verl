@@ -587,17 +587,18 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                                 metrics[f"replay/task{task_id}_max_use_count"] = float(np.max(use_counts))
 
                             task_batch.batch["task_id"] = torch.tensor([task_id for _ in range(len(task_batch))], dtype=int)
-                            task_batch = self._process_batch_common(
-                                task_batch, metrics, task_timing, self.local_trigger_step if self.compute_prox_log_prob else None, task_id
-                            )
-                            self._restore_reward_extra_infos_for_logging(task_batch, task_id)
+                            if self.use_rm:
+                                task_batch = self._process_batch_common(
+                                    task_batch,
+                                    metrics,
+                                    task_timing,
+                                    self.local_trigger_step if self.compute_prox_log_prob else None,
+                                    task_id,
+                                    skip_old_log_prob=True,
+                                    skip_ref_values_adv=True,
+                                )
                             task_batches[task_id] = task_batch
                             task_timings[task_id] = task_timing
-
-                            if should_log_rollout:
-                                task_reward_extra = {k: v for k, v in task_batch.meta_info.items()}
-                                task_rollout_dir = os.path.join(rollout_data_dir, f"task{task_id}")
-                                self._submit_rollout_dump(task_batch, task_reward_extra, task_timing, task_rollout_dir)
                     else:
                         # ---- Non-replay path: collect from queue (original behavior) ----
                         epoch, batch, queued_task_batches = self._get_samples_from_queue()
@@ -616,19 +617,48 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                                 task_batch = self._clone_dataproto(batch)
 
                             task_batch.batch["task_id"] = torch.tensor([task_id for _ in range(len(task_batch))], dtype=int)
-                            task_batch = self._process_batch_common(
-                                task_batch, metrics, timing_raw, self.local_trigger_step if self.compute_prox_log_prob else None, task_id
-                            )
-                            self._restore_reward_extra_infos_for_logging(task_batch, task_id)
+                            if self.use_rm:
+                                task_batch = self._process_batch_common(
+                                    task_batch,
+                                    metrics,
+                                    timing_raw,
+                                    self.local_trigger_step if self.compute_prox_log_prob else None,
+                                    task_id,
+                                    skip_old_log_prob=True,
+                                    skip_ref_values_adv=True,
+                                )
                             task_batches[task_id] = task_batch
-
-                            if should_log_rollout:
-                                task_reward_extra = {k: v for k, v in task_batch.meta_info.items()}
-                                task_rollout_dir = os.path.join(rollout_data_dir, f"task{task_id}")
-                                self._submit_rollout_dump(task_batch, task_reward_extra, timing_raw, task_rollout_dir)
 
                     if not task_batches:
                         break
+
+                    task_batches = self._compute_old_log_probs_for_task_batches(
+                        task_batches,
+                        metrics,
+                        timing_raw,
+                        self.local_trigger_step if self.compute_prox_log_prob else None,
+                    )
+                    task_batches = self._compute_ref_log_probs_for_task_batches(task_batches, timing_raw)
+
+                    for task_id in list(task_batches.keys()):
+                        task_timing = task_timings.get(task_id, timing_raw)
+                        task_batch = self._process_batch_common(
+                            task_batches[task_id],
+                            metrics,
+                            task_timing,
+                            None,
+                            task_id,
+                            skip_old_log_prob=True,
+                            skip_reward=True,
+                            skip_ref_log_prob=True,
+                        )
+                        self._restore_reward_extra_infos_for_logging(task_batch, task_id)
+                        task_batches[task_id] = task_batch
+
+                        if should_log_rollout:
+                            task_reward_extra = {k: v for k, v in task_batch.meta_info.items()}
+                            task_rollout_dir = os.path.join(rollout_data_dir, f"task{task_id}")
+                            self._submit_rollout_dump(task_batch, task_reward_extra, task_timing, task_rollout_dir)
 
                     # Merge all task batches into one combined batch
                     combined_batch = self._merge_task_batches(task_batches)
@@ -644,7 +674,8 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         with marked_timer("update_actor", timing_raw, color="red"):
                             combined_batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
-                            actor_output = self.actor_rollout_wg.update_actor(combined_batch)
+                            actor_update_batch = self._select_actor_update_rpc_batch(combined_batch)
+                            actor_output = self.actor_rollout_wg.update_actor(actor_update_batch)
                         log_prob_info = log_prob_metrics(actor_output.meta_info["metrics"], task_ids)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(log_prob_info)
@@ -924,28 +955,9 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                 if key.startswith(task_prefix):
                     combined.non_tensor_batch[key] = other.non_tensor_batch[key]
 
-            # Alias cross-task context keys so dp_actor can use the correct
-            # INPUT context (= the image actually shown to the policy at
-            # rollout time) for each task's replay samples. Under multi-turn,
-            # task2/task3 consume `current_*` (rolling image stream), not
-            # task1's original output. Fall back to `task1_*` for single-turn
-            # batches that have no `current_*` stamped.
-            if task_id == 2:
-                src_key = (
-                    "current_imgs_pixel_values"
-                    if "current_imgs_pixel_values" in other.batch.keys()
-                    else "task1_gen_imgs_pixel_values"
-                )
-                if src_key in other.batch.keys():
-                    combined.batch["task2_task1_gen_imgs_pixel_values"] = other.batch[src_key]
-            elif task_id == 3:
-                src_key = (
-                    "current_img_tokens"
-                    if "current_img_tokens" in other.batch.keys()
-                    else "task1_gen_img_tokens"
-                )
-                if src_key in other.batch.keys():
-                    combined.batch["task3_task1_gen_img_tokens"] = other.batch[src_key]
+            # Alias cross-task context keys from the task's own source batch so
+            # replay samples do not accidentally use the base task's context.
+            self._set_task_context_alias_from_source(combined, other, task_id)
 
             # Alias sample_param_version per task so _collect_task_metrics
             # uses the correct replay freshness versions for each task.
@@ -963,6 +975,9 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                 if k.startswith(task_prefix):
                     combined.meta_info[k] = v
 
+        for task_id in task_ids:
+            self._ensure_task_context_alias(combined, task_id)
+
         # Create per-task data_source aliases for no-replay path
         # In no-replay case all tasks share the same batch (same rows, same data_source per row).
         if "data_source" in combined.non_tensor_batch:
@@ -971,19 +986,19 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                 if ds_key not in combined.non_tensor_batch:
                     combined.non_tensor_batch[ds_key] = combined.non_tensor_batch["data_source"]
 
-        # Recompute global_token_num if missing (e.g. after replay buffer meta_info filtering)
-        if "global_token_num" not in combined.meta_info:
-            total = None
-            for tid in task_ids:
-                att_key = f"task{tid}_attention_mask"
-                resp_key = f"task{tid}_response_mask"
-                if att_key in combined.batch.keys():
-                    t = combined.batch[att_key].sum(-1)
-                    if resp_key in combined.batch.keys():
-                        t = t + combined.batch[resp_key].sum(-1)
-                    total = t if total is None else total + t
-            if total is not None:
-                combined.meta_info["global_token_num"] = total.tolist()
+        # Recompute after merging so throughput/MFU logging reflects the tasks
+        # actually present in this combined training batch.
+        total = None
+        for tid in task_ids:
+            att_key = f"task{tid}_attention_mask"
+            resp_key = f"task{tid}_response_mask"
+            if att_key in combined.batch.keys():
+                t = combined.batch[att_key].sum(-1)
+                if resp_key in combined.batch.keys():
+                    t = t + combined.batch[resp_key].sum(-1)
+                total = t if total is None else total + t
+        if total is not None:
+            combined.meta_info["global_token_num"] = total.tolist()
 
         return combined
 
