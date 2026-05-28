@@ -294,6 +294,26 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                 if "task3_input_img_tokens" in batch.batch.keys():
                     batch.batch["task3_task1_gen_img_tokens"] = batch.batch["task3_input_img_tokens"]
 
+    @staticmethod
+    def _set_task_context_alias_from_source(target: DataProto, source: DataProto, task_id: int):
+        if target.batch is None or source.batch is None:
+            return
+
+        if task_id == 2 and "task2_task1_gen_imgs_pixel_values" not in target.batch.keys():
+            for src_key in (
+                "task2_task1_gen_imgs_pixel_values",
+                "current_imgs_pixel_values",
+                "task1_gen_imgs_pixel_values",
+            ):
+                if src_key in source.batch.keys():
+                    target.batch["task2_task1_gen_imgs_pixel_values"] = source.batch[src_key]
+                    break
+        elif task_id == 3 and "task3_task1_gen_img_tokens" not in target.batch.keys():
+            for src_key in ("task3_task1_gen_img_tokens", "task3_input_img_tokens"):
+                if src_key in source.batch.keys():
+                    target.batch["task3_task1_gen_img_tokens"] = source.batch[src_key]
+                    break
+
     def _select_log_prob_rpc_batch(self, batch: DataProto, task_id: int) -> DataProto:
         """Build a small DataProto for actor/ref log-prob RPCs."""
         self._ensure_task_context_alias(batch, task_id)
