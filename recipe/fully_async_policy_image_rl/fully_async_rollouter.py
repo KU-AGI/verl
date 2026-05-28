@@ -564,7 +564,11 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
 
     def _init_models(self):
         self.rollout_wg = self.all_wg[str(Role.Rollout)]
-        self.rollout_wg.init_model()
+        rollout_name = self.config.actor_rollout_ref.rollout.name
+        if rollout_name == "janus_sglang":
+            print("[FullyAsyncRollouter] janus_sglang rollout: skipping HF rollout worker init_model", flush=True)
+        else:
+            self.rollout_wg.init_model()
         self.actor_rollout_wg = self.rollout_wg
 
     def _create_continuous_iterator(self):
@@ -973,11 +977,29 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         async with self.lock:
             self.reward_tasks.add(t)
 
+    @staticmethod
+    def _select_legacy_full_batch(task_batches: dict[int, Any]) -> DataProto:
+        from recipe.fully_async_policy_image_rl.detach_utils import _slice_dataproto_with_meta
+
+        for tid in (2, 3, 1):
+            candidate = task_batches.get(tid)
+            if candidate is None:
+                continue
+            if "phase" in candidate.non_tensor_batch:
+                phase_arr = np.asarray(candidate.non_tensor_batch["phase"])
+                phase1_idx = np.where(phase_arr == 1)[0].tolist()
+                if phase1_idx:
+                    return _slice_dataproto_with_meta(candidate, phase1_idx)
+                continue
+            return candidate
+        raise RuntimeError("[Rollouter] generate_sequences returned empty task_batches dict")
+
     async def _process_single_sample_streaming(self, rollout_sample: RolloutSample, finalize_budget: int, server_index: int):
         batch_size = len(rollout_sample.full_batch)
         active_released = False
         enqueued_to_finalize = False
         token_released = False
+        deferred_finalize_context = None
 
         rollout_start_time = time.perf_counter()
         try:
@@ -1016,30 +1038,9 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 rollout_sample.full_batch,
                 server_index=server_index,
                 on_task_complete=on_task_complete,
+                defer_reward_finalize=True,
             )
             await self._wait_server_idle(server_index)
-
-            # Orchestrator now always returns {task_id: DataProto | None}.
-            # Pick a legacy `full_batch` view from the dict so existing
-            # consumers that read `rollout_sample.full_batch` still work.
-            task_batches: dict[int, Any] = result if isinstance(result, dict) else {1: result}
-            legacy_full_batch = None
-            from recipe.fully_async_policy_image_rl.detach_utils import _slice_dataproto_with_meta
-            for tid in (2, 3, 1):
-                candidate = task_batches.get(tid)
-                if candidate is None:
-                    continue
-                if "phase" in candidate.non_tensor_batch:
-                    phase_arr = np.asarray(candidate.non_tensor_batch["phase"])
-                    phase1_idx = np.where(phase_arr == 1)[0].tolist()
-                    if phase1_idx:
-                        legacy_full_batch = _slice_dataproto_with_meta(candidate, phase1_idx)
-                        break
-                    continue
-                legacy_full_batch = candidate
-                break
-            if legacy_full_batch is None:
-                raise RuntimeError("[Rollouter] generate_sequences returned empty task_batches dict")
 
             rollout_duration = time.perf_counter() - rollout_start_time
             if self.processed_sample_count % 100 == 0: # 10번째 샘플에 대해서만 출력 (Warm-up 고려)
@@ -1054,20 +1055,39 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 self.active_sample_count -= batch_size
             active_released = True
 
-            legacy_full_batch.meta_info["param_version_end"] = self.current_param_version
+            if isinstance(result, tuple) and len(result) == 2:
+                task_batches, deferred_finalize_context = result
+            else:
+                task_batches = result if isinstance(result, dict) else {1: result}
+
             # Save pre-generation prompt batch for quality-filter retry before overwriting
             rollout_sample.original_prompt_batch = rollout_sample.full_batch
-            rollout_sample.full_batch = legacy_full_batch
             rollout_sample.task_batches = task_batches
             rollout_sample.agent_loop_output_list = []
-            n = len(legacy_full_batch)
-            rollout_sample.param_version_start = [used_version] * n
-            rollout_sample.param_version_end = [self.current_param_version] * n
-            rollout_sample.processing_times = [rollout_duration] * n
+            if deferred_finalize_context is None:
+                legacy_full_batch = self._select_legacy_full_batch(task_batches)
+                legacy_full_batch.meta_info["param_version_end"] = self.current_param_version
+                rollout_sample.full_batch = legacy_full_batch
+                n = len(legacy_full_batch)
+                rollout_sample.param_version_start = [used_version] * n
+                rollout_sample.param_version_end = [self.current_param_version] * n
+                rollout_sample.processing_times = [rollout_duration] * n
+            else:
+                rollout_sample.param_version_start = [used_version] * batch_size
+                rollout_sample.param_version_end = [self.current_param_version] * batch_size
+                rollout_sample.processing_times = [rollout_duration] * batch_size
 
             # 3) finalize 워커로 넘기고 즉시 종료
             await self.reward_finalize_queue.put(
-                (rollout_sample, sample_reward_tasks, used_version, finalize_budget, rollout_duration, batch_size)
+                (
+                    rollout_sample,
+                    sample_reward_tasks,
+                    used_version,
+                    finalize_budget,
+                    rollout_duration,
+                    batch_size,
+                    deferred_finalize_context,
+                )
             )
             enqueued_to_finalize = True
             return  # 여기서 끝
@@ -1149,16 +1169,42 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                     break
 
                 finalize_start_time = time.perf_counter()
-                (
-                    rollout_sample,
-                    sample_reward_tasks,
-                    used_version,
-                    finalize_budget,
-                    rollout_duration,
-                    staleness_batch_size,
-                ) = item
-                batch_size = len(rollout_sample.full_batch)
+                if len(item) == 7:
+                    (
+                        rollout_sample,
+                        sample_reward_tasks,
+                        used_version,
+                        finalize_budget,
+                        rollout_duration,
+                        staleness_batch_size,
+                        deferred_finalize_context,
+                    ) = item
+                else:
+                    (
+                        rollout_sample,
+                        sample_reward_tasks,
+                        used_version,
+                        finalize_budget,
+                        rollout_duration,
+                        staleness_batch_size,
+                    ) = item
+                    deferred_finalize_context = None
                 is_retry = rollout_sample.retry_count > 0
+
+                if deferred_finalize_context is not None:
+                    task_batches = await self.async_rollout_manager._finalize_phase1_task_dict(
+                        deferred_finalize_context
+                    )
+                    rollout_sample.task_batches = task_batches
+                    legacy_full_batch = self._select_legacy_full_batch(task_batches)
+                    legacy_full_batch.meta_info["param_version_end"] = self.current_param_version
+                    rollout_sample.full_batch = legacy_full_batch
+                    n = len(legacy_full_batch)
+                    rollout_sample.param_version_start = [used_version] * n
+                    rollout_sample.param_version_end = [self.current_param_version] * n
+                    rollout_sample.processing_times = [rollout_duration] * n
+
+                batch_size = len(rollout_sample.full_batch)
 
                 # 1. reward 완료 대기
                 # Reward tasks have already written per-row tensors into

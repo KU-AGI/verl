@@ -1260,6 +1260,19 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
             if rank == 0:
                 sorted_keys = sorted(sd.keys())
                 total_numel = sum(sd[k].numel() for k in sorted_keys)
+                rollout_weight_metadata = {
+                    "total_numel": int(total_numel),
+                    "dtype": "torch.bfloat16",
+                    "tensors": [
+                        {
+                            "name": k,
+                            "shape": tuple(sd[k].shape),
+                            "dtype": "torch.bfloat16",
+                            "numel": int(sd[k].numel()),
+                        }
+                        for k in sorted_keys
+                    ],
+                }
                 
                 flat_tensor = torch.empty(total_numel, dtype=torch.bfloat16, pin_memory=True)
                 
@@ -1279,6 +1292,10 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
                 keys_blob = "\n".join(sorted_keys).encode("utf-8")
                 import hashlib
                 key_fp = hashlib.sha256(keys_blob).hexdigest()
+                metadata_tmp = "/dev/shm/rollout_weight_metadata.pt.tmp"
+                metadata_path = "/dev/shm/rollout_weight_metadata.pt"
+                torch.save(rollout_weight_metadata, metadata_tmp)
+                os.replace(metadata_tmp, metadata_path)
                
                 return flat_tensor.view(torch.int16).numpy()
             else:

@@ -43,6 +43,16 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+def get_image_rollout_replica_class(rollout_name: str):
+    if rollout_name in {"image_unified", "hf"}:
+        return HuggingFaceReplica
+    if rollout_name == "janus_sglang":
+        from recipe.fully_async_policy_image_rl.sglang_rollout import JanusSGLangReplica
+
+        return JanusSGLangReplica
+    raise NotImplementedError(f"Unsupported fully-async image rollout backend: {rollout_name}")
+
+
 _NO_EDIT_MARKER = "No need to generate feedback."
 
 
@@ -595,7 +605,7 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         self.reward_model_manager = None
         self.reward_router_address = None
         self.agent_loop_workers_class = FullyAsyncAgentLoopWorker
-        self.rollout_replica_class = HuggingFaceReplica
+        self.rollout_replica_class = get_image_rollout_replica_class(config.actor_rollout_ref.rollout.name)
 
         self.rm_wg = rm_wg
         self.rollout_replicas = None
@@ -3546,7 +3556,70 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             )
         return phase1_task_dict
 
-    async def generate_sequences_with_callback_on_server(self, prompts: DataProto, server_index: int, on_task_complete=None) -> dict[int, Optional[DataProto]]:
+    async def _finalize_phase1_task_dict(
+        self,
+        context: dict,
+    ) -> dict[int, Optional[DataProto]]:
+        task1_batch = context["task1_batch"]
+        task2_batches_per_turn = context["task2_batches_per_turn"]
+        task3_batches_per_turn = context["task3_batches_per_turn"]
+        pre_task2_batches_per_turn = context["pre_task2_batches_per_turn"]
+        pre_task3_batches_per_turn = context["pre_task3_batches_per_turn"]
+        pending_task1_rewards = context["pending_task1_rewards"]
+        pending_task3_rewards = context["pending_task3_rewards"]
+        pending_task2_raw_rewards = context["pending_task2_raw_rewards"]
+        has_task1_first_turn = context["has_task1_first_turn"]
+
+        await self._await_and_attach_reward_entries(pending_task1_rewards)
+        await self._await_and_attach_reward_entries(pending_task3_rewards)
+        self._attach_phase1_task3_mdp_step5_rewards(
+            task1_batch,
+            pre_task3_batches_per_turn,
+            task3_batches_per_turn,
+        )
+        await self._await_and_finalize_task2_entries(
+            pending_task2_raw_rewards,
+            pre_task2_batches_per_turn,
+            task2_batches_per_turn,
+        )
+
+        outcomes: tuple[dict, dict] = ({}, {})
+        all_tids = None
+        if task1_batch is not None and "trajectory_id" in task1_batch.non_tensor_batch:
+            all_tids = task1_batch.non_tensor_batch["trajectory_id"]
+        elif task2_batches_per_turn and "trajectory_id" in task2_batches_per_turn[0].non_tensor_batch:
+            all_tids = task2_batches_per_turn[0].non_tensor_batch["trajectory_id"]
+        if all_tids is not None:
+            outcomes = self._compute_outcomes_with_avg(
+                all_tids, task1_batch, task2_batches_per_turn, task3_batches_per_turn
+            )
+            self._attach_phase1_mdp_token_scores(
+                all_tids,
+                task1_batch,
+                task2_batches_per_turn,
+                task3_batches_per_turn,
+            )
+        self._propagate_logging_context(
+            task1_batch,
+            task2_batches_per_turn,
+            task3_batches_per_turn,
+        )
+
+        return self._build_task_dict_per_sample(
+            task1_batch,
+            task2_batches_per_turn,
+            task3_batches_per_turn,
+            outcomes,
+            has_task1_first_turn,
+        )
+
+    async def generate_sequences_with_callback_on_server(
+        self,
+        prompts: DataProto,
+        server_index: int,
+        on_task_complete=None,
+        defer_reward_finalize: bool = False,
+    ) -> Any:
         """Server-pinned counterpart of `generate_sequences_with_callback`.
         Returns the same `{1, 2, 3}`-keyed dict."""
         max_turns = int(getattr(self.config.actor_rollout_ref.rollout, "max_turns", 1))
@@ -3670,6 +3743,23 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
                     pending_task3_rewards.append((3, accumulated_batch, t3_rt))
 
             task3_batches_per_turn.append(accumulated_batch)
+
+        algo_cfg = getattr(getattr(self, "config", None), "algorithm", None) or {}
+        _get_hp = algo_cfg.get if hasattr(algo_cfg, "get") else lambda k, d: getattr(algo_cfg, k, d)
+        phase2_topk = int(_get_hp("phase2_topk", 0))
+        if defer_reward_finalize and phase2_topk <= 0:
+            deferred_context = {
+                "task1_batch": task1_batch,
+                "task2_batches_per_turn": task2_batches_per_turn,
+                "task3_batches_per_turn": task3_batches_per_turn,
+                "pre_task2_batches_per_turn": pre_task2_batches_per_turn,
+                "pre_task3_batches_per_turn": pre_task3_batches_per_turn,
+                "pending_task1_rewards": pending_task1_rewards,
+                "pending_task3_rewards": pending_task3_rewards,
+                "pending_task2_raw_rewards": pending_task2_raw_rewards,
+                "has_task1_first_turn": has_task1_first_turn,
+            }
+            return {}, deferred_context
 
         await self._await_and_attach_reward_entries(pending_task1_rewards)
         await self._await_and_attach_reward_entries(pending_task3_rewards)

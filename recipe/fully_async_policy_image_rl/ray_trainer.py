@@ -467,24 +467,43 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
             )
 
             if needs_recompute:
-                def compute_multi_old_log_prob():
-                    log_prob_batch = self._select_multi_log_prob_rpc_batch({tid: task_batches[tid] for tid in task_ids})
+                def compute_multi_old_log_prob(selected_task_ids):
+                    log_prob_batch = self._select_multi_log_prob_rpc_batch(
+                        {tid: task_batches[tid] for tid in selected_task_ids}
+                    )
                     return self.actor_rollout_wg.compute_multi_task_log_prob(log_prob_batch)
+
+                def compute_old_log_probs_by_task():
+                    grouped_task_ids = {}
+                    for task_id in task_ids:
+                        grouped_task_ids.setdefault(len(task_batches[task_id]), []).append(task_id)
+
+                    outputs_by_task = {}
+                    for selected_task_ids in grouped_task_ids.values():
+                        output = compute_multi_old_log_prob(selected_task_ids)
+                        for task_id in selected_task_ids:
+                            outputs_by_task[task_id] = output
+                    return outputs_by_task
 
                 if use_rollout_log_probs and local_trigger_step == 1:
                     self.actor_rollout_wg.save_model_to_cpu(1)
-                    old_log_prob = compute_multi_old_log_prob()
+                    old_log_prob_by_task = compute_old_log_probs_by_task()
                 elif use_rollout_log_probs and local_trigger_step is not None:
                     self.actor_rollout_wg.save_model_to_cpu(local_trigger_step)
                     self.actor_rollout_wg.restore_model_from_cpu(1)
-                    old_log_prob = compute_multi_old_log_prob()
+                    old_log_prob_by_task = compute_old_log_probs_by_task()
                     self.actor_rollout_wg.restore_model_from_cpu(local_trigger_step)
                     self.actor_rollout_wg.clear_cpu_model(local_trigger_step)
                 else:
-                    old_log_prob = compute_multi_old_log_prob()
+                    old_log_prob_by_task = compute_old_log_probs_by_task()
 
-                gen_meta = {k: old_log_prob.meta_info[k] for k in old_log_prob.meta_info if k in self._TRAIN_RPC_META_KEYS}
                 for task_id in task_ids:
+                    old_log_prob = old_log_prob_by_task.get(task_id)
+                    if old_log_prob is None:
+                        continue
+                    gen_meta = {
+                        k: old_log_prob.meta_info[k] for k in old_log_prob.meta_info if k in self._TRAIN_RPC_META_KEYS
+                    }
                     old_key = f"task{task_id}_old_log_probs"
                     entropy_key = f"task{task_id}_entropys"
                     if old_key not in old_log_prob.batch.keys():
@@ -527,13 +546,24 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
             return task_batches
 
         with marked_timer("ref", timing_raw, color="olive"):
-            ref_batch = self._select_multi_log_prob_rpc_batch({tid: task_batches[tid] for tid in task_ids})
-            if not self.ref_in_actor:
-                ref_log_prob = self.ref_policy_wg.compute_multi_task_ref_log_prob(ref_batch)
-            else:
-                ref_log_prob = self.actor_rollout_wg.compute_multi_task_ref_log_prob(ref_batch)
+            grouped_task_ids = {}
+            for task_id in task_ids:
+                grouped_task_ids.setdefault(len(task_batches[task_id]), []).append(task_id)
+
+            ref_log_prob_by_task = {}
+            for selected_task_ids in grouped_task_ids.values():
+                ref_batch = self._select_multi_log_prob_rpc_batch({tid: task_batches[tid] for tid in selected_task_ids})
+                if not self.ref_in_actor:
+                    ref_log_prob = self.ref_policy_wg.compute_multi_task_ref_log_prob(ref_batch)
+                else:
+                    ref_log_prob = self.actor_rollout_wg.compute_multi_task_ref_log_prob(ref_batch)
+                for task_id in selected_task_ids:
+                    ref_log_prob_by_task[task_id] = ref_log_prob
 
             for task_id in task_ids:
+                ref_log_prob = ref_log_prob_by_task.get(task_id)
+                if ref_log_prob is None:
+                    continue
                 ref_key = f"task{task_id}_ref_log_prob"
                 if ref_key not in ref_log_prob.batch.keys():
                     continue
