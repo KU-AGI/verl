@@ -19,6 +19,7 @@ import ray
 from ray.util.collective import collective
 import asyncio
 import numpy as np
+from omegaconf import OmegaConf
 
 from verl.utils.device import get_nccl_backend
 
@@ -70,6 +71,7 @@ class ParameterSynchronizer:
         # Weight Version
         self.latest_version = 0
         self.latest_weights_ref = None
+        self.latest_metadata_ref = None
         self.keep_last_n = getattr(config.async_training, "keep_last_n_weights", 1)
         self._weights_refs = {}
 
@@ -87,7 +89,10 @@ class ParameterSynchronizer:
         self.self_handle = None
 
         self._export_method_name = None
+        self._metadata_method_name = None
         self._rank_method_name = None
+        rollout_name = OmegaConf.select(config, "actor_rollout_ref.rollout.name", default="")
+        self._sync_rollout_weight_metadata = str(rollout_name).lower() == "janus_sglang"
 
         self._init_weights_info()
         self._init_sync_group()
@@ -305,6 +310,16 @@ class ParameterSynchronizer:
         all_results = await asyncio.gather(send_task, *recv_tasks)
         return all_results
 
+    async def _write_metadata_to_relays(self, metadata_ref):
+        if not self._sync_rollout_weight_metadata or metadata_ref is None:
+            return []
+        return await asyncio.gather(
+            *[
+                self.relays[node_id].write_rollout_weight_metadata.remote(metadata_ref)
+                for node_id in self._relay_nodes_ordered
+            ]
+        )
+
     def set_self_handle(self, handle):
         """Store the actor handle for this ParameterSynchronizer"""
         self.self_handle = handle
@@ -319,18 +334,33 @@ class ParameterSynchronizer:
                 self.actor_wg.workers[0], "export_rollout_weights",
                 prefer_prefixes=("actor", "rollout")
             )
+        if self._sync_rollout_weight_metadata and self._metadata_method_name is None:
+            try:
+                self._metadata_method_name = _resolve_method_by_suffix(
+                    self.actor_wg.workers[0], "export_rollout_weight_metadata",
+                    prefer_prefixes=("actor", "rollout")
+                )
+            except RuntimeError:
+                self._metadata_method_name = False
 
         export_refs = [getattr(w, self._export_method_name).remote() for w in self.actor_wg.workers]
         
         weights_ref = export_refs[self._actor_rank0_idx]
+        metadata_ref = None
+        if self._metadata_method_name:
+            metadata_ref = getattr(
+                self.actor_wg.workers[self._actor_rank0_idx],
+                self._metadata_method_name,
+            ).remote()
         self.latest_weights_ref = weights_ref
+        self.latest_metadata_ref = metadata_ref
         self.latest_version = version
 
         w0 = self.actor_wg.workers[self._actor_rank0_idx]
         owner_node = ray.get(w0.__ray_call__.remote(lambda self: __import__("ray").get_runtime_context().get_node_id()))
         print(f"[ParamSync] weights owner node_id = {owner_node}", flush=True)
         print(f"[ParamSync] trainer_node_id     = {self._trainer_node_id}", flush=True)
-        return weights_ref
+        return weights_ref, metadata_ref
 
     async def sync_weights(self, version, validate=False, global_steps=0):
 
@@ -342,7 +372,7 @@ class ParameterSynchronizer:
         
         self.mq_client.update_param_version_sync(version)
 
-        weights_ref = await self._publish_weights(version)
+        weights_ref, metadata_ref = await self._publish_weights(version)
 
         t_pub = time.time() - t_pub0
 
@@ -359,6 +389,7 @@ class ParameterSynchronizer:
                     else:
                         tasks.append(relay.stream_to_shm_gloo.remote(version, None))
                 results = await asyncio.gather(*tasks)
+            await self._write_metadata_to_relays(metadata_ref)
         t_stream = time.time() - t_stream0
 
         backend_label = "NIXL" if self._use_nixl else "GLOO"
@@ -384,12 +415,19 @@ class ParameterSynchronizer:
     async def export_weights_only(self, version):
         self.current_version = version
         self.mq_client.update_param_version_sync(version)
-        weights_ref = await self._publish_weights(version)
-        return weights_ref
+        weights_ref, metadata_ref = await self._publish_weights(version)
+        return {"weights_ref": weights_ref, "metadata_ref": metadata_ref}
 
-    async def distribute_weights(self, version, weights_ref, validate=False, global_steps=0):
+    async def distribute_weights(self, version, weights_ref, validate=False, global_steps=0, metadata_ref=None):
         start_time = time.time()
         self.current_version = version
+        if isinstance(weights_ref, dict):
+            metadata_ref = weights_ref.get("metadata_ref", metadata_ref)
+            weights_ref = weights_ref["weights_ref"]
+        elif isinstance(weights_ref, (tuple, list)) and len(weights_ref) == 2:
+            weights_ref, metadata_ref = weights_ref
+        if metadata_ref is None:
+            metadata_ref = self.latest_metadata_ref
 
         async with self._dist_lock:
             if self._use_nixl:
@@ -403,6 +441,7 @@ class ParameterSynchronizer:
                     else:
                         tasks.append(relay.stream_to_shm_gloo.remote(version, None))
                 await asyncio.gather(*tasks)
+            await self._write_metadata_to_relays(metadata_ref)
 
         backend_label = "NIXL" if self._use_nixl else "GLOO"
         print(f"[ParameterSynchronizer][{backend_label}] v{version} stream done. Time: {time.time()-start_time:.2f}s")

@@ -29,6 +29,15 @@ def _open_shm_u8(path: str, nbytes: int):
     ten_ = torch.from_numpy(arr_)  # uint8 tensor backed by /dev/shm mmap
     return fd_, mm_, ten_
 
+def _write_rollout_weight_metadata(metadata):
+    if metadata is None:
+        return None
+    metadata_tmp = "/dev/shm/rollout_weight_metadata.pt.tmp"
+    metadata_path = "/dev/shm/rollout_weight_metadata.pt"
+    torch.save(metadata, metadata_tmp)
+    os.replace(metadata_tmp, metadata_path)
+    return metadata_path
+
 @ray.remote(num_cpus=1)
 class WeightRelayActor:
     def __init__(self, node_id: str):
@@ -47,6 +56,16 @@ class WeightRelayActor:
         self.fanout = fanout
         self.chunk_bytes = chunk_bytes
         return True
+
+    async def write_rollout_weight_metadata(self, metadata_ref=None):
+        if metadata_ref is None:
+            return {"node": self.node_id, "metadata_file": None}
+        if isinstance(metadata_ref, ray.ObjectRef):
+            metadata = await metadata_ref
+        else:
+            metadata = metadata_ref
+        metadata_path = _write_rollout_weight_metadata(metadata)
+        return {"node": self.node_id, "metadata_file": metadata_path}
 
     async def prefetch_to_shm(self, version: int, weights_ref: ray.ObjectRef):
         raise RuntimeError("prefetch_to_shm CALLED (should not happen)")

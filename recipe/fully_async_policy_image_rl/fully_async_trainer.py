@@ -1109,12 +1109,12 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             ray.get(self.param_synchronizer.wait_last_valid.remote())
         with marked_timer("timing_s/param_sync", timing_param_sync):
             t0 = time.time()
-            weights_ref = ray.get(
-            self.param_synchronizer.export_weights_only.remote(self.current_param_version)
+            exported_weights = ray.get(
+                self.param_synchronizer.export_weights_only.remote(self.current_param_version)
             )
             self.param_synchronizer.distribute_weights.remote(
                 self.current_param_version,
-                weights_ref,
+                exported_weights,
                 validate=validate,
                 global_steps=global_steps
             )

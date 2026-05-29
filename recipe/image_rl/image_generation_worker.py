@@ -1305,6 +1305,17 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
             if getattr(self, "_is_offload_param", False):
                 offload_fsdp_model_to_cpu(self.actor_module_fsdp)
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def export_rollout_weight_metadata(self):
+        rank = dist.get_rank() if torch.distributed.is_initialized() else 0
+        if rank != 0:
+            return None
+
+        metadata_path = "/dev/shm/rollout_weight_metadata.pt"
+        if not os.path.exists(metadata_path):
+            return None
+        return torch.load(metadata_path, map_location="cpu", weights_only=False)
+
 # TODO(sgm): we may need to extract it to dp_reward_model.py
 class ImageGenerationRewardModelWorker(RewardModelWorker):
     """
