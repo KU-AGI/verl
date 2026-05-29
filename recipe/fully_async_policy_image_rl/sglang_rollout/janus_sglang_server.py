@@ -55,7 +55,7 @@ def _vendored_sglang_python_path() -> str | None:
     return str(sglang_python) if sglang_python.exists() else None
 
 
-_ensure_vendored_sglang_path()
+# _ensure_vendored_sglang_path()
 
 from sglang.srt.configs.janus_pro import VLChatProcessor  # noqa: E402
 from verl.workers.rollout.utils import get_free_port  # noqa: E402
@@ -212,9 +212,6 @@ class JanusSGLangAsyncServer:
 
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = os.environ["CUDA_VISIBLE_DEVICES"]
-        vendored_sglang_python = _vendored_sglang_python_path()
-        if vendored_sglang_python is not None:
-            env["PYTHONPATH"] = f"{vendored_sglang_python}:{env.get('PYTHONPATH', '')}"
         env["SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK"] = "1"
         env.setdefault("CUDA_HOME", "/data/anaconda3/envs/sglang_diffusion")
 

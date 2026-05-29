@@ -75,7 +75,7 @@ class JanusSGLangReplica(RolloutReplica):
                 runtime_env={
                     "env_vars": {
                         "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
-                        "PYTHONPATH": f"/verl/sglang/python:{os.environ.get('PYTHONPATH', '')}",
+                        "PYTHONPATH": f"sglang/python:{os.environ.get('PYTHONPATH', '')}",
                         "SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK": "1",
                     }
                 },

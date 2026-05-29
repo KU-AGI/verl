@@ -128,7 +128,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         # the same background dump submission helpers.
         self._rollout_dump_executor = None
         self._rollout_dump_futures = []
-        self._rollout_dump_workers = int(self.config.trainer.get("rollout_dump_workers", 1) or 0)
+        self._rollout_dump_workers = int(self.config.trainer.get("rollout_dump_workers", 8) or 0)
         self._rollout_dump_max_pending = int(
             self.config.trainer.get("rollout_dump_max_pending", max(2, 2 * max(self._rollout_dump_workers, 1))) or 0
         )
