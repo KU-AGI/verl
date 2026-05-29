@@ -1199,13 +1199,14 @@ class SchedulerOutputProcessorMixin:
                         indexer_topk = []
                     indexer_topk.append(req.indexer_topk)
 
-                if req.customized_info is not None:
-                    for k, v in req.customized_info.items():
-                        if k not in customized_info:
-                            customized_info[k] = []
-                        customized_info[k].append(
-                            v[send_token_offset : len(output_ids_)]
-                        )
+                req_customized_info = req.customized_info or {}
+                for k in list(customized_info.keys()):
+                    if k not in req_customized_info:
+                        customized_info[k].append(None)
+                for k, v in req_customized_info.items():
+                    if k not in customized_info:
+                        customized_info[k] = [None] * (len(rids) - 1)
+                    customized_info[k].append(v[send_token_offset : len(output_ids_)])
 
             if (
                 req.finished()

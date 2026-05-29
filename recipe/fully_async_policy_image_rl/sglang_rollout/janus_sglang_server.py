@@ -121,7 +121,6 @@ class JanusSGLangAsyncServer:
         self.processor = None
         self.tokenizer = None
         self.formatter_v3 = FormattingEvaluatorV3()
-        self.is_validate = False
 
     def get_master_address(self):
         return self._master_address, self._master_port
@@ -380,23 +379,29 @@ class JanusSGLangAsyncServer:
     async def _post_json(self, path: str, payload: dict[str, Any]):
         return await asyncio.to_thread(self._post_json_sync, self._server_url(path), payload)
 
-    def _set_generation_config(self, prompt: DataProto):
-        self.is_validate = bool(prompt.meta_info.get("validate", False))
-        if self.is_validate:
+    def _get_generation_config(self, prompt: DataProto) -> dict[str, Any]:
+        is_validate = bool(prompt.meta_info.get("validate", False))
+        if is_validate:
             val_kwargs = self.config.val_kwargs
-            self.cfg_weight = getattr(val_kwargs, "val_cfg_weight", 5.0)
-            self.temperature = getattr(val_kwargs, "val_temperature", 1.0)
-            self.txt_top_k = getattr(val_kwargs, "val_txt_top_k", 50)
-            self.txt_top_p = getattr(val_kwargs, "val_txt_top_p", 1.0)
-            self.img_top_k = getattr(val_kwargs, "val_img_top_k", 4096)
-            self.img_top_p = getattr(val_kwargs, "val_img_top_p", 1.0)
+            return {
+                "is_validate": True,
+                "cfg_weight": getattr(val_kwargs, "val_cfg_weight", 5.0),
+                "temperature": getattr(val_kwargs, "val_temperature", 1.0),
+                "txt_top_k": getattr(val_kwargs, "val_txt_top_k", 50),
+                "txt_top_p": getattr(val_kwargs, "val_txt_top_p", 1.0),
+                "img_top_k": getattr(val_kwargs, "val_img_top_k", 4096),
+                "img_top_p": getattr(val_kwargs, "val_img_top_p", 1.0),
+            }
         else:
-            self.cfg_weight = getattr(self.config, "cfg_weight", 5.0)
-            self.temperature = getattr(self.config, "temperature", 1.0)
-            self.txt_top_k = getattr(self.config, "txt_top_k", 50)
-            self.txt_top_p = getattr(self.config, "txt_top_p", 1.0)
-            self.img_top_k = getattr(self.config, "img_top_k", 4096)
-            self.img_top_p = getattr(self.config, "img_top_p", 1.0)
+            return {
+                "is_validate": False,
+                "cfg_weight": getattr(self.config, "cfg_weight", 5.0),
+                "temperature": getattr(self.config, "temperature", 1.0),
+                "txt_top_k": getattr(self.config, "txt_top_k", 50),
+                "txt_top_p": getattr(self.config, "txt_top_p", 1.0),
+                "img_top_k": getattr(self.config, "img_top_k", 4096),
+                "img_top_p": getattr(self.config, "img_top_p", 1.0),
+            }
 
     def _get_sft_format(self, prompt: str, system_prompt: str = "") -> str:
         formatted_system = (
@@ -561,7 +566,7 @@ class JanusSGLangAsyncServer:
                 out[i, : len(value)] = torch.tensor(value, dtype=dtype)
         return out
 
-    async def _generate_task1(self, data_proto: DataProto) -> DataProto:
+    async def _generate_task1(self, data_proto: DataProto, gen_config: dict[str, Any]) -> DataProto:
         prompts = self._as_str_list(data_proto.non_tensor_batch["prompt"])
         input_ids, attention_mask = self._tokenize_left([self._get_sft_format(prompt) for prompt in prompts])
         data_proto.batch["task1_input_ids"] = input_ids.cpu()
@@ -572,12 +577,12 @@ class JanusSGLangAsyncServer:
                 "/janus/generate_image",
                 {
                     "prompt": prompt,
-                    "cfg_weight": float(self.cfg_weight),
-                    "temperature": float(self.temperature),
-                    "top_p": float(self.img_top_p),
-                    "top_k": self._sglang_top_k(self.img_top_k),
+                    "cfg_weight": float(gen_config["cfg_weight"]),
+                    "temperature": float(gen_config["temperature"]),
+                    "top_p": float(gen_config["img_top_p"]),
+                    "top_k": self._sglang_top_k(gen_config["img_top_k"]),
                     "n": 1,
-                    "return_logprob": not self.is_validate,
+                    "return_logprob": not gen_config["is_validate"],
                 },
             )
 
@@ -597,7 +602,7 @@ class JanusSGLangAsyncServer:
         data_proto.batch["task1_response_mask"] = torch.ones_like(image_tokens, dtype=torch.long).cpu()
         data_proto.batch["current_imgs_pixel_values"] = pixel_values.cpu().clone()
         data_proto.batch["current_img_tokens"] = image_tokens.cpu().clone()
-        if not self.is_validate:
+        if not gen_config["is_validate"]:
             logprobs = [
                 self._extract_token_logprobs(info.get("image_token_logprobs"), tokens)
                 for info, tokens in zip(image_infos, token_lists)
@@ -605,7 +610,7 @@ class JanusSGLangAsyncServer:
             data_proto.batch["task1_rollout_log_probs"] = self._stack_2d(logprobs, pad_value=0, dtype=torch.float32)
         return data_proto
 
-    async def _generate_task2(self, data_proto: DataProto) -> DataProto:
+    async def _generate_task2(self, data_proto: DataProto, gen_config: dict[str, Any]) -> DataProto:
         prompts = self._as_str_list(data_proto.non_tensor_batch["prompt"])
         training_texts = [self._task2_training_text(prompt) for prompt in prompts]
         input_ids, _ = self._tokenize_left(training_texts)
@@ -631,12 +636,12 @@ class JanusSGLangAsyncServer:
                     "image_data": image_uri,
                     "sampling_params": {
                         "max_new_tokens": int(self.response_length),
-                        "temperature": float(self.temperature),
-                        "top_p": float(self.txt_top_p),
-                        "top_k": self._sglang_top_k(self.txt_top_k),
+                        "temperature": float(gen_config["temperature"]),
+                        "top_p": float(gen_config["txt_top_p"]),
+                        "top_k": self._sglang_top_k(gen_config["txt_top_k"]),
                         "skip_special_tokens": True,
                     },
-                    "return_logprob": not self.is_validate,
+                    "return_logprob": not gen_config["is_validate"],
                 },
             )
 
@@ -654,7 +659,7 @@ class JanusSGLangAsyncServer:
             token_ids = [int(x) for x in token_ids]
             feedback_texts.append(text)
             token_lists.append(token_ids)
-            if not self.is_validate:
+            if not gen_config["is_validate"]:
                 raw_logprobs = (output.get("meta_info") or {}).get("output_token_logprobs")
                 logprob_lists.append(self._extract_token_logprobs(raw_logprobs, token_ids))
 
@@ -665,14 +670,14 @@ class JanusSGLangAsyncServer:
         data_proto.batch["task2_feedback_ids"] = feedback_ids.cpu()
         data_proto.batch["task2_response_mask"] = response_mask.cpu()
         data_proto.batch["task2_segment_mask"] = segment_mask.cpu()
-        if not self.is_validate:
+        if not gen_config["is_validate"]:
             log_probs = self._stack_2d(logprob_lists, pad_value=0, dtype=torch.float32)
             if log_probs.size(1) < response_mask.size(1):
                 log_probs = self._pad_tensor_right(log_probs, response_mask.size(1), 0)
             data_proto.batch["task2_rollout_log_probs"] = log_probs[:, : response_mask.size(1)].masked_fill(response_mask == 0, 0.0).cpu()
         return data_proto
 
-    async def _generate_task3(self, data_proto: DataProto) -> DataProto:
+    async def _generate_task3(self, data_proto: DataProto, gen_config: dict[str, Any]) -> DataProto:
         prompts = self._as_str_list(data_proto.non_tensor_batch["prompt"])
         current_pixels = data_proto.batch.get("current_imgs_pixel_values", None)
         if current_pixels is None or len(current_pixels) == 0:
@@ -709,12 +714,12 @@ class JanusSGLangAsyncServer:
                     "input_prompt": prompt,
                     "feedback": feedback or "No need to generate feedback.",
                     "input_image_token_ids": image_tokens,
-                    "cfg_weight": float(self.cfg_weight),
-                    "temperature": float(self.temperature),
-                    "top_p": float(self.img_top_p),
-                    "top_k": self._sglang_top_k(self.img_top_k),
+                    "cfg_weight": float(gen_config["cfg_weight"]),
+                    "temperature": float(gen_config["temperature"]),
+                    "top_p": float(gen_config["img_top_p"]),
+                    "top_k": self._sglang_top_k(gen_config["img_top_k"]),
                     "n": 1,
-                    "return_logprob": not self.is_validate,
+                    "return_logprob": not gen_config["is_validate"],
                 },
             )
 
@@ -739,7 +744,7 @@ class JanusSGLangAsyncServer:
         data_proto.batch["task3_response_mask"] = torch.ones_like(regen_tokens, dtype=torch.long).cpu()
         data_proto.batch["current_imgs_pixel_values"] = regen_pixels.cpu().clone()
         data_proto.batch["current_img_tokens"] = regen_tokens.cpu().clone()
-        if not self.is_validate:
+        if not gen_config["is_validate"]:
             logprobs = [
                 self._extract_token_logprobs(info.get("image_token_logprobs"), tokens)
                 for info, tokens in zip(image_infos, regen_token_lists)
@@ -757,14 +762,14 @@ class JanusSGLangAsyncServer:
             self.ongoing_generations += 1
         try:
             prompt_data.meta_info.update(sampling_params)
-            self._set_generation_config(prompt_data)
+            gen_config = self._get_generation_config(prompt_data)
             prompt_data.meta_info.update(
-                temperature=self.temperature,
-                cfg_weight=self.cfg_weight,
-                txt_top_k=self.txt_top_k,
-                txt_top_p=self.txt_top_p,
-                img_top_k=self.img_top_k,
-                img_top_p=self.img_top_p,
+                temperature=gen_config["temperature"],
+                cfg_weight=gen_config["cfg_weight"],
+                txt_top_k=gen_config["txt_top_k"],
+                txt_top_p=gen_config["txt_top_p"],
+                img_top_k=gen_config["img_top_k"],
+                img_top_p=gen_config["img_top_p"],
             )
             task_funcs = {
                 1: self._generate_task1,
@@ -782,7 +787,7 @@ class JanusSGLangAsyncServer:
             gen_start = time.perf_counter()
             for func in selected:
                 if func is not None:
-                    prompt_data = await func(prompt_data)
+                    prompt_data = await func(prompt_data, gen_config)
             elapsed = time.perf_counter() - gen_start
             prompt_data.meta_info.setdefault("metrics", {})["generate_sequences"] = [elapsed] * len(prompt_data)
             return self._apply_padding_to_dataproto(prompt_data)
