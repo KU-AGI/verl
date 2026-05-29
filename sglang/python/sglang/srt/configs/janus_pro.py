@@ -154,7 +154,7 @@ class MultiModalityConfig(PretrainedConfig):
             self.language_config = language_config
         else:
             self.language_config = LlamaConfig(**language_config)
-        if bool(kwargs.get("tie_word_embeddings", getattr(self, "tie_word_embeddings", False))):
+        if "tie_word_embeddings" in kwargs and bool(kwargs["tie_word_embeddings"]):
             self.language_config.tie_word_embeddings = True
 
 
