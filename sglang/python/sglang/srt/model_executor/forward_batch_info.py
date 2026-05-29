@@ -451,6 +451,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     janus_image_patch_sizes: Optional[List[int]] = None
     janus_input_image_token_ids: Optional[List[Optional[List[int]]]] = None
     janus_input_image_placeholder_ids: Optional[List[Optional[int]]] = None
+    janus_input_image_placeholder_starts: Optional[List[Optional[int]]] = None
+    janus_input_image_placeholder_lens: Optional[List[Optional[int]]] = None
 
     @classmethod
     def init_new(
@@ -526,6 +528,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         janus_image_patch_sizes = []
         janus_input_image_token_ids = []
         janus_input_image_placeholder_ids = []
+        janus_input_image_placeholder_starts = []
+        janus_input_image_placeholder_lens = []
         for req in batch.reqs:
             custom_params = getattr(req.sampling_params, "custom_params", None) or {}
             enabled = bool(custom_params.get("janus_image_generation", False))
@@ -549,6 +553,16 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             janus_input_image_placeholder_ids.append(
                 None if placeholder_id is None else int(placeholder_id)
             )
+            placeholder_start = custom_params.get(
+                "janus_input_image_placeholder_start"
+            )
+            janus_input_image_placeholder_starts.append(
+                None if placeholder_start is None else int(placeholder_start)
+            )
+            placeholder_len = custom_params.get("janus_input_image_placeholder_len")
+            janus_input_image_placeholder_lens.append(
+                None if placeholder_len is None else int(placeholder_len)
+            )
 
         if any(janus_image_generation):
             ret.janus_image_generation = janus_image_generation
@@ -560,6 +574,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ret.janus_image_patch_sizes = janus_image_patch_sizes
             ret.janus_input_image_token_ids = janus_input_image_token_ids
             ret.janus_input_image_placeholder_ids = janus_input_image_placeholder_ids
+            ret.janus_input_image_placeholder_starts = (
+                janus_input_image_placeholder_starts
+            )
+            ret.janus_input_image_placeholder_lens = janus_input_image_placeholder_lens
 
         # For MLP sync
         if batch.global_num_tokens is not None:

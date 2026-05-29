@@ -920,6 +920,7 @@ async def janus_generate_image_request(request: Request):
 
     prompt_ids = janus_tokenizer.encode(prompt_text)
     image_placeholder_id = int(processor.image_id)
+    source_placeholder_start = None
     if source_image_token_batches is not None:
         if not tokenizer_manager.server_args.disable_radix_cache:
             return _create_error_response(
@@ -935,6 +936,7 @@ async def janus_generate_image_request(request: Request):
         placeholder_count = 0
         for token_id in prompt_ids:
             if token_id == image_placeholder_id:
+                source_placeholder_start = len(expanded_prompt_ids)
                 expanded_prompt_ids.extend([image_placeholder_id] * image_token_num)
                 placeholder_count += 1
             else:
@@ -1007,6 +1009,10 @@ async def janus_generate_image_request(request: Request):
             if image_token_batch is not None:
                 custom_params["janus_input_image_token_ids"] = image_token_batch
                 custom_params["janus_input_image_placeholder_id"] = image_placeholder_id
+                custom_params["janus_input_image_placeholder_start"] = (
+                    source_placeholder_start
+                )
+                custom_params["janus_input_image_placeholder_len"] = image_token_num
             batch_sampling_params.append(
                 {
                     "max_new_tokens": image_token_num,

@@ -2029,6 +2029,12 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
         placeholder_ids = getattr(
             forward_batch, "janus_input_image_placeholder_ids", None
         )
+        placeholder_starts = getattr(
+            forward_batch, "janus_input_image_placeholder_starts", None
+        )
+        placeholder_lens = getattr(
+            forward_batch, "janus_input_image_placeholder_lens", None
+        )
         if (
             forward_batch.forward_mode.is_decode()
             or image_token_lists is None
@@ -2039,6 +2045,14 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
         if forward_batch.extend_seq_lens_cpu is None:
             raise RuntimeError(
                 "Janus input-image conditioning requires extend sequence lengths."
+            )
+        if (
+            placeholder_starts is not None
+            and any(start is not None for start in placeholder_starts)
+            and forward_batch.extend_prefix_lens_cpu is None
+        ):
+            raise RuntimeError(
+                "Janus input-image conditioning requires extend prefix lengths."
             )
 
         offset = 0
@@ -2054,6 +2068,52 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
                 )
 
             row_input_ids = input_ids[offset : offset + seq_len]
+            placeholder_start = (
+                None
+                if placeholder_starts is None
+                else placeholder_starts[batch_idx]
+            )
+            placeholder_len = (
+                None if placeholder_lens is None else placeholder_lens[batch_idx]
+            )
+            if placeholder_start is not None and placeholder_len is not None:
+                chunk_start = forward_batch.extend_prefix_lens_cpu[batch_idx]
+                chunk_end = chunk_start + seq_len
+                placeholder_end = placeholder_start + placeholder_len
+                overlap_start = max(chunk_start, placeholder_start)
+                overlap_end = min(chunk_end, placeholder_end)
+
+                if overlap_start >= overlap_end:
+                    offset += seq_len
+                    continue
+
+                local_start = overlap_start - chunk_start
+                local_end = overlap_end - chunk_start
+                image_start = overlap_start - placeholder_start
+                image_end = overlap_end - placeholder_start
+                row_placeholder_ids = row_input_ids[local_start:local_end]
+                if not torch.all(row_placeholder_ids == placeholder_id):
+                    found = (row_placeholder_ids == placeholder_id).sum().item()
+                    raise RuntimeError(
+                        "Janus input-image conditioning expected "
+                        f"{local_end - local_start} placeholder tokens in the "
+                        f"current chunk overlap, found {found}."
+                    )
+
+                image_ids = torch.tensor(
+                    image_token_ids[image_start:image_end],
+                    dtype=torch.long,
+                    device=input_ids.device,
+                )
+                image_embeds = self.prepare_gen_img_embeds(image_ids).to(
+                    dtype=input_embeds.dtype
+                )
+                input_embeds[
+                    offset + local_start : offset + local_end
+                ] = image_embeds
+                offset += seq_len
+                continue
+
             placeholder_positions = (
                 row_input_ids == placeholder_id
             ).nonzero(as_tuple=False).flatten()
