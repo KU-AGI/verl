@@ -38,6 +38,23 @@ def _ensure_vendored_sglang_path() -> None:
         os.environ["PYTHONPATH"] = f"{path}:{os.environ.get('PYTHONPATH', '')}"
 
 
+def _resolve_sglang_python() -> str:
+    env_python = os.environ.get("JANUS_SGLANG_PYTHON")
+    if env_python:
+        return env_python
+    if sys.executable and os.path.exists(sys.executable):
+        return sys.executable
+    fallback = "/data/anaconda3/envs/sglang_diffusion/bin/python"
+    if os.path.exists(fallback):
+        return fallback
+    return "python"
+
+
+def _vendored_sglang_python_path() -> str | None:
+    sglang_python = Path(__file__).resolve().parents[3] / "sglang" / "python"
+    return str(sglang_python) if sglang_python.exists() else None
+
+
 _ensure_vendored_sglang_path()
 
 from sglang.srt.configs.janus_pro import VLChatProcessor  # noqa: E402
@@ -143,7 +160,7 @@ class JanusSGLangAsyncServer:
         self._server_port, server_sock = get_free_port(self._server_address)
         server_sock.close()
 
-        sglang_python = os.environ.get("JANUS_SGLANG_PYTHON", "/data/anaconda3/envs/sglang_diffusion/bin/python")
+        sglang_python = _resolve_sglang_python()
         cmd = [
             sglang_python,
             "-m",
@@ -195,7 +212,9 @@ class JanusSGLangAsyncServer:
 
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = os.environ["CUDA_VISIBLE_DEVICES"]
-        env["PYTHONPATH"] = f"/verl/sglang/python:{env.get('PYTHONPATH', '')}"
+        vendored_sglang_python = _vendored_sglang_python_path()
+        if vendored_sglang_python is not None:
+            env["PYTHONPATH"] = f"{vendored_sglang_python}:{env.get('PYTHONPATH', '')}"
         env["SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK"] = "1"
         env.setdefault("CUDA_HOME", "/data/anaconda3/envs/sglang_diffusion")
 
