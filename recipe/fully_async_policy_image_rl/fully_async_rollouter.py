@@ -853,8 +853,16 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             sid = await self.server_token_q.get()
 
             # 5) Create generation task (NO pause gate here)
+            staleness_batch_size = (
+                0 if sample_from_cancel_queue or sample_from_retry_queue else batch_size
+            )
             task = asyncio.create_task(
-                self._process_single_sample_streaming(rollout_sample, finalize_budget=batch_size, server_index=sid),
+                self._process_single_sample_streaming(
+                    rollout_sample,
+                    finalize_budget=batch_size,
+                    server_index=sid,
+                    staleness_batch_size=staleness_batch_size,
+                ),
                 name=getattr(rollout_sample, "sample_id", None) or "rollout_sample",
             )
             async with self.lock:
@@ -994,7 +1002,13 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             return candidate
         raise RuntimeError("[Rollouter] generate_sequences returned empty task_batches dict")
 
-    async def _process_single_sample_streaming(self, rollout_sample: RolloutSample, finalize_budget: int, server_index: int):
+    async def _process_single_sample_streaming(
+        self,
+        rollout_sample: RolloutSample,
+        finalize_budget: int,
+        server_index: int,
+        staleness_batch_size: int,
+    ):
         batch_size = len(rollout_sample.full_batch)
         active_released = False
         enqueued_to_finalize = False
@@ -1085,7 +1099,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                     used_version,
                     finalize_budget,
                     rollout_duration,
-                    batch_size,
+                    staleness_batch_size,
                     deferred_finalize_context,
                 )
             )
@@ -1104,6 +1118,10 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                 await self._release_finalize_budget(finalize_budget)
 
             async with self.lock:
+                if not enqueued_to_finalize and staleness_batch_size > 0:
+                    self.staleness_samples -= staleness_batch_size
+                    if self.paused:
+                        self.condition.notify_all()
                 if not active_released:
                     self.active_sample_count -= batch_size
                 self.active_tasks.discard(asyncio.current_task())

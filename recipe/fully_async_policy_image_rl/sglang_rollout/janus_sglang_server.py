@@ -285,17 +285,15 @@ class JanusSGLangAsyncServer:
         async with self.weight_update_lock:
             if self.applied_version >= self.latest_available_version:
                 return self.applied_version
-            target_v = self.latest_available_version
 
-        async with self.weight_update_lock:
-            if self.applied_version >= target_v:
-                return self.applied_version
         while True:
             async with self.weight_update_lock:
                 if self.ongoing_generations == 0:
                     break
             await asyncio.sleep(0.05)
+
         async with self.weight_update_lock:
+            target_v = self.latest_available_version
             if self.applied_version >= target_v:
                 return self.applied_version
             await self._apply_weights_from_shm(target_v)

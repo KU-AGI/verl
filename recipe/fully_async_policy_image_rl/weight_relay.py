@@ -210,20 +210,7 @@ class WeightRelayActor:
             torch.save(weights_tensor, tmp_pt)
             os.replace(tmp_pt, file_path)
 
-            # 3. 이전 버전 파일 정리 (Rank 0 노드 관리용)
-            try:
-                for f in glob.glob("/dev/shm/weights_v*.pt"):
-                    base = os.path.basename(f)
-                    if (base.startswith("weights_v")
-                        and base.endswith(".pt")
-                        and base.count(".") == 1 
-                        and os.path.abspath(f) != os.path.abspath(file_path)):
-                        try:
-                            os.remove(f)
-                        except:
-                            pass
-            except:
-                pass
+            self._cleanup_old_weights(file_path)
 
             t_save = time.time() - t_save0
             t_total = time.time() - t_total0
@@ -286,21 +273,7 @@ class WeightRelayActor:
         except:
             pass
 
-        # Cleanup older versions (.pt only; keep behavior)
-        try:
-            for f in glob.glob("/dev/shm/weights_v*.pt"):
-                # weights_v{number}.pt 만 지우기 (tmp, suffix 붙은 것 제외)
-                base = os.path.basename(f)
-                if (base.startswith("weights_v")
-                    and base.endswith(".pt")
-                    and base.count(".") == 1   # weights_v15.pt 처럼 점이 1개인 것만
-                    and os.path.abspath(f) != os.path.abspath(file_path)):
-                    try:
-                        os.remove(f)
-                    except:
-                        pass
-        except:
-            pass
+        self._cleanup_old_weights(file_path)
         print("EXPORT ROLLOUT WEIGHT Done")
         t_save = time.time() - t_save0
         t_total = time.time() - t_total0
@@ -487,18 +460,35 @@ class WeightRelayActor:
             "skip_write": False,
         }
 
-    def _cleanup_old_weights(self, keep_path: str):
-        """Remove older weight .pt files from /dev/shm, keeping only keep_path."""
+    def _cleanup_old_weights(self, keep_path: str, keep_recent: int = 4):
+        """Remove old /dev/shm weight files while retaining recent versions."""
         try:
+            parsed = []
             for f in glob.glob("/dev/shm/weights_v*.pt"):
                 base = os.path.basename(f)
-                if (base.startswith("weights_v")
+                if not (
+                    base.startswith("weights_v")
                     and base.endswith(".pt")
                     and base.count(".") == 1
-                    and os.path.abspath(f) != os.path.abspath(keep_path)):
-                    try:
-                        os.remove(f)
-                    except Exception:
-                        pass
+                ):
+                    continue
+                version_text = base[len("weights_v") : -len(".pt")]
+                try:
+                    version = int(version_text)
+                except ValueError:
+                    continue
+                parsed.append((version, os.path.abspath(f)))
+
+            keep = {os.path.abspath(keep_path)}
+            for _, path in sorted(parsed, reverse=True)[:keep_recent]:
+                keep.add(path)
+
+            for _, path in parsed:
+                if path in keep:
+                    continue
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
         except Exception:
             pass
