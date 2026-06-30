@@ -197,6 +197,8 @@ class ReplayBuffer:
             buf = self.buffers[task_id]
             if not buf:
                 return None
+            if sum(len(e.data) for e in buf) < n_samples:
+                return None
 
             indices = list(range(len(buf)))
             random.shuffle(indices)
@@ -208,7 +210,7 @@ class ReplayBuffer:
                 selected_indices.append(idx)
                 collected += len(buf[idx].data)
 
-            if not selected_indices:
+            if not selected_indices or collected < n_samples:
                 return None
 
             for idx in selected_indices:
@@ -303,6 +305,70 @@ class ReplayBuffer:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def state_dict(self) -> dict:
+        """Return a pickle-friendly snapshot of the replay buffer."""
+        with self._lock:
+            return {
+                "task_ids": list(self.task_ids),
+                "score_thresholds": dict(self.score_thresholds),
+                "std_thresholds": dict(self.std_thresholds),
+                "max_size_per_task": self.max_size_per_task,
+                "max_version_gap": self.max_version_gap,
+                "max_use_count": self.max_use_count,
+                "filter_mode": self.filter_mode,
+                "reward_history_size": self.reward_history_size,
+                "max_quantile": self.max_quantile,
+                "std_quantile": self.std_quantile,
+                "buffers": {tid: list(buf) for tid, buf in self.buffers.items()},
+                "max_reward_history": {
+                    tid: list(hist) for tid, hist in self.max_reward_history.items()
+                },
+                "std_history": {
+                    tid: list(hist) for tid, hist in self.std_history.items()
+                },
+            }
+
+    def load_state_dict(self, state: dict):
+        """Restore replay buffer contents from ``state_dict`` output."""
+        with self._lock:
+            self.task_ids = [int(tid) for tid in state.get("task_ids", self.task_ids)]
+            self.score_thresholds = {
+                int(k): float(v) for k, v in state.get("score_thresholds", self.score_thresholds).items()
+            }
+            self.std_thresholds = {
+                int(k): float(v) for k, v in state.get("std_thresholds", self.std_thresholds).items()
+            }
+            self.max_size_per_task = state.get("max_size_per_task", self.max_size_per_task)
+            self.max_version_gap = state.get("max_version_gap", self.max_version_gap)
+            self.max_use_count = state.get("max_use_count", self.max_use_count)
+            self.filter_mode = state.get("filter_mode", self.filter_mode)
+            self.reward_history_size = state.get("reward_history_size", self.reward_history_size)
+            self.max_quantile = state.get("max_quantile", self.max_quantile)
+            self.std_quantile = state.get("std_quantile", self.std_quantile)
+
+            raw_buffers = state.get("buffers", {})
+            self.buffers = {
+                tid: list(raw_buffers.get(tid, raw_buffers.get(str(tid), [])))
+                for tid in self.task_ids
+            }
+
+            raw_max_hist = state.get("max_reward_history", {})
+            raw_std_hist = state.get("std_history", {})
+            self.max_reward_history = {
+                tid: deque(
+                    raw_max_hist.get(tid, raw_max_hist.get(str(tid), [])),
+                    maxlen=self.reward_history_size,
+                )
+                for tid in self.task_ids
+            }
+            self.std_history = {
+                tid: deque(
+                    raw_std_hist.get(tid, raw_std_hist.get(str(tid), [])),
+                    maxlen=self.reward_history_size,
+                )
+                for tid in self.task_ids
+            }
+
     def _enforce_capacity(self, task_id: int):
         buf = self.buffers[task_id]
         if len(buf) <= self.max_size_per_task:
@@ -321,8 +387,14 @@ class ReplayBuffer:
     # Size / stats helpers
     # ------------------------------------------------------------------
 
-    def task_size(self, task_id: int) -> int:
+    def task_size(self, task_id: int, current_version: int = -1) -> int:
         with self._lock:
+            if self.max_version_gap >= 0 and current_version >= 0:
+                return sum(
+                    len(e.data)
+                    for e in self.buffers[task_id]
+                    if current_version - e.param_version <= self.max_version_gap
+                )
             return sum(len(e.data) for e in self.buffers[task_id])
 
     def total_size(self) -> int:

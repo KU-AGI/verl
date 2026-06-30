@@ -36,3 +36,36 @@ class AdaptiveEntropyCoefficient:
         # compute psi based on clipped alpha
         self.psi.data = torch.asinh(self.get_alpha())
         return loss.item()
+
+    def state_dict(self):
+        def to_cpu(value):
+            if isinstance(value, torch.Tensor):
+                return value.detach().cpu()
+            if isinstance(value, dict):
+                return {k: to_cpu(v) for k, v in value.items()}
+            if isinstance(value, list):
+                return [to_cpu(v) for v in value]
+            if isinstance(value, tuple):
+                return tuple(to_cpu(v) for v in value)
+            return value
+
+        return {
+            "psi": self.psi.detach().cpu(),
+            "optimizer": to_cpu(self.opt.state_dict()),
+            "target_entropy": self.target_entropy,
+            "max_coeff": self.max_coeff,
+            "min_coeff": self.min_coeff,
+        }
+
+    def load_state_dict(self, state):
+        device = self.psi.device
+        self.psi.data.copy_(state["psi"].to(device))
+        self.target_entropy = state.get("target_entropy", self.target_entropy)
+        self.max_coeff = state.get("max_coeff", self.max_coeff)
+        self.min_coeff = state.get("min_coeff", self.min_coeff)
+        if "optimizer" in state:
+            self.opt.load_state_dict(state["optimizer"])
+            for optim_state in self.opt.state.values():
+                for key, value in optim_state.items():
+                    if isinstance(value, torch.Tensor):
+                        optim_state[key] = value.to(device)

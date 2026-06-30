@@ -14,7 +14,7 @@ exec 2>&1
 #                         EXPERIMENT CONFIGURATION
 ###############################################################################
 project_name='mllm_reasoning'
-exp_name="0320_our_model_our_dataset_total_step_fine_grained_reward_replay_buffer_v4_rollout_IS"
+exp_name="0609_nipa_neurips_ablation_qwen35_4b"
 # exp_name='testest'
 task_ids='[1,2,3]'
 
@@ -54,13 +54,13 @@ MODEL_PATH="/data/mllm/ckpt/step=014000.ckpt/hf_model"
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
 
 # Dataset Paths
-TRAIN_FILES=/data/mllm/data/train_wo_focusdiff_v2.parquet
-VAL_FILES='[/data/mllm/data/val_wo_focusdiff_v2.parquet,/data/mllm/data/train_subset_24_wo_focusdiff_v2.parquet]'
+TRAIN_FILES='[/data/mllm/data/v5/train_filtered_wo_focusdiff_aug_v5.parquet,/data/mllm/data/v5/train_sft_data_v5.parquet,/data/mllm/data/v5/train_ospo_v5.parquet]'
+VAL_FILES='[/data/mllm/data/v5/val_v5.parquet,/data/mllm/data/v5/val_benchmark_v5.parquet,/data/mllm/data/v5/longalign_conpair_v5.parquet]'
 # TRAIN_FILES='/data/users/pimang62/verl_image_rl/data/train_reasongen.parquet'
 # VAL_FILES=["/data/users/pimang62/verl_image_rl/data/val_reasongen_16.parquet","/data/users/pimang62/verl_image_rl/data/val_reasongen.parquet"]
 
 # Reward Model Paths
-rm_vlm_model_path="Qwen/Qwen3.5-35B-A3B"
+rm_vlm_model_path="Qwen3.5-4B"
 rm_llm_model_path="Qwen/Qwen3-30B-A3B-Instruct-2507"
 
 ###############################################################################
@@ -93,12 +93,18 @@ rollout_mode=async
 use_kl_in_reward=False
 kl_coef=0.0
 use_kl_loss=False
-kl_loss_coef=0.001
+kl_loss_coef=0.0
 
 # PPO Clipping
 clip_ratio_low=0.2
-clip_ratio_high=0.2
+clip_ratio_high=0.28
 entropy_coeff=0.0
+
+# Adaptive Entropy Coefficient (per-task)
+adaptive_entropy_coeff_enable=True
+adaptive_entropy_coeff_task1_target_entropy=5.0
+adaptive_entropy_coeff_task2_target_entropy=0.3
+adaptive_entropy_coeff_task3_target_entropy=5.0
 
 # Group Filtering
 enable_filter_groups=True
@@ -108,7 +114,7 @@ norm_adv_by_std_in_grpo=True
 ###############################################################################
 #                          SEQUENCE LENGTH SETTINGS
 ###############################################################################
-max_prompt_length=1000
+max_prompt_length=1576
 max_response_length=2800
 
 # Overlong Buffer Configuration
@@ -120,15 +126,15 @@ overlong_penalty_factor=1.0
 #                          SAMPLING PARAMETERS
 ###############################################################################
 # Training Sampling
-cfg_weight=1.0
-temperature=1.1
+cfg_weight=2.0
+temperature=1.0
 txt_top_k=0   # 0 for no top_k filtering
 txt_top_p=1.0
 img_top_k=0   # 0 for no top_k filtering
 img_top_p=1.0
 
 # Validation Sampling
-val_cfg_weight=1.0
+val_cfg_weight=5.0
 val_temperature=1.0
 val_txt_top_k=0
 val_txt_top_p=1.0
@@ -141,8 +147,8 @@ val_img_top_p=1.0
 # Prompt Batch Sizes
 train_prompt_bsz=0            # not used in async mode
 gen_prompt_bsz=1              # streaming generation, set to 1
-train_prompt_mini_bsz=8
-rollout_prompt_size=2         # prompts per actor per batch (async mode)
+train_prompt_mini_bsz=16
+rollout_prompt_size=1         # prompts per actor per batch (async mode)
 val_rollout_prompt_size=16
 
 # Response & Micro Batch
@@ -161,7 +167,7 @@ loss_agg_mode="token-mean"
 ###############################################################################
 #                          OPTIMIZER SETTINGS
 ###############################################################################
-lr=5e-6
+lr=1e-6
 lr_scheduler_type=constant
 lr_warmup_steps=10
 weight_decay=0.01
@@ -181,13 +187,16 @@ max_regen_retries=3
 
 # Replay Buffer
 replay_buffer_enable=True
-replay_buffer_max_version_gap=-1
-replay_buffer_max_size_per_task=30
+replay_buffer_max_version_gap=4
+replay_buffer_max_size_per_task=64
 replay_buffer_max_use_count=-1
-replay_buffer_filter_mode=max_and_std  # "mean", "std", "max", or "max_and_std"
-replay_buffer_score_threshold_1=0.8
-replay_buffer_score_threshold_2=2.0 # 3점 만점
-replay_buffer_score_threshold_3=1.0 # 2점 만점
+replay_buffer_filter_mode=max_and_std_constant  # "mean", "std", "max", or "max_and_std"
+replay_buffer_score_threshold_1=1
+replay_buffer_score_threshold_2=2.5 # 3점 만점
+replay_buffer_score_threshold_3=1 # 2점 만점
+replay_buffer_score_std_threshold_1=0.1
+replay_buffer_score_std_threshold_2=0.1
+replay_buffer_score_std_threshold_3=0.1
 replay_buffer_reward_history_size=100
 replay_buffer_max_quantile=0.75
 replay_buffer_std_quantile=0.50
@@ -203,7 +212,7 @@ bypass_mode=false
 #                         TRAINING SCHEDULE
 ###############################################################################
 total_epochs=10
-test_freq=10
+test_freq=50
 save_freq=50
 rollout_freq=1
 # total_training_steps=3000
@@ -306,7 +315,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     actor_rollout_ref.ref.ulysses_sequence_parallel_size=${sp_size} \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
-    trainer.val_before_train=True \
+    trainer.val_before_train=False \
     trainer.balance_batch=False \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
@@ -343,6 +352,9 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     +async_training.replay_buffer.score_thresholds.1=${replay_buffer_score_threshold_1} \
     +async_training.replay_buffer.score_thresholds.2=${replay_buffer_score_threshold_2} \
     +async_training.replay_buffer.score_thresholds.3=${replay_buffer_score_threshold_3} \
+    +async_training.replay_buffer.score_std_thresholds.1=${replay_buffer_score_std_threshold_1} \
+    +async_training.replay_buffer.score_std_thresholds.2=${replay_buffer_score_std_threshold_2} \
+    +async_training.replay_buffer.score_std_thresholds.3=${replay_buffer_score_std_threshold_3} \
     async_training.replay_buffer.reward_history_size=${replay_buffer_reward_history_size} \
     async_training.replay_buffer.max_quantile=${replay_buffer_max_quantile} \
     async_training.replay_buffer.std_quantile=${replay_buffer_std_quantile} \
@@ -358,4 +370,8 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     +reward_model.reward_kwargs.rm_llm_model_path="${rm_llm_model_path}" \
     +actor_rollout_ref.actor.multi_task.enable=True \
     +actor_rollout_ref.actor.multi_task.task_ids="${task_ids}" \
-    +actor_rollout_ref.actor.multi_task.task_selection=weighted_sample \
+    +actor_rollout_ref.actor.multi_task.task_weights='[0.3,0.3,0.3]' \
+    actor_rollout_ref.actor.adaptive_entropy_coeff.enable=${adaptive_entropy_coeff_enable} \
+    actor_rollout_ref.actor.adaptive_entropy_coeff.task1.target_entropy=${adaptive_entropy_coeff_task1_target_entropy} \
+    actor_rollout_ref.actor.adaptive_entropy_coeff.task2.target_entropy=${adaptive_entropy_coeff_task2_target_entropy} \
+    actor_rollout_ref.actor.adaptive_entropy_coeff.task3.target_entropy=${adaptive_entropy_coeff_task3_target_entropy} \

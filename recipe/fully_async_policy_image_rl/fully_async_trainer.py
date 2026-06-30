@@ -255,7 +255,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
 
         while True:
             min_buf = min(
-                self.replay_buffer.task_size(tid)
+                self.replay_buffer.task_size(tid, self.current_param_version)
                 for tid in self._feeder_task_ids
             )
             if min_buf >= min_samples:
@@ -263,7 +263,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             if self._feeder_terminated:
                 # Feeder stopped — check once more
                 min_buf = min(
-                    self.replay_buffer.task_size(tid)
+                    self.replay_buffer.task_size(tid, self.current_param_version)
                     for tid in self._feeder_task_ids
                 )
                 return min_buf >= min_samples
@@ -492,10 +492,13 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                                     task_id, self.required_samples, self.current_param_version
                                 )
                             if task_batch is None:
-                                print(f"[FullyAsyncTrainer] task{task_id}: buffer empty after sample, skipping")
+                                print(
+                                    f"[FullyAsyncTrainer] task{task_id}: buffer has fewer than "
+                                    f"{self.required_samples} eligible rows after stale eviction; waiting"
+                                )
                                 continue
 
-                            buf_size = self.replay_buffer.task_size(task_id)
+                            buf_size = self.replay_buffer.task_size(task_id, self.current_param_version)
                             print(
                                 f"[FullyAsyncTrainer] Replay sample task{task_id}: "
                                 f"sampled={len(task_batch)}, buffer_remaining={buf_size}"
@@ -517,6 +520,17 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                                 task_reward_extra = {k: v for k, v in task_batch.meta_info.items()}
                                 task_rollout_dir = os.path.join(rollout_data_dir, f"task{task_id}")
                                 self._log_rollout_data(task_batch, task_reward_extra, task_timing, task_rollout_dir)
+
+                        sampled_sizes = {tid: len(batch) for tid, batch in task_batches.items()}
+                        if set(task_batches.keys()) != set(task_ids) or any(
+                            size != self.required_samples for size in sampled_sizes.values()
+                        ):
+                            print(
+                                "[FullyAsyncTrainer] Replay batch incomplete; skip training update. "
+                                f"required={self.required_samples}, sampled={sampled_sizes}",
+                                flush=True,
+                            )
+                            continue
                     else:
                         # ---- Non-replay path: collect from queue (original behavior) ----
                         epoch, batch = self._get_samples_from_queue()
@@ -717,12 +731,72 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                 max_ckpt_to_keep=max_critic_ckpt_to_keep,
             )
         ray.get(self.param_synchronizer.rollouter_save_checkpoint.remote(local_global_step_folder))
+        self._save_extra_training_state(local_global_step_folder)
         # latest checkpointed iteration tracker (for atomic usage)
         local_latest_checkpointed_iteration = os.path.join(
             self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt"
         )
         with open(local_latest_checkpointed_iteration, "w") as f:
             f.write(str(self.current_param_version))
+
+    def _extra_training_state_path(self, global_step_folder: str) -> str:
+        return os.path.join(global_step_folder, "trainer_extra_state.pt")
+
+    def _save_extra_training_state(self, global_step_folder: str):
+        os.makedirs(global_step_folder, exist_ok=True)
+        state = {
+            "current_param_version": self.current_param_version,
+            "global_steps": self.global_steps,
+            "replay_buffer": None,
+            "adaptive_entropy": None,
+        }
+
+        if self.use_replay_buffer:
+            state["replay_buffer"] = self.replay_buffer.state_dict()
+
+        if hasattr(self.actor_rollout_wg, "get_adaptive_entropy_state"):
+            try:
+                state["adaptive_entropy"] = self.actor_rollout_wg.get_adaptive_entropy_state()
+            except Exception as exc:
+                print(f"[FullyAsyncTrainer] Warning: failed to collect adaptive entropy state: {exc}")
+
+        path = self._extra_training_state_path(global_step_folder)
+        torch.save(state, path)
+        replay_rows = self.replay_buffer.total_size() if self.use_replay_buffer else 0
+        adaptive_ranks = len(state["adaptive_entropy"] or [])
+        print(
+            f"[FullyAsyncTrainer] Saved extra training state to {path} "
+            f"(replay_rows={replay_rows}, adaptive_entropy_ranks={adaptive_ranks})"
+        )
+
+    def _load_extra_training_state(self, global_step_folder: str):
+        path = self._extra_training_state_path(global_step_folder)
+        if not os.path.exists(path):
+            print(f"[FullyAsyncTrainer] Extra training state not found, skip: {path}")
+            return
+
+        try:
+            state = torch.load(path, map_location="cpu", weights_only=False)
+        except TypeError:
+            state = torch.load(path, map_location="cpu")
+
+        replay_state = state.get("replay_buffer")
+        if self.use_replay_buffer and replay_state is not None:
+            self.replay_buffer.load_state_dict(replay_state)
+            print(
+                f"[FullyAsyncTrainer] Loaded replay buffer state: "
+                f"rows={self.replay_buffer.total_size()}, entries={self.replay_buffer.num_entries()}"
+            )
+        elif replay_state is not None:
+            print("[FullyAsyncTrainer] Replay buffer state exists but replay buffer is disabled; skip")
+
+        adaptive_state = state.get("adaptive_entropy")
+        if adaptive_state is not None and hasattr(self.actor_rollout_wg, "load_adaptive_entropy_state"):
+            try:
+                self.actor_rollout_wg.load_adaptive_entropy_state(adaptive_state)
+                print(f"[FullyAsyncTrainer] Loaded adaptive entropy state from {path}")
+            except Exception as exc:
+                print(f"[FullyAsyncTrainer] Warning: failed to load adaptive entropy state: {exc}")
 
     def load_checkpoint(self):
         if self.config.trainer.resume_mode == "disable":
@@ -778,6 +852,7 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             self.critic_wg.load_checkpoint(
                 critic_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
             )
+        self._load_extra_training_state(global_step_folder)
         return self.current_param_version
 
     def _merge_task_batches(self, task_batches: dict) -> DataProto:

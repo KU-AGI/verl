@@ -28,6 +28,71 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+def _response_mask_last_lengths(response_mask: torch.Tensor) -> List[int]:
+    """Return last nonzero position + 1 for each response mask row."""
+    lengths = []
+    for row in response_mask:
+        valid = row > 0
+        if valid.any():
+            lengths.append(int(valid.nonzero(as_tuple=False)[-1].item()) + 1)
+        else:
+            lengths.append(0)
+    return lengths
+
+
+def _format_logprob_shape_debug(
+    *,
+    task_id: int,
+    logits_seq_len: int,
+    output_starts: List[int],
+    output_lengths: List[int],
+    task_logits: torch.Tensor,
+    valid_output_tokens: torch.Tensor,
+    output_tokens: torch.Tensor,
+    response_mask: torch.Tensor,
+    micro_batch: Dict[str, Any],
+) -> str:
+    response_sums = response_mask.sum(dim=1).detach().cpu().to(torch.long).tolist()
+    response_last = _response_mask_last_lengths(response_mask.detach().cpu())
+    response_unique = torch.unique(response_mask.detach().cpu()).tolist()
+
+    segment_unique = None
+    if task_id == 2 and "task2_segment_mask" in micro_batch:
+        segment_unique = torch.unique(micro_batch["task2_segment_mask"].detach().cpu()).tolist()
+
+    row_infos = []
+    for i, (start, out_len) in enumerate(zip(output_starts, output_lengths)):
+        logit_start = int(start) - 1
+        logit_end = logit_start + int(out_len)
+        available = max(0, logits_seq_len - max(logit_start, 0))
+        row_infos.append(
+            {
+                "row": i,
+                "start": int(start),
+                "out_len": int(out_len),
+                "logit_start": int(logit_start),
+                "logit_end": int(logit_end),
+                "available_logits": int(available),
+                "mask_sum": int(response_sums[i]) if i < len(response_sums) else None,
+                "mask_last": int(response_last[i]) if i < len(response_last) else None,
+                "hole": int(response_last[i] - response_sums[i]) if i < len(response_sums) else None,
+            }
+        )
+
+    return (
+        "[LOGPROB SHAPE MISMATCH] "
+        f"task_id={task_id} "
+        f"logits_seq_len={logits_seq_len} "
+        f"task_logits_shape={tuple(task_logits.shape)} "
+        f"valid_output_tokens_shape={tuple(valid_output_tokens.shape)} "
+        f"output_tokens_shape={tuple(output_tokens.shape)} "
+        f"response_mask_shape={tuple(response_mask.shape)} "
+        f"response_mask_unique={response_unique} "
+        f"segment_mask_unique={segment_unique} "
+        f"rows={row_infos}"
+    )
+
+
 def extract_output_logits(
     logits: torch.Tensor,
     output_start_positions: List[int],
@@ -173,6 +238,28 @@ class DataParallelImageGenerationActor(BasePPOActor):
             # For FSDP wrapped models
             self.actor_module.module.set_processor(processor)
 
+    def get_adaptive_entropy_state(self) -> dict:
+        if not getattr(self, "use_adaptive_entropy_coeff", False):
+            return {"enabled": False, "coeffs": {}}
+        return {
+            "enabled": True,
+            "coeffs": {
+                int(task_id): coeff.state_dict()
+                for task_id, coeff in self.adaptive_entropy_coeffs.items()
+            },
+        }
+
+    def load_adaptive_entropy_state(self, state: dict):
+        if not state or not state.get("enabled", False):
+            return
+        if not getattr(self, "use_adaptive_entropy_coeff", False):
+            print("[DataParallelImageGenerationActor] Skip adaptive entropy state load: disabled in current config")
+            return
+        for task_id, coeff_state in state.get("coeffs", {}).items():
+            task_id = int(task_id)
+            if task_id in self.adaptive_entropy_coeffs:
+                self.adaptive_entropy_coeffs[task_id].load_state_dict(coeff_state)
+
     def _extract_valid_output_tokens(
         self,
         output_tokens: torch.Tensor,
@@ -207,6 +294,89 @@ class DataParallelImageGenerationActor(BasePPOActor):
                 padded_tokens[i, :len(valid_tokens)] = valid_tokens
 
         return padded_tokens
+
+    def _build_output_lengths(self, response_mask: torch.Tensor) -> List[int]:
+        # Match `_extract_valid_output_tokens`: length is last valid position + 1,
+        # not mask sum, so non-contiguous masks cannot desync labels/logits.
+        output_lengths = []
+        for i in range(response_mask.size(0)):
+            valid = response_mask[i] == 1
+            if valid.any():
+                output_lengths.append(int(valid.nonzero(as_tuple=False)[-1].item()) + 1)
+            else:
+                output_lengths.append(0)
+        return output_lengths
+
+    def _zero_missing_image_placeholder_rows(
+        self,
+        micro_batch: Dict[str, Any],
+        response_mask: torch.Tensor,
+        task_id: int,
+    ) -> torch.Tensor:
+        """Drop rows whose expanded image placeholder is missing or partial."""
+        if task_id not in (2, 3):
+            return response_mask
+
+        input_key = f"task{task_id}_input_ids"
+        input_ids = micro_batch.get(input_key)
+        image_id = getattr(self.processor, "image_id", None)
+        if input_ids is None or image_id is None:
+            return response_mask
+
+        placeholder_counts = (input_ids == image_id).sum(dim=1)
+        expected_count = getattr(self.processor, "num_image_tokens", None)
+        if expected_count is None:
+            bad_rows = placeholder_counts == 0
+        else:
+            bad_rows = placeholder_counts != int(expected_count)
+        if not bool(bad_rows.any().item()):
+            return response_mask
+
+        response_mask = response_mask.clone()
+        response_mask[bad_rows] = 0
+        micro_batch[f"task{task_id}_response_mask"] = response_mask
+        print(
+            f"[DPActor] task{task_id}: zeroed rows with bad image placeholder count "
+            f"expected={expected_count} "
+            f"indices={bad_rows.nonzero(as_tuple=False).view(-1).detach().cpu().tolist()} "
+            f"counts={placeholder_counts[bad_rows].detach().cpu().tolist()}",
+            flush=True,
+        )
+        return response_mask
+
+    def _zero_rows_with_insufficient_logits(
+        self,
+        micro_batch: Dict[str, Any],
+        response_mask: torch.Tensor,
+        output_starts: List[int],
+        output_lengths: List[int],
+        logits_seq_len: int,
+        task_id: int,
+    ) -> tuple[torch.Tensor, List[int]]:
+        """Drop rows where model logits cannot cover the requested output span."""
+        bad = []
+        for i, (start, out_len) in enumerate(zip(output_starts, output_lengths)):
+            if out_len <= 0:
+                continue
+            logit_start = max(int(start) - 1, 0)
+            available = max(0, int(logits_seq_len) - logit_start)
+            if available < int(out_len):
+                bad.append((i, int(start), int(out_len), int(available)))
+
+        if not bad:
+            return response_mask, output_lengths
+
+        response_mask = response_mask.clone()
+        bad_indices = [item[0] for item in bad]
+        response_mask[bad_indices] = 0
+        micro_batch[f"task{task_id}_response_mask"] = response_mask
+        output_lengths = self._build_output_lengths(response_mask)
+        print(
+            f"[DPActor] task{task_id}: zeroed rows with insufficient logits "
+            f"logits_seq_len={logits_seq_len} rows={bad}",
+            flush=True,
+        )
+        return response_mask, output_lengths
 
     def _restore_log_probs_to_original_length(
         self,
@@ -269,6 +439,9 @@ class DataParallelImageGenerationActor(BasePPOActor):
         """
         # Get original response mask for length restoration
         original_response_mask = micro_batch[f"task{task_id}_response_mask"]
+        original_response_mask = self._zero_missing_image_placeholder_rows(
+            micro_batch, original_response_mask, task_id
+        )
 
         # Extract valid output tokens (remove right padding)
         if task_id == 1:
@@ -282,7 +455,8 @@ class DataParallelImageGenerationActor(BasePPOActor):
 
         valid_output_tokens = self._extract_valid_output_tokens(output_tokens, original_response_mask)
 
-        output_lengths = [original_response_mask[i].sum().item() for i in range(original_response_mask.size(0))]
+        # Must match `_extract_valid_output_tokens` exactly.
+        output_lengths = self._build_output_lengths(original_response_mask)
         local_has_output = 1 if max(output_lengths) > 0 else 0
 
         # IMPORTANT: Always do forward pass even if no valid output
@@ -313,12 +487,44 @@ class DataParallelImageGenerationActor(BasePPOActor):
         output_starts = self.actor_module.get_output_starts()
 
         logits = output.logits
+        logits_seq_len = int(logits.size(1))
+        original_response_mask, output_lengths = self._zero_rows_with_insufficient_logits(
+            micro_batch,
+            original_response_mask,
+            output_starts,
+            output_lengths,
+            logits_seq_len,
+            task_id,
+        )
+        valid_output_tokens = self._extract_valid_output_tokens(output_tokens, original_response_mask)
+        if max(output_lengths) == 0:
+            dummy_scalar = logits.flatten()[0] * 0.0
+            log_probs = torch.zeros_like(original_response_mask, dtype=logits.dtype, device=logits.device) + dummy_scalar
+            entropy = None
+            if calculate_entropy:
+                entropy = torch.zeros_like(original_response_mask, dtype=logits.dtype, device=logits.device) + dummy_scalar
+            return entropy, log_probs
         task_logits = extract_output_logits(logits, output_starts, output_lengths)
 
         del logits
         del output
 
         # Compute log probabilities
+        if task_logits.shape[:2] != valid_output_tokens.shape:
+            print(
+                _format_logprob_shape_debug(
+                    task_id=task_id,
+                    logits_seq_len=logits_seq_len,
+                    output_starts=output_starts,
+                    output_lengths=output_lengths,
+                    task_logits=task_logits,
+                    valid_output_tokens=valid_output_tokens,
+                    output_tokens=output_tokens,
+                    response_mask=original_response_mask,
+                    micro_batch=micro_batch,
+                ),
+                flush=True,
+            )
         compact_log_probs = logprobs_from_logits(task_logits, valid_output_tokens)
         log_probs = self._restore_log_probs_to_original_length(compact_log_probs, original_response_mask)
 

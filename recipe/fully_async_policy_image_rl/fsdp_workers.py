@@ -136,6 +136,33 @@ class DetachActorWorker(DetachNcclSync):
         return ret
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def get_adaptive_entropy_state(self):
+        assert self._is_actor
+        if not hasattr(self, "actor") or not hasattr(self.actor, "get_adaptive_entropy_state"):
+            return {"rank": self.rank, "enabled": False, "state": {}}
+        return {
+            "rank": self.rank,
+            "enabled": True,
+            "state": self.actor.get_adaptive_entropy_state(),
+        }
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def load_adaptive_entropy_state(self, states_by_rank):
+        assert self._is_actor
+        if not states_by_rank or not hasattr(self, "actor") or not hasattr(self.actor, "load_adaptive_entropy_state"):
+            return
+        state = None
+        if isinstance(states_by_rank, dict):
+            state = states_by_rank.get(self.rank, states_by_rank.get(str(self.rank)))
+        else:
+            for item in states_by_rank:
+                if isinstance(item, dict) and item.get("rank") == self.rank:
+                    state = item.get("state")
+                    break
+        if state is not None:
+            self.actor.load_adaptive_entropy_state(state)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_model_to_cpu(self, n):
         if not hasattr(self, "cpu_saved_models"):
             self.cpu_saved_models = {}

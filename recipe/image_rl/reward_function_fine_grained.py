@@ -420,8 +420,6 @@ def get_messages_task2_stage3(gen_img, tuple_raw: str, vqa_raw: str):
 def get_messages_task2_stage4(prompt: str, predicted_summarize: str, tuple_raw: str, vqa_raw: str, predicted_feedback: str):
     """Stage 4: VQA -> FEEDBACK reward judge (text-only)."""
     user_content = (
-        f"PROMPT:\n{prompt or ''}\n\n"
-        f"SUMMARY:\n{predicted_summarize or ''}\n\n"
         f"PRED_TUPLES:\n{tuple_raw or ''}\n\n"
         f"VQA_RESULTS:\n{vqa_raw or ''}\n\n"
         f"FEEDBACK:\n{predicted_feedback or 'No need to generate feedback.'}"
@@ -620,7 +618,7 @@ async def compute_score_single_async(prompt, gen_img, feedback_text, regen_img, 
         reward_extra_info["task2_no_feedback_needed"] = int(no_feedback_needed)
 
         # Prepare normalized inputs for stage judges
-        tuple_raw = _normalize_tuple_lines(predicted_tuple or '')
+        tuple_raw = predicted_tuple or ''
         vqa_raw = _add_index_to_vqa_lines(predicted_answer or '')
 
         # Format gates: wrong format → skip judge (saves API call), _safe_stage_score maps None → 0.0
