@@ -417,7 +417,7 @@ class JanusSGLangAsyncServer:
                 "img_top_p": getattr(self.config, "img_top_p", 1.0),
             }
 
-    def _get_sft_format(self, prompt: str, system_prompt: str = "") -> str:
+    def _get_sft_format(self, prompt: str, system_prompt: str = "", append_image_start: bool = True) -> str:
         formatted_system = (
             system_prompt.format(image_start_tag=self.image_start_tag, image_end_tag=self.image_end_tag)
             if system_prompt
@@ -445,10 +445,15 @@ class JanusSGLangAsyncServer:
                 else:
                     sft_format += f"{role}:"
             sft_format = sft_format.strip()
-        return sft_format + self.image_start_tag
+        return sft_format + self.image_start_tag if append_image_start else sft_format
 
     def _task2_request_text(self, prompt: str) -> str:
-        return self._task2_training_text(prompt)
+        return (
+            self._get_sft_format(prompt, append_image_start=False)
+            + self.image_tag
+            + "\nFirst, decompose the input prompt into explicit prompt contents that are visually verifiable.\n"
+            + "Exclude subjective, inferential, or non-verifiable content.\n"
+        )
 
     def _task2_training_text(self, prompt: str) -> str:
         return (
