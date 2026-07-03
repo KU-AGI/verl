@@ -186,7 +186,7 @@ class BaseModelMerger(ABC):
 
     def __init__(self, config: ModelMergerConfig):
         self.config = config
-        self.hf_model_config_path = "/data/mllm/checkpoints/Janus-Pro-7B"
+        self.hf_model_config_path = "/home/work/AGILAB/mllm_reasoning/data/checkpoints/Janus-Pro-7B"
         self.model_config = MultiModalityConfig.from_pretrained(
             self.hf_model_config_path, trust_remote_code=self.config.trust_remote_code
         )

@@ -76,7 +76,7 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
             - The updated data with token-level rewards adjusted by KL penalty
             - A dictionary of metrics related to the KL penalty
     """
-    response_mask = data.batch[f"task{task_id}_response_mask"]
+    response_mask = data.batch.get(f"task{task_id}_loss_mask", data.batch[f"task{task_id}_response_mask"])
     token_level_scores = data.batch[f"task{task_id}_token_level_scores"]
     batch_size = data.batch.batch_size[0]
 
@@ -218,7 +218,7 @@ def compute_advantage(
             f"(task_skip has been removed). Got: {adv_estimator}"
         )
 
-    grpo_calculation_mask = data.batch[f"task{task_id}_response_mask"]
+    grpo_calculation_mask = data.batch.get(f"task{task_id}_loss_mask", data.batch[f"task{task_id}_response_mask"])
     group_index = _compute_grpo_group_index(data)
     if task_id == 2 and "task2_segment_mask" in data.batch:
         advantages, returns = _compute_task2_segmentwise_grpo_advantage(
@@ -265,6 +265,7 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
         "multi_turn",
         "is_lora",
         "_verl_auto_padding",
+        "step_mode_step_ids",
     )
 
     @staticmethod
@@ -332,6 +333,8 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
             keys.append("task2_feedback_ids")
             if "task2_segment_mask" in available:
                 keys.append("task2_segment_mask")
+            if "task2_loss_mask" in available:
+                keys.append("task2_loss_mask")
             if "task2_task1_gen_imgs_pixel_values" in available:
                 keys.append("task2_task1_gen_imgs_pixel_values")
             else:
@@ -355,6 +358,55 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
         """Build a small DataProto for update_actor RPC."""
         available = set(batch.batch.keys())
         actor_cfg = self.config.actor_rollout_ref.actor
+
+        step_ids = [sid for sid in range(1, 6) if f"step{sid}_advantages" in available]
+        if step_ids:
+            keys = []
+            for step_id in step_ids:
+                prefix = f"step{step_id}_"
+                keys.extend(
+                    [
+                        f"{prefix}input_ids",
+                        f"{prefix}attention_mask",
+                        f"{prefix}response_mask",
+                        f"{prefix}loss_mask",
+                        f"{prefix}old_log_probs",
+                        f"{prefix}advantages",
+                    ]
+                )
+                if step_id == 1:
+                    keys.append(f"{prefix}gen_img_tokens")
+                elif step_id in (2, 3, 4):
+                    keys.append(f"{prefix}feedback_ids")
+                    if f"{prefix}segment_mask" in available:
+                        keys.append(f"{prefix}segment_mask")
+                    if f"{prefix}task1_gen_imgs_pixel_values" in available:
+                        keys.append(f"{prefix}task1_gen_imgs_pixel_values")
+                elif step_id == 5:
+                    keys.append(f"{prefix}regen_img_tokens")
+                    if f"{prefix}task1_gen_img_tokens" in available:
+                        keys.append(f"{prefix}task1_gen_img_tokens")
+                    if f"{prefix}input_img_tokens" in available:
+                        keys.append(f"{prefix}input_img_tokens")
+
+                if actor_cfg.get("use_kl_loss", False):
+                    keys.append(f"{prefix}ref_log_prob")
+                if f"{prefix}rollout_is_weights" in available:
+                    keys.append(f"{prefix}rollout_is_weights")
+                if f"{prefix}unit_loss_weights" in available:
+                    keys.append(f"{prefix}unit_loss_weights")
+                if f"{prefix}stage_ids" in available:
+                    keys.append(f"{prefix}stage_ids")
+                if f"{prefix}lane_ids" in available:
+                    keys.append(f"{prefix}lane_ids")
+
+            available_non_tensor = set((getattr(batch, "non_tensor_batch", None) or {}).keys())
+            return batch.select(
+                batch_keys=self._present_keys(available, keys),
+                non_tensor_batch_keys=self._present_keys(available_non_tensor, ["uid"] + [f"step{sid}_uid" for sid in step_ids]),
+                meta_info_keys=self._select_train_rpc_meta_keys(batch),
+            )
+
         multi_task_cfg = actor_cfg.get("multi_task", {})
         task_ids = list(multi_task_cfg.get("task_ids", [1, 2, 3]))
         task_ids = [task_id for task_id in task_ids if f"task{task_id}_advantages" in available]
@@ -369,6 +421,7 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                     f"task{task_id}_input_ids",
                     f"task{task_id}_attention_mask",
                     f"task{task_id}_response_mask",
+                    f"task{task_id}_loss_mask",
                     f"task{task_id}_old_log_probs",
                     f"task{task_id}_advantages",
                 ]
@@ -392,6 +445,8 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                 keys.append(f"task{task_id}_ref_log_prob")
             if f"task{task_id}_rollout_is_weights" in available:
                 keys.append(f"task{task_id}_rollout_is_weights")
+            if f"task{task_id}_unit_loss_weights" in available:
+                keys.append(f"task{task_id}_unit_loss_weights")
 
         if "task_id" in available:
             keys.append("task_id")
@@ -438,11 +493,12 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
 
         batch.batch["old_log_probs"] = batch.batch[f"task{task_id}_old_log_probs"]
         batch.batch["rollout_log_probs"] = batch.batch[f"task{task_id}_rollout_log_probs"]
-        batch.batch["response_mask"] = batch.batch[f"task{task_id}_response_mask"]
+        mask_key = f"task{task_id}_loss_mask" if f"task{task_id}_loss_mask" in batch.batch else f"task{task_id}_response_mask"
+        batch.batch["response_mask"] = batch.batch[mask_key]
 
         batch, corr_metrics = compute_rollout_correction_and_add_to_batch(batch, rollout_corr_config)
 
-        batch.batch[f"task{task_id}_response_mask"] = batch.batch.pop("response_mask")
+        batch.batch[mask_key] = batch.batch.pop("response_mask")
         batch.batch[f"task{task_id}_old_log_probs"] = batch.batch.pop("old_log_probs")
         batch.batch.pop("rollout_log_probs")
         if "rollout_is_weights" in batch.batch:
@@ -512,7 +568,7 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                     task_batch = task_batches[task_id]
                     if entropy_key in old_log_prob.batch.keys():
                         entropys = old_log_prob.batch[entropy_key]
-                        response_masks = task_batch.batch[f"task{task_id}_response_mask"]
+                        response_masks = task_batch.batch.get(f"task{task_id}_loss_mask", task_batch.batch[f"task{task_id}_response_mask"])
                         loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
                         entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
                         metrics[f"actor/task{task_id}_old_entropy"] = entropy_agg.detach().item()
@@ -1584,12 +1640,13 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
             # Alias task-prefixed keys to standard keys
             batch.batch["old_log_probs"] = batch.batch[f"task{task_id}_old_log_probs"]
             batch.batch["rollout_log_probs"] = batch.batch[f"task{task_id}_rollout_log_probs"]
-            batch.batch["response_mask"] = batch.batch[f"task{task_id}_response_mask"]
+            mask_key = f"task{task_id}_loss_mask" if f"task{task_id}_loss_mask" in batch.batch else f"task{task_id}_response_mask"
+            batch.batch["response_mask"] = batch.batch[mask_key]
 
             batch, corr_metrics = compute_rollout_correction_and_add_to_batch(batch, rollout_corr_config)
 
             # Copy results back to task-prefixed keys
-            batch.batch[f"task{task_id}_response_mask"] = batch.batch.pop("response_mask")
+            batch.batch[mask_key] = batch.batch.pop("response_mask")
             batch.batch[f"task{task_id}_old_log_probs"] = batch.batch.pop("old_log_probs")
             batch.batch.pop("rollout_log_probs")
             if "rollout_is_weights" in batch.batch:

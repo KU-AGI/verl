@@ -29,6 +29,7 @@ from recipe.fully_async_policy_image_rl.detach_utils import (
     MetricsAggregator,
     ValidateMetrics,
     assemble_batch_from_rollout_samples,
+    _concat_dataprotos_with_meta,
 )
 from recipe.image_rl.reward import load_reward_manager
 from recipe.fully_async_policy_image_rl.message_queue import MessageQueueClient
@@ -137,6 +138,8 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
 
         self.message_queue_client = None
         self.param_synchronizer = None
+        self.async_rollout_mode = False
+        self.async_rollout_manager = None
 
         # Statistics
         # we start from step 1
@@ -170,12 +173,25 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         self.use_replay_buffer = replay_cfg.get("enable", False)
         if self.use_replay_buffer:
             task_ids = list(config.actor_rollout_ref.actor.multi_task.get("task_ids", [1]))
+            replay_unit = str(replay_cfg.get("unit", "task"))
+            if replay_unit == "step":
+                stage2_cfg = config.actor_rollout_ref.rollout.get("stage2", {})
+                raw_stage2_steps = stage2_cfg.get("steps", [1, 2, 3, 4, 5])
+                if isinstance(raw_stage2_steps, str):
+                    stage2_steps = [int(s.strip()) for s in raw_stage2_steps.strip().strip("[]").split(",") if s.strip()]
+                else:
+                    stage2_steps = [int(s) for s in list(raw_stage2_steps)]
+                buffer_ids = [ReplayBuffer.encode_lane_id(1, s) for s in [1, 2, 3, 4, 5]]
+                if bool(stage2_cfg.get("enable", False)):
+                    buffer_ids.extend(ReplayBuffer.encode_lane_id(2, s) for s in stage2_steps)
+            else:
+                buffer_ids = task_ids
             raw_thresholds = replay_cfg.get("score_thresholds", {})
             score_thresholds = {int(k): float(v) for k, v in raw_thresholds.items()}
             raw_std_thresholds = replay_cfg.get("score_std_thresholds", {})
             score_std_thresholds = {int(k): float(v) for k, v in raw_std_thresholds.items()}
             self.replay_buffer = ReplayBuffer(
-                task_ids=task_ids,
+                task_ids=buffer_ids,
                 score_thresholds=score_thresholds,
                 score_std_thresholds=score_std_thresholds,
                 max_size_per_task=replay_cfg.get("max_size_per_task", -1),
@@ -190,9 +206,10 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             self._feeder_stop = False
             self._feeder_terminated = False
             self._feeder_thread = None
-            self._feeder_task_ids = task_ids
+            self._feeder_task_ids = buffer_ids
+            self._physical_task_ids = task_ids
             print(
-                f"[FullyAsyncTrainer] ReplayBuffer enabled: "
+                f"[FullyAsyncTrainer] ReplayBuffer enabled: unit={replay_unit}, ids={buffer_ids}, "
                 f"max_version_gap={self.replay_buffer.max_version_gap}, "
                 f"max_size_per_task={self.replay_buffer.max_size_per_task}, "
                 f"filter_mode={self.replay_buffer.filter_mode}, "
@@ -201,6 +218,449 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                 f"max_quantile={self.replay_buffer.max_quantile}, "
                 f"std_quantile={self.replay_buffer.std_quantile}"
             )
+
+
+    def init_workers(self):
+        """Initialize trainer workers.
+
+        The fully async trainer consumes rollout samples from MessageQueue and
+        does not own rollout workers. Avoid the base init path that tries to
+        create an async rollout manager with a missing rollout worker group.
+        """
+        self._init_resource_pools()
+        self._create_worker_classes()
+        self._init_worker_groups()
+        self._init_models()
+
+    @staticmethod
+    def _step_id_to_task_id(step_id: int) -> int:
+        return ReplayBuffer.physical_task_id_for_step(step_id)
+
+    @staticmethod
+    def _lane_id(stage_id: int, step_id: int) -> int:
+        return ReplayBuffer.encode_lane_id(stage_id, step_id)
+
+    def _replay_unit(self) -> str:
+        replay_cfg = self.config.async_training.get("replay_buffer", {})
+        return str(replay_cfg.get("unit", "task"))
+
+    @staticmethod
+    def _as_int_list(value, default: list[int]) -> list[int]:
+        if value is None:
+            return list(default)
+        if isinstance(value, str):
+            stripped = value.strip().strip("[]")
+            if not stripped:
+                return []
+            return [int(x.strip()) for x in stripped.split(",") if x.strip()]
+        return [int(s) for s in list(value)]
+
+    def _configured_train_stages(self) -> list[int]:
+        stages = self.config.async_training.get("train_stages", [1])
+        return self._as_int_list(stages, [1])
+
+    def _configured_stage2_steps(self) -> list[int]:
+        stage2_cfg = self.config.actor_rollout_ref.rollout.get("stage2", {})
+        steps = stage2_cfg.get("steps", [1, 2, 3, 4, 5])
+        return self._as_int_list(steps, [1, 2, 3, 4, 5])
+
+    def _all_replay_lanes(self) -> list[int]:
+        if self._replay_unit() != "step":
+            return list(self.config.actor_rollout_ref.actor.multi_task.get("task_ids", [1]))
+        lanes = [self._lane_id(1, step_id) for step_id in [1, 2, 3, 4, 5]]
+        stage2_cfg = self.config.actor_rollout_ref.rollout.get("stage2", {})
+        if bool(stage2_cfg.get("enable", False)):
+            lanes.extend(self._lane_id(2, step_id) for step_id in self._configured_stage2_steps())
+        return lanes
+
+    def _active_lane_ids(self) -> list[int]:
+        if self._replay_unit() != "step":
+            return list(self.config.actor_rollout_ref.actor.multi_task.get("task_ids", [1]))
+        train_stages = set(self._configured_train_stages())
+        lanes = []
+        if 1 in train_stages:
+            lanes.extend(self._lane_id(1, step_id) for step_id in [1, 2, 3, 4, 5])
+        if 2 in train_stages:
+            lanes.extend(self._lane_id(2, step_id) for step_id in self._configured_stage2_steps())
+        return lanes
+
+    def _unit_loss_weight(self, stage_id: int, step_id: int) -> float:
+        actor_cfg = self.config.actor_rollout_ref.actor
+        step_weights = list(actor_cfg.get("step_weights", []))
+        if step_weights and 1 <= int(step_id) <= len(step_weights):
+            step_w = float(step_weights[int(step_id) - 1])
+        else:
+            task_weights = list(actor_cfg.get("multi_task", {}).get("task_weights", [1.0, 1.0, 1.0]))
+            task_id = self._step_id_to_task_id(step_id)
+            step_w = float(task_weights[task_id - 1]) if task_id - 1 < len(task_weights) else 1.0
+        stage_weights = actor_cfg.get("stage_loss_weights", {})
+        stage_w = float(stage_weights.get(str(stage_id), stage_weights.get(int(stage_id), 1.0)))
+        return step_w * stage_w
+
+    @staticmethod
+    def _terminal_reward_tensor(response_mask: torch.Tensor, rewards: list[float]) -> torch.Tensor:
+        out = torch.zeros_like(response_mask, dtype=torch.float32)
+        for i, reward in enumerate(rewards):
+            valid = torch.where(response_mask[i] > 0)[0]
+            if len(valid) > 0:
+                out[i, valid[-1]] = float(reward)
+        return out
+
+    def _local_task2_reward_tensor(self, batch: DataProto, step_id: int, target_mask: torch.Tensor) -> torch.Tensor | None:
+        extras = (getattr(batch, "meta_info", None) or {}).get("task2_reward_extra_info", {}) or {}
+        local_reward_keys = {
+            2: "task2_prompt_to_tuple_reward",
+            3: "task2_tuple_to_vqa_reward",
+            4: "task2_vqa_to_feedback_reward",
+        }
+        key = local_reward_keys.get(int(step_id))
+        values = extras.get(key) if key is not None else None
+        if values is None:
+            return None
+        if hasattr(values, "tolist"):
+            values = values.tolist()
+        rewards = [float(v if v is not None else 0.0) for v in list(values)[:len(batch)]]
+        if len(rewards) < len(batch):
+            rewards.extend([0.0] * (len(batch) - len(rewards)))
+        return self._terminal_reward_tensor(target_mask.long(), rewards)
+
+    def _make_step_training_batch(self, batch: DataProto, stage_id: int, step_id: int) -> DataProto | None:
+        if batch is None or len(batch) == 0:
+            return None
+        task_id = self._step_id_to_task_id(step_id)
+        score_key = f"task{task_id}_token_level_scores"
+        if score_key not in batch.batch:
+            return None
+        out = self._clone_dataproto(batch)
+        n = len(out)
+        out.non_tensor_batch["stage_id"] = np.full(n, int(stage_id), dtype=np.int64)
+        out.non_tensor_batch["step_id"] = np.full(n, int(step_id), dtype=np.int64)
+        out.non_tensor_batch["physical_task_id"] = np.full(n, int(task_id), dtype=np.int64)
+        out.non_tensor_batch["lane_id"] = np.full(n, self._lane_id(stage_id, step_id), dtype=np.int64)
+        out.non_tensor_batch["unit_loss_weight"] = np.full(n, self._unit_loss_weight(stage_id, step_id), dtype=np.float32)
+        out.batch["unit_loss_weights"] = torch.full((n,), self._unit_loss_weight(stage_id, step_id), dtype=torch.float32)
+        out.batch[f"task{task_id}_unit_loss_weights"] = out.batch["unit_loss_weights"]
+
+        if int(stage_id) == 2 and int(step_id) == 1:
+            local_key = "task1_local_token_level_scores"
+            if local_key in out.batch:
+                out.batch["task1_token_level_scores"] = out.batch[local_key]
+                out.meta_info["task1_token_level_scores"] = out.batch[local_key]
+
+        if task_id == 2:
+            if "task2_response_mask" not in out.batch:
+                return None
+            response_mask = out.batch["task2_response_mask"]
+            if int(stage_id) == 2 and "task2_stage2_target_mask" in out.batch:
+                target_mask = (out.batch["task2_stage2_target_mask"] > 0) & (response_mask > 0)
+            elif "task2_segment_mask" in out.batch:
+                target_mask = (out.batch["task2_segment_mask"] == int(step_id)) & (response_mask > 0)
+            else:
+                return None
+            if target_mask.sum().item() == 0:
+                return None
+            target_mask = target_mask.long()
+            out.batch["task2_loss_mask"] = target_mask
+            out.batch["task2_segment_mask"] = target_mask * int(step_id)
+            if int(stage_id) == 2:
+                local_scores = self._local_task2_reward_tensor(out, step_id, target_mask)
+                if local_scores is not None:
+                    out.batch["task2_token_level_scores"] = local_scores
+        return out
+
+    def _build_step_batches_from_task_batch(self, task_id: int, batch: DataProto) -> list[tuple[int, int, int, DataProto]]:
+        if batch is None:
+            return []
+        phase_arr = batch.non_tensor_batch.get("phase")
+        if phase_arr is None:
+            phases = np.ones(len(batch), dtype=np.int64)
+        else:
+            phases = np.asarray(phase_arr, dtype=np.int64)
+        out = []
+        stage_steps = {1: [1, 2, 3, 4, 5], 2: self._configured_stage2_steps()}
+        for stage_id, steps in stage_steps.items():
+            idx = np.where(phases == int(stage_id))[0].tolist()
+            if not idx:
+                continue
+            phase_batch = self._slice_batch(batch, idx)
+            for step_id in steps:
+                if self._step_id_to_task_id(step_id) != int(task_id):
+                    continue
+                source_batch = phase_batch
+                if int(stage_id) == 2 and "stage2_target_step" in phase_batch.non_tensor_batch:
+                    target_steps = np.asarray(phase_batch.non_tensor_batch["stage2_target_step"], dtype=np.int64)
+                    step_idx = np.where(target_steps == int(step_id))[0].tolist()
+                    if not step_idx:
+                        continue
+                    source_batch = self._slice_batch(phase_batch, step_idx)
+                step_batch = self._make_step_training_batch(source_batch, stage_id, step_id)
+                if step_batch is not None:
+                    out.append((self._lane_id(stage_id, step_id), stage_id, step_id, step_batch))
+
+        stage2_cfg = self.config.actor_rollout_ref.rollout.get("stage2", {})
+        if (
+            int(task_id) == 1
+            and bool(stage2_cfg.get("enable", False))
+            and 1 in self._configured_stage2_steps()
+        ):
+            phase1_idx = np.where(phases == 1)[0].tolist()
+            if phase1_idx:
+                phase1_batch = self._slice_batch(batch, phase1_idx)
+                step_batch = self._make_step_training_batch(phase1_batch, 2, 1)
+                if step_batch is not None:
+                    out.append((self._lane_id(2, 1), 2, 1, step_batch))
+        return out
+
+    @staticmethod
+    def _slice_batch(batch: DataProto, idxs: list[int]) -> DataProto:
+        from recipe.fully_async_policy_image_rl.detach_utils import _slice_dataproto_with_meta
+        return _slice_dataproto_with_meta(batch, idxs)
+
+    def _step_lane_quotas_for_step(
+        self,
+        step_id: int,
+        lane_ids: list[int],
+        allow_available_fallback: bool = False,
+    ) -> dict[int, int]:
+        step_lanes = [lid for lid in lane_ids if ReplayBuffer.decode_lane_id(lid)[1] == int(step_id)]
+        if not step_lanes:
+            return {}
+        stage_ratios_cfg = self.config.async_training.get("stage_ratios", {})
+        raw_weights = []
+        for lane_id in step_lanes:
+            stage_id, _step_id = ReplayBuffer.decode_lane_id(lane_id)
+            raw_weights.append(float(stage_ratios_cfg.get(str(stage_id), stage_ratios_cfg.get(int(stage_id), 1.0))))
+        total = sum(raw_weights) if sum(raw_weights) > 0 else float(len(raw_weights))
+        quotas = {}
+        remaining = self.required_samples
+        for i, (lane_id, weight) in enumerate(zip(step_lanes, raw_weights)):
+            if i == len(step_lanes) - 1:
+                q = remaining
+            else:
+                q = max(1, int(round(self.required_samples * (weight / total))))
+                q = min(q, remaining)
+            quotas[lane_id] = q
+            remaining -= q
+        if not allow_available_fallback:
+            return quotas
+
+        sizes = {lane_id: self.replay_buffer.task_size(lane_id) for lane_id in step_lanes}
+        if all(sizes.get(lane_id, 0) >= quota for lane_id, quota in quotas.items()):
+            return quotas
+        if sum(sizes.values()) < self.required_samples:
+            return {}
+
+        fallback_lanes = [lane_id for lane_id in step_lanes if sizes.get(lane_id, 0) > 0]
+        if not fallback_lanes:
+            return {}
+        fallback_weights = [
+            float(stage_ratios_cfg.get(str(ReplayBuffer.decode_lane_id(lane_id)[0]), stage_ratios_cfg.get(ReplayBuffer.decode_lane_id(lane_id)[0], 1.0)))
+            for lane_id in fallback_lanes
+        ]
+        total_weight = sum(fallback_weights) if sum(fallback_weights) > 0 else float(len(fallback_lanes))
+        fallback_quotas = {}
+        remaining = self.required_samples
+        for i, (lane_id, weight) in enumerate(zip(fallback_lanes, fallback_weights)):
+            if i == len(fallback_lanes) - 1:
+                q = remaining
+            else:
+                q = max(1, int(round(self.required_samples * (weight / total_weight))))
+            q = min(q, sizes[lane_id], remaining)
+            fallback_quotas[lane_id] = q
+            remaining -= q
+
+        while remaining > 0:
+            candidates = [lane_id for lane_id in fallback_lanes if sizes[lane_id] > fallback_quotas.get(lane_id, 0)]
+            if not candidates:
+                return {}
+            for lane_id in candidates:
+                if remaining <= 0:
+                    break
+                capacity = sizes[lane_id] - fallback_quotas.get(lane_id, 0)
+                add = min(capacity, remaining)
+                fallback_quotas[lane_id] = fallback_quotas.get(lane_id, 0) + add
+                remaining -= add
+
+        return {lane_id: quota for lane_id, quota in fallback_quotas.items() if quota > 0}
+
+    def _sample_step_batches(self, metrics: dict, timing_raw: dict) -> tuple[dict[int, DataProto], dict[int, dict]]:
+        active_lanes = self._active_lane_ids()
+        step_ids = sorted({ReplayBuffer.decode_lane_id(lid)[1] for lid in active_lanes})
+        step_batches: dict[int, DataProto] = {}
+        step_timings: dict[int, dict] = {}
+        for step_id in step_ids:
+            lane_batches = []
+            step_timing = {}
+            desired_quotas = self._step_lane_quotas_for_step(step_id, active_lanes)
+            quotas = self._step_lane_quotas_for_step(step_id, active_lanes, allow_available_fallback=True)
+            for lane_id, desired_quota in desired_quotas.items():
+                actual_quota = quotas.get(lane_id, 0)
+                if actual_quota < desired_quota:
+                    stage_id, lane_step_id = ReplayBuffer.decode_lane_id(lane_id)
+                    shortfall = desired_quota - actual_quota
+                    metrics[f"replay/stage{stage_id}_step{lane_step_id}_quota_shortfall"] = shortfall
+                    print(
+                        f"[FullyAsyncTrainer] lane stage{stage_id}/step{lane_step_id}: "
+                        f"quota fallback {actual_quota}/{desired_quota}"
+                    )
+            for lane_id, quota in quotas.items():
+                with marked_timer("replay/sample_from_buffer", step_timing):
+                    lane_batch = self.replay_buffer.sample_task(lane_id, quota, self.current_param_version)
+                stage_id, lane_step_id = ReplayBuffer.decode_lane_id(lane_id)
+                if lane_batch is None:
+                    print(f"[FullyAsyncTrainer] lane stage{stage_id}/step{lane_step_id}: buffer empty after sample")
+                    continue
+                lane_batches.append(lane_batch)
+                metrics[f"replay/stage{stage_id}_step{lane_step_id}_sampled"] = len(lane_batch)
+                zero_stats = self.replay_buffer.zero_std_stats_per_task().get(lane_id, {})
+                seen = int(zero_stats.get("seen_groups", 0))
+                dropped = int(zero_stats.get("dropped_groups", 0))
+                metrics[f"replay/stage{stage_id}_step{lane_step_id}_zero_std_seen_groups"] = seen
+                metrics[f"replay/stage{stage_id}_step{lane_step_id}_zero_std_dropped_groups"] = dropped
+                metrics[f"replay/stage{stage_id}_step{lane_step_id}_zero_std_dropped_rows"] = int(zero_stats.get("dropped_rows", 0))
+                metrics[f"replay/stage{stage_id}_step{lane_step_id}_zero_std_drop_ratio"] = float(dropped / seen) if seen > 0 else 0.0
+            if not lane_batches:
+                continue
+            step_batch = _concat_dataprotos_with_meta(lane_batches) if len(lane_batches) > 1 else lane_batches[0]
+            if len(step_batch) > self.required_samples:
+                step_batch = self._slice_batch(step_batch, list(range(self.required_samples)))
+            elif len(step_batch) < self.required_samples:
+                print(f"[FullyAsyncTrainer] step{step_id}: sampled {len(step_batch)}/{self.required_samples} rows")
+            task_id = self._step_id_to_task_id(step_id)
+            step_batch.batch["task_id"] = torch.tensor([task_id for _ in range(len(step_batch))], dtype=int)
+            step_batches[step_id] = step_batch
+            step_timings[step_id] = step_timing
+        return step_batches, step_timings
+
+    def _rename_task_batch_to_step(self, batch: DataProto, step_id: int) -> DataProto:
+        task_id = self._step_id_to_task_id(step_id)
+        task_prefix = f"task{task_id}_"
+        step_prefix = f"step{step_id}_"
+        tensors = {}
+        non_tensors = {}
+        meta_info = {}
+
+        for key, value in batch.batch.items():
+            if key == "task_id":
+                continue
+            if key.startswith(task_prefix):
+                tensors[step_prefix + key[len(task_prefix):]] = value
+        if f"task{task_id}_unit_loss_weights" not in batch.batch.keys() and "unit_loss_weights" in batch.batch.keys():
+            tensors[f"step{step_id}_unit_loss_weights"] = batch.batch["unit_loss_weights"]
+        if "stage_id" in batch.non_tensor_batch:
+            tensors[f"step{step_id}_stage_ids"] = torch.as_tensor(
+                np.asarray(batch.non_tensor_batch["stage_id"], dtype=np.int64), dtype=torch.long
+            )
+        if "lane_id" in batch.non_tensor_batch:
+            tensors[f"step{step_id}_lane_ids"] = torch.as_tensor(
+                np.asarray(batch.non_tensor_batch["lane_id"], dtype=np.int64), dtype=torch.long
+            )
+
+        for key, value in batch.non_tensor_batch.items():
+            out_key = step_prefix + key[len(task_prefix):] if key.startswith(task_prefix) else f"step{step_id}_{key}"
+            non_tensors[out_key] = value
+        if "uid" in batch.non_tensor_batch and "uid" not in non_tensors:
+            non_tensors["uid"] = batch.non_tensor_batch["uid"]
+
+        for key, value in batch.meta_info.items():
+            if key.startswith(task_prefix):
+                meta_info[step_prefix + key[len(task_prefix):]] = value
+            elif key in self._TRAIN_RPC_META_KEYS:
+                meta_info[key] = value
+
+        return DataProto.from_dict(tensors=tensors, non_tensors=non_tensors, meta_info=meta_info)
+
+    def _merge_step_batches(self, step_batches: dict[int, DataProto]) -> DataProto:
+        tensors = {}
+        non_tensors = {}
+        meta_info = {}
+        step_ids = sorted(step_batches.keys())
+        for step_id in step_ids:
+            step_view = self._rename_task_batch_to_step(step_batches[step_id], step_id)
+            tensors.update(dict(step_view.batch.items()))
+            non_tensors.update(dict(step_view.non_tensor_batch.items()))
+            for key, value in step_view.meta_info.items():
+                meta_info.setdefault(key, value)
+
+        if "uid" not in non_tensors:
+            for step_id in step_ids:
+                uid_key = f"step{step_id}_uid"
+                if uid_key in non_tensors:
+                    non_tensors["uid"] = non_tensors[uid_key]
+                    break
+
+        total = None
+        for step_id in step_ids:
+            att_key = f"step{step_id}_attention_mask"
+            resp_key = f"step{step_id}_response_mask"
+            if att_key in tensors:
+                t = tensors[att_key].sum(-1)
+                if resp_key in tensors:
+                    t = t + tensors[resp_key].sum(-1)
+                total = t if total is None else total + t
+        if total is not None:
+            meta_info["global_token_num"] = total.tolist()
+        meta_info["step_mode_step_ids"] = step_ids
+        return DataProto.from_dict(tensors=tensors, non_tensors=non_tensors, meta_info=meta_info)
+
+    def _prepare_step_combined_batch(
+        self,
+        step_batches: dict[int, DataProto],
+        metrics: dict,
+        timing_raw: dict,
+        step_timings: dict[int, dict],
+        should_log_rollout: bool = False,
+        rollout_data_dir: str | None = None,
+    ) -> tuple[DataProto, dict[int, DataProto]]:
+        processed_steps: dict[int, DataProto] = {}
+        for step_id in sorted(step_batches.keys()):
+            task_id = self._step_id_to_task_id(step_id)
+            step_timing = step_timings.get(step_id, {})
+            step_batch = step_batches[step_id]
+            step_batch.batch["task_id"] = torch.tensor([task_id for _ in range(len(step_batch))], dtype=int)
+            if self.use_rm:
+                step_batch = self._process_batch_common(
+                    step_batch,
+                    metrics,
+                    step_timing,
+                    self.local_trigger_step if self.compute_prox_log_prob else None,
+                    task_id,
+                    skip_old_log_prob=True,
+                    skip_ref_values_adv=True,
+                )
+            task_batches = {task_id: step_batch}
+            task_batches = self._compute_old_log_probs_for_task_batches(
+                task_batches,
+                metrics,
+                step_timing,
+                self.local_trigger_step if self.compute_prox_log_prob else None,
+            )
+            task_batches = self._compute_ref_log_probs_for_task_batches(task_batches, step_timing)
+            step_batch = self._process_batch_common(
+                task_batches[task_id],
+                metrics,
+                step_timing,
+                None,
+                task_id,
+                skip_old_log_prob=True,
+                skip_reward=True,
+                skip_ref_log_prob=True,
+            )
+            self._restore_reward_extra_infos_for_logging(step_batch, task_id)
+            processed_steps[step_id] = step_batch
+
+            if should_log_rollout and rollout_data_dir:
+                task_reward_extra = {k: v for k, v in step_batch.meta_info.items()}
+                task_rollout_dir = os.path.join(rollout_data_dir, f"step{step_id}")
+                self._submit_rollout_dump(step_batch, task_reward_extra, step_timing, task_rollout_dir)
+
+            use_counts = step_batch.non_tensor_batch.get("entry_use_count")
+            if use_counts is not None:
+                metrics[f"replay/step{step_id}_mean_use_count"] = float(np.mean(use_counts))
+                metrics[f"replay/step{step_id}_min_use_count"] = float(np.min(use_counts))
+                metrics[f"replay/step{step_id}_max_use_count"] = float(np.max(use_counts))
+
+        return self._merge_step_batches(processed_steps), processed_steps
 
     # ------------------------------------------------------------------
     # Background buffer feeder (replay-buffer mode only)
@@ -260,21 +720,76 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                         [deserialized], self.tokenizer, self.config, balance_fn
                     )
 
-                # Push to all task buffers (lock is inside replay_buffer)
-                for tid in self._feeder_task_ids:
-                    batch = _assemble_for_tid(tid)
-                    if batch is None:
-                        continue
-                    stored = self.replay_buffer.push(batch, tid)
-                    if stored > 0:
-                        n = self.config.actor_rollout_ref.rollout.n
-                        required_groups = self.required_samples // n
-                        print(
-                            f"[BufferFeeder] task{tid}: pushed {stored} rows, "
-                            f"buffer={self.replay_buffer.task_size(tid)}/{self.required_samples} rows, "
-                            f"groups={self.replay_buffer.entries_per_task()[tid]}/{required_groups} groups, "
-                            f"mq_len={queue_len}"
-                        )
+                if self._replay_unit() == "step":
+                    replay_cfg = self.config.async_training.get("replay_buffer", {})
+                    stage2_cfg = self.config.actor_rollout_ref.rollout.get("stage2", {})
+                    drop_stage2_zero_std = bool(stage2_cfg.get("drop_zero_std", replay_cfg.get("drop_zero_std", False)))
+                    for tid in self._physical_task_ids:
+                        batch = _assemble_for_tid(tid)
+                        if batch is None:
+                            continue
+                        for lane_id, stage_id, step_id, step_batch in self._build_step_batches_from_task_batch(tid, batch):
+                            before_zero_stats = self.replay_buffer.zero_std_stats_per_task().get(lane_id, {})
+                            before_dropped = int(before_zero_stats.get("dropped_groups", 0))
+                            stored = self.replay_buffer.push(
+                                step_batch,
+                                tid,
+                                lane_id=lane_id,
+                                stage_id=stage_id,
+                                step_id=step_id,
+                                drop_zero_std=(
+                                    drop_stage2_zero_std
+                                    and int(stage_id) == 2
+                                    and int(step_id) != 1
+                                ),
+                            )
+                            zero_stats = self.replay_buffer.zero_std_stats_per_task().get(lane_id, {})
+                            dropped_delta = int(zero_stats.get("dropped_groups", 0)) - before_dropped
+                            if stored > 0:
+                                n = self.config.actor_rollout_ref.rollout.n
+                                required_groups = max(1, self.required_samples // n)
+                                seen = int(zero_stats.get("seen_groups", 0))
+                                dropped = int(zero_stats.get("dropped_groups", 0))
+                                drop_ratio = float(dropped / seen) if seen > 0 else 0.0
+                                entry_count = self.replay_buffer.entries_per_task()[lane_id]
+                                entry_cap = self.replay_buffer.max_size_per_task
+                                entry_cap_text = f"{entry_count}/{entry_cap}" if entry_cap > 0 else f"{entry_count}/unbounded"
+                                print(
+                                    f"[BufferFeeder] stage{stage_id}/step{step_id}: pushed {stored} rows, "
+                                    f"buffer={self.replay_buffer.task_size(lane_id)}/{self.required_samples} rows, "
+                                    f"groups={entry_count}/{required_groups} groups, "
+                                    f"entries={entry_cap_text} capacity, "
+                                    f"zero_std_drop={dropped}/{seen} ({drop_ratio:.3f}), "
+                                    f"mq_len={queue_len}"
+                                )
+                            elif dropped_delta > 0:
+                                seen = int(zero_stats.get("seen_groups", 0))
+                                dropped = int(zero_stats.get("dropped_groups", 0))
+                                drop_ratio = float(dropped / seen) if seen > 0 else 0.0
+                                entry_count = self.replay_buffer.entries_per_task()[lane_id]
+                                entry_cap = self.replay_buffer.max_size_per_task
+                                entry_cap_text = f"{entry_count}/{entry_cap}" if entry_cap > 0 else f"{entry_count}/unbounded"
+                                print(
+                                    f"[BufferFeeder] stage{stage_id}/step{step_id}: zero-std dropped {dropped_delta} groups, "
+                                    f"entries={entry_cap_text} capacity, "
+                                    f"zero_std_drop={dropped}/{seen} ({drop_ratio:.3f}), mq_len={queue_len}"
+                                )
+                else:
+                    # Push to all task buffers (lock is inside replay_buffer)
+                    for tid in self._feeder_task_ids:
+                        batch = _assemble_for_tid(tid)
+                        if batch is None:
+                            continue
+                        stored = self.replay_buffer.push(batch, tid)
+                        if stored > 0:
+                            n = self.config.actor_rollout_ref.rollout.n
+                            required_groups = self.required_samples // n
+                            print(
+                                f"[BufferFeeder] task{tid}: pushed {stored} rows, "
+                                f"buffer={self.replay_buffer.task_size(tid)}/{self.required_samples} rows, "
+                                f"groups={self.replay_buffer.entries_per_task()[tid]}/{required_groups} groups, "
+                                f"mq_len={queue_len}"
+                            )
             except Exception as e:
                 print(f"[BufferFeeder Error] {e}")
                 import traceback
@@ -290,19 +805,39 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             min_samples = self.required_samples
 
         while True:
-            min_buf = min(
-                self.replay_buffer.task_size(tid)
-                for tid in self._feeder_task_ids
-            )
-            if min_buf >= min_samples:
-                return True
-            if self._feeder_terminated:
-                # Feeder stopped — check once more
+            if self._replay_unit() == "step":
+                active_lanes = self._active_lane_ids()
+                step_ids = sorted({ReplayBuffer.decode_lane_id(lid)[1] for lid in active_lanes})
+                ready = True
+                for step_id in step_ids:
+                    quotas = self._step_lane_quotas_for_step(step_id, active_lanes, allow_available_fallback=True)
+                    if not quotas:
+                        ready = False
+                        break
+                    for lane_id, quota in quotas.items():
+                        if self.replay_buffer.task_size(lane_id) < quota:
+                            ready = False
+                            break
+                    if not ready:
+                        break
+                if ready:
+                    return True
+                if self._feeder_terminated:
+                    return ready
+            else:
                 min_buf = min(
                     self.replay_buffer.task_size(tid)
                     for tid in self._feeder_task_ids
                 )
-                return min_buf >= min_samples
+                if min_buf >= min_samples:
+                    return True
+                if self._feeder_terminated:
+                    # Feeder stopped — check once more
+                    min_buf = min(
+                        self.replay_buffer.task_size(tid)
+                        for tid in self._feeder_task_ids
+                    )
+                    return min_buf >= min_samples
             time.sleep(0.5)
 
     def _run_prefetch(self):
@@ -556,6 +1091,8 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
 
                     task_batches: dict[int, DataProto] = {}
                     task_timings: dict[int, dict] = {}
+                    combined_batch: DataProto | None = None
+                    processed_step_batches: dict[int, DataProto] = {}
 
                     if self.use_replay_buffer:
                         # ---- Replay path: sample from buffer (feeder pushes in background) ----
@@ -565,40 +1102,55 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                             print("[FullyAsyncTrainer] Buffer feeder terminated and buffer insufficient, stopping.")
                             break
 
-                        for task_id in task_ids:
-                            task_timing = {}
-                            with marked_timer("replay/sample_from_buffer", task_timing):
-                                task_batch = self.replay_buffer.sample_task(
-                                    task_id, self.required_samples, self.current_param_version
-                                )
-                            if task_batch is None:
-                                print(f"[FullyAsyncTrainer] task{task_id}: buffer empty after sample, skipping")
-                                continue
-
-                            buf_size = self.replay_buffer.task_size(task_id)
-                            print(
-                                f"[FullyAsyncTrainer] Replay sample task{task_id}: "
-                                f"sampled={len(task_batch)}, buffer_remaining={buf_size}"
+                        if self._replay_unit() == "step":
+                            step_batches, step_timings = self._sample_step_batches(metrics, timing_raw)
+                            if not step_batches:
+                                break
+                            combined_batch, processed_step_batches = self._prepare_step_combined_batch(
+                                step_batches,
+                                metrics,
+                                timing_raw,
+                                step_timings,
+                                should_log_rollout=should_log_rollout,
+                                rollout_data_dir=rollout_data_dir,
                             )
-                            use_counts = task_batch.non_tensor_batch.get("entry_use_count")
-                            if use_counts is not None:
-                                metrics[f"replay/task{task_id}_mean_use_count"] = float(np.mean(use_counts))
-                                metrics[f"replay/task{task_id}_min_use_count"] = float(np.min(use_counts))
-                                metrics[f"replay/task{task_id}_max_use_count"] = float(np.max(use_counts))
+                            task_batches = processed_step_batches
+                            task_timings = step_timings
+                        else:
+                            for task_id in task_ids:
+                                task_timing = {}
+                                with marked_timer("replay/sample_from_buffer", task_timing):
+                                    task_batch = self.replay_buffer.sample_task(
+                                        task_id, self.required_samples, self.current_param_version
+                                    )
+                                if task_batch is None:
+                                    print(f"[FullyAsyncTrainer] task{task_id}: buffer empty after sample, skipping")
+                                    continue
 
-                            task_batch.batch["task_id"] = torch.tensor([task_id for _ in range(len(task_batch))], dtype=int)
-                            if self.use_rm:
-                                task_batch = self._process_batch_common(
-                                    task_batch,
-                                    metrics,
-                                    task_timing,
-                                    self.local_trigger_step if self.compute_prox_log_prob else None,
-                                    task_id,
-                                    skip_old_log_prob=True,
-                                    skip_ref_values_adv=True,
+                                buf_size = self.replay_buffer.task_size(task_id)
+                                print(
+                                    f"[FullyAsyncTrainer] Replay sample task{task_id}: "
+                                    f"sampled={len(task_batch)}, buffer_remaining={buf_size}"
                                 )
-                            task_batches[task_id] = task_batch
-                            task_timings[task_id] = task_timing
+                                use_counts = task_batch.non_tensor_batch.get("entry_use_count")
+                                if use_counts is not None:
+                                    metrics[f"replay/task{task_id}_mean_use_count"] = float(np.mean(use_counts))
+                                    metrics[f"replay/task{task_id}_min_use_count"] = float(np.min(use_counts))
+                                    metrics[f"replay/task{task_id}_max_use_count"] = float(np.max(use_counts))
+
+                                task_batch.batch["task_id"] = torch.tensor([task_id for _ in range(len(task_batch))], dtype=int)
+                                if self.use_rm:
+                                    task_batch = self._process_batch_common(
+                                        task_batch,
+                                        metrics,
+                                        task_timing,
+                                        self.local_trigger_step if self.compute_prox_log_prob else None,
+                                        task_id,
+                                        skip_old_log_prob=True,
+                                        skip_ref_values_adv=True,
+                                    )
+                                task_batches[task_id] = task_batch
+                                task_timings[task_id] = task_timing
                     else:
                         # ---- Non-replay path: collect from queue (original behavior) ----
                         epoch, batch, queued_task_batches = self._get_samples_from_queue()
@@ -629,39 +1181,40 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                                 )
                             task_batches[task_id] = task_batch
 
-                    if not task_batches:
-                        break
+                    if combined_batch is None:
+                        if not task_batches:
+                            break
 
-                    task_batches = self._compute_old_log_probs_for_task_batches(
-                        task_batches,
-                        metrics,
-                        timing_raw,
-                        self.local_trigger_step if self.compute_prox_log_prob else None,
-                    )
-                    task_batches = self._compute_ref_log_probs_for_task_batches(task_batches, timing_raw)
-
-                    for task_id in list(task_batches.keys()):
-                        task_timing = task_timings.get(task_id, timing_raw)
-                        task_batch = self._process_batch_common(
-                            task_batches[task_id],
+                        task_batches = self._compute_old_log_probs_for_task_batches(
+                            task_batches,
                             metrics,
-                            task_timing,
-                            None,
-                            task_id,
-                            skip_old_log_prob=True,
-                            skip_reward=True,
-                            skip_ref_log_prob=True,
+                            timing_raw,
+                            self.local_trigger_step if self.compute_prox_log_prob else None,
                         )
-                        self._restore_reward_extra_infos_for_logging(task_batch, task_id)
-                        task_batches[task_id] = task_batch
+                        task_batches = self._compute_ref_log_probs_for_task_batches(task_batches, timing_raw)
 
-                        if should_log_rollout:
-                            task_reward_extra = {k: v for k, v in task_batch.meta_info.items()}
-                            task_rollout_dir = os.path.join(rollout_data_dir, f"task{task_id}")
-                            self._submit_rollout_dump(task_batch, task_reward_extra, task_timing, task_rollout_dir)
+                        for task_id in list(task_batches.keys()):
+                            task_timing = task_timings.get(task_id, timing_raw)
+                            task_batch = self._process_batch_common(
+                                task_batches[task_id],
+                                metrics,
+                                task_timing,
+                                None,
+                                task_id,
+                                skip_old_log_prob=True,
+                                skip_reward=True,
+                                skip_ref_log_prob=True,
+                            )
+                            self._restore_reward_extra_infos_for_logging(task_batch, task_id)
+                            task_batches[task_id] = task_batch
 
-                    # Merge all task batches into one combined batch
-                    combined_batch = self._merge_task_batches(task_batches)
+                            if should_log_rollout:
+                                task_reward_extra = {k: v for k, v in task_batch.meta_info.items()}
+                                task_rollout_dir = os.path.join(rollout_data_dir, f"task{task_id}")
+                                self._submit_rollout_dump(task_batch, task_reward_extra, task_timing, task_rollout_dir)
+
+                        # Merge all task batches into one combined batch
+                        combined_batch = self._merge_task_batches(task_batches)
 
                     # update critic (once with all tasks)
                     if self.use_critic:
@@ -684,23 +1237,39 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
                     # Post-training: evict low quality used groups from replay buffer
                     if self.use_replay_buffer:
                         with marked_timer("replay/evict", timing_raw):
-                            for _tid in task_ids:
+                            evict_ids = self._active_lane_ids() if self._replay_unit() == "step" else task_ids
+                            evict_infos = {}
+                            for _tid in evict_ids:
                                 kept, evicted, evict_info = self.replay_buffer.evict_after_use(_tid)
-                                metrics[f"replay/task{_tid}_kept"] = kept
-                                metrics[f"replay/task{_tid}_evicted"] = evicted
+                                evict_infos[_tid] = evict_info
+                                if self._replay_unit() == "step":
+                                    _stage, _step = ReplayBuffer.decode_lane_id(_tid)
+                                    pfx = f"replay/stage{_stage}_step{_step}"
+                                else:
+                                    pfx = f"replay/task{_tid}"
+                                metrics[f"{pfx}_kept"] = kept
+                                metrics[f"{pfx}_evicted"] = evicted
                                 for k, v in evict_info.items():
-                                    metrics[f"replay/task{_tid}_{k}"] = v
+                                    metrics[f"{pfx}_{k}"] = v
                             # Read size and entry count under a single lock
                             buf_stats = self.replay_buffer.stats_per_task()
-                            for _tid in task_ids:
+                            for _tid in evict_ids:
                                 buf_size, buf_entries = buf_stats.get(_tid, (0, 0))
-                                metrics[f"replay/task{_tid}_buffer_size"] = buf_size
-                                metrics[f"replay/task{_tid}_buffer_entries"] = buf_entries
+                                evict_info = evict_infos.get(_tid, {})
+                                if self._replay_unit() == "step":
+                                    _stage, _step = ReplayBuffer.decode_lane_id(_tid)
+                                    pfx = f"replay/stage{_stage}_step{_step}"
+                                    label = f"stage{_stage}/step{_step}"
+                                else:
+                                    pfx = f"replay/task{_tid}"
+                                    label = f"task{_tid}"
+                                metrics[f"{pfx}_buffer_size"] = buf_size
+                                metrics[f"{pfx}_buffer_entries"] = buf_entries
                                 evict_info_str = ", ".join(f"{k}={v:.4f}" for k, v in evict_info.items()) if evict_info else ""
                                 print(
-                                    f"[ReplayBuffer] task{_tid}: evict_after_use "
-                                    f"kept={metrics[f'replay/task{_tid}_kept']}, "
-                                    f"evicted={metrics[f'replay/task{_tid}_evicted']}, "
+                                    f"[ReplayBuffer] {label}: evict_after_use "
+                                    f"kept={metrics[f'{pfx}_kept']}, "
+                                    f"evicted={metrics[f'{pfx}_evicted']}, "
                                     f"buffer_size={buf_size}, entries={buf_entries}"
                                     + (f", {evict_info_str}" if evict_info_str else "")
                                 )
@@ -709,11 +1278,17 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
             # Collect step-level metrics (timing, throughput) after step timer completes
             # NOTE: _collect_task_metrics is called here (outside both step/gen timers) so that
             # timing_raw["step"] and timing_raw["gen"] are populated before compute_timing_metrics runs.
-            for task_id in task_ids:
-                # Replay path: merge shared timing with per-task timing so that
-                # reward/old_log_prob/adv reflect each task's actual compute time.
-                per_task_timing = {**timing_raw, **task_timings.get(task_id, {})} if task_timings else timing_raw
-                self._collect_task_metrics(combined_batch, metrics, per_task_timing, task_ids=[task_id])
+            if processed_step_batches:
+                for step_id, step_batch in processed_step_batches.items():
+                    task_id = self._step_id_to_task_id(step_id)
+                    per_task_timing = {**timing_raw, **task_timings.get(step_id, {})} if task_timings else timing_raw
+                    self._collect_task_metrics(step_batch, metrics, per_task_timing, task_ids=[task_id])
+            else:
+                for task_id in task_ids:
+                    # Replay path: merge shared timing with per-task timing so that
+                    # reward/old_log_prob/adv reflect each task's actual compute time.
+                    per_task_timing = {**timing_raw, **task_timings.get(task_id, {})} if task_timings else timing_raw
+                    self._collect_task_metrics(combined_batch, metrics, per_task_timing, task_ids=[task_id])
             self._collect_step_metrics(batch, 0, metrics, timing_raw)
             self.metrics_aggregator.add_step_metrics(
                 metrics=metrics, sample_count=self.required_samples, timestamp=time.time()

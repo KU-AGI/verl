@@ -23,6 +23,10 @@ python -m verl.model_merger merge \
     --target_dir /path/to/merged_hf_model
 ```
 
+```
+python -m verl.model_merger_janus merge --backend fsdp --local_dir /home/work/AGILAB/mllm_reasoning/verl/ckpts/mllm_reasoning/0530_KT_v5_fine_grained_lr_1e_6_GAE_length_norm_gamma_0_6_sglang_v2/global_step_1350/actor --target_dir /home/work/AGILAB/mllm_reasoning/verl/ckpts/mllm_reasoning/0530_KT_v5_fine_grained_lr_1e_6_GAE_length_norm_gamma_0_6_sglang_v2/global_step_1350/hf_model
+```
+
 To merge Megatron checkpoints:
 ```sh
 python -m verl.model_merger merge \

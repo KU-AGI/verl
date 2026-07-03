@@ -50,6 +50,10 @@ class ImageGenerationRolloutConfig(RolloutConfig):
     # Single-turn behavior is recovered with max_turns=1.
     max_turns: int = 1
 
+    # Stage2 local-branch rollout options. Kept as a dict because rollout-side
+    # code reads it with .get() and Hydra passes nested overrides here.
+    stage2: dict = field(default_factory=dict)
+
     val_kwargs: ImageGenerationSamplingConfig = field(default_factory=ImageGenerationSamplingConfig)
 
 

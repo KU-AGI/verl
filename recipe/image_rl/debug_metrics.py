@@ -76,7 +76,7 @@ def calculate_debug_metrics(data: DataProto, task_id: int = 1) -> dict:
     # Get task-specific tensors
     rollout_key = f"task{task_id}_rollout_log_probs"
     old_key = f"task{task_id}_old_log_probs"
-    response_mask_key = f"task{task_id}_response_mask"
+    response_mask_key = f"task{task_id}_loss_mask" if f"task{task_id}_loss_mask" in data.batch else f"task{task_id}_response_mask"
     attention_mask_key = f"task{task_id}_attention_mask"
     responses_key = f"task{task_id}_responses"
     

@@ -701,10 +701,10 @@ class DataParallelImageGenerationActor(BasePPOActor):
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
-        """Update policy with multi-task support"""
+        """Update policy with task-mode or unified step-row batches."""
         self.actor_module.train()
         self._set_train_eval_modes()
-        
+
         temperature = data.meta_info["temperature"]
         cfg_weight = data.meta_info["cfg_weight"]
         txt_top_k = data.meta_info.get("txt_top_k", 0)
@@ -712,89 +712,159 @@ class DataParallelImageGenerationActor(BasePPOActor):
         img_top_k = data.meta_info.get("img_top_k", 0)
         img_top_p = data.meta_info.get("img_top_p", 1.0)
 
-        # Multi-task configuration
         multi_task_config = self.config.get("multi_task", {})
         enable_multi_task = multi_task_config.get("enable", True)
         task_weights = multi_task_config.get("task_weights", [1.0, 1.0, 1.0])
         task_selection = multi_task_config.get("task_selection", "all")
 
-        # Determine which tasks to process
-        if enable_multi_task:
-            configured_task_ids = multi_task_config.get("task_ids", None)
-            if configured_task_ids is not None:
-                # Explicit task_ids from config (shell: task_ids='[1]' or '[1,2]' etc.)
-                task_ids = list(configured_task_ids)
-            elif task_selection == "all":
-                task_ids = [1, 2, 3]
-            elif task_selection == "weighted_sample":
-                import random
-                task_ids = random.choices([1, 2, 3], weights=task_weights, k=1)
+        def _step_to_task(step_id: int) -> int:
+            if step_id == 1:
+                return 1
+            if step_id in (2, 3, 4):
+                return 2
+            if step_id == 5:
+                return 3
+            raise ValueError(f"Invalid step_id: {step_id}")
+
+        available_keys = set(data.batch.keys())
+        step_ids = [sid for sid in data.meta_info.get("step_mode_step_ids", []) if f"step{int(sid)}_advantages" in available_keys]
+        if not step_ids:
+            step_ids = [sid for sid in range(1, 6) if f"step{sid}_advantages" in available_keys]
+        step_ids = [int(sid) for sid in step_ids]
+        step_mode = bool(step_ids)
+
+        units = []
+        all_select_batch_keys = []
+        if step_mode:
+            for step_id in step_ids:
+                task_id = _step_to_task(step_id)
+                prefix = f"step{step_id}_"
+                units.append({"kind": "step", "id": step_id, "task_id": task_id, "prefix": prefix, "metric": f"actor/step{step_id}"})
+                unit_keys = [
+                    f"{prefix}input_ids",
+                    f"{prefix}attention_mask",
+                    f"{prefix}response_mask",
+                    f"{prefix}old_log_probs",
+                    f"{prefix}advantages",
+                ]
+                if step_id == 1:
+                    unit_keys.append(f"{prefix}gen_img_tokens")
+                elif step_id in (2, 3, 4):
+                    unit_keys.append(f"{prefix}feedback_ids")
+                    unit_keys.append(f"{prefix}segment_mask")
+                    unit_keys.append(f"{prefix}task1_gen_imgs_pixel_values")
+                elif step_id == 5:
+                    unit_keys.append(f"{prefix}regen_img_tokens")
+                    unit_keys.append(f"{prefix}task1_gen_img_tokens")
+                    unit_keys.append(f"{prefix}input_img_tokens")
+                if self.config.use_kl_loss:
+                    unit_keys.append(f"{prefix}ref_log_prob")
+                unit_keys.append(f"{prefix}rollout_is_weights")
+                unit_keys.append(f"{prefix}unit_loss_weights")
+                unit_keys.append(f"{prefix}stage_ids")
+                unit_keys.append(f"{prefix}lane_ids")
+                all_select_batch_keys.extend([k for k in unit_keys if k in available_keys])
+        else:
+            if enable_multi_task:
+                configured_task_ids = multi_task_config.get("task_ids", None)
+                if configured_task_ids is not None:
+                    task_ids = list(configured_task_ids)
+                elif task_selection == "all":
+                    task_ids = [1, 2, 3]
+                elif task_selection == "weighted_sample":
+                    import random
+                    task_ids = random.choices([1, 2, 3], weights=task_weights, k=1)
+                else:
+                    task_ids = [data.batch["task_id"].view(-1)[0].item()]
             else:
                 task_ids = [data.batch["task_id"].view(-1)[0].item()]
-        else:
-            # Original behavior - single task
-            task_ids = [data.batch["task_id"].view(-1)[0].item()]
+            task_ids = [tid for tid in task_ids if f"task{tid}_advantages" in available_keys]
+            for task_id in task_ids:
+                prefix = f"task{task_id}_"
+                units.append({"kind": "task", "id": task_id, "task_id": task_id, "prefix": prefix, "metric": f"actor/task{task_id}"})
+                task_keys = [
+                    f"task{task_id}_input_ids",
+                    f"task{task_id}_attention_mask",
+                    f"task{task_id}_response_mask",
+                    f"task{task_id}_loss_mask",
+                    f"task{task_id}_old_log_probs",
+                    f"task{task_id}_advantages",
+                ]
+                if task_id == 1:
+                    task_keys.append("task1_gen_img_tokens")
+                elif task_id == 2:
+                    task_keys.append("task2_feedback_ids")
+                    task_keys.append("task2_segment_mask")
+                    if "task2_task1_gen_imgs_pixel_values" in available_keys:
+                        task_keys.append("task2_task1_gen_imgs_pixel_values")
+                    else:
+                        task_keys.append("task1_gen_imgs_pixel_values")
+                elif task_id == 3:
+                    task_keys.append("task3_regen_img_tokens")
+                    if "task3_task1_gen_img_tokens" in available_keys:
+                        task_keys.append("task3_task1_gen_img_tokens")
+                    elif "task3_input_img_tokens" in available_keys:
+                        task_keys.append("task3_input_img_tokens")
+                if self.config.use_kl_loss:
+                    task_keys.append(f"task{task_id}_ref_log_prob")
+                task_keys.append(f"task{task_id}_rollout_is_weights")
+                task_keys.append(f"task{task_id}_unit_loss_weights")
+                all_select_batch_keys.extend([k for k in task_keys if k in available_keys])
+            if "task_id" in available_keys:
+                all_select_batch_keys.append("task_id")
 
-        # Filter to only tasks whose advantages were actually computed upstream
-        available_keys = set(data.batch.keys())
-        task_ids = [tid for tid in task_ids if f"task{tid}_advantages" in available_keys]
-        if not task_ids:
-            print("[dp_actor] WARNING: no tasks have computed advantages, skipping update_policy")
+        if not units:
+            print("[dp_actor] WARNING: no units have computed advantages, skipping update_policy")
             return {}
 
-        # Prepare batch keys for all selected tasks
-        all_select_batch_keys = []
-        for task_id in task_ids:
-            task_keys = [
-                f"task{task_id}_input_ids", 
-                f"task{task_id}_attention_mask",
-                f"task{task_id}_response_mask",
-                f"task{task_id}_old_log_probs",
-                f"task{task_id}_advantages",
-            ]
-            # Add task-specific keys
-            if task_id == 1:
-                task_keys.append(f"task{task_id}_gen_img_tokens")
-            elif task_id == 2:
-                task_keys.append(f"task{task_id}_feedback_ids")
-                if "task2_segment_mask" in available_keys:
-                    task_keys.append("task2_segment_mask")
-                # Aliased key for replay: correct task1 context from task2's trajectory
-                if "task2_task1_gen_imgs_pixel_values" in available_keys:
-                    task_keys.append("task2_task1_gen_imgs_pixel_values")
-                else:
-                    task_keys.append("task1_gen_imgs_pixel_values")  # Task 2 needs task1 pixel values
-            elif task_id == 3:
-                task_keys.append(f"task{task_id}_regen_img_tokens")
-                # Aliased key for replay: correct task1 context from task3's trajectory
-                if "task3_task1_gen_img_tokens" in available_keys:
-                    task_keys.append("task3_task1_gen_img_tokens")
-                elif "task3_input_img_tokens" in available_keys:
-                    task_keys.append("task3_input_img_tokens")
-            
-            all_select_batch_keys.extend(task_keys)
-            
-            if self.config.use_kl_loss:
-                all_select_batch_keys.append(f"task{task_id}_ref_log_prob")
-            if f"task{task_id}_rollout_is_weights" in available_keys:
-                all_select_batch_keys.append(f"task{task_id}_rollout_is_weights")
-
-        # Add common keys
-        if "task_id" in data.batch.keys():
-            all_select_batch_keys.append("task_id")
-
-        all_select_batch_keys = list(set(all_select_batch_keys))
-        
-        non_tensor_select_keys = ['uid']
+        all_select_batch_keys = list(dict.fromkeys(all_select_batch_keys))
+        non_tensor_available = set((getattr(data, "non_tensor_batch", None) or {}).keys())
+        non_tensor_select_keys = [k for k in ["uid"] if k in non_tensor_available]
         data = data.select(all_select_batch_keys, non_tensor_select_keys)
-        
+
         num_mini_batches = data.batch.batch_size[0] // self.config.ppo_mini_batch_size
         mini_batches = data.chunk(num_mini_batches)
-
         on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1
-        
         metrics = {}
-        
+
+        def _unit_inputs(base_inputs, unit):
+            task_id = unit["task_id"]
+            if unit["kind"] == "task":
+                if task_id == 2 and "task2_task1_gen_imgs_pixel_values" in base_inputs:
+                    return {**base_inputs, "task1_gen_imgs_pixel_values": base_inputs["task2_task1_gen_imgs_pixel_values"]}
+                if task_id == 3 and "task3_task1_gen_img_tokens" in base_inputs:
+                    return {**base_inputs, "task1_gen_img_tokens": base_inputs["task3_task1_gen_img_tokens"]}
+                if task_id == 3 and "task3_input_img_tokens" in base_inputs:
+                    return {**base_inputs, "task1_gen_img_tokens": base_inputs["task3_input_img_tokens"]}
+                return base_inputs
+
+            step_id = unit["id"]
+            prefix = unit["prefix"]
+            task_prefix = f"task{task_id}_"
+            mapped = {**base_inputs}
+            for suffix in (
+                "input_ids", "attention_mask", "response_mask", "loss_mask", "old_log_probs", "advantages",
+                "ref_log_prob", "rollout_is_weights", "unit_loss_weights", "stage_ids", "lane_ids", "gen_img_tokens",
+                "feedback_ids", "regen_img_tokens",
+            ):
+                src = f"{prefix}{suffix}"
+                if src in base_inputs:
+                    mapped[f"{task_prefix}{suffix}"] = base_inputs[src]
+            if step_id in (2, 3, 4):
+                if f"{prefix}segment_mask" in base_inputs:
+                    mapped["task2_segment_mask"] = base_inputs[f"{prefix}segment_mask"]
+                if f"{prefix}task1_gen_imgs_pixel_values" in base_inputs:
+                    mapped["task2_task1_gen_imgs_pixel_values"] = base_inputs[f"{prefix}task1_gen_imgs_pixel_values"]
+                    mapped["task1_gen_imgs_pixel_values"] = base_inputs[f"{prefix}task1_gen_imgs_pixel_values"]
+            elif step_id == 5:
+                if f"{prefix}task1_gen_img_tokens" in base_inputs:
+                    mapped["task3_task1_gen_img_tokens"] = base_inputs[f"{prefix}task1_gen_img_tokens"]
+                    mapped["task1_gen_img_tokens"] = base_inputs[f"{prefix}task1_gen_img_tokens"]
+                elif f"{prefix}input_img_tokens" in base_inputs:
+                    mapped["task3_input_img_tokens"] = base_inputs[f"{prefix}input_img_tokens"]
+                    mapped["task1_gen_img_tokens"] = base_inputs[f"{prefix}input_img_tokens"]
+            return mapped
+
         for _ in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
                 if self.config.use_dynamic_bsz:
@@ -804,41 +874,30 @@ class DataParallelImageGenerationActor(BasePPOActor):
                     self.gradient_accumulation = (
                         self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
                     )
-
                     num_micro_batches = (
                         mini_batch.batch.batch_size[0] // self.config.ppo_micro_batch_size_per_gpu
                     )
-                    micro_batches = mini_batch.select(
-                        all_select_batch_keys, non_tensor_select_keys
-                    ).chunk(num_micro_batches)
-                
+                    micro_batches = mini_batch.select(all_select_batch_keys, non_tensor_select_keys).chunk(num_micro_batches)
+
                 self.actor_optimizer.zero_grad()
-                
+
                 for micro_batch in micro_batches:
                     micro_batch = micro_batch.to(get_device_id())
-                    model_inputs = {**micro_batch.batch}
-
+                    base_inputs = {**micro_batch.batch}
                     micro_batch_metrics = {}
-                    
-                    # Process each task separately with backward
-                    for task_id in task_ids:
-                        # Override cross-task context keys with per-task aliased versions
-                        # (only differs from model_inputs when replay fills the batch)
-                        if task_id == 2 and "task2_task1_gen_imgs_pixel_values" in model_inputs:
-                            model_inputs = {**model_inputs,
-                                "task1_gen_imgs_pixel_values": model_inputs["task2_task1_gen_imgs_pixel_values"]}
-                        elif task_id == 3 and "task3_task1_gen_img_tokens" in model_inputs:
-                            model_inputs = {**model_inputs,
-                                "task1_gen_img_tokens": model_inputs["task3_task1_gen_img_tokens"]}
-                        elif task_id == 3 and "task3_input_img_tokens" in model_inputs:
-                            model_inputs = {**model_inputs,
-                                "task1_gen_img_tokens": model_inputs["task3_input_img_tokens"]}
 
-                        # Get task-specific data
+                    for unit in units:
+                        task_id = unit["task_id"]
+                        metric_prefix = unit["metric"]
+                        model_inputs = _unit_inputs(base_inputs, unit)
+
                         old_log_prob = model_inputs[f"task{task_id}_old_log_probs"]
                         advantages = model_inputs[f"task{task_id}_advantages"]
+                        unit_loss_weights = model_inputs.get(f"task{task_id}_unit_loss_weights", None)
+                        if unit_loss_weights is not None:
+                            advantages = advantages * unit_loss_weights.to(device=advantages.device, dtype=advantages.dtype).view(-1, 1)
                         response_mask = model_inputs[f"task{task_id}_response_mask"]
-                        loss_mask = response_mask
+                        loss_mask = model_inputs.get(f"task{task_id}_loss_mask", response_mask)
                         if task_id == 2 and "task2_segment_mask" in model_inputs:
                             segment_mask = model_inputs["task2_segment_mask"].to(device=response_mask.device)
                             valid_mask = response_mask > 0
@@ -861,30 +920,27 @@ class DataParallelImageGenerationActor(BasePPOActor):
                         else:
                             loss_scale_factor = 1 / self.gradient_accumulation
 
-                        # Forward pass for this task
-                        # adaptive entropy needs entropy even when coeff starts at 0
                         calculate_entropy = entropy_coeff != 0 or self.use_adaptive_entropy_coeff
                         entropy, log_prob = self._forward_micro_batch(
-                            model_inputs, temperature=temperature,
-                            calculate_entropy=calculate_entropy, task_id=task_id,
-                            cfg_weight=cfg_weight, txt_top_k=txt_top_k, txt_top_p=txt_top_p,
-                            img_top_k=img_top_k, img_top_p=img_top_p,
+                            model_inputs,
+                            temperature=temperature,
+                            calculate_entropy=calculate_entropy,
+                            task_id=task_id,
+                            cfg_weight=cfg_weight,
+                            txt_top_k=txt_top_k,
+                            txt_top_p=txt_top_p,
+                            img_top_k=img_top_k,
+                            img_top_p=img_top_p,
                         )
 
-                        # Handle old_log_prob
                         if hasattr(self.config, "use_rollout_log_probs") and self.config.use_rollout_log_probs:
                             old_log_prob = model_inputs[f"task{task_id}_old_log_probs"]
                         else:
-                            if on_policy:
-                                old_log_prob = log_prob.detach()
-                            else:
-                                old_log_prob = model_inputs[f"task{task_id}_old_log_probs"]
+                            old_log_prob = log_prob.detach() if on_policy else model_inputs[f"task{task_id}_old_log_probs"]
 
                         loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
                         rollout_is_weights = model_inputs.get(f"task{task_id}_rollout_is_weights", None)
                         policy_loss_fn = get_policy_loss_fn(loss_mode)
-
-                        # Compute policy loss
                         pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
                             old_log_prob=old_log_prob,
                             log_prob=log_prob,
@@ -897,98 +953,126 @@ class DataParallelImageGenerationActor(BasePPOActor):
 
                         if calculate_entropy:
                             entropy_loss = agg_loss(loss_mat=entropy, loss_mask=loss_mask, loss_agg_mode=loss_agg_mode)
-                            # Update adaptive coeff after computing entropy
                             if self.use_adaptive_entropy_coeff:
                                 self.adaptive_entropy_coeffs[task_id].update(entropy=entropy_loss.detach())
-                            micro_batch_metrics[f"actor/task{task_id}_entropy"] = entropy_loss.detach().item()
-                            micro_batch_metrics[f"actor/task{task_id}_entropy_loss"] = (entropy_loss * entropy_coeff).detach().item() * loss_scale_factor
-                            micro_batch_metrics[f"actor/task{task_id}_entropy_coeff"] = entropy_coeff
+                            micro_batch_metrics[f"{metric_prefix}_entropy"] = entropy_loss.detach().item()
+                            micro_batch_metrics[f"{metric_prefix}_entropy_loss"] = (entropy_loss * entropy_coeff).detach().item() * loss_scale_factor
+                            micro_batch_metrics[f"{metric_prefix}_entropy_coeff"] = entropy_coeff
                             policy_loss = pg_loss - entropy_loss * entropy_coeff
                         else:
                             policy_loss = pg_loss
 
+                        kld = None
                         if self.config.use_kl_loss:
                             ref_log_prob = model_inputs[f"task{task_id}_ref_log_prob"]
-                            kld = kl_penalty(
-                                logprob=log_prob, ref_logprob=ref_log_prob,
-                                kl_penalty=self.config.kl_loss_type
-                            )
-                            kl_loss = agg_loss(loss_mat=kld, loss_mask=loss_mask,
-                                            loss_agg_mode=loss_agg_mode)
+                            kld = kl_penalty(logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type)
+                            kl_loss = agg_loss(loss_mat=kld, loss_mask=loss_mask, loss_agg_mode=loss_agg_mode)
                             policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
-                            micro_batch_metrics[f"actor/task{task_id}_kl"] = kl_loss.detach().item()
-                            micro_batch_metrics[f"actor/task{task_id}_kl_loss"] = (kl_loss * self.config.kl_loss_coef).detach().item() * loss_scale_factor
-                            micro_batch_metrics[f"actor/task{task_id}_kl_coef"] = self.config.kl_loss_coef
+                            micro_batch_metrics[f"{metric_prefix}_kl"] = kl_loss.detach().item()
+                            micro_batch_metrics[f"{metric_prefix}_kl_loss"] = (kl_loss * self.config.kl_loss_coef).detach().item() * loss_scale_factor
+                            micro_batch_metrics[f"{metric_prefix}_kl_coef"] = self.config.kl_loss_coef
 
-                        # Apply task weight and scale factor
-                        task_weight = task_weights[task_id - 1] if enable_multi_task else 1.0
+                        task_weight = task_weights[task_id - 1] if enable_multi_task and not step_mode else 1.0
+                        unit_weight_mean = 1.0
+                        if unit_loss_weights is not None:
+                            task_weight = 1.0
+                            unit_weight_mean = float(unit_loss_weights.detach().float().mean().item())
                         weighted_loss = policy_loss * task_weight * loss_scale_factor
 
-                        # Backward for each task separately
+                        stage_ids_tensor = model_inputs.get(f"task{task_id}_stage_ids", None)
+                        if stage_ids_tensor is not None:
+                            stage_ids_tensor = stage_ids_tensor.to(device=response_mask.device).view(-1)
+                            for raw_stage in torch.unique(stage_ids_tensor).detach().cpu().tolist():
+                                stage_id = int(raw_stage)
+                                stage_row_mask = (stage_ids_tensor == stage_id).to(dtype=loss_mask.dtype, device=loss_mask.device).view(-1, 1)
+                                stage_loss_mask = loss_mask * stage_row_mask
+                                if float(stage_loss_mask.sum().item()) <= 0.0:
+                                    continue
+                                s_pg_loss, s_pg_clipfrac, s_ppo_kl, s_pg_clipfrac_lower = policy_loss_fn(
+                                    old_log_prob=old_log_prob,
+                                    log_prob=log_prob,
+                                    advantages=advantages,
+                                    response_mask=stage_loss_mask,
+                                    loss_agg_mode=loss_agg_mode,
+                                    config=self.config,
+                                    rollout_is_weights=rollout_is_weights,
+                                )
+                                s_policy_loss = s_pg_loss
+                                if calculate_entropy:
+                                    s_entropy_loss = agg_loss(loss_mat=entropy, loss_mask=stage_loss_mask, loss_agg_mode=loss_agg_mode)
+                                    s_policy_loss = s_policy_loss - s_entropy_loss * entropy_coeff
+                                    micro_batch_metrics[f"actor/stage{stage_id}_step{unit['id']}_entropy"] = s_entropy_loss.detach().item()
+                                if self.config.use_kl_loss and kld is not None:
+                                    s_kl_loss = agg_loss(loss_mat=kld, loss_mask=stage_loss_mask, loss_agg_mode=loss_agg_mode)
+                                    s_policy_loss = s_policy_loss + s_kl_loss * self.config.kl_loss_coef
+                                    micro_batch_metrics[f"actor/stage{stage_id}_step{unit['id']}_kl_loss"] = (
+                                        s_kl_loss * self.config.kl_loss_coef
+                                    ).detach().item() * loss_scale_factor
+                                s_weighted_loss = s_policy_loss * task_weight * loss_scale_factor
+                                micro_batch_metrics.update({
+                                    f"actor/stage{stage_id}_step{unit['id']}_pg_loss": s_pg_loss.detach().item() * loss_scale_factor,
+                                    f"actor/stage{stage_id}_step{unit['id']}_pg_clipfrac": s_pg_clipfrac.detach().item(),
+                                    f"actor/stage{stage_id}_step{unit['id']}_ppo_kl": s_ppo_kl.detach().item(),
+                                    f"actor/stage{stage_id}_step{unit['id']}_pg_clipfrac_lower": s_pg_clipfrac_lower.detach().item(),
+                                    f"actor/stage{stage_id}_step{unit['id']}_loss": s_weighted_loss.detach().item(),
+                                })
+
                         weighted_loss.backward()
 
-                        # Per-task cumulative grad norm (no clipping, just measurement)
                         task_grad_norm = torch.nn.utils.clip_grad_norm_(
                             self.actor_module.parameters(), max_norm=float('inf')
                         ).item()
-
-                        # Store metrics per task
-                        micro_batch_metrics[f"actor/task{task_id}_cum_grad_norm"] = task_grad_norm
                         micro_batch_metrics.update({
-                            f"actor/task{task_id}_pg_loss": pg_loss.detach().item() * loss_scale_factor,
-                            f"actor/task{task_id}_pg_clipfrac": pg_clipfrac.detach().item(),
-                            f"actor/task{task_id}_ppo_kl": ppo_kl.detach().item(),
-                            f"actor/task{task_id}_pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
-                            f"actor/task{task_id}_weight": task_weight,
-                            f"actor/task{task_id}_loss": weighted_loss.detach().item(),
+                            f"{metric_prefix}_cum_grad_norm": task_grad_norm,
+                            f"{metric_prefix}_pg_loss": pg_loss.detach().item() * loss_scale_factor,
+                            f"{metric_prefix}_pg_clipfrac": pg_clipfrac.detach().item(),
+                            f"{metric_prefix}_ppo_kl": ppo_kl.detach().item(),
+                            f"{metric_prefix}_pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+                            f"{metric_prefix}_weight": task_weight,
+                            f"{metric_prefix}_unit_weight_mean": unit_weight_mean,
+                            f"{metric_prefix}_loss": weighted_loss.detach().item(),
                         })
 
-                        adv = model_inputs[f"task{task_id}_advantages"]      # (B, 576)
-                        mask = model_inputs[f"task{task_id}_response_mask"]  # (B, 576)
+                        adv = model_inputs[f"task{task_id}_advantages"]
+                        mask = model_inputs[f"task{task_id}_response_mask"]
                         lp = log_prob.detach()
-
                         seq_adv_sum = adv[:, 0].view(-1, 1)
-                        is_pos_seq = (seq_adv_sum > 0) # (B, 1)
-                        is_neg_seq = (seq_adv_sum < 0)
+                        is_pos_seq = seq_adv_sum > 0
+                        is_neg_seq = seq_adv_sum < 0
+                        pos_mask = is_pos_seq & mask.bool()
+                        neg_mask = is_neg_seq & mask.bool()
+                        micro_batch_metrics[f"{metric_prefix}_pos_log_prob"] = lp[pos_mask].sum().item()
+                        micro_batch_metrics[f"{metric_prefix}_pos_log_prob_cnt"] = pos_mask.sum().item()
+                        micro_batch_metrics[f"{metric_prefix}_neg_log_prob"] = lp[neg_mask].sum().item()
+                        micro_batch_metrics[f"{metric_prefix}_neg_log_prob_cnt"] = neg_mask.sum().item()
 
-                        pos_mask = is_pos_seq & mask.bool() # (B, 576)
-                        neg_mask = is_neg_seq & mask.bool() # (B, 576)
-
-                        micro_batch_metrics[f"actor/task{task_id}_pos_log_prob"] = lp[pos_mask].sum().item()
-                        micro_batch_metrics[f"actor/task{task_id}_pos_log_prob_cnt"] = pos_mask.sum().item()
-                        
-                        micro_batch_metrics[f"actor/task{task_id}_neg_log_prob"] = lp[neg_mask].sum().item()
-                        micro_batch_metrics[f"actor/task{task_id}_neg_log_prob_cnt"] = neg_mask.sum().item()
-
-                    # Add aggregated metrics across tasks
-                    if enable_multi_task and len(task_ids) > 1:
-                        aggregated_metrics = {}
-
-                        avg_pg_loss = sum([micro_batch_metrics.get(f"actor/task{tid}_pg_loss", 0.0) for tid in task_ids]) / len(task_ids)
-                        avg_pg_clipfrac = sum([micro_batch_metrics.get(f"actor/task{tid}_pg_clipfrac", 0.0) for tid in task_ids]) / len(task_ids)
-                        avg_ppo_kl = sum([micro_batch_metrics.get(f"actor/task{tid}_ppo_kl", 0.0) for tid in task_ids]) / len(task_ids)
-                        avg_pg_clipfrac_lower = sum([micro_batch_metrics.get(f"actor/task{tid}_pg_clipfrac_lower", 0.0) for tid in task_ids]) / len(task_ids)
-                        total_loss = sum([micro_batch_metrics.get(f"actor/task{tid}_loss", 0.0) for tid in task_ids])
-
-                        aggregated_metrics.update({
-                            "actor/avg_pg_loss": avg_pg_loss,
-                            "actor/avg_pg_clipfrac": avg_pg_clipfrac,
-                            "actor/avg_ppo_kl": avg_ppo_kl,
-                            "actor/avg_pg_clipfrac_lower": avg_pg_clipfrac_lower,
-                            "actor/loss": total_loss,
-                        })
-
-                        if any(f"actor/task{tid}_kl_loss" in micro_batch_metrics for tid in task_ids):
-                            avg_kl_loss = sum([micro_batch_metrics.get(f"actor/task{tid}_kl_loss", 0.0) for tid in task_ids]) / len(task_ids)
-                            aggregated_metrics["actor/avg_kl_loss"] = avg_kl_loss
-
+                    if len(units) > 1:
+                        prefixes = [u["metric"] for u in units]
+                        aggregated_metrics = {
+                            "actor/avg_pg_loss": sum(micro_batch_metrics.get(f"{p}_pg_loss", 0.0) for p in prefixes) / len(prefixes),
+                            "actor/avg_pg_clipfrac": sum(micro_batch_metrics.get(f"{p}_pg_clipfrac", 0.0) for p in prefixes) / len(prefixes),
+                            "actor/avg_ppo_kl": sum(micro_batch_metrics.get(f"{p}_ppo_kl", 0.0) for p in prefixes) / len(prefixes),
+                            "actor/avg_pg_clipfrac_lower": sum(micro_batch_metrics.get(f"{p}_pg_clipfrac_lower", 0.0) for p in prefixes) / len(prefixes),
+                            "actor/loss": sum(micro_batch_metrics.get(f"{p}_loss", 0.0) for p in prefixes),
+                        }
+                        if any(f"{p}_kl_loss" in micro_batch_metrics for p in prefixes):
+                            aggregated_metrics["actor/avg_kl_loss"] = sum(micro_batch_metrics.get(f"{p}_kl_loss", 0.0) for p in prefixes) / len(prefixes)
+                        if step_mode:
+                            for stage_id in (1, 2):
+                                stage_loss_keys = [f"actor/stage{stage_id}_step{u['id']}_loss" for u in units]
+                                present_loss = [micro_batch_metrics[k] for k in stage_loss_keys if k in micro_batch_metrics]
+                                if present_loss:
+                                    aggregated_metrics[f"actor/stage{stage_id}_loss"] = sum(present_loss)
+                                    pg_keys = [f"actor/stage{stage_id}_step{u['id']}_pg_loss" for u in units]
+                                    pg_vals = [micro_batch_metrics[k] for k in pg_keys if k in micro_batch_metrics]
+                                    if pg_vals:
+                                        aggregated_metrics[f"actor/stage{stage_id}_avg_pg_loss"] = sum(pg_vals) / len(pg_vals)
                         micro_batch_metrics.update(aggregated_metrics)
 
                     append_to_dict(metrics, micro_batch_metrics)
 
                 grad_norm = self._optimizer_step()
-                mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
-                append_to_dict(metrics, mini_batch_metrics)
-        
+                append_to_dict(metrics, {"actor/grad_norm": grad_norm.detach().item()})
+
         self.actor_optimizer.zero_grad()
         return metrics

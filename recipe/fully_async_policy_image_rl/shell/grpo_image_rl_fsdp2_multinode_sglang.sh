@@ -14,9 +14,21 @@ exec 2>&1
 #                         EXPERIMENT CONFIGURATION
 ###############################################################################
 project_name='mllm_reasoning'
-exp_name="0530_KT_v5_fine_grained_lr_1e_6_GAE_length_norm_gamma_0_6_sglang_v2"
+exp_name="0622_KT_v5_fine_grained_lr_1e_6_Stage2_training_test"
 # exp_name="0423_debug"
 task_ids='[1,2,3]'
+train_stages='[1,2]'
+stage1_ratio=0.5
+stage2_ratio=0.5
+stage2_enable=True
+stage2_steps='[1,2,3,4,5]'
+stage2_anchor_selection=entropy  # options: random, entropy, entropy_sample; reward/reward_entropy wait for Stage1 reward but currently fall back to random
+stage2_entropy_top_logprobs_num=20
+stage2_entropy_sample_temperature=0.2
+stage2_drop_zero_std=True
+step_weights='[0.3,0.1,0.1,0.1,0.3]'
+stage1_loss_weight=1.0
+stage2_loss_weight=1.0
 
 ###############################################################################
 #                           ENVIRONMENT VARIABLES
@@ -226,6 +238,8 @@ partial_rollout=False
 use_rollout_log_probs=True
 compute_prox_log_prob=False
 max_regen_retries=3
+# 4x current default: max(10 rollout servers * 1 prompt * 16 n * (3 retries + 2), 768) = 800.
+max_finalize_backlog_samples=${MAX_FINALIZE_BACKLOG_SAMPLES:-3200}
 
 # Replay Buffer
 replay_buffer_enable=True
@@ -236,9 +250,17 @@ replay_buffer_filter_mode=max_and_std_constant      # "mean", "std", or "max", "
 replay_buffer_score_threshold_1=0.8
 replay_buffer_score_threshold_2=3
 replay_buffer_score_threshold_3=0.5 # 2점 만점
+# Stage2 task2 local rewards use a different scale from Stage1 task2 total reward.
+# Lane ids: 22=stage2/step2, 23=stage2/step3, 24=stage2/step4.
+replay_buffer_score_threshold_22=1
+replay_buffer_score_threshold_23=1
+replay_buffer_score_threshold_24=1
 replay_buffer_score_std_threshold_1=0.1
 replay_buffer_score_std_threshold_2=0.1
 replay_buffer_score_std_threshold_3=0.1
+replay_buffer_score_std_threshold_22=0.1
+replay_buffer_score_std_threshold_23=0.1
+replay_buffer_score_std_threshold_24=0.1
 replay_buffer_reward_history_size=100
 replay_buffer_max_quantile=0.75
 replay_buffer_std_quantile=0.50
@@ -254,9 +276,9 @@ bypass_mode=false
 #                         TRAINING SCHEDULE
 ###############################################################################
 total_epochs=10
-test_freq=20
-save_freq=50
-rollout_freq=20
+test_freq=10
+save_freq=500
+rollout_freq=10
 # total_training_steps=3000
 # log_val_generations=20
 
@@ -370,7 +392,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     actor_rollout_ref.ref.fsdp_config.wrap_policy.transformer_layer_cls_to_wrap=['LlamaDecoderLayer'] \
     actor_rollout_ref.ref.ulysses_sequence_parallel_size=${sp_size} \
     trainer.critic_warmup=0 \
-    trainer.logger=['console','wandb'] \
+    trainer.logger=['console'] \
     trainer.val_before_train=False \
     trainer.balance_batch=False \
     trainer.project_name="${project_name}" \
@@ -400,7 +422,12 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     async_training.use_rollout_log_probs=${use_rollout_log_probs} \
     async_training.compute_prox_log_prob=${compute_prox_log_prob} \
     async_training.max_regen_retries=${max_regen_retries} \
+    +async_training.max_finalize_backlog_samples=${max_finalize_backlog_samples} \
     async_training.replay_buffer.enable=${replay_buffer_enable} \
+    +async_training.replay_buffer.unit=step \
+    +async_training.train_stages="${train_stages}" \
+    +async_training.stage_ratios.1=${stage1_ratio} \
+    +async_training.stage_ratios.2=${stage2_ratio} \
     async_training.replay_buffer.max_version_gap=${replay_buffer_max_version_gap} \
     async_training.replay_buffer.max_size_per_task=${replay_buffer_max_size_per_task} \
     async_training.replay_buffer.max_use_count=${replay_buffer_max_use_count} \
@@ -408,9 +435,15 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     +async_training.replay_buffer.score_thresholds.1=${replay_buffer_score_threshold_1} \
     +async_training.replay_buffer.score_thresholds.2=${replay_buffer_score_threshold_2} \
     +async_training.replay_buffer.score_thresholds.3=${replay_buffer_score_threshold_3} \
+    +async_training.replay_buffer.score_thresholds.22=${replay_buffer_score_threshold_22} \
+    +async_training.replay_buffer.score_thresholds.23=${replay_buffer_score_threshold_23} \
+    +async_training.replay_buffer.score_thresholds.24=${replay_buffer_score_threshold_24} \
     +async_training.replay_buffer.score_std_thresholds.1=${replay_buffer_score_std_threshold_1} \
     +async_training.replay_buffer.score_std_thresholds.2=${replay_buffer_score_std_threshold_2} \
     +async_training.replay_buffer.score_std_thresholds.3=${replay_buffer_score_std_threshold_3} \
+    +async_training.replay_buffer.score_std_thresholds.22=${replay_buffer_score_std_threshold_22} \
+    +async_training.replay_buffer.score_std_thresholds.23=${replay_buffer_score_std_threshold_23} \
+    +async_training.replay_buffer.score_std_thresholds.24=${replay_buffer_score_std_threshold_24} \
     async_training.replay_buffer.reward_history_size=${replay_buffer_reward_history_size} \
     async_training.replay_buffer.max_quantile=${replay_buffer_max_quantile} \
     async_training.replay_buffer.std_quantile=${replay_buffer_std_quantile} \
@@ -427,9 +460,18 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     +actor_rollout_ref.actor.multi_task.enable=True \
     +actor_rollout_ref.actor.multi_task.task_ids="${task_ids}" \
     +actor_rollout_ref.actor.multi_task.task_weights='[0.3,0.3,0.3]' \
+    +actor_rollout_ref.actor.step_weights="${step_weights}" \
+    +actor_rollout_ref.actor.stage_loss_weights.1=${stage1_loss_weight} \
+    +actor_rollout_ref.actor.stage_loss_weights.2=${stage2_loss_weight} \
     actor_rollout_ref.actor.adaptive_entropy_coeff.enable=${adaptive_entropy_coeff_enable} \
     actor_rollout_ref.actor.adaptive_entropy_coeff.task1.target_entropy=${adaptive_entropy_coeff_task1_target_entropy} \
     actor_rollout_ref.actor.adaptive_entropy_coeff.task2.target_entropy=${adaptive_entropy_coeff_task2_target_entropy} \
     actor_rollout_ref.actor.adaptive_entropy_coeff.task3.target_entropy=${adaptive_entropy_coeff_task3_target_entropy} \
     +actor_rollout_ref.rollout.max_turns=${max_turns} \
+    +actor_rollout_ref.rollout.stage2.enable=${stage2_enable} \
+    +actor_rollout_ref.rollout.stage2.steps="${stage2_steps}" \
+    +actor_rollout_ref.rollout.stage2.anchor_selection=${stage2_anchor_selection} \
+    +actor_rollout_ref.rollout.stage2.entropy_top_logprobs_num=${stage2_entropy_top_logprobs_num} \
+    +actor_rollout_ref.rollout.stage2.entropy_sample_temperature=${stage2_entropy_sample_temperature} \
+    +actor_rollout_ref.rollout.stage2.drop_zero_std=${stage2_drop_zero_std} \
     

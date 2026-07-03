@@ -7,7 +7,7 @@ trap "kill 0" EXIT
 GDINO_MODEL_PATH=/home/work/AGILAB/mllm_reasoning/data/checkpoints/mm_grounding_dino_large_all
 
 # 대상 GPU 번호들
-GPUS=(6 7)
+GPUS=(7)
 
 for i in "${GPUS[@]}"; do
     port=$((8080 + i))

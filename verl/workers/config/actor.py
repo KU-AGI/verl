@@ -165,6 +165,12 @@ class ActorConfig(BaseConfig):
     # global_batch_size: global batch size
     global_batch_info: dict = field(default_factory=dict)
 
+    # Optional fine-grained loss weights for step-mode replay. Kept on the
+    # actor config so Hydra can pass nested overrides without breaking
+    # FSDPActorConfig instantiation; consumers read them with .get().
+    step_weights: list[float] = field(default_factory=list)
+    stage_loss_weights: dict[str, float] = field(default_factory=dict)
+
     def __post_init__(self):
         """Validate actor configuration parameters."""
         assert self.strategy != MISSING

@@ -30,10 +30,15 @@ from recipe.image_rl.gdino_regex import _CONNECTORS, SKIP_KEYWORDS, _COMPILED_RE
 
 # Configuration
 VLM_BASE_URLS = [
-    "http://192.169.0.2:8007/v1",
+    "http://10.100.85.2:8005/v1",
+    "http://10.100.85.2:8006/v1", # sub1
+    "http://10.100.85.2:8007/v1", # sub1
+    "http://10.100.85.4:8005/v1",
+    "http://10.100.85.4:8006/v1", # sub2
+    "http://10.100.85.4:8007/v1", # sub2
 ]
 LLM_BASE_URLS = [
-    # "http://10.100.44.2:8004/v1", # sub2
+    # "http://10.100.44.2:8004/v1", # sub1
     # "http://10.100.44.2:8005/v1",
     # "http://10.100.44.2:8006/v1",
     # "http://10.100.44.2:8007/v1",
@@ -57,7 +62,8 @@ _rm_slot_queues = {}  # {(loop_id, is_vlm): queue}
 
 # Detector configuration
 DETECTOR_URLS = [
-    "http://192.169.0.2:8086",
+    "http://10.100.85.4:8086",
+    "http://10.100.85.4:8087",
 ]
 DETECTOR_TIMEOUT = 300000.0
 DETECTOR_MAX_RETRIES = 2

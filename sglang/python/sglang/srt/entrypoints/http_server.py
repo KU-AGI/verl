@@ -881,6 +881,9 @@ async def janus_generate_image_request(request: Request):
     if top_k == 0:
         top_k = -1
     return_logprob = bool(body.get("return_logprob", body.get("logprobs", False)))
+    top_logprobs_num = int(body.get("top_logprobs_num", 0))
+    if not return_logprob:
+        top_logprobs_num = 0
     image_token_num = 576
     img_size = 384
     patch_size = 16
@@ -1024,12 +1027,18 @@ async def janus_generate_image_request(request: Request):
                 }
             )
 
+    request_top_logprobs_num = (
+        [top_logprobs_num if i % 2 == 0 else 0 for i in range(len(batch_input_ids))]
+        if top_logprobs_num > 0
+        else 0
+    )
     obj = GenerateReqInput(
         input_ids=batch_input_ids,
         sampling_params=batch_sampling_params,
         rid=batch_rids,
         stream=False,
         return_logprob=return_logprob,
+        top_logprobs_num=request_top_logprobs_num,
     )
 
     try:
@@ -1060,19 +1069,20 @@ async def janus_generate_image_request(request: Request):
                     value = 0.0
                 image_token_logprobs.append(float(value))
 
-        images.append(
-            {
-                "image_base64": image_base64,
-                "image_url": (
-                    f"data:image/png;base64,{image_base64}"
-                    if image_base64 is not None
-                    else None
-                ),
-                "image_token_ids": image_token_ids,
-                "image_token_logprobs": image_token_logprobs,
-                "finish_reason": meta_info.get("finish_reason"),
-            }
-        )
+        image_result = {
+            "image_base64": image_base64,
+            "image_url": (
+                f"data:image/png;base64,{image_base64}"
+                if image_base64 is not None
+                else None
+            ),
+            "image_token_ids": image_token_ids,
+            "image_token_logprobs": image_token_logprobs,
+            "finish_reason": meta_info.get("finish_reason"),
+        }
+        if top_logprobs_num > 0:
+            image_result["image_top_logprobs"] = meta_info.get("output_top_logprobs")
+        images.append(image_result)
 
     return orjson_response({"images": images})
 

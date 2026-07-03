@@ -20,6 +20,26 @@ from typing import Any
 import numpy as np
 
 
+def _flatten_metric_values(val: Any) -> np.ndarray:
+    """Flatten nested numeric metric values into a 1-D numpy array."""
+    if hasattr(val, "detach"):
+        val = val.detach().cpu().numpy()
+
+    if isinstance(val, np.ndarray):
+        if val.dtype == object:
+            parts = [_flatten_metric_values(v) for v in val.tolist()]
+            parts = [p for p in parts if p.size > 0]
+            return np.concatenate(parts) if parts else np.asarray([], dtype=np.float64)
+        return val.reshape(-1)
+
+    if isinstance(val, (list, tuple)):
+        parts = [_flatten_metric_values(v) for v in val]
+        parts = [p for p in parts if p.size > 0]
+        return np.concatenate(parts) if parts else np.asarray([], dtype=np.float64)
+
+    return np.asarray([val], dtype=np.float64)
+
+
 def reduce_metrics(metrics: dict[str, list[Any]]) -> dict[str, Any]:
     """
     Reduces a dictionary of metric lists by computing the mean, max, or min of each list.
@@ -45,6 +65,7 @@ def reduce_metrics(metrics: dict[str, list[Any]]) -> dict[str, Any]:
         {"loss": 2.0, "accuracy": 0.8, "max_reward": 8.0, "min_error": 0.05}
     """
     for key, val in metrics.items():
+        val = _flatten_metric_values(val)
         if "max" in key:
             metrics[key] = np.max(val)
         elif "min" in key:

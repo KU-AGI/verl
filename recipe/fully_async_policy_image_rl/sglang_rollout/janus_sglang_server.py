@@ -3,6 +3,7 @@ import base64
 import concurrent.futures
 import json
 import logging
+import math
 import os
 import signal
 import subprocess
@@ -395,6 +396,12 @@ class JanusSGLangAsyncServer:
 
     def _get_generation_config(self, prompt: DataProto) -> dict[str, Any]:
         is_validate = bool(prompt.meta_info.get("validate", False))
+        stage2_cfg = self.config.get("stage2", {}) if hasattr(self.config, "get") else getattr(self.config, "stage2", {})
+        cfg_get = stage2_cfg.get if hasattr(stage2_cfg, "get") else lambda key, default=None: getattr(stage2_cfg, key, default)
+        entropy_top_logprobs_num = 0
+        anchor_selection = str(cfg_get("anchor_selection", "random")).strip().lower()
+        if not is_validate and anchor_selection in {"entropy", "entropy_sample"}:
+            entropy_top_logprobs_num = int(cfg_get("entropy_top_logprobs_num", 20))
         if is_validate:
             val_kwargs = self.config.val_kwargs
             return {
@@ -405,6 +412,7 @@ class JanusSGLangAsyncServer:
                 "txt_top_p": getattr(val_kwargs, "val_txt_top_p", 1.0),
                 "img_top_k": getattr(val_kwargs, "val_img_top_k", 4096),
                 "img_top_p": getattr(val_kwargs, "val_img_top_p", 1.0),
+                "entropy_top_logprobs_num": 0,
             }
         else:
             return {
@@ -415,6 +423,7 @@ class JanusSGLangAsyncServer:
                 "txt_top_p": getattr(self.config, "txt_top_p", 1.0),
                 "img_top_k": getattr(self.config, "img_top_k", 4096),
                 "img_top_p": getattr(self.config, "img_top_p", 1.0),
+                "entropy_top_logprobs_num": entropy_top_logprobs_num,
             }
 
     def _get_sft_format(self, prompt: str, system_prompt: str = "") -> str:
@@ -525,7 +534,13 @@ class JanusSGLangAsyncServer:
             if key in data_proto.batch:
                 pad_value = 0 if "mask" in key else self.processor.pad_id
                 data_proto.batch[key] = self._pad_tensor_left(data_proto.batch[key], self.prompt_length, pad_value)
-        for key in ("task2_feedback_ids", "task2_response_mask", "task2_segment_mask", "task2_rollout_log_probs"):
+        for key in (
+            "task2_feedback_ids",
+            "task2_response_mask",
+            "task2_segment_mask",
+            "task2_stage2_target_mask",
+            "task2_rollout_log_probs",
+        ):
             if key in data_proto.batch:
                 pad_value = 0 if ("mask" in key or "log_probs" in key) else self.tokenizer.eos_token_id
                 data_proto.batch[key] = self._pad_tensor_right(data_proto.batch[key], self.response_length, pad_value)
@@ -565,6 +580,49 @@ class JanusSGLangAsyncServer:
         if len(values) < len(token_ids):
             values.extend([0.0] * (len(token_ids) - len(values)))
         return values[: len(token_ids)]
+
+    @staticmethod
+    def _extract_topk_entropies(raw_top_logprobs, token_ids: list[int]) -> list[float]:
+        values: list[float] = []
+        if raw_top_logprobs is None:
+            return [float("nan")] * len(token_ids)
+        for token_topk in raw_top_logprobs or []:
+            logps: list[float] = []
+            for item in token_topk or []:
+                if isinstance(item, dict):
+                    value = item.get("logprob", item.get("log_prob", None))
+                elif isinstance(item, (int, float)):
+                    value = item
+                elif isinstance(item, (list, tuple)) and item:
+                    value = item[0]
+                else:
+                    value = None
+                if value is not None:
+                    logps.append(float(value))
+            if not logps:
+                values.append(float("nan"))
+                continue
+            max_logp = max(logps)
+            exp_vals = [math.exp(x - max_logp) for x in logps]
+            denom = sum(exp_vals)
+            if denom <= 0.0:
+                values.append(float("nan"))
+                continue
+            probs = [x / denom for x in exp_vals]
+            log_denom = max_logp + math.log(denom)
+            values.append(float(-sum(p * (lp - log_denom) for p, lp in zip(probs, logps))))
+        if len(values) < len(token_ids):
+            values.extend([float("nan")] * (len(token_ids) - len(values)))
+        return values[: len(token_ids)]
+
+    @staticmethod
+    def _masked_entropy_mean(entropies: torch.Tensor, mask: torch.Tensor) -> np.ndarray:
+        mask = mask.bool() & torch.isfinite(entropies)
+        denom = mask.sum(dim=1).clamp_min(1)
+        summed = entropies.masked_fill(~mask, 0.0).sum(dim=1)
+        out = summed / denom
+        out = out.masked_fill(mask.sum(dim=1) == 0, float("nan"))
+        return out.detach().cpu().numpy().astype(np.float32)
 
     @staticmethod
     def _sglang_top_k(value: int | float) -> int:
@@ -624,7 +682,160 @@ class JanusSGLangAsyncServer:
             data_proto.batch["task1_rollout_log_probs"] = self._stack_2d(logprobs, pad_value=0, dtype=torch.float32)
         return data_proto
 
+    @staticmethod
+    def _find_subsequence_list(haystack: list[int], needle: list[int]) -> int:
+        if not needle:
+            return 0
+        n, m = len(haystack), len(needle)
+        for i in range(max(0, n - m + 1)):
+            if haystack[i:i + m] == needle:
+                return i
+        return -1
+
+    def _assemble_task2_feedback(self, decompose: str, verify: str, feedback: str) -> str:
+        return (
+            f"{(decompose or '').strip()}\n"
+            f"{FormattingEvaluatorV3.SECOND_PATTERN}\n"
+            f"{(verify or '').strip()}\n"
+            f"{FormattingEvaluatorV3.THIRD_PATTERN}\n"
+            f"{(feedback or '').strip()}"
+        ).strip()
+
+    async def _generate_task2_stage2_local(self, data_proto: DataProto, gen_config: dict[str, Any]) -> DataProto:
+        prompts = self._as_str_list(data_proto.non_tensor_batch["prompt"])
+        training_texts = [self._task2_training_text(prompt) for prompt in prompts]
+        input_ids, _ = self._tokenize_left(training_texts)
+        expanded_input_ids, expanded_attention_mask = self._expand_image_placeholders_ids(input_ids)
+        data_proto.batch["task2_input_ids"] = expanded_input_ids.cpu()
+        data_proto.batch["task2_attention_mask"] = expanded_attention_mask.cpu()
+
+        current_base64 = data_proto.non_tensor_batch.get("current_imgs_base64")
+        if current_base64 is None:
+            current_base64 = data_proto.non_tensor_batch.get("task1_gen_imgs_base64")
+        if current_base64 is None:
+            pil_list = data_proto.non_tensor_batch.get("task1_gen_imgs_pil_list")
+            if pil_list is None:
+                raise ValueError("stage2 task2 requires current image base64 or PIL image")
+            current_base64 = [self._pil_to_data_uri(img) for img in np.asarray(pil_list, dtype=object).reshape(-1)]
+        current_base64 = self._as_str_list(current_base64)
+
+        target_steps = np.asarray(data_proto.non_tensor_batch.get("stage2_target_step"), dtype=np.int64).reshape(-1)
+        anchor_texts = self._as_str_list(data_proto.non_tensor_batch.get("stage2_anchor_task2_feedback_texts"))
+        if len(anchor_texts) != len(prompts):
+            raise ValueError("stage2 task2 requires one anchor feedback text per row")
+
+        async def request_one(prompt: str, image_uri: str, anchor_text: str, target_step: int):
+            decompose, verify, feedback = self.formatter_v3._split_text_into_parts(anchor_text)
+            decompose = decompose or ""
+            verify = verify or ""
+            feedback = feedback or "No need to generate feedback."
+            if int(target_step) == 2:
+                request_text = self._task2_request_text(prompt)
+            elif int(target_step) == 3:
+                request_text = (
+                    self._task2_request_text(prompt)
+                    + decompose.strip()
+                    + "\n"
+                    + FormattingEvaluatorV3.SECOND_PATTERN
+                    + "\n"
+                )
+            elif int(target_step) == 4:
+                request_text = (
+                    self._task2_request_text(prompt)
+                    + decompose.strip()
+                    + "\n"
+                    + FormattingEvaluatorV3.SECOND_PATTERN
+                    + "\n"
+                    + verify.strip()
+                    + "\n"
+                    + FormattingEvaluatorV3.THIRD_PATTERN
+                    + "\n"
+                )
+            else:
+                raise ValueError(f"Invalid stage2 task2 target_step={target_step}")
+            output = await self._post_json(
+                "/generate",
+                {
+                    "text": request_text,
+                    "image_data": image_uri,
+                    "sampling_params": {
+                        "max_new_tokens": int(self.response_length),
+                        "temperature": float(gen_config["temperature"]),
+                        "top_p": float(gen_config["txt_top_p"]),
+                        "top_k": self._sglang_top_k(gen_config["txt_top_k"]),
+                        "skip_special_tokens": True,
+                    },
+                    "return_logprob": not gen_config["is_validate"],
+                },
+            )
+            if isinstance(output, list):
+                output = output[0]
+            text = str(output.get("text", ""))
+            if int(target_step) == 2:
+                target_text = text.split(FormattingEvaluatorV3.SECOND_PATTERN, 1)[0].strip()
+                decompose = target_text
+            elif int(target_step) == 3:
+                target_text = text.split(FormattingEvaluatorV3.THIRD_PATTERN, 1)[0].strip()
+                verify = target_text
+            else:
+                target_text = text.strip()
+                feedback = target_text
+            assembled = self._assemble_task2_feedback(decompose, verify, feedback)
+            raw_logprobs = (output.get("meta_info") or {}).get("output_token_logprobs")
+            return assembled, target_text, raw_logprobs
+
+        outputs = await asyncio.gather(
+            *[
+                request_one(prompt, image_uri, anchor, int(step))
+                for prompt, image_uri, anchor, step in zip(prompts, current_base64, anchor_texts, target_steps)
+            ]
+        )
+
+        token_lists = []
+        target_masks = []
+        logprob_lists = []
+        feedback_texts = []
+        for assembled, target_text, raw_logprobs in outputs:
+            full_ids = self.tokenizer.encode(assembled, add_special_tokens=False)
+            target_ids = self.tokenizer.encode(target_text, add_special_tokens=False)
+            pos = self._find_subsequence_list(full_ids, target_ids)
+            target_mask = [0] * len(full_ids)
+            if pos >= 0:
+                for j in range(pos, min(pos + len(target_ids), len(target_mask))):
+                    target_mask[j] = 1
+            token_lists.append([int(x) for x in full_ids])
+            target_masks.append(target_mask)
+            feedback_texts.append(assembled)
+            if not gen_config["is_validate"]:
+                vals = self._extract_token_logprobs(raw_logprobs, target_ids)
+                full_lp = [0.0] * len(full_ids)
+                if pos >= 0:
+                    for offset, value in enumerate(vals):
+                        if pos + offset < len(full_lp):
+                            full_lp[pos + offset] = float(value)
+                logprob_lists.append(full_lp)
+
+        feedback_ids = self._stack_2d(token_lists, pad_value=int(self.tokenizer.eos_token_id), dtype=torch.long)
+        segment_mask = build_segment_response_mask(feedback_ids, self.tokenizer)
+        response_mask = (segment_mask > 0).long()
+        target_mask = self._stack_2d(target_masks, pad_value=0, dtype=torch.long)
+        if target_mask.size(1) < response_mask.size(1):
+            target_mask = self._pad_tensor_right(target_mask, response_mask.size(1), 0)
+        data_proto.non_tensor_batch["task2_feedback_texts"] = np.array(feedback_texts, dtype=object)
+        data_proto.batch["task2_feedback_ids"] = feedback_ids.cpu()
+        data_proto.batch["task2_response_mask"] = response_mask.cpu()
+        data_proto.batch["task2_segment_mask"] = segment_mask.cpu()
+        data_proto.batch["task2_stage2_target_mask"] = target_mask[:, : response_mask.size(1)].cpu()
+        if not gen_config["is_validate"]:
+            log_probs = self._stack_2d(logprob_lists, pad_value=0, dtype=torch.float32)
+            if log_probs.size(1) < response_mask.size(1):
+                log_probs = self._pad_tensor_right(log_probs, response_mask.size(1), 0)
+            data_proto.batch["task2_rollout_log_probs"] = log_probs[:, : response_mask.size(1)].masked_fill(target_mask[:, : response_mask.size(1)] == 0, 0.0).cpu()
+        return data_proto
+
     async def _generate_task2(self, data_proto: DataProto, gen_config: dict[str, Any]) -> DataProto:
+        if "stage2_target_step" in data_proto.non_tensor_batch:
+            return await self._generate_task2_stage2_local(data_proto, gen_config)
         prompts = self._as_str_list(data_proto.non_tensor_batch["prompt"])
         training_texts = [self._task2_training_text(prompt) for prompt in prompts]
         input_ids, _ = self._tokenize_left(training_texts)
@@ -642,27 +853,30 @@ class JanusSGLangAsyncServer:
             current_base64 = [self._pil_to_data_uri(img) for img in np.asarray(pil_list, dtype=object).reshape(-1)]
         current_base64 = self._as_str_list(current_base64)
 
+        top_logprobs_num = int(gen_config.get("entropy_top_logprobs_num", 0))
+
         async def request_one(prompt: str, image_uri: str):
-            return await self._post_json(
-                "/generate",
-                {
-                    "text": self._task2_request_text(prompt),
-                    "image_data": image_uri,
-                    "sampling_params": {
-                        "max_new_tokens": int(self.response_length),
-                        "temperature": float(gen_config["temperature"]),
-                        "top_p": float(gen_config["txt_top_p"]),
-                        "top_k": self._sglang_top_k(gen_config["txt_top_k"]),
-                        "skip_special_tokens": True,
-                    },
-                    "return_logprob": not gen_config["is_validate"],
+            payload = {
+                "text": self._task2_request_text(prompt),
+                "image_data": image_uri,
+                "sampling_params": {
+                    "max_new_tokens": int(self.response_length),
+                    "temperature": float(gen_config["temperature"]),
+                    "top_p": float(gen_config["txt_top_p"]),
+                    "top_k": self._sglang_top_k(gen_config["txt_top_k"]),
+                    "skip_special_tokens": True,
                 },
-            )
+                "return_logprob": not gen_config["is_validate"],
+            }
+            if top_logprobs_num > 0:
+                payload["top_logprobs_num"] = top_logprobs_num
+            return await self._post_json("/generate", payload)
 
         outputs = await asyncio.gather(*[request_one(prompt, image_uri) for prompt, image_uri in zip(prompts, current_base64)])
         token_lists = []
         feedback_texts = []
         logprob_lists = []
+        entropy_lists = []
         for output in outputs:
             if isinstance(output, list):
                 output = output[0]
@@ -674,8 +888,11 @@ class JanusSGLangAsyncServer:
             feedback_texts.append(text)
             token_lists.append(token_ids)
             if not gen_config["is_validate"]:
-                raw_logprobs = (output.get("meta_info") or {}).get("output_token_logprobs")
+                meta_info = output.get("meta_info") or {}
+                raw_logprobs = meta_info.get("output_token_logprobs")
                 logprob_lists.append(self._extract_token_logprobs(raw_logprobs, token_ids))
+                if top_logprobs_num > 0:
+                    entropy_lists.append(self._extract_topk_entropies(meta_info.get("output_top_logprobs"), token_ids))
 
         feedback_ids = self._stack_2d(token_lists, pad_value=int(self.tokenizer.eos_token_id), dtype=torch.long)
         segment_mask = build_segment_response_mask(feedback_ids, self.tokenizer)
@@ -689,6 +906,14 @@ class JanusSGLangAsyncServer:
             if log_probs.size(1) < response_mask.size(1):
                 log_probs = self._pad_tensor_right(log_probs, response_mask.size(1), 0)
             data_proto.batch["task2_rollout_log_probs"] = log_probs[:, : response_mask.size(1)].masked_fill(response_mask == 0, 0.0).cpu()
+            if top_logprobs_num > 0:
+                entropies = self._stack_2d(entropy_lists, pad_value=float("nan"), dtype=torch.float32)
+                if entropies.size(1) < response_mask.size(1):
+                    entropies = self._pad_tensor_right(entropies, response_mask.size(1), float("nan"))
+                entropies = entropies[:, : response_mask.size(1)]
+                data_proto.non_tensor_batch["task2_step2_entropy"] = self._masked_entropy_mean(entropies, segment_mask == 2)
+                data_proto.non_tensor_batch["task2_step3_entropy"] = self._masked_entropy_mean(entropies, segment_mask == 3)
+                data_proto.non_tensor_batch["task2_step4_entropy"] = self._masked_entropy_mean(entropies, segment_mask == 4)
         return data_proto
 
     async def _generate_task3(self, data_proto: DataProto, gen_config: dict[str, Any]) -> DataProto:
@@ -719,23 +944,26 @@ class JanusSGLangAsyncServer:
         data_proto.batch["task3_attention_mask"] = expanded_attention_mask.cpu()
 
         token_lists_for_request = current_tokens.detach().cpu().long().tolist()
+        top_logprobs_num = int(gen_config.get("entropy_top_logprobs_num", 0))
+        if "stage2_target_step" in data_proto.non_tensor_batch:
+            top_logprobs_num = 0
 
         async def request_one(prompt: str, feedback: str, image_tokens: list[int]):
-            return await self._post_json(
-                "/janus/generate_image",
-                {
-                    "mode": "edit",
-                    "input_prompt": prompt,
-                    "feedback": feedback or "No need to generate feedback.",
-                    "input_image_token_ids": image_tokens,
-                    "cfg_weight": float(gen_config["cfg_weight"]),
-                    "temperature": float(gen_config["temperature"]),
-                    "top_p": float(gen_config["img_top_p"]),
-                    "top_k": self._sglang_top_k(gen_config["img_top_k"]),
-                    "n": 1,
-                    "return_logprob": not gen_config["is_validate"],
-                },
-            )
+            payload = {
+                "mode": "edit",
+                "input_prompt": prompt,
+                "feedback": feedback or "No need to generate feedback.",
+                "input_image_token_ids": image_tokens,
+                "cfg_weight": float(gen_config["cfg_weight"]),
+                "temperature": float(gen_config["temperature"]),
+                "top_p": float(gen_config["img_top_p"]),
+                "top_k": self._sglang_top_k(gen_config["img_top_k"]),
+                "n": 1,
+                "return_logprob": not gen_config["is_validate"],
+            }
+            if top_logprobs_num > 0:
+                payload["top_logprobs_num"] = top_logprobs_num
+            return await self._post_json("/janus/generate_image", payload)
 
         results = await asyncio.gather(
             *[
@@ -764,6 +992,13 @@ class JanusSGLangAsyncServer:
                 for info, tokens in zip(image_infos, regen_token_lists)
             ]
             data_proto.batch["task3_rollout_log_probs"] = self._stack_2d(logprobs, pad_value=0, dtype=torch.float32)
+            if top_logprobs_num > 0:
+                entropy_values = []
+                for info, tokens in zip(image_infos, regen_token_lists):
+                    token_entropies = self._extract_topk_entropies(info.get("image_top_logprobs"), tokens)
+                    finite_values = [x for x in token_entropies if math.isfinite(x)]
+                    entropy_values.append(float(np.mean(finite_values)) if finite_values else float("nan"))
+                data_proto.non_tensor_batch["task3_step5_entropy"] = np.asarray(entropy_values, dtype=np.float32)
         return data_proto
 
     async def _generate_step(

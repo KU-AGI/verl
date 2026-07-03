@@ -91,6 +91,33 @@ class ReplayBuffer:
         self.std_history: dict[int, deque[float]] = {
             tid: deque(maxlen=reward_history_size) for tid in task_ids
         }
+        self.zero_std_drop_stats: dict[int, dict[str, int]] = {
+            tid: {"seen_groups": 0, "dropped_groups": 0, "dropped_rows": 0}
+            for tid in task_ids
+        }
+
+    @staticmethod
+    def encode_lane_id(stage_id: int, step_id: int) -> int:
+        return int(stage_id) * 10 + int(step_id)
+
+    @staticmethod
+    def decode_lane_id(lane_id: int) -> tuple[int, int]:
+        lane_id = int(lane_id)
+        return lane_id // 10, lane_id % 10
+
+    @staticmethod
+    def physical_task_id_for_step(step_id: int) -> int:
+        step_id = int(step_id)
+        if step_id == 1:
+            return 1
+        if step_id in (2, 3, 4):
+            return 2
+        if step_id == 5:
+            return 3
+        raise ValueError(f"Invalid step_id={step_id}")
+
+    def _threshold_for(self, lane_id: int, physical_task_id: int, mapping: dict[int, float], default: float = 0.0) -> float:
+        return mapping.get(int(lane_id), mapping.get(int(physical_task_id), default))
 
     # ------------------------------------------------------------------
     # Push
@@ -116,6 +143,9 @@ class ReplayBuffer:
                 },
                 "std_history": {
                     tid: list(hist) for tid, hist in self.std_history.items()
+                },
+                "zero_std_drop_stats": {
+                    tid: dict(stats) for tid, stats in self.zero_std_drop_stats.items()
                 },
             }
 
@@ -146,9 +176,28 @@ class ReplayBuffer:
                 tid: deque(restored_std_hist.get(tid, []), maxlen=self.reward_history_size)
                 for tid in self.task_ids
             }
+            restored_drop_stats = state.get("zero_std_drop_stats", {})
+            self.zero_std_drop_stats = {
+                tid: {
+                    "seen_groups": int(restored_drop_stats.get(tid, {}).get("seen_groups", 0)),
+                    "dropped_groups": int(restored_drop_stats.get(tid, {}).get("dropped_groups", 0)),
+                    "dropped_rows": int(restored_drop_stats.get(tid, {}).get("dropped_rows", 0)),
+                }
+                for tid in self.task_ids
+            }
 
-    def push(self, batch: DataProto, task_id: int) -> int:
-        score_key = f"task{task_id}_token_level_scores"
+    def push(
+        self,
+        batch: DataProto,
+        task_id: int,
+        lane_id: int | None = None,
+        stage_id: int | None = None,
+        step_id: int | None = None,
+        drop_zero_std: bool = False,
+    ) -> int:
+        physical_task_id = int(task_id)
+        lane_id = int(lane_id if lane_id is not None else physical_task_id)
+        score_key = f"task{physical_task_id}_token_level_scores"
         outcome_key = "outcome_token_level_scores"
         if score_key not in batch.batch and outcome_key not in batch.batch:
             return 0
@@ -175,11 +224,14 @@ class ReplayBuffer:
             t_idx = int(turn_idx_arr[i]) if turn_idx_arr is not None else 0
             key_idxs.setdefault((uid, t_idx), []).append(i)
 
-        task_prefix = f"task{task_id}_"
+        task_prefix = f"task{physical_task_id}_"
         total_stored = 0
         entries_to_add: list[BufferEntry] = []
+        seen_groups = 0
+        zero_std_dropped_groups = 0
+        zero_std_dropped_rows = 0
 
-        allowed_prefixes = tuple(f"task{t}_" for t in range(1, task_id + 1))
+        allowed_prefixes = tuple(f"task{t}_" for t in range(1, physical_task_id + 1))
         base_ntb = {
             "uid",
             "turn_idx",
@@ -197,6 +249,11 @@ class ReplayBuffer:
             "outcome_IF_bar",
             "outcome_P_bar",
             "outcome_T",
+            "stage_id",
+            "step_id",
+            "physical_task_id",
+            "lane_id",
+            "unit_loss_weight",
         }
 
         for (uid, turn_idx), idxs in key_idxs.items():
@@ -237,6 +294,12 @@ class ReplayBuffer:
                 reward_std = variance ** 0.5
             else:
                 reward_std = 0.0
+            if drop_zero_std:
+                seen_groups += 1
+            if drop_zero_std and reward_std <= 1e-8:
+                zero_std_dropped_groups += 1
+                zero_std_dropped_rows += len(idxs)
+                continue
 
             version = min(int(param_versions[i]) for i in idxs)
             filtered = _slice_dataproto_with_meta(batch, idxs)
@@ -244,7 +307,7 @@ class ReplayBuffer:
             cross_task_vals = {}
             # Multi-turn: task2/task3 training should consume the image the
             # policy actually saw at rollout time.
-            if task_id == 2:
+            if physical_task_id == 2:
                 img_src = (
                     "current_imgs_pixel_values"
                     if "current_imgs_pixel_values" in filtered.batch.keys()
@@ -254,7 +317,7 @@ class ReplayBuffer:
                     cross_task_vals["task2_task1_gen_imgs_pixel_values"] = filtered.batch[img_src]
                 if "task1_token_level_scores" in filtered.batch.keys():
                     cross_task_vals["task2_task1_token_level_scores"] = filtered.batch["task1_token_level_scores"]
-            elif task_id == 3:
+            elif physical_task_id == 3:
                 if "task3_input_img_tokens" in filtered.batch.keys():
                     cross_task_vals["task3_task1_gen_img_tokens"] = filtered.batch["task3_input_img_tokens"]
                 if "task1_token_level_scores" in filtered.batch.keys():
@@ -278,10 +341,10 @@ class ReplayBuffer:
                 filtered.batch[k] = val
 
             cross_ntb_vals = {}
-            if task_id == 2:
+            if physical_task_id == 2:
                 if "task1_gen_imgs_pil_list" in filtered.non_tensor_batch:
                     cross_ntb_vals["task2_task1_gen_imgs_pil_list"] = filtered.non_tensor_batch["task1_gen_imgs_pil_list"]
-            elif task_id == 3:
+            elif physical_task_id == 3:
                 if "task1_gen_imgs_pil_list" in filtered.non_tensor_batch:
                     cross_ntb_vals["task3_task1_gen_imgs_pil_list"] = filtered.non_tensor_batch["task1_gen_imgs_pil_list"]
                 if "task2_feedback_texts" in filtered.non_tensor_batch:
@@ -292,7 +355,13 @@ class ReplayBuffer:
             }
             filtered.non_tensor_batch.update(cross_ntb_vals)
             if "data_source" in filtered.non_tensor_batch:
-                filtered.non_tensor_batch[f"task{task_id}_data_source"] = filtered.non_tensor_batch.pop("data_source")
+                filtered.non_tensor_batch[f"task{physical_task_id}_data_source"] = filtered.non_tensor_batch.pop("data_source")
+            if stage_id is not None:
+                filtered.non_tensor_batch["stage_id"] = np.full(len(filtered), int(stage_id), dtype=np.int64)
+            if step_id is not None:
+                filtered.non_tensor_batch["step_id"] = np.full(len(filtered), int(step_id), dtype=np.int64)
+            filtered.non_tensor_batch["physical_task_id"] = np.full(len(filtered), physical_task_id, dtype=np.int64)
+            filtered.non_tensor_batch["lane_id"] = np.full(len(filtered), lane_id, dtype=np.int64)
 
             filtered.meta_info = {
                 k: v for k, v in filtered.meta_info.items()
@@ -312,14 +381,20 @@ class ReplayBuffer:
             total_stored += len(idxs)
 
         with self._lock:
-            self.buffers[task_id].extend(entries_to_add)
+            stats = self.zero_std_drop_stats.setdefault(
+                lane_id, {"seen_groups": 0, "dropped_groups": 0, "dropped_rows": 0}
+            )
+            stats["seen_groups"] += seen_groups
+            stats["dropped_groups"] += zero_std_dropped_groups
+            stats["dropped_rows"] += zero_std_dropped_rows
+            self.buffers[lane_id].extend(entries_to_add)
             # history는 adaptive 모드에서만 기록
             if self.filter_mode == "max_and_std_adaptive":
                 for entry in entries_to_add:
-                    self.max_reward_history[task_id].append(entry.max_reward)
-                    self.std_history[task_id].append(entry.reward_std)
+                    self.max_reward_history[lane_id].append(entry.max_reward)
+                    self.std_history[lane_id].append(entry.reward_std)
             if self.max_size_per_task > 0:
-                self._enforce_capacity(task_id)
+                self._enforce_capacity(lane_id)
 
         return total_stored
 
@@ -389,18 +464,25 @@ class ReplayBuffer:
                     "history_half": int(history_half),
                 }
 
-            elif self.filter_mode == "max_and_std_constant":
-                max_thr = self.score_thresholds.get(task_id, 0.0)
-                std_thr = self.std_thresholds.get(task_id, 0.0)
-                info = {"max_threshold": max_thr, "std_threshold": std_thr}
+            else:
+                try:
+                    _stage_id, _step_id = self.decode_lane_id(task_id)
+                    physical_task_id = self.physical_task_id_for_step(_step_id) if _stage_id > 0 else task_id
+                except Exception:
+                    physical_task_id = task_id
 
-            elif self.filter_mode == "mean_std_constant":
-                mean_thr = self.score_thresholds.get(task_id, 0.0)
-                std_thr  = self.std_thresholds.get(task_id, 0.0)
-                info = {"mean_threshold": mean_thr, "std_threshold": std_thr}
+                if self.filter_mode == "max_and_std_constant":
+                    max_thr = self._threshold_for(task_id, physical_task_id, self.score_thresholds, 0.0)
+                    std_thr = self._threshold_for(task_id, physical_task_id, self.std_thresholds, 0.0)
+                    info = {"max_threshold": max_thr, "std_threshold": std_thr}
 
-            else:  # "mean" / "std" / "max"
-                static_thr = self.score_thresholds.get(task_id, 0.0)
+                elif self.filter_mode == "mean_std_constant":
+                    mean_thr = self._threshold_for(task_id, physical_task_id, self.score_thresholds, 0.0)
+                    std_thr  = self._threshold_for(task_id, physical_task_id, self.std_thresholds, 0.0)
+                    info = {"mean_threshold": mean_thr, "std_threshold": std_thr}
+
+                else:  # "mean" / "std" / "max"
+                    static_thr = self._threshold_for(task_id, physical_task_id, self.score_thresholds, 0.0)
 
             # ── 필터링 ──────────────────────────────────────────────────
             for entry in buf:
@@ -492,3 +574,7 @@ class ReplayBuffer:
                 tid: (sum(len(e.data) for e in self.buffers[tid]), len(self.buffers[tid]))
                 for tid in self.task_ids
             }
+
+    def zero_std_stats_per_task(self) -> dict[int, dict[str, int]]:
+        with self._lock:
+            return {tid: dict(self.zero_std_drop_stats.get(tid, {})) for tid in self.task_ids}

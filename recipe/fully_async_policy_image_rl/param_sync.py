@@ -110,8 +110,6 @@ class ParameterSynchronizer:
                 print("[ParameterSynchronizer] NIXL backend initialized successfully")
             except Exception as e:
                 print(f"[ParameterSynchronizer] NIXL init failed, falling back to Gloo: {e}")
-                import traceback
-                traceback.print_exc()
                 self._use_nixl = False
 
         # Prevent overlapping weight distribution (vN and vN+1 race)
