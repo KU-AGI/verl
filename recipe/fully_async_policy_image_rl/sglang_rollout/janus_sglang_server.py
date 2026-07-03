@@ -682,7 +682,7 @@ class JanusSGLangAsyncServer:
                 raw_logprobs = (output.get("meta_info") or {}).get("output_token_logprobs")
                 logprob_lists.append(self._extract_token_logprobs(raw_logprobs, token_ids))
 
-        feedback_ids = self._stack_2d(token_lists, pad_value=int(self.tokenizer.eos_token_id), dtype=torch.long)
+        feedback_ids = self._stack_2d(token_lists, pad_value=int(self.processor.pad_id), dtype=torch.long)
         segment_mask = build_segment_response_mask(feedback_ids, self.tokenizer)
         response_mask = (segment_mask > 0).long()
         data_proto.non_tensor_batch["task2_feedback_texts"] = np.array(feedback_texts, dtype=object)
