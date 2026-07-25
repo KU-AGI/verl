@@ -34,6 +34,7 @@ async_training:
   compute_prox_log_prob: False
 
   max_regen_retries: 3 # maximum number of regeneration retries for bad samples
+  reward_finalize_workers: 1 # number of async workers that finalize rewarded rollout samples
 
   # Replay buffer for filling idle time with additional training
   replay_buffer:
@@ -86,6 +87,7 @@ data:
 actor_rollout_ref:
   actor:
     use_rollout_log_probs: ${oc.select:async_training.use_rollout_log_probs, True}
+    task3_compact_logits: true
     adaptive_entropy_coeff:
       enable: false
       task1:
@@ -119,6 +121,7 @@ actor_rollout_ref:
     name: image_unified
     mode: sync
     prompt_length: 1024
+    task3_prompt_length: null
     response_length: 1024
     feedback_system_prompt: "You should give me a feedback on the image generation."
     regen_system_prompt: "You should refine the image generation."

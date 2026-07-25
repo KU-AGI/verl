@@ -809,14 +809,19 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                 step4_return = self._get_safe_val(scores, 'task2_step4_return_scores', i)
                 if step4_return == "N/A":
                     step4_return = self._get_safe_val(reward_extra_infos_dict, 'task2_step4_return_score', i)
+                step5_return = self._get_safe_val(scores, 'task2_step5_return_scores', i)
+                if step5_return == "N/A":
+                    step5_return = self._get_safe_val(reward_extra_infos_dict, 'task2_step5_return_score', i)
                 f.write(f"💬 [TASK 2] FEEDBACK GENERATION\n")
-                f.write(f"  - Token Score Sum (G_step2 + G_step3 + G_step4 in phase1 train): {self._get_safe_val(scores, 'task2_scores', i)}\n")
+                f.write(f"  - Token Score Sum (G_step2 + G_step3 + G_step4 + G_step5 in phase1 train): {self._get_safe_val(scores, 'task2_scores', i)}\n")
                 f.write(f"  - MDP Step2 Return G_step2: {step2_return}\n")
                 f.write(f"  - MDP Step3 Return G_step3: {step3_return}\n")
                 f.write(f"  - MDP Step4 Return G_step4: {step4_return}\n")
+                f.write(f"  - MDP Step5 Return G_step5: {step5_return}\n")
                 f.write(f"  - MDP Step2 Reward r_step2: {self._get_safe_val(reward_extra_infos_dict, 'task2_step2_reward', i)}\n")
                 f.write(f"  - MDP Step3 Reward r_step3: {self._get_safe_val(reward_extra_infos_dict, 'task2_step3_reward', i)}\n")
                 f.write(f"  - MDP Step4 Reward r_step4: {self._get_safe_val(reward_extra_infos_dict, 'task2_step4_reward', i)}\n")
+                f.write(f"  - MDP Step5 Reward r_step5: {self._get_safe_val(reward_extra_infos_dict, 'task2_step5_reward', i)}\n")
                 f.write(f"  - Format Reward (rule-based) (add score): {self._get_safe_val(reward_extra_infos_dict, 'task2_rule_based_format_reward', i)}\n")
                 f.write(f"  - Decompose Reward (rule-based) (add score): {self._get_safe_val(reward_extra_infos_dict, 'task2_rule_based_decompose_reward', i)}\n")
                 f.write(f"  - Internal Consistency OK (gating decompose): {self._get_safe_val(reward_extra_infos_dict, 'task2_internal_consistency_ok', i)}\n")
@@ -824,25 +829,30 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                 f.write(f"  - VQA Format OK (gating tuple→vqa / vqa→feedback): {self._get_safe_val(reward_extra_infos_dict, 'task2_vqa_format_ok', i)}\n")
                 f.write(f"  - Feedback Format OK (rule-based) (gating vqa→feedback): {self._get_safe_val(reward_extra_infos_dict, 'task2_rule_based_feedback_format_ok', i)}\n")
                 f.write(f"  - No Feedback Needed (rule-based) (gating vqa→feedback): {self._get_safe_val(reward_extra_infos_dict, 'task2_no_feedback_needed', i)}\n")
-                f.write(f"  - Stage1 Prompt→Tuple Reward: {self._get_safe_val(reward_extra_infos_dict, 'task2_prompt_to_tuple_reward', i)}\n")
-                f.write(f"  - Stage2 Tuple→VQA Reward: {self._get_safe_val(reward_extra_infos_dict, 'task2_tuple_to_vqa_reward', i)}\n")
-                f.write(f"  - Stage3 VQA→Feedback Reward: {self._get_safe_val(reward_extra_infos_dict, 'task2_vqa_to_feedback_reward', i)}\n")
+                f.write(f"  - Stage1 Prompt→Summary Reward: {self._get_safe_val(reward_extra_infos_dict, 'task2_prompt_to_summary_reward', i)}\n")
+                f.write(f"  - Stage2 Summary→Tuple Reward: {self._get_safe_val(reward_extra_infos_dict, 'task2_summary_to_tuple_reward', i)}\n")
+                f.write(f"  - Stage3 Tuple→VQA Reward: {self._get_safe_val(reward_extra_infos_dict, 'task2_tuple_to_vqa_reward', i)}\n")
+                f.write(f"  - Stage4 VQA→Feedback Reward: {self._get_safe_val(reward_extra_infos_dict, 'task2_vqa_to_feedback_reward', i)}\n")
                 f.write(f"  - Total VLM Reward: {self._get_safe_val(reward_extra_infos_dict, 'task2_vlm_reward', i)}\n")
                 f.write(f"  - Model Feedback:\n{feedback_texts[i]}\n")
-                f.write(f"  - Stage1 Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task2_prompt_to_tuple_response', i)}\n")
-                f.write(f"  - Stage2 Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task2_tuple_to_vqa_response', i)}\n")
-                f.write(f"  - Stage3 Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task2_vqa_to_feedback_response', i)}\n")
+                f.write(f"  - Stage1 Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task2_prompt_to_summary_response', i)}\n")
+                f.write(f"  - Stage2 Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task2_summary_to_tuple_response', i)}\n")
+                f.write(f"  - Stage3 Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task2_tuple_to_vqa_response', i)}\n")
+                f.write(f"  - Stage4 Response:\n{self._get_safe_response(reward_extra_infos_dict, 'task2_vqa_to_feedback_response', i)}\n")
                 f.write("\n")
 
             # Log Task 3 if regen images exist (even if task_id != 3)
             if 3 in _report_task_ids:
+                task3_step6_reward = self._get_safe_val(reward_extra_infos_dict, 'task3_step6_reward', i)
+                if task3_step6_reward == "N/A":
+                    task3_step6_reward = self._get_safe_val(reward_extra_infos_dict, 'task3_step5_reward', i)
                 f.write(f"🔄 [TASK 3] RE-GENERATION\n")
-                f.write(f"  - Token Score Sum (MDP Step5 return in phase1 train): {self._get_safe_val(scores, 'task3_scores', i)}\n")
+                f.write(f"  - Token Score Sum (MDP Step6 return in phase1 train): {self._get_safe_val(scores, 'task3_scores', i)}\n")
                 f.write(f"  - Previous Image Score S_t: {self._get_safe_val(reward_extra_infos_dict, 'task3_prev_image_score', i)}\n")
                 f.write(f"  - Next Image Score S_t+1: {self._get_safe_val(reward_extra_infos_dict, 'task3_next_image_score', i)}\n")
                 f.write(f"  - Image Score Gain: {self._get_safe_val(reward_extra_infos_dict, 'task3_image_score_gain', i)}\n")
                 f.write(f"  - Edit IF Reward e_t: {self._get_safe_val(reward_extra_infos_dict, 'task3_edit_if_reward', i)}\n")
-                f.write(f"  - MDP Step5 Reward r_step5: {self._get_safe_val(reward_extra_infos_dict, 'task3_step5_reward', i)}\n")
+                f.write(f"  - MDP Step6 Reward r_step6: {task3_step6_reward}\n")
                 f.write(f"  - VQA Reward: {self._get_safe_val(reward_extra_infos_dict, 'task3_vqa_reward', i)}\n")
                 f.write(f"  - Edit Instruction Following Reward: {self._get_safe_val(reward_extra_infos_dict, 'task3_edit_reward', i)}\n")
                 f.write(f"  - Detector Reward (bonus): {self._get_safe_val(reward_extra_infos_dict, 'task3_detector_reward', i)}\n")
@@ -1010,7 +1020,7 @@ class RayImageGenerationTrainer(RayPPOTrainer):
                         break
 
             if task2_score_tensor is not None and task2_segment_mask is not None:
-                for seg, name in ((2, "step2"), (3, "step3"), (4, "step4")):
+                for seg, name in ((2, "step2"), (3, "step3"), (4, "step4"), (5, "step5")):
                     seg_mask = (task2_segment_mask == seg).to(task2_score_tensor.dtype)
                     scores[f"task2_{name}_return_scores"] = (
                         task2_score_tensor * seg_mask

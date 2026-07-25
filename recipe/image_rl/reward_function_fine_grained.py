@@ -9,12 +9,18 @@ import PIL.Image
 from openai import AsyncOpenAI
 import numpy as np
 import time
-from recipe.image_rl.utils import FormattingEvaluatorV3, filter_entity_questions
+from recipe.image_rl.utils import (
+    FormattingEvaluatorV2,
+    classify_task2_feedback,
+    filter_entity_questions,
+    should_route_task3,
+)
 from recipe.image_rl.prompts import REASONGEN_R1_TEMPLATE
 from recipe.image_rl.prompts_finegrained_simple import (
     TASK1_TASK3_IMAGE_GENERATOR_SYSTEM_PROMPT_TEMPLATE,
     TASK3_REGENERATION_FOLLOWED_BY_EDITING_SYSTEM_PROMPT,
-    PROMPT_TO_TUPLE_DECOMPOSITION_REWARD_SYSTEM_PROMPT,
+    PROMPT_TO_SUMMARY_REWARD_SYSTEM_PROMPT,
+    SUMMARY_TO_TUPLE_DECOMPOSITION_REWARD_SYSTEM_PROMPT,
     TUPLE_DECOMPOSITION_TO_VQA_REWARD_SYSTEM_PROMPT,
     VQA_TO_FEEDBACK_REWARD_SYSTEM_PROMPT,
 )
@@ -30,7 +36,12 @@ from recipe.image_rl.gdino_regex import _CONNECTORS, SKIP_KEYWORDS, _COMPILED_RE
 
 # Configuration
 VLM_BASE_URLS = [
-    "http://192.169.0.2:8007/v1",
+    "http://10.100.87.2:8005/v1",
+    "http://10.100.87.2:8006/v1",
+    "http://10.100.87.2:8007/v1",
+    "http://10.100.87.6:8005/v1",
+    "http://10.100.87.6:8006/v1",
+    "http://10.100.87.6:8007/v1",
 ]
 LLM_BASE_URLS = [
     # "http://10.100.44.2:8004/v1", # sub2
@@ -51,13 +62,13 @@ HEALTH_CHECK_INTERVAL = 30  # seconds
 FAILURE_THRESHOLD = 3  # consecutive failures before marking as unhealthy
 RECOVERY_CHECK_INTERVAL = 60  # seconds to wait before checking if unhealthy server recovered
 
-RM_PER_SERVER_INFLIGHT = 16
+RM_PER_SERVER_INFLIGHT = 32
 _rm_slot_lock = threading.Lock()
 _rm_slot_queues = {}  # {(loop_id, is_vlm): queue}
 
 # Detector configuration
 DETECTOR_URLS = [
-    "http://192.169.0.2:8086",
+    # "http://192.169.0.2:8086",
 ]
 DETECTOR_TIMEOUT = 300000.0
 DETECTOR_MAX_RETRIES = 2
@@ -398,8 +409,8 @@ def _add_index_to_vqa_entries(text: str) -> str:
     """
     if not text:
         return ''
-    formatting_evaluator = FormattingEvaluatorV3()
-    entries = formatting_evaluator._extract_verify_paragraphs(text)
+    formatting_evaluator = FormattingEvaluatorV2()
+    entries = formatting_evaluator._extract_answer_paragraphs(text)
     if not entries:
         return ''
     return '\n\n'.join(f'{i + 1} | {entry.strip()}' for i, entry in enumerate(entries))
@@ -407,21 +418,34 @@ def _add_index_to_vqa_entries(text: str) -> str:
 
 # --- Task-2 stage message builders ---
 
-def get_messages_task2_stage1(prompt: str, tuple_raw: str):
-    """Stage 1: PROMPT -> TUPLE_DECOMPOSITION reward judge (text-only)."""
+def get_messages_task2_stage1(prompt: str, predicted_summarize: str):
+    """Stage 1: PROMPT -> SUMMARY reward judge (text-only)."""
     user_content = (
         f"PROMPT:\n{prompt or ''}\n\n"
-        f"PRED_TUPLES:\n{tuple_raw or ''}"
+        f"SUMMARY:\n{predicted_summarize or ''}"
     )
     messages = [
-        {"role": "system", "content": PROMPT_TO_TUPLE_DECOMPOSITION_REWARD_SYSTEM_PROMPT},
+        {"role": "system", "content": PROMPT_TO_SUMMARY_REWARD_SYSTEM_PROMPT},
         {"role": "user", "content": user_content},
     ]
     return messages, RM_VLM_MODEL_PATH
 
 
-def get_messages_task2_stage2(gen_img, tuple_raw: str, vqa_raw: str):
-    """Stage 2: TUPLE_DECOMPOSITION -> VQA reward judge (requires image)."""
+def get_messages_task2_stage2(predicted_summarize: str, tuple_raw: str):
+    """Stage 2: SUMMARY -> TUPLE_DECOMPOSITION reward judge (text-only)."""
+    user_content = (
+        f"SUMMARY:\n{predicted_summarize or ''}\n\n"
+        f"PRED_TUPLES:\n{tuple_raw or ''}"
+    )
+    messages = [
+        {"role": "system", "content": SUMMARY_TO_TUPLE_DECOMPOSITION_REWARD_SYSTEM_PROMPT},
+        {"role": "user", "content": user_content},
+    ]
+    return messages, RM_VLM_MODEL_PATH
+
+
+def get_messages_task2_stage3(gen_img, tuple_raw: str, vqa_raw: str):
+    """Stage 3: TUPLE_DECOMPOSITION -> VQA reward judge (requires image)."""
     user_content = (
         f"IMAGE:\n<image>\n\n"
         f"PRED_TUPLES:\n{tuple_raw or ''}\n\n"
@@ -434,24 +458,24 @@ def get_messages_task2_stage2(gen_img, tuple_raw: str, vqa_raw: str):
     return messages, RM_VLM_MODEL_PATH
 
 
-def get_messages_task2_stage3(tuple_raw: str, vqa_raw: str, predicted_feedback: str):
-    """Stage 3: VQA -> FEEDBACK reward judge (text-only)."""
+def get_messages_task2_stage4(
+    prompt: str,
+    predicted_summarize: str,
+    tuple_raw: str,
+    vqa_raw: str,
+    predicted_feedback: str,
+):
+    """Stage 4: VQA -> FEEDBACK reward judge (text-only)."""
     user_content = (
         f"PRED_TUPLES:\n{tuple_raw or ''}\n\n"
         f"VQA_RESULTS:\n{vqa_raw or ''}\n\n"
-        f"FEEDBACK:\n{predicted_feedback or 'No need to generate feedback.'}"
+        f"FEEDBACK:\n{predicted_feedback or ''}"
     )
     messages = [
         {"role": "system", "content": VQA_TO_FEEDBACK_REWARD_SYSTEM_PROMPT},
         {"role": "user", "content": user_content},
     ]
     return messages, RM_VLM_MODEL_PATH
-
-
-def get_messages_task2_stage4(prompt: str, predicted_summarize: str, tuple_raw: str, vqa_raw: str, predicted_feedback: str):
-    """Compatibility wrapper for old callers; summary is ignored in V3."""
-    return get_messages_task2_stage3(tuple_raw, vqa_raw, predicted_feedback)
-
 
 def get_messages_task3_edit(gen_img, predicted_feedback: str, regen_img):
     """Task 3 edit reward: SOURCE_IMAGE + FEEDBACK -> EDITED_IMAGE judge.
@@ -835,24 +859,25 @@ async def compute_score_single_async(
     reward_score = 0.0
     reward_extra_info = {}
 
-    if task_id == 1: # Total score: vqa (0..1) + detector bonus (0..1)
-        # Parse detection items from feedback_tuple
-        detection_results = verify_detection_single(feedback_tuple)
-
-        # Launch VQA and detector in parallel
-        vqa_task = asyncio.create_task(
-            get_response(get_messages, prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback, vqa_question, extra_info, task_id)
+    if task_id == 1:  # Total score: VQA only (0..1)
+        vqa_response = await get_response(
+            get_messages,
+            prompt,
+            gen_img,
+            feedback_text,
+            regen_img,
+            ground_truth_img,
+            summarize,
+            feedback_tuple,
+            predicted_summarize,
+            predicted_tuple,
+            predicted_answer,
+            predicted_feedback,
+            vqa_question,
+            extra_info,
+            task_id,
         )
-        detector_task = None
-        if detection_results and DETECTOR_URLS:
-            detector_task = asyncio.create_task(
-                request_detector_single(detection_results, gen_img)
-            )
 
-        vqa_response = await vqa_task
-        detector_response = (await detector_task) if detector_task else {"results": {}, "details": [], "errors": []}
-
-        # VQA score
         vqa_score = 0.0
         if vqa_response is None:
             print(f"[REWARD] Task {task_id}: vqa_response is None")
@@ -862,113 +887,119 @@ async def compute_score_single_async(
             except Exception:
                 pass
 
-        reward_score += vqa_score
-        reward_extra_info[f"task{task_id}_vqa_reward"] = vqa_score
-        reward_extra_info[f"task{task_id}_vqa_reward_response"] = vqa_response if not isinstance(vqa_response, Exception) else str(vqa_response)
+        reward_score = vqa_score
+        reward_extra_info["task1_vqa_reward"] = vqa_score
+        reward_extra_info["task1_vqa_reward_response"] = (
+            vqa_response if not isinstance(vqa_response, Exception) else str(vqa_response)
+        )
+        reward_extra_info["task1_align"] = vqa_score
+        reward_extra_info["task1_image_score"] = vqa_score
+        reward_extra_info["task1_image_score_max"] = 1.0
+        reward_extra_info["task1_mdp_reward"] = vqa_score
 
-        # Detector bonus
-        detector_bonus = _compute_detector_bonus(detector_response, detection_results)
-        reward_score += detector_bonus
-        reward_extra_info[f"task{task_id}_detector_reward"] = detector_bonus
-        reward_extra_info[f"task{task_id}_detector_details"] = detector_response.get("details", [])
-        reward_extra_info[f"task{task_id}_detector_active"] = int(bool(detection_results))
-        reward_extra_info[f"task{task_id}_detector_count"] = len(detection_results)
-        reward_extra_info[f"task{task_id}_detector_active_score"] = int(bool(detection_results))
-        reward_extra_info[f"task{task_id}_detector_active_only_reward"] = detector_bonus if detection_results else None
-
-        # MDP image score: V_t + m_x D_t, with max score 1 + m_x.
-        detector_active = float(bool(detection_results))
-        task1_image_score = vqa_score + detector_active * detector_bonus
-        task1_image_score_max = 1.0 + detector_active
-        reward_extra_info["task1_align"] = task1_image_score
-        reward_extra_info["task1_image_score"] = task1_image_score
-        reward_extra_info["task1_image_score_max"] = task1_image_score_max
-        reward_extra_info["task1_mdp_reward"] = task1_image_score
-
-    elif task_id == 2: # Total score: post-hoc finalized from stage scores
-        formatting_evaluator = FormattingEvaluatorV3()
+    elif task_id == 2:  # Total score: format + post-hoc four-stage geometric mean
+        formatting_evaluator = FormattingEvaluatorV2()
         raw_stage_only = bool((extra_info or {}).get("task2_raw_stage_only", False))
 
-        all_parts_present = all(part is not None for part in [predicted_tuple, predicted_answer, predicted_feedback])
+        all_parts_present = all(
+            part is not None
+            for part in [predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback]
+        )
         task2_rule_based_format_reward = 1.0 if all_parts_present else 0.0
         reward_extra_info["task2_rule_based_format_reward"] = task2_rule_based_format_reward
+        reward_extra_info["task2_stage_raw_only"] = int(raw_stage_only)
 
-        # If any part is missing, skip all stage judges and return 0
+        stage_reward_keys = [
+            "task2_prompt_to_summary_reward",
+            "task2_summary_to_tuple_reward",
+            "task2_tuple_to_vqa_reward",
+            "task2_vqa_to_feedback_reward",
+        ]
+        stage_response_keys = [
+            "task2_prompt_to_summary_response",
+            "task2_summary_to_tuple_response",
+            "task2_tuple_to_vqa_response",
+            "task2_vqa_to_feedback_response",
+        ]
+
         if not all_parts_present:
             reward_extra_info["task2_rule_based_decompose_reward"] = 0.0
             reward_extra_info["task2_rule_based_feedback_format_ok"] = 0
             reward_extra_info["task2_no_feedback_needed"] = 0
             reward_extra_info["task2_no_feedback_needed_score"] = 0
+            reward_extra_info["task2_noncanonical_no_edit"] = 0
             reward_extra_info["task2_tuple_format_ok"] = 0
             reward_extra_info["task2_vqa_format_ok"] = 0
-            reward_extra_info["task2_stage_raw_only"] = int(raw_stage_only)
-            for key in ["task2_prompt_to_tuple_reward", "task2_tuple_to_vqa_reward", "task2_vqa_to_feedback_reward"]:
-                reward_extra_info[key] = 0.0
             reward_extra_info["task2_vqa_to_feedback_content_reward"] = 0.0
-            reward_extra_info["task2_step2_reward"] = _shape_mdp_reasoning_reward(
-                0.0,
-                mdp_reasoning_reward_weight,
-                mdp_reasoning_reward_cost,
-            )
-            reward_extra_info["task2_step3_reward"] = _shape_mdp_reasoning_reward(
-                0.0,
-                mdp_reasoning_reward_weight,
-                mdp_reasoning_reward_cost,
-            )
-            reward_extra_info["task2_step4_reward"] = _shape_mdp_reasoning_reward(
-                0.0,
-                mdp_reasoning_reward_weight,
-                mdp_reasoning_reward_cost,
-            )
-            for key in ["task2_prompt_to_tuple_response", "task2_tuple_to_vqa_response", "task2_vqa_to_feedback_response"]:
+            for key in stage_reward_keys:
+                reward_extra_info[key] = 0.0
+            for step in range(2, 6):
+                reward_extra_info[f"task2_step{step}_reward"] = _shape_mdp_reasoning_reward(
+                    0.0,
+                    mdp_reasoning_reward_weight,
+                    mdp_reasoning_reward_cost,
+                )
+            for key in stage_response_keys:
                 reward_extra_info[key] = "Skipped: missing parts"
             return {"score": 0.0, "reward_extra_info": reward_extra_info}
 
-        reward_score += task2_rule_based_format_reward  # 1.0
+        reward_score += task2_rule_based_format_reward
 
-        # Rule-based: decompose — internal_consistency_ok gates the F1 score (0..1)
-        feedback_parsed_tuple = formatting_evaluator._parse_tuples(feedback_tuple)
-        predict_parsed_tuple = formatting_evaluator._parse_tuples(predicted_tuple)
-        predict_decomposed_ans = formatting_evaluator._extract_verify_paragraphs(predicted_answer)
-        part2_reward_dict = formatting_evaluator._calculate_metrics_for_reward(feedback_parsed_tuple, predict_parsed_tuple, predict_decomposed_ans)
+        feedback_parsed_tuple = formatting_evaluator._parse_part2(feedback_tuple)
+        predict_parsed_tuple = formatting_evaluator._parse_part2(predicted_tuple)
+        predict_decomposed_ans = formatting_evaluator._extract_answer_paragraphs(predicted_answer)
+        part2_reward_dict = formatting_evaluator._calculate_metrics_for_reward(
+            feedback_parsed_tuple,
+            predict_parsed_tuple,
+            predict_decomposed_ans,
+        )
 
         consistency_ok = part2_reward_dict.get("task2_internal_consistency_ok", 0)
         reward_extra_info["task2_internal_consistency_ok"] = int(consistency_ok)
         f1_score = part2_reward_dict.get("task2_part2_accuracy", 0.0)
-        task2_rule_based_decompose_reward = float(f1_score * consistency_ok)  # 0..1
-        #reward_score += task2_rule_based_decompose_reward
-        reward_extra_info["task2_rule_based_decompose_reward"] = task2_rule_based_decompose_reward
+        reward_extra_info["task2_rule_based_decompose_reward"] = float(f1_score * consistency_ok)
 
+        feedback_class = classify_task2_feedback(predicted_feedback)
+        canonical_no_edit = feedback_class == "canonical_no_edit"
+        noncanonical_no_edit = feedback_class == "noncanonical_no_edit"
         feedback_step_format_ok = formatting_evaluator.check_feedback_step_format(predicted_feedback)
-        no_feedback_needed = predicted_feedback is not None and "no need to generate feedback" in predicted_feedback.lower()
         reward_extra_info["task2_rule_based_feedback_format_ok"] = int(feedback_step_format_ok)
-        reward_extra_info["task2_no_feedback_needed"] = int(no_feedback_needed)
-        reward_extra_info["task2_no_feedback_needed_score"] = int(no_feedback_needed)
-        # Prepare normalized inputs for stage judges
-        # tuple_raw = _normalize_tuple_lines(predicted_tuple or '')
-        tuple_raw = predicted_tuple or ''
-        vqa_raw = _add_index_to_vqa_entries(predicted_answer or '')
+        reward_extra_info["task2_no_feedback_needed"] = int(canonical_no_edit)
+        reward_extra_info["task2_no_feedback_needed_score"] = int(canonical_no_edit)
+        reward_extra_info["task2_noncanonical_no_edit"] = int(noncanonical_no_edit)
 
-        # Format gates: wrong format → skip judge (saves API call), _safe_stage_score maps None → 0.0
+        tuple_raw = predicted_tuple or ""
+        vqa_raw = _add_index_to_vqa_entries(predicted_answer or "")
         tuple_format_ok = formatting_evaluator.check_tuple_schema_ok(predict_parsed_tuple)
-        vqa_format_ok = len(predict_decomposed_ans) > 0         # has "Answer: Yes/No"
-        # Feedback judge runs only when feedback is needed AND format is correct.
-        feedback_should_run = (not no_feedback_needed) and feedback_step_format_ok
+        vqa_format_ok = len(predict_decomposed_ans) > 0
+        feedback_should_run = feedback_class == "other" and feedback_step_format_ok
         reward_extra_info["task2_tuple_format_ok"] = int(tuple_format_ok)
         reward_extra_info["task2_vqa_format_ok"] = int(vqa_format_ok)
 
         async def _none():
             return None
 
-        # Run stage judges in parallel with format gating
-        prompt_to_tuple_resp, tuple_to_vqa_resp, feedback_resp = await asyncio.gather(
-            get_response(get_messages_task2_stage1, prompt, tuple_raw) if tuple_format_ok else _none(),
-            get_response(get_messages_task2_stage2, gen_img, tuple_raw, vqa_raw) if (gen_img is not None and tuple_format_ok and vqa_format_ok) else _none(),
-            get_response(get_messages_task2_stage3, tuple_raw, vqa_raw, predicted_feedback) if (vqa_format_ok and feedback_should_run) else _none(),
+        s1_resp, s2_resp, s3_resp, s4_resp = await asyncio.gather(
+            get_response(get_messages_task2_stage1, prompt, predicted_summarize),
+            get_response(get_messages_task2_stage2, predicted_summarize, tuple_raw)
+            if tuple_format_ok
+            else _none(),
+            get_response(get_messages_task2_stage3, gen_img, tuple_raw, vqa_raw)
+            if (gen_img is not None and tuple_format_ok and vqa_format_ok)
+            else _none(),
+            get_response(
+                get_messages_task2_stage4,
+                prompt,
+                predicted_summarize,
+                tuple_raw,
+                vqa_raw,
+                predicted_feedback,
+            )
+            if (vqa_format_ok and feedback_should_run)
+            else _none(),
             return_exceptions=True,
         )
 
-        # Parse each stage score; None/Exception → 0.0
         def _safe_stage_score(resp) -> float:
             if resp is None or isinstance(resp, Exception):
                 return 0.0
@@ -977,33 +1008,33 @@ async def compute_score_single_async(
             except Exception:
                 return 0.0
 
-        prompt_to_tuple = _safe_stage_score(prompt_to_tuple_resp)
-        tuple_to_vqa = _safe_stage_score(tuple_to_vqa_resp)
-        feedback_content = _safe_stage_score(feedback_resp)
+        s1 = _safe_stage_score(s1_resp)
+        s2 = _safe_stage_score(s2_resp)
+        s3 = _safe_stage_score(s3_resp)
+        s4_content = _safe_stage_score(s4_resp)
 
-        reward_extra_info["task2_prompt_to_tuple_reward"] = prompt_to_tuple
-        reward_extra_info["task2_prompt_to_tuple_response"] = prompt_to_tuple_resp if not isinstance(prompt_to_tuple_resp, Exception) else str(prompt_to_tuple_resp)
-        reward_extra_info["task2_tuple_to_vqa_reward"] = tuple_to_vqa
-        reward_extra_info["task2_tuple_to_vqa_response"] = tuple_to_vqa_resp if not isinstance(tuple_to_vqa_resp, Exception) else str(tuple_to_vqa_resp)
-        reward_extra_info["task2_vqa_to_feedback_content_reward"] = feedback_content
-        reward_extra_info["task2_vqa_to_feedback_response"] = feedback_resp if not isinstance(feedback_resp, Exception) else str(feedback_resp)
-        reward_extra_info["task2_step2_reward"] = _shape_mdp_reasoning_reward(
-            prompt_to_tuple,
-            mdp_reasoning_reward_weight,
-            mdp_reasoning_reward_cost,
+        reward_extra_info["task2_prompt_to_summary_reward"] = s1
+        reward_extra_info["task2_prompt_to_summary_response"] = (
+            s1_resp if not isinstance(s1_resp, Exception) else str(s1_resp)
         )
-        reward_extra_info["task2_step3_reward"] = _shape_mdp_reasoning_reward(
-            tuple_to_vqa,
-            mdp_reasoning_reward_weight,
-            mdp_reasoning_reward_cost,
+        reward_extra_info["task2_summary_to_tuple_reward"] = s2
+        reward_extra_info["task2_summary_to_tuple_response"] = (
+            s2_resp if not isinstance(s2_resp, Exception) else str(s2_resp)
         )
-        reward_extra_info["task2_step4_content_reward"] = _shape_mdp_reasoning_reward(
-            feedback_content,
-            mdp_reasoning_reward_weight,
-            mdp_reasoning_reward_cost,
+        reward_extra_info["task2_tuple_to_vqa_reward"] = s3
+        reward_extra_info["task2_tuple_to_vqa_response"] = (
+            s3_resp if not isinstance(s3_resp, Exception) else str(s3_resp)
         )
-        reward_extra_info["task2_step4_reward"] = reward_extra_info["task2_step4_content_reward"]
-        reward_extra_info["task2_stage_raw_only"] = int(raw_stage_only)
+        reward_extra_info["task2_vqa_to_feedback_content_reward"] = s4_content
+        reward_extra_info["task2_vqa_to_feedback_response"] = (
+            s4_resp if not isinstance(s4_resp, Exception) else str(s4_resp)
+        )
+        for step, value in zip(range(2, 6), [s1, s2, s3, s4_content]):
+            reward_extra_info[f"task2_step{step}_reward"] = _shape_mdp_reasoning_reward(
+                value,
+                mdp_reasoning_reward_weight,
+                mdp_reasoning_reward_cost,
+            )
 
         if not raw_stage_only:
             decision_vqa = float((extra_info or {}).get("task2_decision_vqa_reward", 0.0))
@@ -1017,28 +1048,49 @@ async def compute_score_single_async(
             )
             reward_score += vlm_reward
 
-    elif task_id == 3: # Total score: sqrt(vqa*2 * edit) + detector bonus (0..1)
-        # NOTE: the `no_feedback_needed` → -100 shortcut was removed.
+    elif task_id == 3:  # Total score: geometric combination of VQA and edit judge
+        if not should_route_task3(predicted_feedback):
+            reward_extra_info.update({
+                "task3_vqa_reward": 0.0,
+                "task3_vqa_reward_response": "Skipped: no-edit feedback",
+                "task3_edit_reward": 0.0,
+                "task3_edit_reward_response": "Skipped: no-edit feedback",
+                "task3_geo_reward": 0.0,
+                "task3_align": 0.0,
+                "task3_image_score": 0.0,
+                "task3_image_score_max": 1.0,
+                "task3_if": 0.0,
+                "task3_edit_if_reward": 0.0,
+            })
+            return {"score": 0.0, "reward_extra_info": reward_extra_info}
 
-        # Parse detection items from feedback_tuple
-        detection_results = verify_detection_single(feedback_tuple)
+        call_args = (
+            prompt,
+            gen_img,
+            feedback_text,
+            regen_img,
+            ground_truth_img,
+            summarize,
+            feedback_tuple,
+            predicted_summarize,
+            predicted_tuple,
+            predicted_answer,
+            predicted_feedback,
+            vqa_question,
+            extra_info,
+            task_id,
+        )
 
-        call_args = (prompt, gen_img, feedback_text, regen_img, ground_truth_img, summarize, feedback_tuple, predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback, vqa_question, extra_info, task_id)
         async def _none():
             return None
 
-        # Launch VQA, edit, and detector in parallel
-        vqa_response, edit_response, detector_response = await asyncio.gather(
+        vqa_response, edit_response = await asyncio.gather(
             get_response(get_messages, *call_args) if regen_img is not None else _none(),
-            get_response(get_messages_task3_edit, gen_img, predicted_feedback, regen_img) if regen_img is not None else _none(),
-            request_detector_single(detection_results, regen_img) if (detection_results and DETECTOR_URLS and regen_img is not None) else _none(),
+            get_response(get_messages_task3_edit, gen_img, predicted_feedback, regen_img)
+            if regen_img is not None
+            else _none(),
             return_exceptions=True,
         )
-
-        # Handle detector exception from gather
-        if isinstance(detector_response, Exception):
-            print(f"[REWARD] Task {task_id}: detector exception: {detector_response}")
-            detector_response = None
 
         vqa_score = 0.0
         if vqa_response is None:
@@ -1054,36 +1106,25 @@ async def compute_score_single_async(
             print(f"[REWARD] Task {task_id}: edit_response is None")
         elif not isinstance(edit_response, Exception):
             try:
-                edit_score = _parse_json_score(edit_response)
+                edit_score = max(0.0, min(2.0, _parse_json_score(edit_response)))
             except Exception:
                 pass
 
-        reward_score = np.sqrt((vqa_score * 2) * edit_score)
-        reward_extra_info[f"task{task_id}_vqa_reward"] = vqa_score
-        reward_extra_info[f"task{task_id}_vqa_reward_response"] = vqa_response if not isinstance(vqa_response, Exception) else str(vqa_response)
-        reward_extra_info[f"task{task_id}_edit_reward"] = edit_score
-        reward_extra_info[f"task{task_id}_edit_reward_response"] = edit_response if not isinstance(edit_response, Exception) else str(edit_response)
-
-        # Detector bonus
-        detector_bonus = _compute_detector_bonus(detector_response, detection_results)
-        reward_score += detector_bonus
-        reward_extra_info[f"task{task_id}_detector_reward"] = detector_bonus
-        reward_extra_info[f"task{task_id}_detector_details"] = detector_response.get("details", []) if detector_response else []
-        reward_extra_info[f"task{task_id}_detector_active"] = int(bool(detection_results))
-        reward_extra_info[f"task{task_id}_detector_count"] = len(detection_results)
-        reward_extra_info[f"task{task_id}_detector_active_score"] = int(bool(detection_results))
-        reward_extra_info[f"task{task_id}_detector_active_only_reward"] = detector_bonus if detection_results else None
-
-        # MDP image score: V_t + m_x D_t, with max score 1 + m_x.
-        detector_active = float(bool(detection_results))
-        task3_image_score = vqa_score + detector_active * detector_bonus
-        task3_image_score_max = 1.0 + detector_active
-        task3_edit_if_reward = edit_score / 2.0
-        reward_extra_info["task3_align"] = task3_image_score
-        reward_extra_info["task3_image_score"] = task3_image_score
-        reward_extra_info["task3_image_score_max"] = task3_image_score_max
-        reward_extra_info["task3_if"] = task3_edit_if_reward
-        reward_extra_info["task3_edit_if_reward"] = task3_edit_if_reward
+        reward_score = float(np.sqrt((vqa_score * 2.0) * edit_score))
+        reward_extra_info["task3_vqa_reward"] = vqa_score
+        reward_extra_info["task3_vqa_reward_response"] = (
+            vqa_response if not isinstance(vqa_response, Exception) else str(vqa_response)
+        )
+        reward_extra_info["task3_edit_reward"] = edit_score
+        reward_extra_info["task3_edit_reward_response"] = (
+            edit_response if not isinstance(edit_response, Exception) else str(edit_response)
+        )
+        reward_extra_info["task3_geo_reward"] = reward_score
+        reward_extra_info["task3_align"] = vqa_score
+        reward_extra_info["task3_image_score"] = vqa_score
+        reward_extra_info["task3_image_score_max"] = 1.0
+        reward_extra_info["task3_if"] = edit_score / 2.0
+        reward_extra_info["task3_edit_if_reward"] = edit_score / 2.0
 
     return {
         "score": reward_score,
@@ -1125,9 +1166,10 @@ async def compute_score_batch_async(
         if ground_truth_img is not None:
             ground_truth_img = await asyncio.to_thread(lambda p=ground_truth_img: PIL.Image.open(p).convert("RGB"))
 
-        formatting_evaluator = FormattingEvaluatorV3()
-        predicted_tuple, predicted_answer, predicted_feedback = formatting_evaluator._split_text_into_parts(feedback_text.strip())
-        predicted_summarize = None
+        formatting_evaluator = FormattingEvaluatorV2()
+        predicted_summarize, predicted_tuple, predicted_answer, predicted_feedback = (
+            formatting_evaluator._split_text_into_parts((feedback_text or "").strip())
+        )
 
         result = await compute_score_single_async(
             prompt,
@@ -1271,52 +1313,58 @@ def finalize_task2_reward_extra_info(
     mdp_reasoning_reward_weight: Optional[float] = None,
     mdp_reasoning_reward_cost: Optional[float] = None,
 ) -> tuple[float, Dict]:
-    """Finalize task2 reward fields from raw stage outputs plus decision target.
-
-    This is shared by the live final-reward path and the Phase1 post-hoc
-    finalization path.
-    """
+    """Finalize four raw task2 stage rewards using the Task1 no-edit target."""
     finalized = dict(reward_extra_info or {})
-    target_no_edit = bool(decision_vqa >= 1.0 - 1e-6)
-    model_no_edit = bool(finalized.get("task2_no_feedback_needed", 0))
 
-    prompt_to_tuple = float(finalized.get("task2_prompt_to_tuple_reward", 0.0) or 0.0)
-    tuple_to_vqa = float(finalized.get("task2_tuple_to_vqa_reward", 0.0) or 0.0)
-    feedback_content = float(finalized.get("task2_vqa_to_feedback_content_reward", 0.0) or 0.0)
+    def _safe_float(key: str, default: float = 0.0) -> float:
+        try:
+            value = finalized.get(key, default)
+            return default if value is None else float(value)
+        except Exception:
+            return default
 
-    if target_no_edit and model_no_edit:
-        feedback_total = 2.0
-    elif target_no_edit and not model_no_edit:
-        feedback_total = 0.0
-    elif (not target_no_edit) and model_no_edit:
-        feedback_total = 0.0
+    target_no_edit = bool(float(decision_vqa) >= 1.0 - 1e-6)
+    model_no_edit = bool(int(_safe_float("task2_no_feedback_needed")))
+    noncanonical_no_edit = bool(int(_safe_float("task2_noncanonical_no_edit")))
+
+    s1 = _safe_float("task2_prompt_to_summary_reward")
+    s2 = _safe_float("task2_summary_to_tuple_reward")
+    s3 = _safe_float("task2_tuple_to_vqa_reward")
+    s4_content = _safe_float(
+        "task2_vqa_to_feedback_content_reward",
+        _safe_float("task2_vqa_to_feedback_reward"),
+    )
+
+    if noncanonical_no_edit:
+        s4 = 0.0
+    elif target_no_edit and model_no_edit:
+        s4 = 2.0
+    elif target_no_edit != model_no_edit:
+        s4 = 0.0
     else:
-        feedback_total = feedback_content
+        s4 = s4_content
 
-    vlm_reward = (prompt_to_tuple + tuple_to_vqa + feedback_total) / 3.0
+    scores = [s1, s2, s3, s4]
+    vlm_reward = math.prod(scores) ** (1.0 / len(scores))
+
     finalized["task2_decision_vqa_reward"] = float(decision_vqa)
     finalized["task2_decision_vqa_source"] = decision_source
     finalized["task2_target_no_edit"] = int(target_no_edit)
     finalized["task2_target_no_edit_score"] = int(target_no_edit)
     finalized["task2_no_feedback_needed_score"] = int(model_no_edit)
-    finalized["task2_vqa_to_feedback_reward"] = feedback_total
-    finalized["task2_step2_reward"] = _shape_mdp_reasoning_reward(
-        prompt_to_tuple,
-        mdp_reasoning_reward_weight,
-        mdp_reasoning_reward_cost,
-    )
-    finalized["task2_step3_reward"] = _shape_mdp_reasoning_reward(
-        tuple_to_vqa,
-        mdp_reasoning_reward_weight,
-        mdp_reasoning_reward_cost,
-    )
-    finalized["task2_step4_reward"] = _shape_mdp_reasoning_reward(
-        feedback_total,
-        mdp_reasoning_reward_weight,
-        mdp_reasoning_reward_cost,
-    )
+    finalized["task2_vqa_to_feedback_content_reward"] = s4_content
+    finalized["task2_vqa_to_feedback_reward"] = s4
+
+    for step, value in zip(range(2, 6), scores):
+        finalized[f"task2_step{step}_reward"] = _shape_mdp_reasoning_reward(
+            value,
+            mdp_reasoning_reward_weight,
+            mdp_reasoning_reward_cost,
+        )
+
+    format_reward = _safe_float("task2_rule_based_format_reward")
     finalized["task2_vlm_reward"] = vlm_reward
-    finalized["task2_total_reward"] = float(finalized.get("task2_rule_based_format_reward", 0.0) or 0.0) + vlm_reward
+    finalized["task2_total_reward"] = format_reward + vlm_reward
     finalized["task2_process"] = vlm_reward / 2.0
     return vlm_reward, finalized
 

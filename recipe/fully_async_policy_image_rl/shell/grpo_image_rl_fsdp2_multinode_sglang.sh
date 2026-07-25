@@ -14,7 +14,7 @@ exec 2>&1
 #                         EXPERIMENT CONFIGURATION
 ###############################################################################
 project_name='mllm_reasoning'
-exp_name="0530_KT_v5_fine_grained_lr_1e_6_GAE_length_norm_gamma_0_6_sglang_v2"
+exp_name="${EXP_NAME:-0718_KT_v5_1e_6_multi_step_neurips_sglang_fixed_v3}"
 # exp_name="0423_debug"
 task_ids='[1,2,3]'
 
@@ -45,9 +45,9 @@ export PYTHONPATH="${WORKING_DIR}/sglang/python:${WORKING_DIR}:${PYTHONPATH:-}"
 export SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1
 
 # Model & Checkpoint Paths
-HOME="/home/work/AGILAB/mllm_reasoning"
-RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
-MODEL_PATH=/home/work/AGILAB/mllm_reasoning/data/experiments/ckpt/janus_sft/0425_v10_no_summarize/hf_model
+MLLM_ROOT="/home/work/AGILAB/mllm_reasoning"
+RAY_DATA_HOME=${RAY_DATA_HOME:-"${MLLM_ROOT}/verl"}
+MODEL_PATH="/home/work/AGILAB/mllm_reasoning/data/experiments/ckpt/janus_sft/1223_v10_sft_warmup_constant_long_prompt/version_1/step=014000.ckpt/hf_model"
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
 
 # Dataset Paths
@@ -102,7 +102,7 @@ max_turns=2
 ###############################################################################
 # Return discount used when backing up phase1 step rewards:
 #   G_h = r_h + mdp_gamma * G_{h+1}
-mdp_reward_version=gae # gae | multi_step
+mdp_reward_version=multi_step # gae | multi_step
 mdp_gamma=0.6
 
 # Initial image reward weight:
@@ -156,8 +156,10 @@ adaptive_entropy_coeff_task3_target_entropy=4.5
 ###############################################################################
 #                          SEQUENCE LENGTH SETTINGS
 ###############################################################################
-max_prompt_length=1576
+max_prompt_length=2048
+task3_max_prompt_length="${TASK3_MAX_PROMPT_LENGTH:-3072}"
 max_response_length=2800
+task3_compact_logits="${TASK3_COMPACT_LOGITS:-True}"
 
 # Overlong Buffer Configuration
 enable_overlong_buffer=True
@@ -189,15 +191,15 @@ val_img_top_p=1.0
 # Prompt Batch Sizes
 train_prompt_bsz=0            # not used in async mode
 gen_prompt_bsz=1              # streaming generation, set to 1
-n_resp_per_prompt=16
+n_resp_per_prompt="${N_RESP_PER_PROMPT:-16}"
 rollout_prompt_size=1         # prompts per actor per batch (async mode)
-val_rollout_prompt_size=16
+val_rollout_prompt_size="${VAL_ROLLOUT_PROMPT_SIZE:-32}"
 
 # Response & Micro Batch
-train_prompt_mini_bsz=8 # 한번에 몇개 프롬프트 training?
-ppo_micro_batch_size_per_gpu=8 # accum 몇개?
-log_prob_micro_batch_size_per_gpu=8
-require_batches=2
+train_prompt_mini_bsz="${TRAIN_PROMPT_MINI_BSZ:-8}" # prompt groups per global PPO mini-batch
+ppo_micro_batch_size_per_gpu="${PPO_MICRO_BATCH_SIZE_PER_GPU:-16}" # flattened samples per rank
+log_prob_micro_batch_size_per_gpu="${LOG_PROB_MICRO_BATCH_SIZE_PER_GPU:-16}"
+require_batches="${REQUIRE_BATCHES:-2}"
 
 # Dynamic Batching
 use_dynamic_bsz=False
@@ -219,13 +221,14 @@ weight_decay=0.01
 #                        ASYNC TRAINING PARAMETERS
 ###############################################################################
 # https://verl.readthedocs.io/en/latest/advance/fully_async.html#parameter-description
-total_rollout_steps=$(((512*100*3*10)))
+total_rollout_steps="${TOTAL_ROLLOUT_STEPS:-1536000}"
 staleness_threshold=2.0
 trigger_parameter_sync_step=1
 partial_rollout=False
 use_rollout_log_probs=True
 compute_prox_log_prob=False
 max_regen_retries=3
+reward_finalize_workers=2
 
 # Replay Buffer
 replay_buffer_enable=True
@@ -233,8 +236,8 @@ replay_buffer_max_version_gap=-1
 replay_buffer_max_size_per_task=64
 replay_buffer_max_use_count=-1
 replay_buffer_filter_mode=max_and_std_constant      # "mean", "std", or "max", "max_and_std_constant"
-replay_buffer_score_threshold_1=0.8
-replay_buffer_score_threshold_2=3
+replay_buffer_score_threshold_1=0.7
+replay_buffer_score_threshold_2=1.0
 replay_buffer_score_threshold_3=0.5 # 2점 만점
 replay_buffer_score_std_threshold_1=0.1
 replay_buffer_score_std_threshold_2=0.1
@@ -253,14 +256,17 @@ bypass_mode=false
 ###############################################################################
 #                         TRAINING SCHEDULE
 ###############################################################################
-total_epochs=10
-test_freq=20
-save_freq=50
-rollout_freq=20
+total_epochs="${TOTAL_EPOCHS:-10}"
+test_freq="${TEST_FREQ:-250}"
+save_freq="${SAVE_FREQ:-500}"
+rollout_freq="${ROLLOUT_FREQ:-250}"
+trainer_logger="${TRAINER_LOGGER:-['console','wandb']}"
+resume_mode="${RESUME_MODE:-auto}"
+val_before_train="${VAL_BEFORE_TRAIN:-True}"
 # total_training_steps=3000
 # log_val_generations=20
 
-ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
+ray job submit --address="${RAY_ADDRESS}" --no-wait --runtime-env="${RUNTIME_ENV}" \
     --working-dir "${WORKING_DIR}" \
     -- python -m recipe.fully_async_policy_image_rl.fully_async_main \
     --config-name="fully_async_ppo_trainer.yaml" \
@@ -284,6 +290,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     actor_rollout_ref.actor.strategy=fsdp2 \
     actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${ppo_micro_batch_size_per_gpu} \
+    actor_rollout_ref.actor.task3_compact_logits=${task3_compact_logits} \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=${sp_size} \
     actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
     actor_rollout_ref.actor.use_kl_loss=${use_kl_loss} \
@@ -346,6 +353,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     actor_rollout_ref.rollout.img_top_p=${img_top_p} \
     actor_rollout_ref.rollout.image_token_num_per_image=576 \
     actor_rollout_ref.rollout.prompt_length=${max_prompt_length} \
+    actor_rollout_ref.rollout.task3_prompt_length=${task3_max_prompt_length} \
     actor_rollout_ref.rollout.response_length=${max_response_length} \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${gen_tp} \
     +actor_rollout_ref.rollout.engine_kwargs.sglang.attention_backend=triton \
@@ -370,14 +378,14 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     actor_rollout_ref.ref.fsdp_config.wrap_policy.transformer_layer_cls_to_wrap=['LlamaDecoderLayer'] \
     actor_rollout_ref.ref.ulysses_sequence_parallel_size=${sp_size} \
     trainer.critic_warmup=0 \
-    trainer.logger=['console','wandb'] \
-    trainer.val_before_train=False \
+    trainer.logger="${trainer_logger}" \
+    trainer.val_before_train=${val_before_train} \
     trainer.balance_batch=False \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
     trainer.save_freq="${save_freq}" \
     trainer.total_epochs="${total_epochs}" \
-    trainer.resume_mode=auto \
+    trainer.resume_mode="${resume_mode}" \
     trainer.default_local_dir=$CKPTS_DIR \
     trainer.rollout_data_dir="$CKPTS_DIR/rollout" \
     trainer.rollout_freq=${rollout_freq} \
@@ -400,6 +408,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     async_training.use_rollout_log_probs=${use_rollout_log_probs} \
     async_training.compute_prox_log_prob=${compute_prox_log_prob} \
     async_training.max_regen_retries=${max_regen_retries} \
+    async_training.reward_finalize_workers=${reward_finalize_workers} \
     async_training.replay_buffer.enable=${replay_buffer_enable} \
     async_training.replay_buffer.max_version_gap=${replay_buffer_max_version_gap} \
     async_training.replay_buffer.max_size_per_task=${replay_buffer_max_size_per_task} \
@@ -431,5 +440,4 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     actor_rollout_ref.actor.adaptive_entropy_coeff.task1.target_entropy=${adaptive_entropy_coeff_task1_target_entropy} \
     actor_rollout_ref.actor.adaptive_entropy_coeff.task2.target_entropy=${adaptive_entropy_coeff_task2_target_entropy} \
     actor_rollout_ref.actor.adaptive_entropy_coeff.task3.target_entropy=${adaptive_entropy_coeff_task3_target_entropy} \
-    +actor_rollout_ref.rollout.max_turns=${max_turns} \
-    
+    +actor_rollout_ref.rollout.max_turns=${max_turns}

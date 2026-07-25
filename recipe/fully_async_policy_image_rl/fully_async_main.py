@@ -348,7 +348,7 @@ class FullyAsyncTaskRunner:
                 ray.cancel(future)
             raise
         finally:
-            self.components["message_queue_client"].clear_queue()
+            self.components["message_queue_client"].clear_queue_sync()
             print("[ASYNC MAIN] Training completed or interrupted")
 
 

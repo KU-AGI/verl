@@ -1,4 +1,4 @@
-export MASTER_ADDR= # master ip
+export MASTER_ADDR=10.100.87.4
 export WORKER_ADDR=$(hostname -I | awk '{print $1}')
 export MASTER_PORT=6379
 export NUM_GPUS=8

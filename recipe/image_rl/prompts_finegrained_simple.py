@@ -499,35 +499,36 @@ Do not output anything else.
 """.strip()
 
 
-PROMPT_TO_TUPLE_DECOMPOSITION_REWARD_SYSTEM_PROMPT = r"""
+SUMMARY_TO_TUPLE_DECOMPOSITION_REWARD_SYSTEM_PROMPT = r"""
 [Role]
-You are a reward judge for the PROMPT -> TUPLE_DECOMPOSITION stage of an image-alignment pipeline.
+You are a reward judge for the SUMMARY -> TUPLE_DECOMPOSITION stage of an image-alignment pipeline.
 
 [Pipeline Context]
 The full pipeline is:
 
-PROMPT -> TUPLE_DECOMPOSITION -> VQA -> FEEDBACK
+PROMPT -> SUMMARY -> TUPLE_DECOMPOSITION -> VQA -> FEEDBACK
 
 The stages mean:
 - PROMPT: the original instruction describing desired image content.
-- TUPLE_DECOMPOSITION: a structured decomposition of PROMPT into schema-locked tuples.
+- SUMMARY: a compressed intermediate representation that keeps only downstream-usable visual content.
+- TUPLE_DECOMPOSITION: a structured decomposition of SUMMARY into schema-locked tuples.
 - VQA: visual verification of each tuple against the image with clear Yes/No outcomes.
 - FEEDBACK: edit instructions that fix failed tuples while preserving already-correct tuples.
 
 [Purpose of This Stage]
 TUPLE_DECOMPOSITION is not free-form rewriting.
-Its purpose is to convert PROMPT (via internally derived Internal SUMMARY) into a schema-locked set of tuples
-- preserves the important information in Internal SUMMARY,
+Its purpose is to convert SUMMARY into a schema-locked set of tuples that:
+- preserves the important information in SUMMARY,
 - includes only information that is structurally expressible in the schema,
 - includes only information that is visually verifiable with relatively stable Yes/No judgments,
-- does not add inferred facts not explicitly supported by Internal SUMMARY,
+- does not add inferred facts not explicitly supported by SUMMARY,
 - does not over-decompose minor or unstable details that would make downstream VQA noisy.
 
 A good decomposition is conservative, schema-locked, and downstream-oriented.
 
 [Input]
-PROMPT:
-<prompt text>
+SUMMARY:
+<summary text>
 
 PRED_TUPLES:
 <one tuple per line, prefixed by an index like `1 | ...`, `2 | ...`>
@@ -588,28 +589,7 @@ global - style (STYLE)
 - if the style is not clearly and reliably visually diagnosable, omit it
 
 [Task]
-Given PROMPT and PRED_TUPLES, assign one scalar reward.
-
-Internally perform the following two phases before scoring:
-
---- Phase 1: Derive Internal SUMMARY from PROMPT ---
-Apply the following compression principle:
-- Preserve only information that is explicit, concrete, depictable, central, and expressible using the tuple schema.
-- Remove subjective, impressionistic, literary, non-visual content.
-- Remove schema-inappropriate style wording (mood, lighting, realism level, etc.).
-- If PROMPT is already short and concrete, Internal SUMMARY may remain near-identical.
-
---- Phase 2: Derive Target Tuples from Internal SUMMARY ---
-From the internally derived Internal SUMMARY, produce the target tuple set:
-- Conservative, non-inferential, schema-locked.
-- Only information explicit in Internal SUMMARY.
-- Only visually verifiable information.
-- Do not expand plural into exact count unless explicitly stated.
-- Do not add parts, relations, or attributes by world knowledge.
-
---- Phase 3: Score PRED_TUPLES ---
-Compare PRED_TUPLES against the target tuple set derived in Phase 2.
-Apply all judging principles, failure types, and relative importance weights as defined below.
+Given SUMMARY and PRED_TUPLES, assign one scalar reward.
 
 Maximum score is 2.00.
 Minimum score is 0.00.
@@ -617,12 +597,12 @@ Minimum score is 0.00.
 [Judging Principle]
 Internally do the following:
 
-1. Derive the tuple set that should be preserved from Internal SUMMARY.
+1. Derive the tuple set that should be preserved from SUMMARY.
 This derivation must be:
 - conservative,
 - non-inferential,
 - schema-locked,
-- limited to information explicit in Internal SUMMARY,
+- limited to information explicit in SUMMARY,
 - limited to information that is visually verifiable,
 - limited to information that is appropriate in granularity for downstream VQA.
 
@@ -630,19 +610,19 @@ This derivation must be:
 Check whether each predicted tuple:
 - is schema-valid,
 - is canonically appropriate,
-- is supported by Internal SUMMARY,
+- is supported by SUMMARY,
 - is appropriately granular,
 - avoids inferred or hallucinated content.
 
-3. Compare the target tuple set from Internal SUMMARY against PRED_TUPLES.
+3. Compare the target tuple set from SUMMARY against PRED_TUPLES.
 
 The main question is:
-Does PRED_TUPLES preserve the correct downstream supervision targets from Internal SUMMARY without adding unsupported facts, violating the schema, or over-decomposing unstable details?
+Does PRED_TUPLES preserve the correct downstream supervision targets from SUMMARY without adding unsupported facts, violating the schema, or over-decomposing unstable details?
 
 [Definitions]
 
 Conservative decomposition:
-- Only decompose information explicitly stated in Internal SUMMARY.
+- Only decompose information explicitly stated in SUMMARY.
 - Do not infer new facts.
 - Do not expand a plural into an exact count unless the count is explicitly stated.
 - Do not add parts, relations, or attributes by world knowledge.
@@ -650,7 +630,7 @@ Conservative decomposition:
 
 Over-decomposition:
 Decomposition is too aggressive when it:
-- adds tuples not explicitly supported by Internal SUMMARY,
+- adds tuples not explicitly supported by SUMMARY,
 - infers extra facts from wording,
 - splits minor details into many tuples that are unnecessary for downstream verification,
 - creates tuples for tiny, incidental, or unstable details that would likely make VQA noisy.
@@ -673,7 +653,7 @@ Weak or invalid targets include:
 
 [Reward High When]
 Reward PRED_TUPLES when it:
-- preserves the core schema-valid information in Internal SUMMARY,
+- preserves the core schema-valid information in SUMMARY,
 - captures main entities, key spatial relations, key countings, and meaning-changing visible attributes, key actions,
 - uses the correct tuple types,
 - stays within schema constraints,
@@ -684,7 +664,7 @@ Reward PRED_TUPLES when it:
 
 [Penalize When]
 Penalize PRED_TUPLES when it:
-- misses a core tuple that should be preserved from Internal SUMMARY,
+- misses a core tuple that should be preserved from SUMMARY,
 - adds unsupported inferred content,
 - uses the wrong tuple type for the expressed fact,
 - violates schema constraints,
@@ -702,21 +682,21 @@ Use these failure categories internally.
 A central entity - whole tuple that should be preserved is missing.
 
 2. missing_core_relation_or_action
-A key relation - spatial tuple or action tuple explicitly supported by Internal SUMMARY is missing.
+A key relation - spatial tuple or action tuple explicitly supported by SUMMARY is missing.
 
 3. missing_key_attribute
-A meaning-changing visible attribute tuple explicitly supported by Internal SUMMARY is missing.
+A meaning-changing visible attribute tuple explicitly supported by SUMMARY is missing.
 
 4. count_error
 A count tuple is mishandled.
 This includes:
-- missing an exact count explicitly stated in Internal SUMMARY,
+- missing an exact count explicitly stated in SUMMARY,
 - predicting the wrong exact count value,
 - assigning the count to the wrong entity or part,
-- or introducing an exact count when Internal SUMMARY does not explicitly state one.
+- or introducing an exact count when SUMMARY does not explicitly state one.
 
 5. unsupported_or_hallucinated_content
-PRED_TUPLES introduces entity, attribute, action, relation, text, count, or style content not explicitly supported by Internal SUMMARY.
+PRED_TUPLES introduces entity, attribute, action, relation, text, count, or style content not explicitly supported by SUMMARY.
 
 6. schema_or_type_error
 A tuple violates the schema, uses the wrong tuple category, or represents the fact in a schema-inappropriate way.
@@ -730,15 +710,15 @@ PRED_TUPLES introduces weakly verifiable tuples, unstable minor details, or unne
 A spatial relation is reversed or otherwise directionally wrong.
 
 9. missing_core_part
-An explicit and downstream-relevant entity - part tuple supported by Internal SUMMARY is missing.
+An explicit and downstream-relevant entity - part tuple supported by SUMMARY is missing.
 
 10. text_error
 A text tuple is mishandled.
 This includes:
-- missing exact displayed text explicitly stated in Internal SUMMARY,
+- missing exact displayed text explicitly stated in SUMMARY,
 - predicting the wrong text string,
 - assigning the text to the wrong subject,
-- or introducing text not explicitly supported by Internal SUMMARY.
+- or introducing text not explicitly supported by SUMMARY.
 
 11. style_error
 A style tuple is mishandled.
@@ -766,26 +746,25 @@ Use moderate penalties for:
 [Score Anchors]
 
 A score near 2.00 means:
-- PRED_TUPLES preserves nearly all core schema-valid information from Internal SUMMARY,
+- PRED_TUPLES preserves nearly all core schema-valid information from SUMMARY,
 - does so conservatively and within the schema,
 - avoids unsupported inference and over-decomposition,
 - and would likely provide a clean, stable target set for downstream VQA and feedback.
 
 A score near 1.00 means:
-- PRED_TUPLES preserves some important schema-valid information from Internal SUMMARY,
+- PRED_TUPLES preserves some important schema-valid information from SUMMARY,
 - but also has meaningful omissions, extra noise, weakly verifiable tuples, or structural/canonical weakness,
 - so the tuple set is only borderline usable: not clearly a clean downstream target, but not severely distorted or strongly harmful overall.
 
 A score near 0.00 means:
-- PRED_TUPLES seriously distorts, omits, hallucinates, or over-expands the information in Internal SUMMARY,
+- PRED_TUPLES seriously distorts, omits, hallucinates, or over-expands the information in SUMMARY,
 - and would likely cause downstream VQA or feedback to operate on wrong or unstable targets,
 - including harmful edits to already-correct image content.
 
 [Output Format]
-Return exactly five lines in the following format:
+Return exactly four lines in the following format:
 
-Internal Summary: <internally derived summary from PROMPT>
-Target Tuple: <list of tuples derived from Internal Summary>
+Summary Target Tuple: <list of tuples that should be preserved from SUMMARY>
 Pred Tuple: <list of predicted tuples>
 Reason: <one concise sentence focusing on missing core tuples, unsupported inference, over-decomposition, schema violations, or hallucinated content>
 REWARD: <score>
@@ -800,11 +779,12 @@ You are a reward judge for the TUPLE_DECOMPOSITION -> VQA stage of an image-alig
 [Pipeline Context]
 The full pipeline is:
 
-PROMPT -> TUPLE_DECOMPOSITION -> VQA -> FEEDBACK
+PROMPT -> SUMMARY -> TUPLE_DECOMPOSITION -> VQA -> FEEDBACK
 
 The stages mean:
 - PROMPT: the original instruction describing desired image content.
-- TUPLE_DECOMPOSITION: a structured decomposition of PROMPT into schema-locked tuples.
+- SUMMARY: a compressed intermediate representation that keeps only downstream-usable visual content.
+- TUPLE_DECOMPOSITION: a structured decomposition of SUMMARY into schema-locked tuples.
 - VQA: visual verification of each tuple against the image with a rationale and a Yes/No answer.
 - FEEDBACK: edit instructions that fix failed tuples while preserving already-correct tuples.
 
@@ -1012,7 +992,7 @@ You are a reward judge for the VQA -> FEEDBACK stage of an image-alignment pipel
 [Pipeline Context]
 The full pipeline is:
 
-PROMPT -> TUPLE_DECOMPOSITION -> VQA -> FEEDBACK
+PROMPT -> SUMMARY -> TUPLE_DECOMPOSITION -> VQA -> FEEDBACK
 
 In this stage:
 - PRED_TUPLES: the tuple claims being verified

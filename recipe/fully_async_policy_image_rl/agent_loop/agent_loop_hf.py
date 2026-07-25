@@ -24,6 +24,7 @@ import ray
 from omegaconf import DictConfig
 
 from recipe.fully_async_policy_image_rl.hf_rollout.hf_replica import HuggingFaceReplica
+from recipe.image_rl.utils import should_route_task3
 from recipe.fully_async_policy_image_rl.agent_loop.agent_loop import (
     AgentLoopManager,
     AgentLoopOutput,
@@ -53,19 +54,9 @@ def get_image_rollout_replica_class(rollout_name: str):
     raise NotImplementedError(f"Unsupported fully-async image rollout backend: {rollout_name}")
 
 
-_NO_EDIT_MARKER = "No need to generate feedback."
-
-
 def _is_edit_sample(feedback_text) -> bool:
-    """An edit-worthy task2 feedback is any non-empty string that does NOT
-    contain the explicit `No need to generate feedback.` sentence (the exact
-    marker used by the task2 prompt template — see
-    `recipe/image_rl/prompts_finegrained.py` / `reward_function_fine_grained.py`).
-    Empty / non-string feedback is treated as no-edit.
-    """
-    if not isinstance(feedback_text, str) or not feedback_text:
-        return False
-    return _NO_EDIT_MARKER not in feedback_text
+    """Return whether task2 feedback should trigger Task3 editing."""
+    return should_route_task3(feedback_text)
 
 
 def build_edit_batch(batch: DataProto, group_size: Optional[int] = None) -> DataProto:
@@ -809,23 +800,44 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
     def _spawn_child_branch_ids(
         self,
         batch: DataProto,
+        next_branch_id: int,
         parent_ids: Optional[np.ndarray] = None,
-    ) -> DataProto:
-        """Assign fresh branch ids to every row in `batch`."""
+    ) -> tuple[DataProto, int]:
+        """Assign sample-local branch ids and return the next unused id."""
         if batch is None or len(batch) == 0:
-            return batch
+            return batch, next_branch_id
         batch = self._ensure_branch_metadata(batch)
         n = len(batch)
         if parent_ids is None:
             parent_ids = np.asarray(batch.non_tensor_batch["branch_id"], dtype=np.int64)
         else:
             parent_ids = np.asarray(parent_ids, dtype=np.int64)
-        next_id = int(getattr(self, "_branch_id_counter", 0))
-        new_ids = np.arange(next_id, next_id + n, dtype=np.int64)
-        self._branch_id_counter = next_id + n
+        new_ids = np.arange(next_branch_id, next_branch_id + n, dtype=np.int64)
         batch.non_tensor_batch["parent_branch_id"] = parent_ids
         batch.non_tensor_batch["branch_id"] = new_ids
-        return batch
+        return batch, next_branch_id + n
+
+    @staticmethod
+    def _resolve_branch_chain(
+        branch_parent: dict[int, int],
+        branch_id: int,
+        trajectory_id: Optional[int] = None,
+    ) -> list[int]:
+        """Resolve a root-to-leaf chain and fail fast on corrupt cyclic metadata."""
+        chain = []
+        visited = set()
+        current = branch_id
+        while current >= 0:
+            if current in visited:
+                raise ValueError(
+                    "Cycle detected in branch metadata: "
+                    f"trajectory_id={trajectory_id}, branch_id={branch_id}, "
+                    f"repeated_branch_id={current}, chain={chain}"
+                )
+            visited.add(current)
+            chain.append(current)
+            current = int(branch_parent.get(current, -1))
+        return list(reversed(chain))
 
     @staticmethod
     def _build_row_map_by_trajectory(
@@ -1201,7 +1213,9 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             gain_positive_vals = self._ensure_reward_extra_list(t3_extras, "task3_image_gain_positive_score", n)
             relative_gain_vals = self._ensure_reward_extra_list(t3_extras, "task3_relative_image_gain", n)
             edit_if_vals = self._ensure_reward_extra_list(t3_extras, "task3_step5_edit_if_score", n)
+            edit_if_step6_vals = self._ensure_reward_extra_list(t3_extras, "task3_step6_edit_if_score", n)
             step5_vals = self._ensure_reward_extra_list(t3_extras, "task3_step5_reward", n)
+            step6_vals = self._ensure_reward_extra_list(t3_extras, "task3_step6_reward", n)
 
             for row in range(n):
                 next_s = self._read_reward_extra_value(t3_extras, "task3_image_score", row, None)
@@ -1253,7 +1267,9 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
                 gain_positive_vals[row] = gain_positive
                 relative_gain_vals[row] = relative_gain
                 edit_if_vals[row] = edit_if
+                edit_if_step6_vals[row] = edit_if
                 step5_vals[row] = step5_reward
+                step6_vals[row] = step5_reward
 
     @staticmethod
     def _event_return_key(dp: DataProto, row: int, event_name: str) -> tuple[int, int, str]:
@@ -1351,8 +1367,8 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
     ) -> None:
         """Replace phase1 token scores with immediate multi-step rewards.
 
-        Rewards are intentionally built from raw components, not `*_image_score`
-        or `*_align`, because those fields include a 0.2 detector weight.
+        Rewards are intentionally built from raw components. Yongjin's setup
+        does not run a detector, so task1 uses VQA and task3 uses its geo reward.
         """
         if task1_batch is not None and "task1_response_mask" in task1_batch.batch:
             mask = task1_batch.batch["task1_response_mask"]
@@ -1363,8 +1379,7 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             multi_vals = self._ensure_reward_extra_list(task1_extras, "task1_multi_step_score", len(task1_batch))
             for row in range(len(task1_batch)):
                 vqa = self._as_float(self._read_reward_extra_value(task1_extras, "task1_vqa_reward", row, 0.0))
-                detector = self._as_float(self._read_reward_extra_value(task1_extras, "task1_detector_reward", row, 0.0))
-                value = vqa + detector
+                value = vqa
                 multi_vals[row] = value
                 self._put_scalar_on_last_mask_token(scores, mask, row, value)
             task1_batch.batch["task1_token_level_scores"] = scores
@@ -1382,16 +1397,20 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             step2_vals = self._ensure_reward_extra_list(task2_extras, "task2_step2_multi_step_score", len(t2_b))
             step3_vals = self._ensure_reward_extra_list(task2_extras, "task2_step3_multi_step_score", len(t2_b))
             step4_vals = self._ensure_reward_extra_list(task2_extras, "task2_step4_multi_step_score", len(t2_b))
+            step5_vals = self._ensure_reward_extra_list(task2_extras, "task2_step5_multi_step_score", len(t2_b))
             for row in range(len(t2_b)):
-                step2 = self._as_float(self._read_reward_extra_value(task2_extras, "task2_prompt_to_tuple_reward", row, 0.0))
-                step3 = self._as_float(self._read_reward_extra_value(task2_extras, "task2_tuple_to_vqa_reward", row, 0.0))
-                step4 = self._as_float(self._read_reward_extra_value(task2_extras, "task2_vqa_to_feedback_reward", row, 0.0))
+                step2 = self._as_float(self._read_reward_extra_value(task2_extras, "task2_prompt_to_summary_reward", row, 0.0))
+                step3 = self._as_float(self._read_reward_extra_value(task2_extras, "task2_summary_to_tuple_reward", row, 0.0))
+                step4 = self._as_float(self._read_reward_extra_value(task2_extras, "task2_tuple_to_vqa_reward", row, 0.0))
+                step5 = self._as_float(self._read_reward_extra_value(task2_extras, "task2_vqa_to_feedback_reward", row, 0.0))
                 step2_vals[row] = step2
                 step3_vals[row] = step3
                 step4_vals[row] = step4
+                step5_vals[row] = step5
                 self._put_scalar_on_last_segment_token(scores, segment_mask, row, 2, step2)
                 self._put_scalar_on_last_segment_token(scores, segment_mask, row, 3, step3)
                 self._put_scalar_on_last_segment_token(scores, segment_mask, row, 4, step4)
+                self._put_scalar_on_last_segment_token(scores, segment_mask, row, 5, step5)
             t2_b.batch["task2_token_level_scores"] = scores
             t2_b.batch["task2_local_token_level_scores"] = scores.clone()
             t2_b.meta_info["task2_token_level_scores"] = scores
@@ -1408,11 +1427,11 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             multi_vals = self._ensure_reward_extra_list(task3_extras, "task3_multi_step_score", len(t3_b))
             for row in range(len(t3_b)):
                 vqa = self._as_float(self._read_reward_extra_value(task3_extras, "task3_vqa_reward", row, 0.0))
-                detector = self._as_float(self._read_reward_extra_value(task3_extras, "task3_detector_reward", row, 0.0))
-                edit_if = self._read_reward_extra_value(task3_extras, "task3_edit_if_reward", row, None)
-                if edit_if is None:
-                    edit_if = self._read_reward_extra_value(task3_extras, "task3_if", row, 0.0)
-                value = vqa + detector + self._as_float(edit_if)
+                value = self._read_reward_extra_value(task3_extras, "task3_geo_reward", row, None)
+                if value is None:
+                    edit_score = self._as_float(self._read_reward_extra_value(task3_extras, "task3_edit_reward", row, 0.0))
+                    value = float(np.sqrt(max(0.0, (vqa * 2.0) * edit_score)))
+                value = self._as_float(value)
                 multi_vals[row] = value
                 self._put_scalar_on_last_mask_token(scores, mask, row, value)
             t3_b.batch["task3_token_level_scores"] = scores
@@ -1512,19 +1531,11 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
                 out.append((turn_i, dp, row))
             return out
 
-        def _branch_chain(bid: int) -> list[int]:
-            chain = []
-            cur = bid
-            while cur >= 0:
-                chain.append(cur)
-                cur = int(branch_parent.get(cur, -1))
-            return list(reversed(chain))
-
         def _collect_branch_rows(bid: int) -> tuple[list[tuple], list[tuple]]:
             tid = int(branch_tid[bid])
             t2_rows = list(shared_t2_rows.get(tid, []))
             t3_rows = list(shared_t3_rows.get(tid, []))
-            for seg_bid in _branch_chain(bid):
+            for seg_bid in self._resolve_branch_chain(branch_parent, bid, trajectory_id=tid):
                 t2_rows.extend(branch_t2_rows.get(seg_bid, []))
                 t3_rows.extend(branch_t3_rows.get(seg_bid, []))
             return _dedupe_sorted(t2_rows), _dedupe_sorted(t3_rows)
@@ -1545,14 +1556,21 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
                 events.append((0.0, task1_batch, row, "step1", reward))
 
             for turn_i, t2_b, row in t2_rows:
-                base = 1.0 + 4.0 * float(turn_i)
-                events.append((base + 0.0, t2_b, row, "step2", _ex(t2_b, 2, "task2_prompt_to_tuple_reward", [row], 0.0)))
-                events.append((base + 1.0, t2_b, row, "step3", _ex(t2_b, 2, "task2_tuple_to_vqa_reward", [row], 0.0)))
-                events.append((base + 2.0, t2_b, row, "step4", _ex(t2_b, 2, "task2_vqa_to_feedback_reward", [row], 0.0)))
+                base = 1.0 + 5.0 * float(turn_i)
+                events.append((base + 0.0, t2_b, row, "step2", _ex(t2_b, 2, "task2_prompt_to_summary_reward", [row], 0.0)))
+                events.append((base + 1.0, t2_b, row, "step3", _ex(t2_b, 2, "task2_summary_to_tuple_reward", [row], 0.0)))
+                events.append((base + 2.0, t2_b, row, "step4", _ex(t2_b, 2, "task2_tuple_to_vqa_reward", [row], 0.0)))
+                events.append((base + 3.0, t2_b, row, "step5", _ex(t2_b, 2, "task2_vqa_to_feedback_reward", [row], 0.0)))
 
             for turn_i, t3_b, row in t3_rows:
-                base = 1.0 + 4.0 * float(turn_i)
-                events.append((base + 3.0, t3_b, row, "step5", _ex(t3_b, 3, "task3_step5_reward", [row], 0.0)))
+                base = 1.0 + 5.0 * float(turn_i)
+                events.append((
+                    base + 4.0,
+                    t3_b,
+                    row,
+                    "step6",
+                    _ex(t3_b, 3, "task3_step6_reward", [row], default=_ex(t3_b, 3, "task3_step5_reward", [row], 0.0)),
+                ))
 
             return sorted(events, key=lambda x: x[0])
 
@@ -1604,35 +1622,46 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             step2_vals = self._ensure_reward_extra_list(task2_extras, "task2_step2_outcome_score", len(t2_b))
             step3_vals = self._ensure_reward_extra_list(task2_extras, "task2_step3_outcome_score", len(t2_b))
             step4_vals = self._ensure_reward_extra_list(task2_extras, "task2_step4_outcome_score", len(t2_b))
+            step5_vals = self._ensure_reward_extra_list(task2_extras, "task2_step5_outcome_score", len(t2_b))
             for row in range(len(t2_b)):
                 step2 = self._mean_return(outcomes_by_event, t2_b, row, "step2", 0.0)
                 step3 = self._mean_return(outcomes_by_event, t2_b, row, "step3", 0.0)
                 step4 = self._mean_return(outcomes_by_event, t2_b, row, "step4", 0.0)
+                step5 = self._mean_return(outcomes_by_event, t2_b, row, "step5", 0.0)
                 step2_vals[row] = step2
                 step3_vals[row] = step3
                 step4_vals[row] = step4
+                step5_vals[row] = step5
                 self._put_scalar_on_last_segment_token(scores, segment_mask, row, 2, step2)
                 self._put_scalar_on_last_segment_token(scores, segment_mask, row, 3, step3)
                 self._put_scalar_on_last_segment_token(scores, segment_mask, row, 4, step4)
+                self._put_scalar_on_last_segment_token(scores, segment_mask, row, 5, step5)
                 self._put_scalar_on_last_segment_token(
                     local_scores,
                     segment_mask,
                     row,
                     2,
-                    _ex(t2_b, 2, "task2_prompt_to_tuple_reward", [row], 0.0),
+                    _ex(t2_b, 2, "task2_prompt_to_summary_reward", [row], 0.0),
                 )
                 self._put_scalar_on_last_segment_token(
                     local_scores,
                     segment_mask,
                     row,
                     3,
-                    _ex(t2_b, 2, "task2_tuple_to_vqa_reward", [row], 0.0),
+                    _ex(t2_b, 2, "task2_summary_to_tuple_reward", [row], 0.0),
                 )
                 self._put_scalar_on_last_segment_token(
                     local_scores,
                     segment_mask,
                     row,
                     4,
+                    _ex(t2_b, 2, "task2_tuple_to_vqa_reward", [row], 0.0),
+                )
+                self._put_scalar_on_last_segment_token(
+                    local_scores,
+                    segment_mask,
+                    row,
+                    5,
                     _ex(t2_b, 2, "task2_vqa_to_feedback_reward", [row], 0.0),
                 )
             t2_b.batch["task2_token_level_scores"] = scores
@@ -1650,7 +1679,7 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             task3_extras = t3_b.meta_info.setdefault("task3_reward_extra_info", {})
             outcome_vals = self._ensure_reward_extra_list(task3_extras, "task3_outcome_score", len(t3_b))
             for row in range(len(t3_b)):
-                value = self._mean_return(outcomes_by_event, t3_b, row, "step5", 0.0)
+                value = self._mean_return(outcomes_by_event, t3_b, row, "step6", 0.0)
                 outcome_vals[row] = value
                 self._put_scalar_on_last_mask_token(scores, mask, row, value)
             t3_b.batch["task3_token_level_scores"] = scores
@@ -1757,19 +1786,11 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
                 out.append((turn_i, dp, row))
             return out
 
-        def _branch_chain(bid: int) -> list[int]:
-            chain = []
-            cur = bid
-            while cur >= 0:
-                chain.append(cur)
-                cur = int(branch_parent.get(cur, -1))
-            return list(reversed(chain))
-
         def _collect_branch_rows(bid: int) -> tuple[list[tuple], list[tuple]]:
             tid = int(branch_tid[bid])
             t2_rows = list(shared_t2_rows.get(tid, []))
             t3_rows = list(shared_t3_rows.get(tid, []))
-            for seg_bid in _branch_chain(bid):
+            for seg_bid in self._resolve_branch_chain(branch_parent, bid, trajectory_id=tid):
                 t2_rows.extend(branch_t2_rows.get(seg_bid, []))
                 t3_rows.extend(branch_t3_rows.get(seg_bid, []))
             return _dedupe_sorted(t2_rows), _dedupe_sorted(t3_rows)
@@ -1781,14 +1802,15 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
                 events.append((0.0, task1_batch, row, "step1", _normalized_image_score(task1_batch, 1, row)))
 
             for turn_i, t2_b, row in t2_rows:
-                base = 1.0 + 4.0 * float(turn_i)
+                base = 1.0 + 5.0 * float(turn_i)
                 events.append((base + 0.0, t2_b, row, "step2", None))
                 events.append((base + 1.0, t2_b, row, "step3", None))
                 events.append((base + 2.0, t2_b, row, "step4", None))
+                events.append((base + 3.0, t2_b, row, "step5", None))
 
             for turn_i, t3_b, row in t3_rows:
-                base = 1.0 + 4.0 * float(turn_i)
-                events.append((base + 3.0, t3_b, row, "step5", _normalized_image_score(t3_b, 3, row)))
+                base = 1.0 + 5.0 * float(turn_i)
+                events.append((base + 4.0, t3_b, row, "step6", _normalized_image_score(t3_b, 3, row)))
 
             return sorted(events, key=lambda x: x[0])
 
@@ -1845,35 +1867,46 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             step2_vals = self._ensure_reward_extra_list(task2_extras, "task2_step2_final_image_outcome_score", len(t2_b))
             step3_vals = self._ensure_reward_extra_list(task2_extras, "task2_step3_final_image_outcome_score", len(t2_b))
             step4_vals = self._ensure_reward_extra_list(task2_extras, "task2_step4_final_image_outcome_score", len(t2_b))
+            step5_vals = self._ensure_reward_extra_list(task2_extras, "task2_step5_final_image_outcome_score", len(t2_b))
             for row in range(len(t2_b)):
                 step2 = self._mean_return(outcomes_by_event, t2_b, row, "step2", 0.0)
                 step3 = self._mean_return(outcomes_by_event, t2_b, row, "step3", 0.0)
                 step4 = self._mean_return(outcomes_by_event, t2_b, row, "step4", 0.0)
+                step5 = self._mean_return(outcomes_by_event, t2_b, row, "step5", 0.0)
                 step2_vals[row] = step2
                 step3_vals[row] = step3
                 step4_vals[row] = step4
+                step5_vals[row] = step5
                 self._put_scalar_on_last_segment_token(scores, segment_mask, row, 2, step2)
                 self._put_scalar_on_last_segment_token(scores, segment_mask, row, 3, step3)
                 self._put_scalar_on_last_segment_token(scores, segment_mask, row, 4, step4)
+                self._put_scalar_on_last_segment_token(scores, segment_mask, row, 5, step5)
                 self._put_scalar_on_last_segment_token(
                     local_scores,
                     segment_mask,
                     row,
                     2,
-                    _ex(t2_b, 2, "task2_prompt_to_tuple_reward", [row], 0.0),
+                    _ex(t2_b, 2, "task2_prompt_to_summary_reward", [row], 0.0),
                 )
                 self._put_scalar_on_last_segment_token(
                     local_scores,
                     segment_mask,
                     row,
                     3,
-                    _ex(t2_b, 2, "task2_tuple_to_vqa_reward", [row], 0.0),
+                    _ex(t2_b, 2, "task2_summary_to_tuple_reward", [row], 0.0),
                 )
                 self._put_scalar_on_last_segment_token(
                     local_scores,
                     segment_mask,
                     row,
                     4,
+                    _ex(t2_b, 2, "task2_tuple_to_vqa_reward", [row], 0.0),
+                )
+                self._put_scalar_on_last_segment_token(
+                    local_scores,
+                    segment_mask,
+                    row,
+                    5,
                     _ex(t2_b, 2, "task2_vqa_to_feedback_reward", [row], 0.0),
                 )
             t2_b.batch["task2_token_level_scores"] = scores
@@ -1893,7 +1926,7 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
                 task3_extras, "task3_final_image_outcome_score", len(t3_b)
             )
             for row in range(len(t3_b)):
-                value = self._mean_return(outcomes_by_event, t3_b, row, "step5", 0.0)
+                value = self._mean_return(outcomes_by_event, t3_b, row, "step6", 0.0)
                 outcome_vals[row] = value
                 self._put_scalar_on_last_mask_token(scores, mask, row, value)
             t3_b.batch["task3_token_level_scores"] = scores
@@ -1910,8 +1943,8 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
 
         The token-score tensors remain task-shaped:
           * task1: one return on the final response token.
-          * task2: step2/3/4 returns on the last token of segment masks 2/3/4.
-          * task3: step5 return on the final response token.
+          * task2: step2/3/4/5 returns on the last token of segment masks 2/3/4/5.
+          * task3: step6 return on the final response token.
         Shared-prefix rows that feed multiple terminal branches receive the
         mean return over descendant branches, mirroring existing outcome logic.
         """
@@ -1995,19 +2028,11 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
                 out.append((turn_i, dp, row))
             return out
 
-        def _branch_chain(bid: int) -> list[int]:
-            chain = []
-            cur = bid
-            while cur >= 0:
-                chain.append(cur)
-                cur = int(branch_parent.get(cur, -1))
-            return list(reversed(chain))
-
         def _collect_branch_rows(bid: int) -> tuple[list[tuple], list[tuple]]:
             tid = int(branch_tid[bid])
             t2_rows = list(shared_t2_rows.get(tid, []))
             t3_rows = list(shared_t3_rows.get(tid, []))
-            for seg_bid in _branch_chain(bid):
+            for seg_bid in self._resolve_branch_chain(branch_parent, bid, trajectory_id=tid):
                 t2_rows.extend(branch_t2_rows.get(seg_bid, []))
                 t3_rows.extend(branch_t3_rows.get(seg_bid, []))
             return _dedupe_sorted(t2_rows), _dedupe_sorted(t3_rows)
@@ -2028,14 +2053,21 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
                 events.append((0.0, task1_batch, row, "step1", reward))
 
             for turn_i, t2_b, row in t2_rows:
-                base = 1.0 + 4.0 * float(turn_i)
-                events.append((base + 0.0, t2_b, row, "step2", _ex(t2_b, 2, "task2_prompt_to_tuple_reward", [row], 0.0)))
-                events.append((base + 1.0, t2_b, row, "step3", _ex(t2_b, 2, "task2_tuple_to_vqa_reward", [row], 0.0)))
-                events.append((base + 2.0, t2_b, row, "step4", _ex(t2_b, 2, "task2_vqa_to_feedback_reward", [row], 0.0)))
+                base = 1.0 + 5.0 * float(turn_i)
+                events.append((base + 0.0, t2_b, row, "step2", _ex(t2_b, 2, "task2_prompt_to_summary_reward", [row], 0.0)))
+                events.append((base + 1.0, t2_b, row, "step3", _ex(t2_b, 2, "task2_summary_to_tuple_reward", [row], 0.0)))
+                events.append((base + 2.0, t2_b, row, "step4", _ex(t2_b, 2, "task2_tuple_to_vqa_reward", [row], 0.0)))
+                events.append((base + 3.0, t2_b, row, "step5", _ex(t2_b, 2, "task2_vqa_to_feedback_reward", [row], 0.0)))
 
             for turn_i, t3_b, row in t3_rows:
-                base = 1.0 + 4.0 * float(turn_i)
-                events.append((base + 3.0, t3_b, row, "step5", _ex(t3_b, 3, "task3_step5_reward", [row], 0.0)))
+                base = 1.0 + 5.0 * float(turn_i)
+                events.append((
+                    base + 4.0,
+                    t3_b,
+                    row,
+                    "step6",
+                    _ex(t3_b, 3, "task3_step6_reward", [row], default=_ex(t3_b, 3, "task3_step5_reward", [row], 0.0)),
+                ))
 
             return sorted(events, key=lambda x: x[0])
 
@@ -2064,13 +2096,26 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         # Write discounted returns back to task token-level score tensors -------
         if task1_batch is not None and "task1_response_mask" in task1_batch.batch:
             scores = torch.zeros_like(task1_batch.batch["task1_response_mask"], dtype=torch.float32)
+            local_scores = torch.zeros_like(task1_batch.batch["task1_response_mask"], dtype=torch.float32)
             for tid, row in t1_index.items():
                 value = self._mean_return(returns_by_event, task1_batch, row, "step1", 0.0)
                 self._put_scalar_on_last_mask_token(scores, task1_batch.batch["task1_response_mask"], row, value)
+                image_score = _ex(
+                    task1_batch,
+                    1,
+                    "task1_image_score",
+                    [row],
+                    default=_ex(task1_batch, 1, "task1_mdp_reward", [row], 0.0),
+                )
+                image_score_max = _ex(task1_batch, 1, "task1_image_score_max", [row], 1.0)
+                local_value = 2.0 * float(image_score) / max(float(image_score_max), eps)
+                self._put_scalar_on_last_mask_token(local_scores, task1_batch.batch["task1_response_mask"], row, local_value)
             task1_batch.batch["task1_token_level_scores"] = scores
+            task1_batch.batch["task1_local_token_level_scores"] = local_scores
             if getattr(task1_batch, "meta_info", None) is None:
                 task1_batch.meta_info = {}
             task1_batch.meta_info["task1_token_level_scores"] = scores
+            task1_batch.meta_info["task1_local_token_level_scores"] = local_scores
 
         for t2_b in task2_batches:
             if t2_b is None or "task2_response_mask" not in t2_b.batch:
@@ -2085,35 +2130,46 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             step2_return_vals = self._ensure_reward_extra_list(task2_extras, "task2_step2_return_score", len(t2_b))
             step3_return_vals = self._ensure_reward_extra_list(task2_extras, "task2_step3_return_score", len(t2_b))
             step4_return_vals = self._ensure_reward_extra_list(task2_extras, "task2_step4_return_score", len(t2_b))
+            step5_return_vals = self._ensure_reward_extra_list(task2_extras, "task2_step5_return_score", len(t2_b))
             for row in range(len(t2_b)):
                 step2_return = self._mean_return(returns_by_event, t2_b, row, "step2", 0.0)
                 step3_return = self._mean_return(returns_by_event, t2_b, row, "step3", 0.0)
                 step4_return = self._mean_return(returns_by_event, t2_b, row, "step4", 0.0)
+                step5_return = self._mean_return(returns_by_event, t2_b, row, "step5", 0.0)
                 step2_return_vals[row] = step2_return
                 step3_return_vals[row] = step3_return
                 step4_return_vals[row] = step4_return
+                step5_return_vals[row] = step5_return
                 self._put_scalar_on_last_segment_token(scores, segment_mask, row, 2, step2_return)
                 self._put_scalar_on_last_segment_token(scores, segment_mask, row, 3, step3_return)
                 self._put_scalar_on_last_segment_token(scores, segment_mask, row, 4, step4_return)
+                self._put_scalar_on_last_segment_token(scores, segment_mask, row, 5, step5_return)
                 self._put_scalar_on_last_segment_token(
                     local_scores,
                     segment_mask,
                     row,
                     2,
-                    _ex(t2_b, 2, "task2_prompt_to_tuple_reward", [row], 0.0),
+                    _ex(t2_b, 2, "task2_prompt_to_summary_reward", [row], 0.0),
                 )
                 self._put_scalar_on_last_segment_token(
                     local_scores,
                     segment_mask,
                     row,
                     3,
-                    _ex(t2_b, 2, "task2_tuple_to_vqa_reward", [row], 0.0),
+                    _ex(t2_b, 2, "task2_summary_to_tuple_reward", [row], 0.0),
                 )
                 self._put_scalar_on_last_segment_token(
                     local_scores,
                     segment_mask,
                     row,
                     4,
+                    _ex(t2_b, 2, "task2_tuple_to_vqa_reward", [row], 0.0),
+                )
+                self._put_scalar_on_last_segment_token(
+                    local_scores,
+                    segment_mask,
+                    row,
+                    5,
                     _ex(t2_b, 2, "task2_vqa_to_feedback_reward", [row], 0.0),
                 )
             t2_b.batch["task2_token_level_scores"] = scores
@@ -2127,7 +2183,7 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             mask = t3_b.batch["task3_response_mask"]
             scores = torch.zeros_like(mask, dtype=torch.float32)
             for row in range(len(t3_b)):
-                value = self._mean_return(returns_by_event, t3_b, row, "step5", 0.0)
+                value = self._mean_return(returns_by_event, t3_b, row, "step6", 0.0)
                 self._put_scalar_on_last_mask_token(scores, mask, row, value)
             t3_b.batch["task3_token_level_scores"] = scores
             if getattr(t3_b, "meta_info", None) is None:
@@ -2453,19 +2509,11 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
                 out.append((turn_i, dp, scores, row))
             return out
 
-        def _branch_chain(bid: int) -> list[int]:
-            chain = []
-            cur = bid
-            while cur >= 0:
-                chain.append(cur)
-                cur = int(branch_parent.get(cur, -1))
-            return list(reversed(chain))
-
         def _collect_branch_rows(bid: int) -> tuple[list[tuple], list[tuple]]:
             tid = int(branch_tid[bid])
             t2_rows = list(shared_t2_rows.get(tid, []))
             t3_rows = list(shared_t3_rows.get(tid, []))
-            for seg_bid in _branch_chain(bid):
+            for seg_bid in self._resolve_branch_chain(branch_parent, bid, trajectory_id=tid):
                 t2_rows.extend(branch_t2_rows.get(seg_bid, []))
                 t3_rows.extend(branch_t3_rows.get(seg_bid, []))
             return _dedupe_sorted(t2_rows), _dedupe_sorted(t3_rows)
@@ -3400,6 +3448,8 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
                 worker = self._select_best_worker()
                 accumulated_batch = await worker.generate_sequences.remote(accumulated_batch, on_task_complete=None)
                 accumulated_batch = self._stamp_turn_idx(accumulated_batch, 0)
+                if current_task_id == 2:
+                    accumulated_batch = self._mark_task2_raw_stage_only(accumulated_batch)
                 if current_task_id == 3:
                     self._apply_no_edit_response_mask(accumulated_batch)
                 if on_task_complete is not None:
@@ -3413,7 +3463,7 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         # per-sample termination / build_edit_batch row reshuffling.
         accumulated_batch = self._stamp_trajectory_ids(prompts)
         accumulated_batch = self._ensure_branch_metadata(accumulated_batch)
-        self._branch_id_counter = 0
+        next_branch_id = 0
 
         task1_batch: Optional[DataProto] = None
         task2_batches_per_turn: list[DataProto] = []
@@ -3480,7 +3530,11 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             parent_ids = np.full(len(accumulated_batch), -1, dtype=np.int64)
             if "branch_id" in accumulated_batch.non_tensor_batch:
                 parent_ids = np.asarray(accumulated_batch.non_tensor_batch["branch_id"], dtype=np.int64)
-            accumulated_batch = self._spawn_child_branch_ids(accumulated_batch, parent_ids=parent_ids)
+            accumulated_batch, next_branch_id = self._spawn_child_branch_ids(
+                accumulated_batch,
+                next_branch_id,
+                parent_ids=parent_ids,
+            )
 
             pre_task3_batch = accumulated_batch
             pre_task3_batches_per_turn.append(pre_task3_batch)
@@ -3654,6 +3708,8 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
                 worker = self._select_best_worker()
                 accumulated_batch = await worker.generate_sequences_on_server.remote(accumulated_batch, server_index)
                 accumulated_batch = self._stamp_turn_idx(accumulated_batch, 0)
+                if current_task_id == 2:
+                    accumulated_batch = self._mark_task2_raw_stage_only(accumulated_batch)
                 if current_task_id == 3:
                     self._apply_no_edit_response_mask(accumulated_batch)
                 if on_task_complete is not None:
@@ -3665,7 +3721,7 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
 
         accumulated_batch = self._stamp_trajectory_ids(prompts)
         accumulated_batch = self._ensure_branch_metadata(accumulated_batch)
-        self._branch_id_counter = 0
+        next_branch_id = 0
 
         task1_batch: Optional[DataProto] = None
         task2_batches_per_turn: list[DataProto] = []
@@ -3727,7 +3783,11 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             parent_ids = np.full(len(accumulated_batch), -1, dtype=np.int64)
             if "branch_id" in accumulated_batch.non_tensor_batch:
                 parent_ids = np.asarray(accumulated_batch.non_tensor_batch["branch_id"], dtype=np.int64)
-            accumulated_batch = self._spawn_child_branch_ids(accumulated_batch, parent_ids=parent_ids)
+            accumulated_batch, next_branch_id = self._spawn_child_branch_ids(
+                accumulated_batch,
+                next_branch_id,
+                parent_ids=parent_ids,
+            )
 
             pre_task3_batch = accumulated_batch
             pre_task3_batches_per_turn.append(pre_task3_batch)

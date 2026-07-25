@@ -1190,6 +1190,39 @@ def _make_assembled_rollout_sample(rs: RolloutSample, final_batch: DataProto, ui
     )
 
 
+def _task_group_has_reward_variation(
+    task_batch: DataProto,
+    task_id: int,
+    eps: float = 1e-8,
+) -> bool:
+    """Whether one task-specific GRPO group contains a non-zero-std signal."""
+    score_key = f"task{task_id}_token_level_scores"
+    if score_key not in task_batch.batch or len(task_batch) < 2:
+        return False
+
+    task_scores = task_batch.batch[score_key]
+    valid_reward_rows = ~(task_scores == -100).any(dim=1)
+
+    if task_id == 2 and "task2_segment_mask" in task_batch.batch:
+        segment_mask = task_batch.batch["task2_segment_mask"]
+        response_mask = task_batch.batch.get("task2_response_mask")
+        if response_mask is None:
+            response_mask = torch.ones_like(segment_mask)
+        for segment_id in (2, 3, 4, 5):
+            token_mask = (segment_mask == segment_id) & (response_mask > 0)
+            valid_rows = valid_reward_rows & token_mask.any(dim=1)
+            if int(valid_rows.sum().item()) < 2:
+                continue
+            segment_scores = (task_scores * token_mask.to(task_scores.dtype)).sum(dim=-1)[valid_rows]
+            if np.std(segment_scores.detach().cpu().numpy()) > eps:
+                return True
+        return False
+
+    valid_scores = torch.where(task_scores >= 0, task_scores, torch.zeros_like(task_scores)).sum(dim=-1)
+    valid_scores = valid_scores[valid_reward_rows]
+    return int(valid_scores.numel()) >= 2 and np.std(valid_scores.detach().cpu().numpy()) > eps
+
+
 def quality_filter_rollout_sample(
     rollout_sample: RolloutSample,
     group_size: int,
@@ -1201,8 +1234,9 @@ def quality_filter_rollout_sample(
 ) -> tuple:
     """Task-batch-native phase-aware std filter over `rollout_sample.task_batches`.
 
-    - phase1 rows are filtered by MDP local-return reward std
-    - phase2 rows are filtered by task-local reward std
+    Each `(task_id, uid, turn_idx, phase)` group is filtered independently.
+    Task1/3 require scalar reward variation; Task2 is kept when any of its
+    step2/3/4/5 segment rewards has non-zero std.
 
     salvage / assembled / retry behavior is intentionally disabled.
     The filter mutates `rollout_sample.task_batches` directly, then rebuilds a
@@ -1217,91 +1251,40 @@ def quality_filter_rollout_sample(
     retry_samples: list = []
     n_dropped: int = 0
     n_salvaged: int = 0
-    phase1_group_keys: dict[str, None] = {}
-    phase2_group_keys: dict[str, None] = {}
+    group_keys_by_task: dict[int, dict[int, dict[str, None]]] = {}
     original_phase1_rows = len(rollout_sample.full_batch) if getattr(rollout_sample, "full_batch", None) is not None else 0
 
-    for task_batch in src_task_batches.values():
+    for task_id, task_batch in src_task_batches.items():
         if task_batch is None or "uid" not in task_batch.non_tensor_batch:
             continue
+        phase_keys = group_keys_by_task.setdefault(int(task_id), {1: {}, 2: {}})
         task_group_keys = _extract_group_keys(task_batch)
         if "phase" in task_batch.non_tensor_batch:
             phase_arr = np.asarray(task_batch.non_tensor_batch["phase"])
             for key in task_group_keys[phase_arr == 1]:
-                phase1_group_keys.setdefault(str(key), None)
+                phase_keys[1].setdefault(str(key), None)
             for key in task_group_keys[phase_arr == 2]:
-                phase2_group_keys.setdefault(str(key), None)
+                phase_keys[2].setdefault(str(key), None)
         else:
             for key in task_group_keys:
-                phase1_group_keys.setdefault(str(key), None)
+                phase_keys[1].setdefault(str(key), None)
 
-    kept_phase1_keys: set[str] = set()
-    for group_key in phase1_group_keys.keys():
-        phase1_rewards: list[float] = []
-        for task_id, task_batch in src_task_batches.items():
-            score_key = f"task{task_id}_token_level_scores"
-            if task_batch is None or "uid" not in task_batch.non_tensor_batch:
-                continue
-            if score_key not in task_batch.batch:
-                continue
-            task_group_keys = _extract_group_keys(task_batch)
-            group_mask = (task_group_keys == group_key)
-            if "phase" in task_batch.non_tensor_batch:
-                phase_arr = np.asarray(task_batch.non_tensor_batch["phase"])
-                group_mask = group_mask & (phase_arr == 1)
-            if not np.any(group_mask):
-                continue
-            group_task_batch = _slice_dataproto_with_meta(task_batch, np.where(group_mask)[0].tolist())
-            task_scores = group_task_batch.batch[score_key]
-            rewards = (
-                torch.where(task_scores >= 0, task_scores, torch.zeros_like(task_scores))
-                .sum(dim=-1)
-                .detach()
-                .cpu()
-                .numpy()
-                .tolist()
-            )
-            phase1_rewards.extend(float(r) for r in rewards)
-
-        if phase1_rewards and len(phase1_rewards) >= 2 and np.std(phase1_rewards) > 1e-8:
-            kept_phase1_keys.add(group_key)
-
-    kept_phase2_keys: set[str] = set()
-    for group_key in phase2_group_keys.keys():
-        keep_group = True
-        saw_valid_local_reward = False
-        for task_id in task_ids:
-            task_batch = src_task_batches.get(task_id)
-            score_key = f"task{task_id}_token_level_scores"
-            if task_batch is None or score_key not in task_batch.batch or "uid" not in task_batch.non_tensor_batch:
-                continue
-            task_group_keys = _extract_group_keys(task_batch)
-            group_mask = (task_group_keys == group_key)
-            if "phase" in task_batch.non_tensor_batch:
-                phase_arr = np.asarray(task_batch.non_tensor_batch["phase"])
-                group_mask = group_mask & (phase_arr == 2)
-            else:
-                group_mask = np.zeros_like(group_mask, dtype=bool)
-            if not np.any(group_mask):
-                continue
-            group_task_batch = _slice_dataproto_with_meta(task_batch, np.where(group_mask)[0].tolist())
-            task_scores = group_task_batch.batch[score_key]
-            valid_mask = ~(task_scores == -100).any(dim=1)
-            valid_rewards = (
-                torch.where(task_scores >= 0, task_scores, torch.zeros_like(task_scores))
-                .sum(dim=-1)[valid_mask]
-                .detach()
-                .cpu()
-                .numpy()
-            )
-            if len(valid_rewards) == 0:
-                continue
-            saw_valid_local_reward = True
-            if len(valid_rewards) < 2 or np.std(valid_rewards) <= 1e-8:
-                keep_group = False
-                break
-        if keep_group and saw_valid_local_reward:
-            kept_phase2_keys.add(group_key)
+    kept_keys_by_task: dict[int, dict[int, set[str]]] = {
+        task_id: {1: set(), 2: set()} for task_id in group_keys_by_task
+    }
+    for task_id, phase_keys in group_keys_by_task.items():
+        task_batch = src_task_batches.get(task_id)
+        task_group_keys = _extract_group_keys(task_batch)
+        phase_arr = np.asarray(
+            task_batch.non_tensor_batch.get("phase", np.ones(len(task_batch), dtype=np.int64))
+        )
+        for phase_id in (1, 2):
+            for group_key in phase_keys[phase_id]:
+                group_mask = (task_group_keys == group_key) & (phase_arr == phase_id)
+                group_indices = np.where(group_mask)[0].tolist()
+                group_task_batch = _slice_dataproto_with_meta(task_batch, group_indices)
+                if _task_group_has_reward_variation(group_task_batch, task_id):
+                    kept_keys_by_task[task_id][phase_id].add(group_key)
 
     filtered_task_batches: dict[int, Any] = {}
     for tid, tdp in src_task_batches.items():
@@ -1312,20 +1295,22 @@ def quality_filter_rollout_sample(
         if "phase" in tdp.non_tensor_batch:
             phase_arr = np.asarray(tdp.non_tensor_batch["phase"])
             keep_mask = np.zeros(len(tdp), dtype=bool)
-            keep_mask |= (phase_arr == 1) & np.isin(task_group_keys, list(kept_phase1_keys))
-            keep_mask |= (phase_arr == 2) & np.isin(task_group_keys, list(kept_phase2_keys))
+            task_kept = kept_keys_by_task.get(int(tid), {1: set(), 2: set()})
+            keep_mask |= (phase_arr == 1) & np.isin(task_group_keys, list(task_kept[1]))
+            keep_mask |= (phase_arr == 2) & np.isin(task_group_keys, list(task_kept[2]))
         else:
-            keep_mask = np.isin(task_group_keys, list(kept_phase1_keys))
+            task_kept = kept_keys_by_task.get(int(tid), {1: set(), 2: set()})
+            keep_mask = np.isin(task_group_keys, list(task_kept[1]))
         keep_idx = np.where(keep_mask)[0].tolist()
         filtered_task_batches[tid] = _slice_dataproto_with_meta(tdp, keep_idx) if keep_idx else None
 
     rollout_sample.task_batches = filtered_task_batches
     rebuilt_full_batch = _pick_legacy_full_batch_from_task_batches(filtered_task_batches)
-    phase1_total_groups = len(phase1_group_keys)
-    phase1_kept_groups = len(kept_phase1_keys)
+    phase1_total_groups = sum(len(phases[1]) for phases in group_keys_by_task.values())
+    phase1_kept_groups = sum(len(phases[1]) for phases in kept_keys_by_task.values())
     phase1_filtered_groups = max(0, phase1_total_groups - phase1_kept_groups)
-    phase2_total_groups = len(phase2_group_keys)
-    phase2_kept_groups = len(kept_phase2_keys)
+    phase2_total_groups = sum(len(phases[2]) for phases in group_keys_by_task.values())
+    phase2_kept_groups = sum(len(phases[2]) for phases in kept_keys_by_task.values())
     phase2_filtered_groups = max(0, phase2_total_groups - phase2_kept_groups)
     if rebuilt_full_batch is None:
         rollout_sample.full_batch = rollout_sample.full_batch[:0]

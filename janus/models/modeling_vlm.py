@@ -462,6 +462,55 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
 
         return logits, cond_output_starts
 
+    def _forward_with_compact_image_head(self, hidden_states, output_starts, output_mask):
+        """Apply only ``gen_head`` at Task3 response prediction positions.
+
+        ``output_mask`` is the right-padded response mask after conditional /
+        unconditional interleaving. The returned sequence dimension is the
+        response dimension, not the full prompt + response sequence dimension.
+        This avoids materializing Task3's unused text-vocabulary logits.
+        """
+        batch_x2, seq_len, hidden_size = hidden_states.shape
+        if batch_x2 % 2 != 0:
+            raise ValueError(f"CFG batch must be even, got {batch_x2}")
+        if output_mask.ndim != 2 or output_mask.shape[0] != batch_x2:
+            raise ValueError(
+                "output_mask must have shape [B*2, response_length], "
+                f"got {tuple(output_mask.shape)} for hidden states {tuple(hidden_states.shape)}"
+            )
+
+        response_len = int(output_mask.shape[1])
+        if response_len == 0:
+            raise ValueError("Task3 compact logits require a non-empty response dimension")
+
+        # Logit at position t predicts token t+1. Therefore response token 0
+        # is predicted by hidden state output_start - 1.
+        response_positions = torch.arange(response_len, device=hidden_states.device)
+        gather_positions = torch.as_tensor(
+            output_starts, dtype=torch.long, device=hidden_states.device
+        ).unsqueeze(1) - 1 + response_positions.unsqueeze(0)
+        gather_positions = gather_positions.clamp_(0, seq_len - 1)
+        compact_hidden = torch.gather(
+            hidden_states,
+            dim=1,
+            index=gather_positions.unsqueeze(-1).expand(-1, -1, hidden_size),
+        )
+
+        # Keep a fixed response shape on every rank, including ranks whose
+        # local Task3 rows are all invalid. Masking the hidden states prevents
+        # clamped padding positions from contributing while all ranks still
+        # execute both the transformer and gen_head under FSDP.
+        compact_hidden = compact_hidden * output_mask.to(hidden_states.dtype).unsqueeze(-1)
+        image_logits = self.gen_head(compact_hidden)
+
+        cond_logits = image_logits[0::2]
+        uncond_logits = image_logits[1::2]
+        compact_logits = uncond_logits.detach() + self.guidance_scale * (
+            cond_logits - uncond_logits.detach()
+        )
+        cond_output_starts = [output_starts[i] for i in range(0, batch_x2, 2)]
+        return compact_logits, cond_output_starts
+
     def _process_task1_data(self, batch: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[int]]:
         """Process Task 1 (Image Generation) data with CFG logic applied."""
         # 1. Load original data
@@ -561,7 +610,7 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
 
         return concat_embeds, concat_mask, position_ids, output_starts
 
-    def _process_task3_data(self, batch: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[int]]:
+    def _process_task3_data(self, batch: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[int], torch.Tensor]:
         """Process Task 3 (Regen Image Generation) data with CFG logic applied."""
         # 1. Load original data
         task3_input_ids = batch["task3_input_ids"].long()
@@ -638,7 +687,7 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
             final_merged_embeds, final_attention_mask, final_regen_img_embeds, final_response_mask,
         )
 
-        return concat_embeds, concat_mask, position_ids, output_starts
+        return concat_embeds, concat_mask, position_ids, output_starts, final_response_mask
 
     def forward(
         self,
@@ -673,6 +722,8 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
         self.txt_top_p = kwargs.get("txt_top_p", 1.0)
         self.img_top_k = kwargs.get("img_top_k", 0)
         self.img_top_p = kwargs.get("img_top_p", 1.0)
+        compact_image_logits = bool(kwargs.get("compact_image_logits", False))
+        task3_response_mask = None
 
         # Data processing (if batch provided)
         if batch is not None:
@@ -681,7 +732,13 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
             elif task_id == 2:
                 inputs_embeds, attention_mask, position_ids, output_starts = self._process_task2_data(batch)
             elif task_id == 3:
-                inputs_embeds, attention_mask, position_ids, output_starts = self._process_task3_data(batch)
+                (
+                    inputs_embeds,
+                    attention_mask,
+                    position_ids,
+                    output_starts,
+                    task3_response_mask,
+                ) = self._process_task3_data(batch)
             else:
                 raise ValueError(f"Invalid task_id: {task_id}. Must be 1, 2, or 3.")
 
@@ -694,9 +751,14 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
                 position_ids=position_ids,
             )
 
-            logits, cond_output_starts = self._forward_with_split_heads(
-                output.last_hidden_state, output_starts,
-            )
+            if task_id == 3 and compact_image_logits:
+                logits, cond_output_starts = self._forward_with_compact_image_head(
+                    output.last_hidden_state, output_starts, task3_response_mask,
+                )
+            else:
+                logits, cond_output_starts = self._forward_with_split_heads(
+                    output.last_hidden_state, output_starts,
+                )
 
             self._output_starts = cond_output_starts
 

@@ -19,12 +19,72 @@ _TUPLE_SCHEMA_PATTERNS = [
     re.compile(r'^global\s*-\s*style\s*\([^,)]+\)$'),                          # single style token, no comma
 ]
 
+CANONICAL_NO_EDIT_FEEDBACK = "No need to generate feedback."
+_NO_EDIT_ROUTING_PREFIXES = (
+    re.compile(r"^no need\b"),
+    re.compile(r"^no feedback needed\b"),
+    re.compile(r"^no correction needed\b"),
+    re.compile(r"^no corrections needed\b"),
+)
+
+
+def image_prompt_valid_mask(
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    image_id: int | None,
+    expected_count: int = 576,
+) -> torch.Tensor:
+    """Return rows whose attended prompt contains one complete image placeholder."""
+    if image_id is None:
+        return torch.ones(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
+    placeholder_mask = input_ids == image_id
+    if attention_mask is not None:
+        placeholder_mask = placeholder_mask & attention_mask.to(dtype=torch.bool)
+    return placeholder_mask.sum(dim=1) == int(expected_count)
+
+
+def extract_task2_feedback(text) -> str:
+    """Extract the feedback part from a V2/V3 task2 response.
+
+    Callers may also pass an already-extracted feedback string.
+    """
+    if not isinstance(text, str):
+        return ""
+    stripped = text.strip()
+    for marker in (
+        "Fourth, Generate corrective feedback.",
+        "Third, Generate corrective feedback.",
+    ):
+        if marker in stripped:
+            return stripped.split(marker, 1)[1].strip()
+    return stripped
+
+
+def classify_task2_feedback(text) -> str:
+    """Classify strict reward validity separately from Task3 routing intent."""
+    feedback = extract_task2_feedback(text)
+    if feedback == CANONICAL_NO_EDIT_FEEDBACK:
+        return "canonical_no_edit"
+    normalized = feedback.lower()
+    if any(pattern.match(normalized) for pattern in _NO_EDIT_ROUTING_PREFIXES):
+        return "noncanonical_no_edit"
+    return "other"
+
+
+def should_route_task3(text) -> bool:
+    """Return whether task2 feedback should trigger Task3 image editing."""
+    feedback = extract_task2_feedback(text)
+    if not feedback:
+        return False
+    return classify_task2_feedback(feedback) == "other"
+
+
 class FormattingEvaluatorV2:
+    SECOND_PATTERN = "Second, Decompose summarize"
+    THIRD_PATTERN = "Third, Verify that the decomposed elements align with the image."
+    FOURTH_PATTERN = "Fourth, Generate corrective feedback."
+
     def __init__(self):
-        # 4단계 구조를 위한 새로운 패턴 정의
-        self.SECOND_PATTERN = "Second, Decompose summarize"
-        self.THIRD_PATTERN = "Third, Verify that the decomposed elements align with the image."
-        self.FOURTH_PATTERN = "Fourth, Generate corrective feedback."
         self.nlp = spacy.load("en_core_web_sm", disable=["parser", "ner"])
 
     def _split_text_into_parts(self, text):
@@ -158,6 +218,8 @@ class FormattingEvaluatorV2:
         """각 non-empty 줄이 Step N:으로 시작하고 1부터 연속인지 확인"""
         if not feedback_text or not feedback_text.strip():
             return False
+        if classify_task2_feedback(feedback_text) == "canonical_no_edit":
+            return True
         lines = [l.strip() for l in feedback_text.split('\n') if l.strip()]
         step_re = re.compile(r'^Step\s*(\d+)\s*:', re.IGNORECASE)
         step_numbers = []
@@ -247,7 +309,7 @@ class FormattingEvaluatorV3:
         )
 
     def check_feedback_step_format(self, feedback_text: str) -> bool:
-        """Valid if lines follow 'Step N:' (consecutive from 1) or text signals no correction needed."""
+        """Valid if lines follow 'Step N:' or text signals no correction needed."""
         if not feedback_text or not feedback_text.strip():
             return False
         normalized = feedback_text.strip().lower()
@@ -332,21 +394,21 @@ def build_segment_response_mask(
     tokenizer,
     second_pattern: str = FormattingEvaluatorV3.SECOND_PATTERN,
     third_pattern: str = FormattingEvaluatorV3.THIRD_PATTERN,
+    fourth_pattern: str | None = None,
 ) -> torch.Tensor:
-    """
-    Build a per-token segment mask for V3 format responses.
+    """Build a per-token segment mask for V3 or four-part V2 responses.
 
     Returns [B, T] tensor with values:
-        0 = padding (pad_token_id positions)
-        2 = Decompose segment (tuple lines)
-        3 = Verify segment
-        4 = Feedback segment
+        0 = padding
+        V3: 2 = Decompose, 3 = Verify, 4 = Feedback
+        V2: 2 = Summary, 3 = Decompose, 4 = Verify, 5 = Feedback
 
-    Falls back to all-2 (Decompose) when boundary markers are absent.
+    Falls back to all-2 when boundary markers are absent.
     """
     pad_id = tokenizer.pad_token_id
     second_toks = tokenizer.encode(second_pattern, add_special_tokens=False)
     third_toks = tokenizer.encode(third_pattern, add_special_tokens=False)
+    fourth_toks = tokenizer.encode(fourth_pattern, add_special_tokens=False) if fourth_pattern else []
 
     B, T = response_ids.shape
     seg_mask = torch.full((B, T), 2, dtype=torch.long, device=response_ids.device)
@@ -355,13 +417,17 @@ def build_segment_response_mask(
         ids = response_ids[b].tolist()
         second_pos = _find_subsequence(ids, second_toks)
         third_pos = _find_subsequence(ids, third_toks)
+        fourth_pos = _find_subsequence(ids, fourth_toks) if fourth_toks else -1
 
         for t in range(T):
             if ids[t] == pad_id:
                 seg_mask[b, t] = 0
+            elif fourth_pos >= 0 and t >= fourth_pos:
+                seg_mask[b, t] = 5
+            elif third_pos >= 0 and t >= third_pos:
+                seg_mask[b, t] = 4
             elif second_pos >= 0 and t >= second_pos:
-                seg_mask[b, t] = 4 if (third_pos >= 0 and t >= third_pos) else 3
-            # else remains 2 (Decompose)
+                seg_mask[b, t] = 3
 
     return seg_mask
 
