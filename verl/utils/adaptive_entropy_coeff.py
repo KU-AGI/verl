@@ -1,4 +1,5 @@
 import torch
+import torch.distributed as dist
 
 class AdaptiveEntropyCoefficient:
     """
@@ -50,7 +51,7 @@ class AdaptiveEntropyCoefficient:
                         opt_state[key] = value.to(device=device)
 
     def update(self, entropy):
-        ent = entropy.detach()
+        ent = entropy.detach().to(device=self.psi.device, dtype=self.psi.dtype)
         # loss = -α * (ent - target)  (so pushes α > 0 when ent < target, α < 0 when ent > target)
         loss = - (self.alpha * (ent - self.target_entropy)).mean()
         self.opt.zero_grad()
@@ -59,3 +60,21 @@ class AdaptiveEntropyCoefficient:
         # compute psi based on clipped alpha
         self.psi.data = torch.asinh(self.get_alpha())
         return loss.item()
+
+    def update_distributed(self, entropy_sum, entropy_count):
+        """Update from global token-mean entropy on every actor rank.
+
+        The caller accumulates a complete mini-batch before entering this
+        collective, so dynamic micro-batching cannot desynchronize calls.
+        """
+        stats = torch.stack(
+            [
+                entropy_sum.detach().to(dtype=torch.float64),
+                entropy_count.detach().to(device=entropy_sum.device, dtype=torch.float64),
+            ]
+        )
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+        if stats[1].item() <= 0:
+            return None
+        return self.update(stats[0] / stats[1])

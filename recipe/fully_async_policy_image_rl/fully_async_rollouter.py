@@ -172,7 +172,11 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         self.reward_tasks = set()
 
         self.reward_finalize_queue = asyncio.Queue(maxsize=0)
-        self.reward_finalize_worker_task = None
+        self.reward_finalize_worker_tasks = []
+        self.reward_finalize_workers = max(
+            1,
+            int(config.async_training.get("reward_finalize_workers", 1)),
+        )
 
         self.max_finalize_backlog_samples = None
         self._finalize_cond = asyncio.Condition()
@@ -1138,7 +1142,10 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         # Start sample feed and processor coroutines (no consumer worker needed)
         self.feed_task = asyncio.create_task(self._feed_samples())
         self.processor_task = asyncio.create_task(self._processor_worker())
-        self.reward_finalize_worker_task = asyncio.create_task(self._reward_finalize_worker())
+        self.reward_finalize_worker_tasks = [
+            asyncio.create_task(self._reward_finalize_worker(worker_id=i))
+            for i in range(self.reward_finalize_workers)
+        ]
 
         try:
             # Wait for sample feed to complete
@@ -1158,9 +1165,12 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
 
             await self.reward_finalize_queue.join()
 
-            await self.reward_finalize_queue.put("DONE")
-            if self.reward_finalize_worker_task:
-                await asyncio.gather(self.reward_finalize_worker_task, return_exceptions=True)
+            finalize_worker_tasks = list(self.reward_finalize_worker_tasks)
+            self.reward_finalize_worker_tasks = []
+            for _ in finalize_worker_tasks:
+                await self.reward_finalize_queue.put("DONE")
+            if finalize_worker_tasks:
+                await asyncio.gather(*finalize_worker_tasks, return_exceptions=True)
 
         # Send a finish signal
         await self.message_queue_client.put_sample(
@@ -1171,8 +1181,8 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
         async with self.lock:
             self.running = False
 
-    async def _reward_finalize_worker(self):
-        print("[FullyAsyncRollouter][RewardFinalize] worker started")
+    async def _reward_finalize_worker(self, worker_id: int = 0):
+        print(f"[FullyAsyncRollouter][RewardFinalize-{worker_id}] worker started")
         group_size = self.config.actor_rollout_ref.rollout.n
         task_ids = list(self.config.actor_rollout_ref.actor.multi_task.get("task_ids", [1]))
 
@@ -1262,13 +1272,6 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                     n_salvaged = 0
 
                 finalize_duration = time.perf_counter() - finalize_start_time
-                if self.processed_sample_count % 100 == 0:
-                    print(
-                        f"[FullyAsyncRollouter][Finalize] 2. Finalize Time: {finalize_duration:.4f}s "
-                        f"| good={len(good_indices)} assembled={len(assembled_groups)} "
-                        f"retry={len(retry_rs_list)} dropped={n_dropped}"
-                    )
-
                 success_count = 0
 
                 # 4. 정상 그룹: merge → expand → send
@@ -1306,6 +1309,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                     await self.retry_queue.put(retry_rs)
 
                 # 7. 통계 업데이트
+                processed_count = 0
                 async with self.lock:
                     self.total_generated_samples += success_count
                     # retry 아이템은 pending_queue에서 staleness 증가 안 했으므로 감소도 안 함
@@ -1315,6 +1319,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                             self.condition.notify_all()
                     self.dropped_stale_samples += n_dropped
                     self.processed_sample_count += 1
+                    processed_count = self.processed_sample_count
 
                     # Accumulate per-version metrics for wandb logging
                     self._version_rollout_durations.append(rollout_duration)
@@ -1331,6 +1336,12 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                     self._version_dropped_counts.append(n_dropped_p)
                     # assembled/dropped된 prompt의 retry 횟수 합산 (avg_retry_count 계산용)
                     self._version_retry_sum.append((n_assembled_p + n_dropped_p) * rollout_sample.retry_count)
+                if processed_count % 100 == 0:
+                    print(
+                        f"[FullyAsyncRollouter][Finalize] 2. Finalize Time: {finalize_duration:.4f}s "
+                        f"| good={len(good_indices)} assembled={len(assembled_groups)} "
+                        f"retry={len(retry_rs_list)} dropped={n_dropped}"
+                    )
                 stats_updated = True
 
             except Exception as e:
@@ -1349,7 +1360,7 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
                                 self.condition.notify_all()
                 self.reward_finalize_queue.task_done()
 
-        print("[FullyAsyncRollouter][RewardFinalize] worker stopped")
+        print(f"[FullyAsyncRollouter][RewardFinalize-{worker_id}] worker stopped")
 
     async def fit(self):
         """
@@ -1515,10 +1526,16 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
 
             # monitor stats
             "monitor/active_tasks_size": len(self.active_tasks),
+            "monitor/reward_tasks_size": len(self.reward_tasks),
             "monitor/active_sample_count": self.active_sample_count,
+            "monitor/finalize_inflight_samples": self._finalize_inflight_samples,
+            "monitor/reward_finalize_workers_alive": sum(
+                not task.done() for task in self.reward_finalize_worker_tasks
+            ),
             "monitor/cancel_sample_count": self.cancel_sample_count,
             "monitor/queue/pending_queue_size": self.pending_queue.qsize(),
             "monitor/queue/cancel_queue_size": self.cancel_queue.qsize(),
+            "monitor/queue/reward_finalize_queue_size": self.reward_finalize_queue.qsize(),
             "monitor/queue/mq_queue_size": queue_stats["queue_size"],
             # counting stats
             "count/current_param_version": self.current_param_version,
@@ -1531,6 +1548,8 @@ class FullyAsyncRollouter(FullyAsyncRayPPOTrainer):
             "static/staleness_threshold": self.staleness_threshold,
             "static/max_queue_size": self.max_queue_size,
             "static/max_concurrent_samples": self.max_concurrent_samples,
+            "static/reward_finalize_workers": self.reward_finalize_workers,
+            "static/max_finalize_backlog_samples": self.max_finalize_backlog_samples,
         }
 
         return stats

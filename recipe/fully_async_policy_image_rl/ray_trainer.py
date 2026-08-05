@@ -18,6 +18,7 @@ PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
+import logging
 import uuid
 from copy import deepcopy
 from pprint import pprint
@@ -58,6 +59,9 @@ from recipe.image_rl import core_algos
 import asyncio
 import uuid
 from collections import defaultdict
+
+
+logger = logging.getLogger(__name__)
 
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl", task_id: int = 1):
@@ -510,6 +514,33 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                         continue
 
                     task_batch = task_batches[task_id]
+                    prompt_valid_rows = None
+                    prompt_original_response_mask = None
+                    validity_key = f"task{task_id}_prompt_valid_mask"
+                    if validity_key in old_log_prob.batch.keys():
+                        valid_rows = old_log_prob.batch[validity_key].to(dtype=torch.bool)
+                        if valid_rows.ndim != 1 or valid_rows.shape[0] != len(task_batch):
+                            raise ValueError(
+                                f"{validity_key} shape {tuple(valid_rows.shape)} does not match batch {len(task_batch)}"
+                            )
+                        response_key = f"task{task_id}_response_mask"
+                        response_mask = task_batch.batch[response_key]
+                        prompt_valid_rows = valid_rows.to(response_mask.device)
+                        prompt_original_response_mask = response_mask
+                        task_batch.batch[response_key] = (
+                            response_mask * valid_rows.to(response_mask.device).unsqueeze(-1)
+                        )
+                        task_batch.batch[validity_key] = valid_rows
+                        invalid_rows = int((~valid_rows).sum().item())
+                        metrics[f"training/task{task_id}_invalid_prompt_rows"] = invalid_rows
+                        metrics[f"training/task{task_id}_invalid_prompt_fraction"] = invalid_rows / max(len(task_batch), 1)
+                        if invalid_rows:
+                            invalid_indices = (~valid_rows).nonzero(as_tuple=False).view(-1).tolist()
+                            logger.warning(
+                                "task%s: excluding %s/%s truncated prompt rows before rollout correction; indices=%s",
+                                task_id, invalid_rows, len(task_batch), invalid_indices[:16],
+                            )
+
                     if entropy_key in old_log_prob.batch.keys():
                         entropys = old_log_prob.batch[entropy_key]
                         response_masks = task_batch.batch[f"task{task_id}_response_mask"]
@@ -526,6 +557,16 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                         from recipe.image_rl.debug_metrics import calculate_debug_metrics
 
                         metrics.update(calculate_debug_metrics(task_batch, task_id=task_id))
+                    if prompt_valid_rows is not None:
+                        # Use this mask only for entropy/IS diagnostics. GRPO
+                        # still sees every rollout reward; DPActor reapplies the
+                        # validity mask immediately before computing actor loss.
+                        corrected_response_mask = task_batch.batch[response_key]
+                        task_batch.batch[response_key] = torch.where(
+                            prompt_valid_rows.unsqueeze(-1),
+                            corrected_response_mask,
+                            prompt_original_response_mask,
+                        )
                     task_batches[task_id] = task_batch
             else:
                 for task_id in task_ids:
@@ -878,6 +919,7 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                     # Move to CPU for memory stability
                     reward_tensor_dict[task_id] = reward_tensor
                     reward_extra_infos[task_id] = reward_extra_infos_dict
+                    return reward_result
 
                 except Exception as e:
                     print(f"[Rollouter][RewardTask{task_id}] ERROR: {e}")
@@ -886,6 +928,7 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
                     # Set default values on error to prevent None propagation
                     reward_tensor_dict[task_id] = torch.zeros((1, 1))
                     reward_extra_infos[task_id] = {}
+                    return None
 
 
         async def _val_generate(test_batch: DataProto, test_gen_batch: DataProto, server_index: int, budget_n: int, val_batch_idx_list):
@@ -982,8 +1025,75 @@ class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
 
                     test_batch, result_batch, reward_tensor_dict, reward_extra_infos, reward_tasks, budget_n, _ = item
 
-                    # Wait for all reward tasks
+                    # Wait for all reward tasks and report both raised and caught failures.
                     results = await asyncio.gather(*reward_tasks, return_exceptions=True)
+                    for reward_task, result in zip(reward_tasks, results):
+                        task_name = reward_task.get_name()
+                        if isinstance(result, Exception):
+                            print(
+                                f"[Validation][{task_name}] reward task exception: {result!r}",
+                                flush=True,
+                            )
+                        elif result is None:
+                            print(
+                                f"[Validation][{task_name}] reward task returned None",
+                                flush=True,
+                            )
+
+                    if 2 in reward_task_ids:
+                        missing = [task_id for task_id in (1, 2) if task_id not in reward_extra_infos]
+                        if missing:
+                            print(
+                                "[Validation][Task2Finalize] missing reward extras for "
+                                f"task_ids={missing}; zero fallback will be used",
+                                flush=True,
+                            )
+
+                    # Finalize task2 after all async reward tasks are done.
+                    # Rollout must not wait for reward, so the agent loop only
+                    # launches raw task2 reward; the no-edit decision target is
+                    # injected here from task1 validation reward.
+                    if 2 in reward_task_ids and 2 in reward_extra_infos:
+                        from recipe.image_rl.reward_function_fine_grained import finalize_task2_reward_extra_info
+
+                        raw_extras = reward_extra_infos.get(2, {}) or {}
+                        task1_extras = reward_extra_infos.get(1, {}) or {}
+                        task1_vqa = task1_extras.get("task1_vqa_reward")
+                        n_rows = len(result_batch)
+
+                        finalized_extras = {}
+                        rewards = []
+                        for row in range(n_rows):
+                            row_stage = {
+                                key: vals[row]
+                                for key, vals in raw_extras.items()
+                                if isinstance(vals, (list, np.ndarray)) and row < len(vals)
+                            }
+                            if isinstance(task1_vqa, (list, np.ndarray)) and row < len(task1_vqa) and task1_vqa[row] is not None:
+                                decision_vqa = float(task1_vqa[row])
+                                decision_source = "task1"
+                            else:
+                                decision_vqa = 0.0
+                                decision_source = "missing"
+
+                            vlm_reward, finalized_row = finalize_task2_reward_extra_info(
+                                row_stage,
+                                decision_vqa=decision_vqa,
+                                decision_source=decision_source,
+                            )
+                            rewards.append(float(finalized_row.get("task2_total_reward", vlm_reward)))
+                            for key, value in finalized_row.items():
+                                finalized_extras.setdefault(key, []).append(value)
+
+                        if "task2_response_mask" in result_batch.batch:
+                            response_mask = result_batch.batch["task2_response_mask"]
+                            reward_tensor = torch.zeros_like(response_mask, dtype=torch.float32)
+                            for row, reward in enumerate(rewards):
+                                valid_response_length = int(response_mask[row].sum().item())
+                                if valid_response_length > 0:
+                                    reward_tensor[row, valid_response_length - 1] = float(reward)
+                            reward_tensor_dict[2] = reward_tensor
+                            reward_extra_infos[2] = finalized_extras
                     
                     # Collect data
                     batch_size = len(result_batch.non_tensor_batch['prompt'])

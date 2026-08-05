@@ -53,7 +53,25 @@ class ImageGenerationRewardManager:
         """Verify and compute scores for batch."""
         # Get lists from non_tensor_batch
         prompt = data.non_tensor_batch.get('prompt', [])
-        gen_imgs_pil_list = data.non_tensor_batch.get('task1_gen_imgs_pil_list', [])
+        source_image_key = {
+            1: 'task1_gen_imgs_pil_list',
+            2: 'task2_input_imgs_pil_list',
+            3: 'task3_input_imgs_pil_list',
+        }.get(task_id, 'task1_gen_imgs_pil_list')
+        gen_imgs_pil_list = data.non_tensor_batch.get(source_image_key)
+        if gen_imgs_pil_list is None and source_image_key != 'task1_gen_imgs_pil_list':
+            print(
+                f"[VERIFY][WARNING] Missing {source_image_key}; "
+                "falling back to task1_gen_imgs_pil_list for legacy batch"
+            )
+            gen_imgs_pil_list = data.non_tensor_batch.get('task1_gen_imgs_pil_list')
+        if gen_imgs_pil_list is None:
+            raise ValueError(f"Missing source images for task{task_id}: expected {source_image_key}")
+        if len(gen_imgs_pil_list) != len(data):
+            raise ValueError(
+                f"Source image count mismatch for task{task_id}: "
+                f"{source_image_key} has {len(gen_imgs_pil_list)} images for batch size {len(data)}"
+            )
         feedback_texts = data.non_tensor_batch.get('task2_feedback_texts', [])
         regen_imgs_pil_list = data.non_tensor_batch.get('task3_regen_imgs_pil_list', [])
         reward_model = data.non_tensor_batch.get('reward_model', {})
@@ -62,7 +80,7 @@ class ImageGenerationRewardManager:
 
         # Prepare batch data
         prompts = prompt
-        gen_imgs = [gen_imgs_pil_list[i] if i < len(gen_imgs_pil_list) else None for i in range(len(data))]
+        gen_imgs = [gen_imgs_pil_list[i] for i in range(len(data))]
         feedback_texts_padded = [feedback_texts[i] if i < len(feedback_texts) else "" for i in range(len(data))]
         regen_imgs = [regen_imgs_pil_list[i] if i < len(regen_imgs_pil_list) else None for i in range(len(data))]
         ground_truth_imgs = [reward_model[i].get("ground_truth", None) if i < len(reward_model) else None for i in range(len(data))]

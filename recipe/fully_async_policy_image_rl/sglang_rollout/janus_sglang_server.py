@@ -25,7 +25,11 @@ from verl.utils.config import omega_conf_to_dataclass
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode
 from recipe.image_rl.config import ImageGenerationHFModelConfig, ImageGenerationRolloutConfig
-from recipe.image_rl.utils import FormattingEvaluatorV3, build_segment_response_mask
+from recipe.image_rl.utils import (
+    build_segment_response_mask,
+    extract_task2_feedback,
+    should_route_task3,
+)
 
 
 def _ensure_vendored_sglang_path() -> None:
@@ -105,7 +109,11 @@ class JanusSGLangAsyncServer:
 
         self.config: RolloutConfig = omega_conf_to_dataclass(config)
         self.model_config: HFModelConfig = omega_conf_to_dataclass(model_config, dataclass_type=HFModelConfig)
-        self.config.max_model_len = self.config.prompt_length + self.config.response_length
+        task3_prompt_length = self.config.task3_prompt_length or self.config.prompt_length
+        self.config.max_model_len = max(
+            self.config.prompt_length + self.config.response_length,
+            task3_prompt_length + self.config.image_token_num_per_image,
+        )
         self.rollout_mode = rollout_mode
         self.workers = workers
         self.replica_rank = replica_rank
@@ -137,7 +145,6 @@ class JanusSGLangAsyncServer:
 
         self.processor = None
         self.tokenizer = None
-        self.formatter_v3 = FormattingEvaluatorV3()
 
     def get_master_address(self):
         return self._master_address, self._master_port
@@ -244,6 +251,7 @@ class JanusSGLangAsyncServer:
         self.image_tag = self.processor.image_tag
         self.image_token_num_per_image = int(getattr(self.config, "image_token_num_per_image", 576))
         self.prompt_length = int(self.config.prompt_length)
+        self.task3_prompt_length = int(self.config.task3_prompt_length or self.prompt_length)
         self.response_length = int(self.config.response_length)
 
         self.weight_update_worker_task = asyncio.create_task(self._weight_update_worker())
@@ -464,6 +472,12 @@ class JanusSGLangAsyncServer:
             + "Exclude subjective, inferential, or non-verifiable content.\n"
         )
 
+    def _task3_system_prompt(self) -> str:
+        return EDIT_SYSTEM_PROMPT.format(
+            image_start_tag=self.image_start_tag,
+            image_end_tag=self.image_end_tag,
+        )
+
     def _task3_training_text(self, prompt: str, feedback: str) -> str:
         content = (
             f"{self.image_start_tag}{self.image_tag}{self.image_end_tag}\n"
@@ -473,7 +487,7 @@ class JanusSGLangAsyncServer:
             f"INPUT_PROMPT: {prompt}\n"
             f"FEEDBACK: \n{feedback or 'No need to generate feedback.'}"
         )
-        return self._get_sft_format(content, system_prompt=EDIT_SYSTEM_PROMPT)
+        return self._get_sft_format(content, system_prompt=self._task3_system_prompt())
 
     @staticmethod
     def _as_str_list(values) -> list[str]:
@@ -529,7 +543,8 @@ class JanusSGLangAsyncServer:
         for key in ("task1_input_ids", "task1_attention_mask", "task2_input_ids", "task2_attention_mask", "task3_input_ids", "task3_attention_mask"):
             if key in data_proto.batch:
                 pad_value = 0 if "mask" in key else self.processor.pad_id
-                data_proto.batch[key] = self._pad_tensor_left(data_proto.batch[key], self.prompt_length, pad_value)
+                target_length = self.task3_prompt_length if key.startswith("task3_") else self.prompt_length
+                data_proto.batch[key] = self._pad_tensor_left(data_proto.batch[key], target_length, pad_value)
         for key in ("task2_feedback_ids", "task2_response_mask", "task2_segment_mask", "task2_rollout_log_probs"):
             if key in data_proto.batch:
                 pad_value = 0 if ("mask" in key or "log_probs" in key) else self.tokenizer.eos_token_id
@@ -646,6 +661,12 @@ class JanusSGLangAsyncServer:
                 raise ValueError("task2 requires current image base64 or PIL image from task1/task3")
             current_base64 = [self._pil_to_data_uri(img) for img in np.asarray(pil_list, dtype=object).reshape(-1)]
         current_base64 = self._as_str_list(current_base64)
+        if len(current_base64) != len(prompts):
+            raise ValueError("task2 requires one current image per prompt")
+        task2_input_images = np.empty(len(current_base64), dtype=object)
+        for i, image_base64 in enumerate(current_base64):
+            task2_input_images[i] = self._image_base64_to_pil(image_base64)
+        data_proto.non_tensor_batch["task2_input_imgs_pil_list"] = task2_input_images
 
         async def request_one(prompt: str, image_uri: str):
             return await self._post_json(
@@ -712,10 +733,24 @@ class JanusSGLangAsyncServer:
         data_proto.batch["task3_input_imgs_pixel_values"] = current_pixels.detach().cpu().clone()
         data_proto.batch["task3_input_img_tokens"] = current_tokens.detach().cpu().clone()
 
+        current_base64_values = data_proto.non_tensor_batch.get("current_imgs_base64")
+        if current_base64_values is None:
+            current_base64_values = data_proto.non_tensor_batch.get("task1_gen_imgs_base64")
+        if current_base64_values is None:
+            raise ValueError("task3 requires current image base64 values")
+        current_base64s = self._as_str_list(current_base64_values)
+        if len(current_base64s) != len(prompts):
+            raise ValueError("task3 requires one current image per prompt")
+        task3_input_images = np.empty(len(current_base64s), dtype=object)
+        for i, image_base64 in enumerate(current_base64s):
+            task3_input_images[i] = self._image_base64_to_pil(image_base64)
+        data_proto.non_tensor_batch["task3_input_imgs_pil_list"] = task3_input_images
+
         raw_feedbacks = self._as_str_list(data_proto.non_tensor_batch.get("task2_feedback_texts", []))
         if len(raw_feedbacks) != len(prompts):
             raise ValueError("task3 requires one task2_feedback_text per prompt")
-        feedbacks = [self.formatter_v3._split_text_into_parts(feedback)[-1] for feedback in raw_feedbacks]
+        feedbacks = [extract_task2_feedback(feedback) for feedback in raw_feedbacks]
+        active_indices = [i for i, feedback in enumerate(raw_feedbacks) if should_route_task3(feedback)]
 
         training_texts = [self._task3_training_text(prompt, feedback) for prompt, feedback in zip(prompts, feedbacks)]
         input_ids, _ = self._tokenize_left(training_texts)
@@ -731,6 +766,7 @@ class JanusSGLangAsyncServer:
                 {
                     "mode": "edit",
                     "input_prompt": prompt,
+                    "system_prompt": self._task3_system_prompt(),
                     "feedback": feedback or "No need to generate feedback.",
                     "input_image_token_ids": image_tokens,
                     "cfg_weight": float(gen_config["cfg_weight"]),
@@ -742,12 +778,26 @@ class JanusSGLangAsyncServer:
                 },
             )
 
-        results = await asyncio.gather(
+        active_results = await asyncio.gather(
             *[
-                request_one(prompt, feedback, image_tokens)
-                for prompt, feedback, image_tokens in zip(prompts, feedbacks, token_lists_for_request)
+                request_one(prompts[i], feedbacks[i], token_lists_for_request[i])
+                for i in active_indices
             ]
         )
+        results = [None] * len(prompts)
+        for i, result in zip(active_indices, active_results):
+            results[i] = result
+
+        for i, result in enumerate(results):
+            if result is None:
+                results[i] = {
+                    "images": [{
+                        "image_token_ids": token_lists_for_request[i],
+                        "image_base64": current_base64s[i],
+                        "image_token_logprobs": None,
+                    }]
+                }
+
         image_infos = [result["images"][0] for result in results]
         regen_token_lists = [[int(x) for x in info["image_token_ids"]] for info in image_infos]
         regen_base64s = [info["image_base64"] for info in image_infos]
@@ -760,7 +810,11 @@ class JanusSGLangAsyncServer:
         data_proto.non_tensor_batch["current_imgs_base64"] = np.array(regen_base64s, dtype=object)
         data_proto.batch["task3_regen_imgs_pixel_values"] = regen_pixels.cpu()
         data_proto.batch["task3_regen_img_tokens"] = regen_tokens.cpu()
-        data_proto.batch["task3_response_mask"] = torch.ones_like(regen_tokens, dtype=torch.long).cpu()
+        task3_response_mask = torch.ones_like(regen_tokens, dtype=torch.long)
+        skipped_indices = sorted(set(range(len(prompts))) - set(active_indices))
+        if skipped_indices:
+            task3_response_mask[skipped_indices] = 0
+        data_proto.batch["task3_response_mask"] = task3_response_mask.cpu()
         data_proto.batch["current_imgs_pixel_values"] = regen_pixels.cpu().clone()
         data_proto.batch["current_img_tokens"] = regen_tokens.cpu().clone()
         if not gen_config["is_validate"]:

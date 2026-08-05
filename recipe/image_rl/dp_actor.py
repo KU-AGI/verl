@@ -20,7 +20,7 @@ from verl.workers.actor import BasePPOActor
 from verl.workers.config import ActorConfig
 
 from recipe.image_rl.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
-from recipe.image_rl.utils import FormattingEvaluatorV2
+from recipe.image_rl.utils import FormattingEvaluatorV3, image_prompt_valid_mask
 from verl.utils.adaptive_entropy_coeff import AdaptiveEntropyCoefficient
 import torch.distributed as dist
 
@@ -182,7 +182,7 @@ class DataParallelImageGenerationActor(BasePPOActor):
         super().__init__(config)
         self.processor = processor
         self.tokenizer = tokenizer
-        self.formatter = FormattingEvaluatorV2()
+        self.formatter = FormattingEvaluatorV3()
         self.actor_module = actor_module
         self.actor_optimizer = actor_optimizer
         role = "Ref" if actor_optimizer is None else "Actor"
@@ -307,7 +307,7 @@ class DataParallelImageGenerationActor(BasePPOActor):
         response_mask: torch.Tensor,
         task_id: int,
     ) -> torch.Tensor:
-        """Drop rows whose image-conditioned prompt lost its image placeholder."""
+        """Drop rows whose image-conditioned prompt has a truncated image placeholder."""
         if task_id not in (2, 3):
             return response_mask
 
@@ -317,19 +317,36 @@ class DataParallelImageGenerationActor(BasePPOActor):
         if input_ids is None or image_id is None:
             return response_mask
 
-        placeholder_counts = (input_ids == image_id).sum(dim=1)
-        bad_rows = placeholder_counts == 0
+        attention_mask = micro_batch.get(f"task{task_id}_attention_mask")
+        expected_count = int(self.config.get("image_token_num_per_image", 576))
+        valid_rows = image_prompt_valid_mask(
+            input_ids, attention_mask, image_id, expected_count=expected_count
+        )
+        placeholder_mask = input_ids == image_id
+        if attention_mask is not None:
+            placeholder_mask = placeholder_mask & attention_mask.to(dtype=torch.bool)
+        placeholder_counts = placeholder_mask.sum(dim=1)
+        bad_rows = ~valid_rows
         if not bool(bad_rows.any().item()):
             return response_mask
 
+        active_bad_rows = bad_rows & (response_mask.sum(dim=1) > 0)
+        # The same dict is used by update_policy after this helper returns, so
+        # replace its mask as well as returning the clone. This keeps invalid
+        # rows out of the actor loss instead of only hiding them inside forward.
         response_mask = response_mask.clone()
         response_mask[bad_rows] = 0
         micro_batch[f"task{task_id}_response_mask"] = response_mask
-        print(
-            f"[DPActor] task{task_id}: zeroed rows with missing image placeholder "
-            f"indices={bad_rows.nonzero(as_tuple=False).view(-1).detach().cpu().tolist()}",
-            flush=True,
-        )
+        if bool(active_bad_rows.any().item()):
+            indices = active_bad_rows.nonzero(as_tuple=False).view(-1)
+            counts = placeholder_counts[indices]
+            print(
+                f"[DPActor] task{task_id}: zeroed rows with truncated image placeholder "
+                f"expected={expected_count} "
+                f"indices={indices.detach().cpu().tolist()} "
+                f"counts={counts.detach().cpu().tolist()}",
+                flush=True,
+            )
         return response_mask
 
     def _zero_rows_with_insufficient_logits(
@@ -446,6 +463,9 @@ class DataParallelImageGenerationActor(BasePPOActor):
         # Must match `_extract_valid_output_tokens` exactly.
         output_lengths = self._build_output_lengths(original_response_mask)
         local_has_output = 1 if max(output_lengths) > 0 else 0
+        use_compact_task3_logits = task_id == 3 and bool(
+            self.config.get("task3_compact_logits", False)
+        )
 
         # IMPORTANT: Always do forward pass even if no valid output
         # FSDP requires all ranks to participate in forward/backward for synchronization
@@ -459,6 +479,7 @@ class DataParallelImageGenerationActor(BasePPOActor):
             txt_top_p=kwargs.get("txt_top_p", 1.0),
             img_top_k=kwargs.get("img_top_k", 0),
             img_top_p=kwargs.get("img_top_p", 1.0),
+            compact_image_logits=use_compact_task3_logits,
         )
         
         if local_has_output == 0:
@@ -476,23 +497,32 @@ class DataParallelImageGenerationActor(BasePPOActor):
 
         logits = output.logits
         logits_seq_len = int(logits.size(1))
-        original_response_mask, output_lengths = self._zero_rows_with_insufficient_logits(
-            micro_batch,
-            original_response_mask,
-            output_starts,
-            output_lengths,
-            logits_seq_len,
-            task_id,
-        )
-        valid_output_tokens = self._extract_valid_output_tokens(output_tokens, original_response_mask)
-        if max(output_lengths) == 0:
-            dummy_scalar = logits.flatten()[0] * 0.0
-            log_probs = torch.zeros_like(original_response_mask, dtype=logits.dtype, device=logits.device) + dummy_scalar
-            entropy = None
-            if calculate_entropy:
-                entropy = torch.zeros_like(original_response_mask, dtype=logits.dtype, device=logits.device) + dummy_scalar
-            return entropy, log_probs
-        task_logits = extract_output_logits(logits, output_starts, output_lengths)
+        if use_compact_task3_logits:
+            max_output_len = max(output_lengths)
+            if logits_seq_len < max_output_len:
+                raise RuntimeError(
+                    "Task3 compact logits are shorter than the response: "
+                    f"logits_seq_len={logits_seq_len}, max_output_len={max_output_len}"
+                )
+            task_logits = logits[:, :max_output_len]
+        else:
+            original_response_mask, output_lengths = self._zero_rows_with_insufficient_logits(
+                micro_batch,
+                original_response_mask,
+                output_starts,
+                output_lengths,
+                logits_seq_len,
+                task_id,
+            )
+            valid_output_tokens = self._extract_valid_output_tokens(output_tokens, original_response_mask)
+            if max(output_lengths) == 0:
+                dummy_scalar = logits.flatten()[0] * 0.0
+                log_probs = torch.zeros_like(original_response_mask, dtype=logits.dtype, device=logits.device) + dummy_scalar
+                entropy = None
+                if calculate_entropy:
+                    entropy = torch.zeros_like(original_response_mask, dtype=logits.dtype, device=logits.device) + dummy_scalar
+                return entropy, log_probs
+            task_logits = extract_output_logits(logits, output_starts, output_lengths)
 
         del logits
         del output
@@ -813,6 +843,10 @@ class DataParallelImageGenerationActor(BasePPOActor):
                     ).chunk(num_micro_batches)
                 
                 self.actor_optimizer.zero_grad()
+
+                adaptive_entropy_stats = {
+                    task_id: [None, None] for task_id in task_ids
+                } if self.use_adaptive_entropy_coeff else {}
                 
                 for micro_batch in micro_batches:
                     micro_batch = micro_batch.to(get_device_id())
@@ -838,6 +872,9 @@ class DataParallelImageGenerationActor(BasePPOActor):
                         old_log_prob = model_inputs[f"task{task_id}_old_log_probs"]
                         advantages = model_inputs[f"task{task_id}_advantages"]
                         response_mask = model_inputs[f"task{task_id}_response_mask"]
+                        response_mask = self._zero_missing_image_placeholder_rows(
+                            model_inputs, response_mask, task_id
+                        )
                         loss_mask = response_mask
                         if task_id == 2 and "task2_segment_mask" in model_inputs:
                             segment_mask = model_inputs["task2_segment_mask"].to(device=response_mask.device)
@@ -897,9 +934,12 @@ class DataParallelImageGenerationActor(BasePPOActor):
 
                         if calculate_entropy:
                             entropy_loss = agg_loss(loss_mat=entropy, loss_mask=loss_mask, loss_agg_mode=loss_agg_mode)
-                            # Update adaptive coeff after computing entropy
                             if self.use_adaptive_entropy_coeff:
-                                self.adaptive_entropy_coeffs[task_id].update(entropy=entropy_loss.detach())
+                                entropy_sum = (entropy.detach() * loss_mask).sum()
+                                entropy_count = loss_mask.detach().sum()
+                                task_stats = adaptive_entropy_stats[task_id]
+                                task_stats[0] = entropy_sum if task_stats[0] is None else task_stats[0] + entropy_sum
+                                task_stats[1] = entropy_count if task_stats[1] is None else task_stats[1] + entropy_count
                             micro_batch_metrics[f"actor/task{task_id}_entropy"] = entropy_loss.detach().item()
                             micro_batch_metrics[f"actor/task{task_id}_entropy_loss"] = (entropy_loss * entropy_coeff).detach().item() * loss_scale_factor
                             micro_batch_metrics[f"actor/task{task_id}_entropy_coeff"] = entropy_coeff
@@ -985,6 +1025,24 @@ class DataParallelImageGenerationActor(BasePPOActor):
                         micro_batch_metrics.update(aggregated_metrics)
 
                     append_to_dict(metrics, micro_batch_metrics)
+
+                if self.use_adaptive_entropy_coeff:
+                    stats_device = next(self.actor_module.parameters()).device
+                    for task_id in task_ids:
+                        entropy_sum, entropy_count = adaptive_entropy_stats[task_id]
+                        if entropy_sum is None:
+                            entropy_sum = torch.zeros((), device=stats_device)
+                            entropy_count = torch.zeros((), device=stats_device)
+                        update_loss = self.adaptive_entropy_coeffs[task_id].update_distributed(
+                            entropy_sum=entropy_sum,
+                            entropy_count=entropy_count,
+                        )
+                        if update_loss is not None:
+                            append_to_dict(metrics, {
+                                f"actor/task{task_id}_adaptive_entropy_update_loss": update_loss,
+                                f"actor/task{task_id}_entropy_coeff_next":
+                                    -self.adaptive_entropy_coeffs[task_id].get_alpha().item(),
+                            })
 
                 grad_norm = self._optimizer_step()
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}

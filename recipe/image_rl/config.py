@@ -45,6 +45,8 @@ class ImageGenerationRolloutConfig(RolloutConfig):
     feedback_system_prompt : Optional[str] = None
     regen_system_prompt : Optional[str] = None
     image_token_num_per_image: int = 576
+    # Optional actor-side Task3 tensor width. When unset, prompt_length is used.
+    task3_prompt_length: Optional[int] = None
 
     # Multi-turn rollout knob: orchestrator runs `task1 -> (task2 -> task3) x max_turns`.
     # Single-turn behavior is recovered with max_turns=1.

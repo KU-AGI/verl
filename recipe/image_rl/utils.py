@@ -19,6 +19,63 @@ _TUPLE_SCHEMA_PATTERNS = [
     re.compile(r'^global\s*-\s*style\s*\([^,)]+\)$'),                          # single style token, no comma
 ]
 
+CANONICAL_NO_EDIT_FEEDBACK = "No need to generate feedback."
+_NO_EDIT_ROUTING_PREFIXES = (
+    re.compile(r"^no need\b"),
+    re.compile(r"^no feedback needed\b"),
+    re.compile(r"^no correction needed\b"),
+    re.compile(r"^no corrections needed\b"),
+)
+
+
+def image_prompt_valid_mask(
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    image_id: int | None,
+    expected_count: int = 576,
+) -> torch.Tensor:
+    """Return rows whose attended prompt contains one complete image placeholder."""
+    if image_id is None:
+        return torch.ones(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
+    placeholder_mask = input_ids == image_id
+    if attention_mask is not None:
+        placeholder_mask = placeholder_mask & attention_mask.to(dtype=torch.bool)
+    return placeholder_mask.sum(dim=1) == int(expected_count)
+
+
+def extract_task2_feedback(text) -> str:
+    """Extract feedback from either the existing V3 or four-part V2 response."""
+    if not isinstance(text, str):
+        return ""
+    stripped = text.strip()
+    for marker in (
+        "Fourth, Generate corrective feedback.",
+        "Third, Generate corrective feedback.",
+    ):
+        if marker in stripped:
+            return stripped.split(marker, 1)[1].strip()
+    return stripped
+
+
+def classify_task2_feedback(text) -> str:
+    """Classify strict reward validity separately from Task3 routing intent."""
+    feedback = extract_task2_feedback(text)
+    if feedback == CANONICAL_NO_EDIT_FEEDBACK:
+        return "canonical_no_edit"
+    normalized = feedback.lower()
+    if any(pattern.match(normalized) for pattern in _NO_EDIT_ROUTING_PREFIXES):
+        return "noncanonical_no_edit"
+    return "other"
+
+
+def should_route_task3(text) -> bool:
+    """Return whether Task2 feedback should trigger Task3 image editing."""
+    feedback = extract_task2_feedback(text)
+    if not feedback:
+        return False
+    return classify_task2_feedback(feedback) == "other"
+
+
 class FormattingEvaluatorV2:
     def __init__(self):
         # 4단계 구조를 위한 새로운 패턴 정의

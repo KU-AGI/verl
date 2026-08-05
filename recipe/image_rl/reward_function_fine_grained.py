@@ -9,7 +9,12 @@ import PIL.Image
 from openai import AsyncOpenAI
 import numpy as np
 import time
-from recipe.image_rl.utils import FormattingEvaluatorV3, filter_entity_questions
+from recipe.image_rl.utils import (
+    FormattingEvaluatorV3,
+    classify_task2_feedback,
+    filter_entity_questions,
+    should_route_task3,
+)
 from recipe.image_rl.prompts import REASONGEN_R1_TEMPLATE
 from recipe.image_rl.prompts_finegrained_simple import (
     TASK1_TASK3_IMAGE_GENERATOR_SYSTEM_PROMPT_TEMPLATE,
@@ -899,6 +904,7 @@ async def compute_score_single_async(
             reward_extra_info["task2_rule_based_feedback_format_ok"] = 0
             reward_extra_info["task2_no_feedback_needed"] = 0
             reward_extra_info["task2_no_feedback_needed_score"] = 0
+            reward_extra_info["task2_noncanonical_no_edit"] = 0
             reward_extra_info["task2_tuple_format_ok"] = 0
             reward_extra_info["task2_vqa_format_ok"] = 0
             reward_extra_info["task2_stage_raw_only"] = int(raw_stage_only)
@@ -940,10 +946,13 @@ async def compute_score_single_async(
         reward_extra_info["task2_rule_based_decompose_reward"] = task2_rule_based_decompose_reward
 
         feedback_step_format_ok = formatting_evaluator.check_feedback_step_format(predicted_feedback)
-        no_feedback_needed = predicted_feedback is not None and "no need to generate feedback" in predicted_feedback.lower()
+        feedback_class = classify_task2_feedback(predicted_feedback)
+        canonical_no_edit = feedback_class == "canonical_no_edit"
+        noncanonical_no_edit = feedback_class == "noncanonical_no_edit"
         reward_extra_info["task2_rule_based_feedback_format_ok"] = int(feedback_step_format_ok)
-        reward_extra_info["task2_no_feedback_needed"] = int(no_feedback_needed)
-        reward_extra_info["task2_no_feedback_needed_score"] = int(no_feedback_needed)
+        reward_extra_info["task2_no_feedback_needed"] = int(canonical_no_edit)
+        reward_extra_info["task2_no_feedback_needed_score"] = int(canonical_no_edit)
+        reward_extra_info["task2_noncanonical_no_edit"] = int(noncanonical_no_edit)
         # Prepare normalized inputs for stage judges
         # tuple_raw = _normalize_tuple_lines(predicted_tuple or '')
         tuple_raw = predicted_tuple or ''
@@ -953,7 +962,7 @@ async def compute_score_single_async(
         tuple_format_ok = formatting_evaluator.check_tuple_schema_ok(predict_parsed_tuple)
         vqa_format_ok = len(predict_decomposed_ans) > 0         # has "Answer: Yes/No"
         # Feedback judge runs only when feedback is needed AND format is correct.
-        feedback_should_run = (not no_feedback_needed) and feedback_step_format_ok
+        feedback_should_run = feedback_class == "other" and feedback_step_format_ok
         reward_extra_info["task2_tuple_format_ok"] = int(tuple_format_ok)
         reward_extra_info["task2_vqa_format_ok"] = int(vqa_format_ok)
 
@@ -1018,7 +1027,25 @@ async def compute_score_single_async(
             reward_score += vlm_reward
 
     elif task_id == 3: # Total score: sqrt(vqa*2 * edit) + detector bonus (0..1)
-        # NOTE: the `no_feedback_needed` → -100 shortcut was removed.
+        if not should_route_task3(predicted_feedback):
+            reward_extra_info.update({
+                "task3_vqa_reward": 0.0,
+                "task3_vqa_reward_response": "Skipped: no-edit feedback",
+                "task3_edit_reward": 0.0,
+                "task3_edit_reward_response": "Skipped: no-edit feedback",
+                "task3_detector_reward": 0.0,
+                "task3_detector_details": [],
+                "task3_detector_active": 0,
+                "task3_detector_count": 0,
+                "task3_detector_active_score": 0,
+                "task3_detector_active_only_reward": None,
+                "task3_align": 0.0,
+                "task3_image_score": 0.0,
+                "task3_image_score_max": 1.0,
+                "task3_if": 0.0,
+                "task3_edit_if_reward": 0.0,
+            })
+            return {"score": 0.0, "reward_extra_info": reward_extra_info}
 
         # Parse detection items from feedback_tuple
         detection_results = verify_detection_single(feedback_tuple)
@@ -1279,12 +1306,15 @@ def finalize_task2_reward_extra_info(
     finalized = dict(reward_extra_info or {})
     target_no_edit = bool(decision_vqa >= 1.0 - 1e-6)
     model_no_edit = bool(finalized.get("task2_no_feedback_needed", 0))
+    noncanonical_no_edit = bool(finalized.get("task2_noncanonical_no_edit", 0))
 
     prompt_to_tuple = float(finalized.get("task2_prompt_to_tuple_reward", 0.0) or 0.0)
     tuple_to_vqa = float(finalized.get("task2_tuple_to_vqa_reward", 0.0) or 0.0)
     feedback_content = float(finalized.get("task2_vqa_to_feedback_content_reward", 0.0) or 0.0)
 
-    if target_no_edit and model_no_edit:
+    if noncanonical_no_edit:
+        feedback_total = 0.0
+    elif target_no_edit and model_no_edit:
         feedback_total = 2.0
     elif target_no_edit and not model_no_edit:
         feedback_total = 0.0

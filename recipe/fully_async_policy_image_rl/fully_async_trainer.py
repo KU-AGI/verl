@@ -491,22 +491,14 @@ class FullyAsyncTrainer(FullyAsyncRayPPOTrainer):
         self.actor_wg.init_model()
         self.actor_rollout_wg = self.actor_wg  # to be compatible with the functions that not be modified
 
-    async def _init_async_rollout_manager(self):
-        # create async rollout manager and request scheduler
-        assert self.config.actor_rollout_ref.rollout.mode == "async"
-        from recipe.fully_async_policy_image_rl.agent_loop import FullyAsyncAgentLoopManager
+    def _init_async_rollout_manager(self):
+        """Skip the colocated rollout manager used by the synchronous trainer.
 
-        self.async_rollout_mode = True
-        self.async_rollout_manager = await FullyAsyncAgentLoopManager.create(
-            config=self.config,
-            worker_group=self.rollout_wg,
-        )
-        num_servers = len(self.async_rollout_manager.server_handles)
-        self.server_token_q = asyncio.Queue()
-        for sid in range(num_servers):
-            self.server_token_q.put_nowait(sid)
-
-        self.server_applied_versions = [-1] * num_servers
+        Fully-async training owns generation in ``FullyAsyncRollouter``. The
+        trainer only consumes finalized batches from the message queue.
+        """
+        self.async_rollout_mode = False
+        self.async_rollout_manager = None
 
     def fit(self):
         """

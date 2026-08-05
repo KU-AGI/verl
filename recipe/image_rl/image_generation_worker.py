@@ -927,6 +927,17 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
     # gen_params carried in meta_info by image_unified_rollout.generate_sequences
     _GEN_PARAM_KEYS = ("temperature", "cfg_weight", "txt_top_k", "txt_top_p", "img_top_k", "img_top_p")
 
+    def _image_prompt_valid_mask(self, data: DataProto, task_id: int) -> torch.Tensor:
+        """Return rows whose attended prompt retains one complete image placeholder."""
+        from recipe.image_rl.utils import image_prompt_valid_mask
+
+        input_ids = data.batch[f"task{task_id}_input_ids"]
+        image_id = getattr(self.processor, "image_id", None)
+        attention_key = f"task{task_id}_attention_mask"
+        attention_mask = data.batch.get(attention_key)
+        expected_count = int(getattr(self.config.rollout, "image_token_num_per_image", 576))
+        return image_prompt_valid_mask(input_ids, attention_mask, image_id, expected_count)
+
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="blue", role="actor_compute_log_prob")
     def compute_log_prob(self, data: DataProto):
@@ -957,8 +968,11 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
             with adapter_ctx:
                 output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
             task_id = data.batch["task_id"].view(-1)[0].item()
+            tensors = {f"task{task_id}_old_log_probs": output, f"task{task_id}_entropys": entropys}
+            if task_id == 3:
+                tensors["task3_prompt_valid_mask"] = self._image_prompt_valid_mask(data, task_id)
             output = DataProto.from_dict(
-                tensors={f"task{task_id}_old_log_probs": output, f"task{task_id}_entropys": entropys},
+                tensors=tensors,
                 meta_info={k: data.meta_info[k] for k in self._GEN_PARAM_KEYS if k in data.meta_info},
             )
 
@@ -1012,6 +1026,8 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
                     output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
                     tensors[f"task{task_id}_old_log_probs"] = output
                     tensors[f"task{task_id}_entropys"] = entropys
+                    if task_id == 3:
+                        tensors["task3_prompt_valid_mask"] = self._image_prompt_valid_mask(data, task_id)
 
         output = DataProto.from_dict(
             tensors=tensors,
@@ -1181,14 +1197,18 @@ class ImageGenerationActorRolloutRefWorker(ActorRolloutRefWorker):
             and local_path is not None
             and getattr(self.actor, "use_adaptive_entropy_coeff", False)
         ):
-            adaptive_entropy_path = os.path.join(local_path, f"adaptive_entropy_coeff_rank_{self.rank}.pt")
+            rank_path = os.path.join(local_path, f"adaptive_entropy_coeff_rank_{self.rank}.pt")
+            rank_zero_path = os.path.join(local_path, "adaptive_entropy_coeff_rank_0.pt")
+            # All ranks restore the same coefficient and Adam state. Fall back
+            # to the rank-local file only for legacy/non-shared checkpoints.
+            adaptive_entropy_path = rank_zero_path if os.path.exists(rank_zero_path) else rank_path
             if os.path.exists(adaptive_entropy_path):
                 adaptive_entropy_state = torch.load(adaptive_entropy_path, map_location="cpu", weights_only=False)
                 self.actor.load_adaptive_entropy_state_dict(adaptive_entropy_state)
                 if dist.get_rank() == 0:
-                    print(f"[rank-{self.rank}]: Loaded adaptive entropy coeff from: {adaptive_entropy_path}")
+                    print(f"Loaded synchronized adaptive entropy coeff from: {adaptive_entropy_path}")
             elif dist.get_rank() == 0:
-                print(f"[rank-{self.rank}]: No adaptive entropy coeff checkpoint found at: {adaptive_entropy_path}")
+                print(f"No adaptive entropy coeff checkpoint found at: {adaptive_entropy_path}")
 
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)

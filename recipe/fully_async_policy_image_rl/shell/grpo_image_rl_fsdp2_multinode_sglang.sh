@@ -45,8 +45,8 @@ export PYTHONPATH="${WORKING_DIR}/sglang/python:${WORKING_DIR}:${PYTHONPATH:-}"
 export SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1
 
 # Model & Checkpoint Paths
-HOME="/home/work/AGILAB/mllm_reasoning"
-RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
+MLLM_REASONING_HOME="/home/work/AGILAB/mllm_reasoning"
+RAY_DATA_HOME=${RAY_DATA_HOME:-"${MLLM_REASONING_HOME}/verl"}
 MODEL_PATH=/home/work/AGILAB/mllm_reasoning/data/experiments/ckpt/janus_sft/0425_v10_no_summarize/hf_model
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
 
@@ -156,7 +156,9 @@ adaptive_entropy_coeff_task3_target_entropy=4.5
 ###############################################################################
 #                          SEQUENCE LENGTH SETTINGS
 ###############################################################################
-max_prompt_length=1576
+max_prompt_length=2048
+task3_max_prompt_length="${TASK3_MAX_PROMPT_LENGTH:-3072}"
+task3_compact_logits="${TASK3_COMPACT_LOGITS:-True}"
 max_response_length=2800
 
 # Overlong Buffer Configuration
@@ -226,6 +228,7 @@ partial_rollout=False
 use_rollout_log_probs=True
 compute_prox_log_prob=False
 max_regen_retries=3
+reward_finalize_workers=2
 
 # Replay Buffer
 replay_buffer_enable=True
@@ -284,6 +287,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     actor_rollout_ref.actor.strategy=fsdp2 \
     actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${ppo_micro_batch_size_per_gpu} \
+    actor_rollout_ref.actor.task3_compact_logits=${task3_compact_logits} \
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=${sp_size} \
     actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
     actor_rollout_ref.actor.use_kl_loss=${use_kl_loss} \
@@ -346,6 +350,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     actor_rollout_ref.rollout.img_top_p=${img_top_p} \
     actor_rollout_ref.rollout.image_token_num_per_image=576 \
     actor_rollout_ref.rollout.prompt_length=${max_prompt_length} \
+    actor_rollout_ref.rollout.task3_prompt_length=${task3_max_prompt_length} \
     actor_rollout_ref.rollout.response_length=${max_response_length} \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${gen_tp} \
     +actor_rollout_ref.rollout.engine_kwargs.sglang.attention_backend=triton \
@@ -400,6 +405,7 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     async_training.use_rollout_log_probs=${use_rollout_log_probs} \
     async_training.compute_prox_log_prob=${compute_prox_log_prob} \
     async_training.max_regen_retries=${max_regen_retries} \
+    async_training.reward_finalize_workers=${reward_finalize_workers} \
     async_training.replay_buffer.enable=${replay_buffer_enable} \
     async_training.replay_buffer.max_version_gap=${replay_buffer_max_version_gap} \
     async_training.replay_buffer.max_size_per_task=${replay_buffer_max_size_per_task} \

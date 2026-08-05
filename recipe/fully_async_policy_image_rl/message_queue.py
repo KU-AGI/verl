@@ -254,6 +254,10 @@ class MessageQueueClient:
         future = self.queue_actor.clear_queue.remote()
         await asyncio.wrap_future(future.future())
 
+    def clear_queue_sync(self):
+        """Clear queue from synchronous task-runner cleanup."""
+        ray.get(self.queue_actor.clear_queue.remote())
+
     async def shutdown(self):
         """Shutdown queue (async)"""
         future = self.queue_actor.shutdown.remote()

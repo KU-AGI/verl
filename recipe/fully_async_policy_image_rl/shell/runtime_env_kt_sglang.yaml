@@ -1,8 +1,16 @@
 excludes: [
   "/.git/",
+  "/.gemini/",
+  "/.pytest_cache/",
+  "**/__pycache__/",
   "verl/third_party/dynamo",
   "bench/",
-  "./ckpts"
+  "/ckpts/",
+  "/dpg_subset_qa_viewer/",
+  "/logs/",
+  "/github_token.txt",
+  "/ray_job.log",
+  "/txt.txt"
 ]
 env_vars:
   VLLM_USE_V1: "1"

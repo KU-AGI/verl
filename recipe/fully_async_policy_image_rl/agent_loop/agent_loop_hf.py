@@ -24,6 +24,7 @@ import ray
 from omegaconf import DictConfig
 
 from recipe.fully_async_policy_image_rl.hf_rollout.hf_replica import HuggingFaceReplica
+from recipe.image_rl.utils import should_route_task3
 from recipe.fully_async_policy_image_rl.agent_loop.agent_loop import (
     AgentLoopManager,
     AgentLoopOutput,
@@ -53,19 +54,9 @@ def get_image_rollout_replica_class(rollout_name: str):
     raise NotImplementedError(f"Unsupported fully-async image rollout backend: {rollout_name}")
 
 
-_NO_EDIT_MARKER = "No need to generate feedback."
-
-
 def _is_edit_sample(feedback_text) -> bool:
-    """An edit-worthy task2 feedback is any non-empty string that does NOT
-    contain the explicit `No need to generate feedback.` sentence (the exact
-    marker used by the task2 prompt template — see
-    `recipe/image_rl/prompts_finegrained.py` / `reward_function_fine_grained.py`).
-    Empty / non-string feedback is treated as no-edit.
-    """
-    if not isinstance(feedback_text, str) or not feedback_text:
-        return False
-    return _NO_EDIT_MARKER not in feedback_text
+    """Return whether Task2 feedback should trigger Task3 editing."""
+    return should_route_task3(feedback_text)
 
 
 def build_edit_batch(batch: DataProto, group_size: Optional[int] = None) -> DataProto:
@@ -809,23 +800,44 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
     def _spawn_child_branch_ids(
         self,
         batch: DataProto,
+        next_branch_id: int,
         parent_ids: Optional[np.ndarray] = None,
-    ) -> DataProto:
-        """Assign fresh branch ids to every row in `batch`."""
+    ) -> tuple[DataProto, int]:
+        """Assign sample-local branch ids and return the next unused id."""
         if batch is None or len(batch) == 0:
-            return batch
+            return batch, next_branch_id
         batch = self._ensure_branch_metadata(batch)
         n = len(batch)
         if parent_ids is None:
             parent_ids = np.asarray(batch.non_tensor_batch["branch_id"], dtype=np.int64)
         else:
             parent_ids = np.asarray(parent_ids, dtype=np.int64)
-        next_id = int(getattr(self, "_branch_id_counter", 0))
-        new_ids = np.arange(next_id, next_id + n, dtype=np.int64)
-        self._branch_id_counter = next_id + n
+        new_ids = np.arange(next_branch_id, next_branch_id + n, dtype=np.int64)
         batch.non_tensor_batch["parent_branch_id"] = parent_ids
         batch.non_tensor_batch["branch_id"] = new_ids
-        return batch
+        return batch, next_branch_id + n
+
+    @staticmethod
+    def _resolve_branch_chain(
+        branch_parent: dict[int, int],
+        branch_id: int,
+        trajectory_id: Optional[int] = None,
+    ) -> list[int]:
+        """Resolve a root-to-leaf chain and fail fast on cyclic metadata."""
+        chain = []
+        visited = set()
+        current = branch_id
+        while current >= 0:
+            if current in visited:
+                raise ValueError(
+                    "Cycle detected in branch metadata: "
+                    f"trajectory_id={trajectory_id}, branch_id={branch_id}, "
+                    f"repeated_branch_id={current}, chain={chain}"
+                )
+            visited.add(current)
+            chain.append(current)
+            current = int(branch_parent.get(current, -1))
+        return list(reversed(chain))
 
     @staticmethod
     def _build_row_map_by_trajectory(
@@ -1512,19 +1524,12 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
                 out.append((turn_i, dp, row))
             return out
 
-        def _branch_chain(bid: int) -> list[int]:
-            chain = []
-            cur = bid
-            while cur >= 0:
-                chain.append(cur)
-                cur = int(branch_parent.get(cur, -1))
-            return list(reversed(chain))
 
         def _collect_branch_rows(bid: int) -> tuple[list[tuple], list[tuple]]:
             tid = int(branch_tid[bid])
             t2_rows = list(shared_t2_rows.get(tid, []))
             t3_rows = list(shared_t3_rows.get(tid, []))
-            for seg_bid in _branch_chain(bid):
+            for seg_bid in self._resolve_branch_chain(branch_parent, bid, trajectory_id=tid):
                 t2_rows.extend(branch_t2_rows.get(seg_bid, []))
                 t3_rows.extend(branch_t3_rows.get(seg_bid, []))
             return _dedupe_sorted(t2_rows), _dedupe_sorted(t3_rows)
@@ -1757,19 +1762,12 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
                 out.append((turn_i, dp, row))
             return out
 
-        def _branch_chain(bid: int) -> list[int]:
-            chain = []
-            cur = bid
-            while cur >= 0:
-                chain.append(cur)
-                cur = int(branch_parent.get(cur, -1))
-            return list(reversed(chain))
 
         def _collect_branch_rows(bid: int) -> tuple[list[tuple], list[tuple]]:
             tid = int(branch_tid[bid])
             t2_rows = list(shared_t2_rows.get(tid, []))
             t3_rows = list(shared_t3_rows.get(tid, []))
-            for seg_bid in _branch_chain(bid):
+            for seg_bid in self._resolve_branch_chain(branch_parent, bid, trajectory_id=tid):
                 t2_rows.extend(branch_t2_rows.get(seg_bid, []))
                 t3_rows.extend(branch_t3_rows.get(seg_bid, []))
             return _dedupe_sorted(t2_rows), _dedupe_sorted(t3_rows)
@@ -1995,19 +1993,12 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
                 out.append((turn_i, dp, row))
             return out
 
-        def _branch_chain(bid: int) -> list[int]:
-            chain = []
-            cur = bid
-            while cur >= 0:
-                chain.append(cur)
-                cur = int(branch_parent.get(cur, -1))
-            return list(reversed(chain))
 
         def _collect_branch_rows(bid: int) -> tuple[list[tuple], list[tuple]]:
             tid = int(branch_tid[bid])
             t2_rows = list(shared_t2_rows.get(tid, []))
             t3_rows = list(shared_t3_rows.get(tid, []))
-            for seg_bid in _branch_chain(bid):
+            for seg_bid in self._resolve_branch_chain(branch_parent, bid, trajectory_id=tid):
                 t2_rows.extend(branch_t2_rows.get(seg_bid, []))
                 t3_rows.extend(branch_t3_rows.get(seg_bid, []))
             return _dedupe_sorted(t2_rows), _dedupe_sorted(t3_rows)
@@ -2453,19 +2444,12 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
                 out.append((turn_i, dp, scores, row))
             return out
 
-        def _branch_chain(bid: int) -> list[int]:
-            chain = []
-            cur = bid
-            while cur >= 0:
-                chain.append(cur)
-                cur = int(branch_parent.get(cur, -1))
-            return list(reversed(chain))
 
         def _collect_branch_rows(bid: int) -> tuple[list[tuple], list[tuple]]:
             tid = int(branch_tid[bid])
             t2_rows = list(shared_t2_rows.get(tid, []))
             t3_rows = list(shared_t3_rows.get(tid, []))
-            for seg_bid in _branch_chain(bid):
+            for seg_bid in self._resolve_branch_chain(branch_parent, bid, trajectory_id=tid):
                 t2_rows.extend(branch_t2_rows.get(seg_bid, []))
                 t3_rows.extend(branch_t3_rows.get(seg_bid, []))
             return _dedupe_sorted(t2_rows), _dedupe_sorted(t3_rows)
@@ -3413,7 +3397,7 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         # per-sample termination / build_edit_batch row reshuffling.
         accumulated_batch = self._stamp_trajectory_ids(prompts)
         accumulated_batch = self._ensure_branch_metadata(accumulated_batch)
-        self._branch_id_counter = 0
+        next_branch_id = 0
 
         task1_batch: Optional[DataProto] = None
         task2_batches_per_turn: list[DataProto] = []
@@ -3480,7 +3464,7 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             parent_ids = np.full(len(accumulated_batch), -1, dtype=np.int64)
             if "branch_id" in accumulated_batch.non_tensor_batch:
                 parent_ids = np.asarray(accumulated_batch.non_tensor_batch["branch_id"], dtype=np.int64)
-            accumulated_batch = self._spawn_child_branch_ids(accumulated_batch, parent_ids=parent_ids)
+            accumulated_batch, next_branch_id = self._spawn_child_branch_ids(accumulated_batch, next_branch_id, parent_ids=parent_ids)
 
             pre_task3_batch = accumulated_batch
             pre_task3_batches_per_turn.append(pre_task3_batch)
@@ -3665,7 +3649,7 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
 
         accumulated_batch = self._stamp_trajectory_ids(prompts)
         accumulated_batch = self._ensure_branch_metadata(accumulated_batch)
-        self._branch_id_counter = 0
+        next_branch_id = 0
 
         task1_batch: Optional[DataProto] = None
         task2_batches_per_turn: list[DataProto] = []
@@ -3727,7 +3711,7 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             parent_ids = np.full(len(accumulated_batch), -1, dtype=np.int64)
             if "branch_id" in accumulated_batch.non_tensor_batch:
                 parent_ids = np.asarray(accumulated_batch.non_tensor_batch["branch_id"], dtype=np.int64)
-            accumulated_batch = self._spawn_child_branch_ids(accumulated_batch, parent_ids=parent_ids)
+            accumulated_batch, next_branch_id = self._spawn_child_branch_ids(accumulated_batch, next_branch_id, parent_ids=parent_ids)
 
             pre_task3_batch = accumulated_batch
             pre_task3_batches_per_turn.append(pre_task3_batch)
