@@ -230,6 +230,11 @@ class ReplayBuffer:
                 or any(s == -100 for s in uid_scores)
             ):
                 continue
+            # Task2 V3 has three fixed reward segments (2/3/4). Normalize its
+            # replay quality statistic to the per-step average while keeping
+            # legacy outcome-only batches on their original scalar scale.
+            if task_id == 2 and stats_key == score_key:
+                uid_scores = [score / 3.0 for score in uid_scores]
             mean_reward = sum(uid_scores) / len(uid_scores)
             max_reward = max(uid_scores)
             if len(uid_scores) > 1:
