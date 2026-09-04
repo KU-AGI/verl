@@ -46,6 +46,16 @@ class GDino:
     def __init__(self, args):
         self.args = args
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        if self.device == "cuda" and args.cuda_memory_fraction is not None:
+            torch.cuda.set_per_process_memory_fraction(
+                args.cuda_memory_fraction, device=0
+            )
+            print(
+                f"[GDino] CUDA allocator limit: "
+                f"{args.cuda_memory_fraction:.1%}",
+                flush=True,
+            )
         
         print(f"[GDino] Loading model from: {args.gdino_ckpt_path}", flush=True)
         self.processor = AutoProcessor.from_pretrained(args.gdino_ckpt_path)
@@ -64,7 +74,7 @@ class GDino:
         self.distance_threshold_min = args.dist_thrs_min 
         self.area_threshold = args.area_thrs
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def __call__(self, info, labels, img):
         inputs = self.processor(
             images=img, text=labels, return_tensors="pt", padding=True
@@ -272,6 +282,17 @@ def get_args():
     parser.add_argument("--dist_thrs_min", type=float, default=0.1)
     parser.add_argument("--area_thrs", type=float, default=0.5)
     parser.add_argument("--visualize", action="store_true", default=False)
+    parser.add_argument(
+        "--cuda_memory_fraction",
+        type=float,
+        default=None,
+        help="Maximum fraction of visible GPU memory available to this process",
+    )
+    parser.add_argument(
+        "--empty_cache_after_request",
+        action="store_true",
+        help="Release cached inference allocations after every HTTP request",
+    )
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     return parser.parse_args()
@@ -280,6 +301,10 @@ def get_args():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global gdino_model, args
+    if args.cuda_memory_fraction is not None and not (
+        0.0 < args.cuda_memory_fraction <= 1.0
+    ):
+        raise ValueError("--cuda_memory_fraction must be in the interval (0, 1]")
     print(f"[Server] Initializing GDino model...", flush=True)
     print(f"[Server] Model path: {args.gdino_ckpt_path}", flush=True)
     gdino_model = GDino(args)
@@ -294,6 +319,16 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan
 )
+
+
+@app.middleware("http")
+async def release_cuda_cache_after_request(request, call_next):
+    try:
+        return await call_next(request)
+    finally:
+        if args.empty_cache_after_request and torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
 
 
 # =============================================================================
