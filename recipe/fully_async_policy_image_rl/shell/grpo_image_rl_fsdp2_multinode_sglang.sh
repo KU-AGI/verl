@@ -14,7 +14,7 @@ exec 2>&1
 #                         EXPERIMENT CONFIGURATION
 ###############################################################################
 project_name='mllm_reasoning'
-exp_name="${EXP_NAME:-0718_KT_v5_1e_6_multi_step_neurips_sglang_fixed_v3}"
+exp_name="${EXP_NAME:-0905_KT_multi_step_final_image_reward}"
 # exp_name="0423_debug"
 task_ids='[1,2,3]'
 
@@ -102,7 +102,7 @@ max_turns=2
 ###############################################################################
 # Return discount used when backing up phase1 step rewards:
 #   G_h = r_h + mdp_gamma * G_{h+1}
-mdp_reward_version=multi_step # gae | multi_step
+mdp_reward_version=outcome # gae | multi_step | outcome | final_image_outcome
 mdp_gamma=0.6
 
 # Initial image reward weight:
@@ -236,9 +236,9 @@ replay_buffer_max_version_gap=-1
 replay_buffer_max_size_per_task=64
 replay_buffer_max_use_count=-1
 replay_buffer_filter_mode=max_and_std_constant      # "mean", "std", or "max", "max_and_std_constant"
-replay_buffer_score_threshold_1=0.7
+replay_buffer_score_threshold_1=1.0
 replay_buffer_score_threshold_2=1.0
-replay_buffer_score_threshold_3=0.5 # 2점 만점
+replay_buffer_score_threshold_3=1.0 # 2점 만점
 replay_buffer_score_std_threshold_1=0.1
 replay_buffer_score_std_threshold_2=0.1
 replay_buffer_score_std_threshold_3=0.1
