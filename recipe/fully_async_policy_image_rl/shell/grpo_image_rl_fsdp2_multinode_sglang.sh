@@ -102,7 +102,12 @@ max_turns=2
 ###############################################################################
 # Return discount used when backing up phase1 step rewards:
 #   G_h = r_h + mdp_gamma * G_{h+1}
-mdp_reward_version=outcome # gae | multi_step | outcome | final_image_outcome
+# multi_step: task1=VQA, task2=four stage scores, task3=sqrt(2*VQA*edit_score).
+# outcome: sum these same rewards over the path and share across steps.
+# outcome_avg: mean these same rewards over the path and share across steps.
+# Shared prefixes receive the mean of descendant path outcomes in both modes.
+# outcome/outcome_avg do not use the discounted/shaping parameters below.
+mdp_reward_version=outcome # gae | multi_step | outcome | outcome_avg | final_image_outcome
 mdp_gamma=0.6
 
 # Initial image reward weight:

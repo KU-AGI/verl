@@ -1319,7 +1319,8 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         """Attach phase1 token scores according to `algorithm.mdp_reward_version`.
 
         Default `gae` preserves the existing discounted-return backup. The
-        `multi_step` variant writes immediate per-step rewards only.
+        `multi_step` writes immediate rewards; `outcome` sums those rewards
+        over a path, and `outcome_avg` averages them.
         """
         algo_cfg = getattr(getattr(self, "config", None), "algorithm", None) or {}
         _get_hp = algo_cfg.get if hasattr(algo_cfg, "get") else lambda k, d: getattr(algo_cfg, k, d)
@@ -1337,6 +1338,7 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
                 task1_batch,
                 task2_batches,
                 task3_batches,
+                average=version != "outcome",
             )
             return
         if version in {"final_image_outcome", "final_image", "image_outcome"}:
@@ -1359,6 +1361,17 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             task3_batches,
         )
 
+    def _task1_multistep_reward(self, extras: dict, row: int) -> float:
+        return self._as_float(self._read_reward_extra_value(extras, "task1_vqa_reward", row, 0.0))
+
+    def _task3_multistep_reward(self, extras: dict, row: int) -> float:
+        value = self._read_reward_extra_value(extras, "task3_geo_reward", row, None)
+        if value is None:
+            vqa = self._as_float(self._read_reward_extra_value(extras, "task3_vqa_reward", row, 0.0))
+            edit_score = self._as_float(self._read_reward_extra_value(extras, "task3_edit_reward", row, 0.0))
+            value = float(np.sqrt(max(0.0, (vqa * 2.0) * edit_score)))
+        return self._as_float(value)
+
     def _attach_phase1_mdp_multistep_token_scores(
         self,
         task1_batch: Optional[DataProto],
@@ -1378,8 +1391,7 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             task1_extras = task1_batch.meta_info.setdefault("task1_reward_extra_info", {})
             multi_vals = self._ensure_reward_extra_list(task1_extras, "task1_multi_step_score", len(task1_batch))
             for row in range(len(task1_batch)):
-                vqa = self._as_float(self._read_reward_extra_value(task1_extras, "task1_vqa_reward", row, 0.0))
-                value = vqa
+                value = self._task1_multistep_reward(task1_extras, row)
                 multi_vals[row] = value
                 self._put_scalar_on_last_mask_token(scores, mask, row, value)
             task1_batch.batch["task1_token_level_scores"] = scores
@@ -1426,12 +1438,7 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             task3_extras = t3_b.meta_info.setdefault("task3_reward_extra_info", {})
             multi_vals = self._ensure_reward_extra_list(task3_extras, "task3_multi_step_score", len(t3_b))
             for row in range(len(t3_b)):
-                vqa = self._as_float(self._read_reward_extra_value(task3_extras, "task3_vqa_reward", row, 0.0))
-                value = self._read_reward_extra_value(task3_extras, "task3_geo_reward", row, None)
-                if value is None:
-                    edit_score = self._as_float(self._read_reward_extra_value(task3_extras, "task3_edit_reward", row, 0.0))
-                    value = float(np.sqrt(max(0.0, (vqa * 2.0) * edit_score)))
-                value = self._as_float(value)
+                value = self._task3_multistep_reward(task3_extras, row)
                 multi_vals[row] = value
                 self._put_scalar_on_last_mask_token(scores, mask, row, value)
             t3_b.batch["task3_token_level_scores"] = scores
@@ -1443,19 +1450,18 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         task1_batch: Optional[DataProto],
         task2_batches: list[DataProto],
         task3_batches: list[DataProto],
+        *,
+        average: bool = False,
     ) -> None:
-        """Replace phase1 token scores with trajectory-average outcome rewards.
+        """Aggregate the same immediate rewards used by multi_step.
 
         For each terminal trajectory path, compute:
-            R_out = mean(r_step1, r_step2, ..., r_stepH)
+            R_out = sum(r_step1, r_step2, ..., r_stepH)
+        dividing by H only when average=True,
         and write the same R_out back to every step event in that path. Shared
         prefix rows that feed multiple terminal branches receive the mean over
         descendant branch outcomes, matching the discounted-return branch logic.
         """
-        algo_cfg = getattr(getattr(self, "config", None), "algorithm", None) or {}
-        _get_hp = algo_cfg.get if hasattr(algo_cfg, "get") else lambda k, d: getattr(algo_cfg, k, d)
-        eps = float(_get_hp("mdp_score_eps", 1e-6))
-
         _ex = self._get_outcome_extra_scalar
         outcomes_by_event: dict[tuple[int, int, str], list[float]] = {}
 
@@ -1544,15 +1550,8 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             events: list[tuple[float, DataProto, int, str, float]] = []
             if task1_batch is not None and tid in t1_index:
                 row = t1_index[tid]
-                image_score = _ex(
-                    task1_batch,
-                    1,
-                    "task1_image_score",
-                    [row],
-                    default=_ex(task1_batch, 1, "task1_mdp_reward", [row], 0.0),
-                )
-                image_score_max = _ex(task1_batch, 1, "task1_image_score_max", [row], 1.0)
-                reward = 2.0 * float(image_score) / max(float(image_score_max), eps)
+                extras = (task1_batch.meta_info or {}).get("task1_reward_extra_info", {})
+                reward = self._task1_multistep_reward(extras, row)
                 events.append((0.0, task1_batch, row, "step1", reward))
 
             for turn_i, t2_b, row in t2_rows:
@@ -1569,7 +1568,7 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
                     t3_b,
                     row,
                     "step6",
-                    _ex(t3_b, 3, "task3_step6_reward", [row], default=_ex(t3_b, 3, "task3_step5_reward", [row], 0.0)),
+                    self._task3_multistep_reward((t3_b.meta_info or {}).get("task3_reward_extra_info", {}), row),
                 ))
 
             return sorted(events, key=lambda x: x[0])
@@ -1577,7 +1576,9 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         def _accumulate_outcome(events: list[tuple]) -> None:
             if not events:
                 return
-            outcome = sum(float(reward) for _, _, _, _, reward in events) / max(float(len(events)), eps)
+            outcome = sum(float(reward) for _, _, _, _, reward in events)
+            if average:
+                outcome /= len(events)
             for _, dp, row, event_name, _ in events:
                 _append_outcome(dp, row, event_name, outcome)
 
