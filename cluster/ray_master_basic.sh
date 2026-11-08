@@ -1,4 +1,4 @@
-export MASTER_ADDR=$(hostname -I | awk '{print $1}')
+export MASTER_ADDR=$(hostname -i | awk '{print $1}')
 export MASTER_PORT=6379
 export DASHBOARD_PORT=8265
 export NUM_GPUS=8

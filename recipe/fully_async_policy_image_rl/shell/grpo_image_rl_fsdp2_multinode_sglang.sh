@@ -14,7 +14,7 @@ exec 2>&1
 #                         EXPERIMENT CONFIGURATION
 ###############################################################################
 project_name='mllm_reasoning'
-exp_name="${EXP_NAME:-0905_KT_multi_step_final_image_reward}"
+exp_name="${EXP_NAME:-0912_KT_multi_step_aggregate_sum_reward}"
 # exp_name="0423_debug"
 task_ids='[1,2,3]'
 
@@ -262,12 +262,12 @@ bypass_mode=false
 #                         TRAINING SCHEDULE
 ###############################################################################
 total_epochs="${TOTAL_EPOCHS:-10}"
-test_freq="${TEST_FREQ:-250}"
-save_freq="${SAVE_FREQ:-500}"
-rollout_freq="${ROLLOUT_FREQ:-250}"
+test_freq="${TEST_FREQ:-500}"
+save_freq="${SAVE_FREQ:-250}"
+rollout_freq="${ROLLOUT_FREQ:-500}"
 trainer_logger="${TRAINER_LOGGER:-['console','wandb']}"
 resume_mode="${RESUME_MODE:-auto}"
-val_before_train="${VAL_BEFORE_TRAIN:-True}"
+val_before_train="${VAL_BEFORE_TRAIN:-False}"
 # total_training_steps=3000
 # log_val_generations=20
 

@@ -1,0 +1,1783 @@
+# Copyright 2024 Bytedance Ltd. and/or its affiliates
+# Copyright 2023-2024 SGLang Team
+# Copyright 2025 ModelBest Inc. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""
+PPO Trainer with Ray-based single controller.
+This trainer supports model-agonistic model initialization with huggingface
+"""
+
+import uuid
+from copy import deepcopy
+from pprint import pprint
+from typing import Any, Dict, Optional, Type
+
+import numpy as np
+import ray
+import torch
+import wandb
+from omegaconf import OmegaConf
+from tqdm import tqdm
+
+from verl import DataProto
+from verl.experimental.dataset.sampler import AbstractCurriculumSampler
+from verl.single_controller.ray import RayClassWithInitArgs
+from verl.single_controller.ray.base import create_colocated_worker_cls
+from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
+from verl.trainer.config import AlgoConfig
+from recipe.image_rl import core_algos
+from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+from recipe.image_rl.core_algos import AdvantageEstimator, agg_loss
+from recipe.image_rl.custom_metric_utils import ( # custom metric
+    compute_data_metrics,
+    compute_throughout_metrics,
+    compute_timing_metrics,
+    compute_group_reward_metrics,
+    process_validation_metrics,
+    reduce_metrics,
+)
+from verl.trainer.ppo.utils import Role
+from verl.utils.checkpoint.checkpoint_manager import should_save_ckpt_esi
+from verl.utils.config import omega_conf_to_dataclass
+from verl.utils.debug import marked_timer
+from verl.utils.rollout_skip import RolloutSkip
+from verl.utils.torch_functional import masked_mean
+from recipe.image_rl.ray_image_generation_trainer import RayImageGenerationTrainer
+from recipe.image_rl import core_algos
+import asyncio
+import uuid
+from collections import defaultdict
+
+
+def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl", task_id: int = 1):
+    """Apply KL penalty to the token-level rewards.
+
+    This function computes the KL divergence between the reference policy and current policy,
+    then applies a penalty to the token-level rewards based on this divergence.
+
+    Args:
+        data (DataProto): The data containing batched model outputs and inputs.
+        kl_ctrl (core_algos.AdaptiveKLController): Controller for adaptive KL penalty.
+        kl_penalty (str, optional): Type of KL penalty to apply. Defaults to "kl".
+
+    Returns:
+        tuple: A tuple containing:
+            - The updated data with token-level rewards adjusted by KL penalty
+            - A dictionary of metrics related to the KL penalty
+    """
+    response_mask = data.batch[f"task{task_id}_response_mask"]
+    token_level_scores = data.batch[f"task{task_id}_token_level_scores"]
+    batch_size = data.batch.batch_size[0]
+
+    # compute kl between ref_policy and current policy
+    # When apply_kl_penalty, algorithm.use_kl_in_reward=True, so the reference model has been enabled.
+    kld = core_algos.kl_penalty(
+        data.batch[f"task{task_id}_old_log_probs"], data.batch[f"task{task_id}_ref_log_prob"], kl_penalty=kl_penalty
+    )  # (batch_size, response_length)
+    kld = kld * response_mask
+    beta = kl_ctrl.value
+
+    token_level_rewards = token_level_scores - beta * kld
+
+    current_kl = masked_mean(kld, mask=response_mask, axis=-1)  # average over sequence
+    current_kl = torch.mean(current_kl, dim=0).item()
+
+    # according to https://github.com/huggingface/trl/blob/951ca1841f29114b969b57b26c7d3e80a39f75a0/trl/trainer/ppo_trainer.py#L837
+    kl_ctrl.update(current_kl=current_kl, n_steps=batch_size)
+    data.batch[f"task{task_id}_token_level_rewards"] = token_level_rewards
+
+    metrics = {f"actor/task{task_id}_reward_kl_penalty": current_kl, f"actor/task{task_id}_reward_kl_penalty_coeff": beta}
+
+    return data, metrics
+
+
+def _compute_grpo_group_index(data: DataProto) -> np.ndarray:
+    """Build the GRPO grouping index as composite `(uid, turn_idx)` so that
+    turn-0 and turn-1 rollouts of the same prompt are NOT collapsed into one
+    group. Different turns represent different policy inputs (turn 1 sees the
+    edited image from turn 0's regen, not the original), so their advantages
+    must be normalized within-turn — otherwise cross-turn variance dominates
+    and the relative ranking within a single turn is lost.
+
+    Falls back to raw `uid` if `turn_idx` is missing (single-turn legacy).
+    """
+    if "grpo_group_id" in data.non_tensor_batch:
+        return np.asarray(data.non_tensor_batch["grpo_group_id"], dtype=object)
+
+    uids = data.non_tensor_batch["uid"]
+    turn_idx_arr = None
+    if "turn_idx" in data.batch:
+        t = data.batch["turn_idx"]
+        turn_idx_arr = t.detach().cpu().numpy() if hasattr(t, "detach") else np.asarray(t)
+    elif "turn_idx" in data.non_tensor_batch:
+        turn_idx_arr = np.asarray(data.non_tensor_batch["turn_idx"])
+    if turn_idx_arr is None:
+        return uids
+    return np.array([f"{u}_t{int(t)}" for u, t in zip(uids, turn_idx_arr)], dtype=object)
+
+
+def _normalize_scores_by_group(
+    scores: torch.Tensor,
+    index: np.ndarray,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+) -> torch.Tensor:
+    id2score = defaultdict(list)
+    id2mean = {}
+    id2std = {}
+    out = scores.clone()
+    with torch.no_grad():
+        for i in range(out.shape[0]):
+            id2score[index[i]].append(out[i])
+        for idx, vals in id2score.items():
+            if len(vals) == 1:
+                id2mean[idx] = torch.tensor(0.0, device=out.device, dtype=out.dtype)
+                id2std[idx] = torch.tensor(1.0, device=out.device, dtype=out.dtype)
+            else:
+                stacked = torch.stack(vals)
+                id2mean[idx] = torch.mean(stacked)
+                id2std[idx] = torch.std(stacked)
+        for i in range(out.shape[0]):
+            if norm_adv_by_std_in_grpo:
+                out[i] = (out[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
+            else:
+                out[i] = out[i] - id2mean[index[i]]
+    return out
+
+
+def _compute_task2_segmentwise_grpo_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    segment_mask: torch.Tensor,
+    index: np.ndarray,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Normalize task2 MDP returns independently for step2/3/4/5 segments."""
+    response_mask = (response_mask > 0).to(token_level_rewards.dtype)
+    advantages = torch.zeros_like(token_level_rewards, dtype=torch.float32)
+    returns = torch.zeros_like(token_level_rewards, dtype=torch.float32)
+    for seg_id in (2, 3, 4, 5):
+        seg_mask = ((segment_mask == seg_id).to(token_level_rewards.dtype) * response_mask)
+        if float(seg_mask.sum().item()) <= 0.0:
+            continue
+        seg_scores = (token_level_rewards * seg_mask).sum(dim=-1)
+        seg_adv = _normalize_scores_by_group(
+            seg_scores,
+            index=index,
+            epsilon=epsilon,
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+        ).to(advantages.dtype)
+        advantages = advantages + seg_adv.unsqueeze(-1) * seg_mask
+        returns = returns + seg_adv.unsqueeze(-1) * seg_mask
+    return advantages, returns
+
+
+def compute_advantage(
+    data: DataProto,
+    adv_estimator: AdvantageEstimator,
+    gamma: float = 1.0,
+    lam: float = 1.0,
+    num_repeat: int = 1,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional[AlgoConfig] = None,
+    task_id: int = 1
+) -> DataProto:
+    """Compute advantage estimates for policy optimization.
+
+    This function computes advantage estimates using various estimators like GAE, GRPO, REINFORCE++, etc.
+    The advantage estimates are used to guide policy optimization in RL algorithms.
+
+    Args:
+        data (DataProto): The data containing batched model outputs and inputs.
+        adv_estimator (AdvantageEstimator): The advantage estimator to use (e.g., GAE, GRPO, REINFORCE++).
+        gamma (float, optional): Discount factor for future rewards. Defaults to 1.0.
+        lam (float, optional): Lambda parameter for GAE. Defaults to 1.0.
+        num_repeat (int, optional): Number of times to repeat the computation. Defaults to 1.
+        norm_adv_by_std_in_grpo (bool, optional): Whether to normalize advantages by standard deviation in
+            GRPO. Defaults to True.
+        config (dict, optional): Configuration dictionary for algorithm settings. Defaults to None.
+
+    Returns:
+        DataProto: The updated data with computed advantages and returns.
+    """
+    if adv_estimator != AdvantageEstimator.GRPO:
+        raise ValueError(
+            f"[compute_advantage] Only GRPO is supported in this recipe "
+            f"(task_skip has been removed). Got: {adv_estimator}"
+        )
+
+    grpo_calculation_mask = data.batch[f"task{task_id}_response_mask"]
+    group_index = _compute_grpo_group_index(data)
+    if task_id == 2 and "task2_segment_mask" in data.batch:
+        advantages, returns = _compute_task2_segmentwise_grpo_advantage(
+            token_level_rewards=data.batch[f"task{task_id}_token_level_rewards"],
+            response_mask=grpo_calculation_mask,
+            segment_mask=data.batch["task2_segment_mask"],
+            index=group_index,
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+        )
+        local_adv_weight = 0.0
+        if config is not None:
+            local_adv_weight = float(config.get("task2_local_adv_weight", 0.0))
+        if local_adv_weight != 0.0 and "task2_local_token_level_scores" in data.batch:
+            local_advantages, _ = _compute_task2_segmentwise_grpo_advantage(
+                token_level_rewards=data.batch["task2_local_token_level_scores"],
+                response_mask=grpo_calculation_mask,
+                segment_mask=data.batch["task2_segment_mask"],
+                index=group_index,
+                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            )
+            advantages = advantages + local_adv_weight * local_advantages
+    else:
+        advantages, returns = core_algos.compute_grpo_outcome_advantage(
+            token_level_rewards=data.batch[f"task{task_id}_token_level_rewards"],
+            response_mask=grpo_calculation_mask,
+            index=group_index,
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+        )
+    data.batch[f"task{task_id}_advantages"] = advantages
+    data.batch[f"task{task_id}_returns"] = returns
+
+    return data
+
+
+class FullyAsyncRayPPOTrainer(RayImageGenerationTrainer):
+    _TRAIN_RPC_META_KEYS = (
+        "temperature",
+        "cfg_weight",
+        "txt_top_k",
+        "txt_top_p",
+        "img_top_k",
+        "img_top_p",
+        "global_token_num",
+        "multi_turn",
+        "is_lora",
+        "_verl_auto_padding",
+    )
+
+    @staticmethod
+    def _present_keys(available_keys, keys):
+        seen = set()
+        selected = []
+        for key in keys:
+            if key in available_keys and key not in seen:
+                selected.append(key)
+                seen.add(key)
+        return selected
+
+    def _select_train_rpc_meta_keys(self, batch: DataProto) -> list[str]:
+        meta_info = getattr(batch, "meta_info", None) or {}
+        return [key for key in self._TRAIN_RPC_META_KEYS if key in meta_info]
+
+    @staticmethod
+    def _ensure_task_context_alias(batch: DataProto, task_id: int):
+        available = set(batch.batch.keys())
+        if task_id == 2 and "task2_task1_gen_imgs_pixel_values" not in available:
+            for src_key in ("current_imgs_pixel_values", "task1_gen_imgs_pixel_values"):
+                if src_key in batch.batch.keys():
+                    batch.batch["task2_task1_gen_imgs_pixel_values"] = batch.batch[src_key]
+                    break
+        elif task_id == 3:
+            if "task3_task1_gen_img_tokens" not in available:
+                if "task3_input_img_tokens" in batch.batch.keys():
+                    batch.batch["task3_task1_gen_img_tokens"] = batch.batch["task3_input_img_tokens"]
+
+    @staticmethod
+    def _set_task_context_alias_from_source(target: DataProto, source: DataProto, task_id: int):
+        if target.batch is None or source.batch is None:
+            return
+
+        if task_id == 2 and "task2_task1_gen_imgs_pixel_values" not in target.batch.keys():
+            for src_key in (
+                "task2_task1_gen_imgs_pixel_values",
+                "current_imgs_pixel_values",
+                "task1_gen_imgs_pixel_values",
+            ):
+                if src_key in source.batch.keys():
+                    target.batch["task2_task1_gen_imgs_pixel_values"] = source.batch[src_key]
+                    break
+        elif task_id == 3 and "task3_task1_gen_img_tokens" not in target.batch.keys():
+            for src_key in ("task3_task1_gen_img_tokens", "task3_input_img_tokens"):
+                if src_key in source.batch.keys():
+                    target.batch["task3_task1_gen_img_tokens"] = source.batch[src_key]
+                    break
+
+    def _select_log_prob_rpc_batch(self, batch: DataProto, task_id: int) -> DataProto:
+        """Build a small DataProto for actor/ref log-prob RPCs."""
+        self._ensure_task_context_alias(batch, task_id)
+        available = set(batch.batch.keys())
+        keys = [
+            f"task{task_id}_input_ids",
+            f"task{task_id}_attention_mask",
+            f"task{task_id}_response_mask",
+            "task_id",
+        ]
+
+        non_tensor_keys = []
+        if task_id == 1:
+            keys.append("task1_gen_img_tokens")
+        elif task_id == 2:
+            keys.append("task2_feedback_ids")
+            if "task2_segment_mask" in available:
+                keys.append("task2_segment_mask")
+            if "task2_task1_gen_imgs_pixel_values" in available:
+                keys.append("task2_task1_gen_imgs_pixel_values")
+            else:
+                keys.append("task1_gen_imgs_pixel_values")
+            non_tensor_keys.append("task2_feedback_texts")
+        elif task_id == 3:
+            keys.append("task3_regen_img_tokens")
+            if "task3_task1_gen_img_tokens" in available:
+                keys.append("task3_task1_gen_img_tokens")
+        else:
+            raise ValueError(f"Invalid task_id: {task_id}")
+
+        available_non_tensor = set((getattr(batch, "non_tensor_batch", None) or {}).keys())
+        return batch.select(
+            batch_keys=self._present_keys(available, keys),
+            non_tensor_batch_keys=self._present_keys(available_non_tensor, non_tensor_keys),
+            meta_info_keys=self._select_train_rpc_meta_keys(batch),
+        )
+
+    def _select_actor_update_rpc_batch(self, batch: DataProto) -> DataProto:
+        """Build a small DataProto for update_actor RPC."""
+        available = set(batch.batch.keys())
+        actor_cfg = self.config.actor_rollout_ref.actor
+        multi_task_cfg = actor_cfg.get("multi_task", {})
+        task_ids = list(multi_task_cfg.get("task_ids", [1, 2, 3]))
+        task_ids = [task_id for task_id in task_ids if f"task{task_id}_advantages" in available]
+        for task_id in task_ids:
+            self._ensure_task_context_alias(batch, task_id)
+        available = set(batch.batch.keys())
+
+        keys = []
+        for task_id in task_ids:
+            keys.extend(
+                [
+                    f"task{task_id}_input_ids",
+                    f"task{task_id}_attention_mask",
+                    f"task{task_id}_response_mask",
+                    f"task{task_id}_old_log_probs",
+                    f"task{task_id}_advantages",
+                ]
+            )
+            if task_id == 1:
+                keys.append("task1_gen_img_tokens")
+            elif task_id == 2:
+                keys.append("task2_feedback_ids")
+                if "task2_segment_mask" in available:
+                    keys.append("task2_segment_mask")
+                if "task2_task1_gen_imgs_pixel_values" in available:
+                    keys.append("task2_task1_gen_imgs_pixel_values")
+                else:
+                    keys.append("task1_gen_imgs_pixel_values")
+            elif task_id == 3:
+                keys.append("task3_regen_img_tokens")
+                if "task3_task1_gen_img_tokens" in available:
+                    keys.append("task3_task1_gen_img_tokens")
+
+            if actor_cfg.get("use_kl_loss", False):
+                keys.append(f"task{task_id}_ref_log_prob")
+            if f"task{task_id}_rollout_is_weights" in available:
+                keys.append(f"task{task_id}_rollout_is_weights")
+
+        if "task_id" in available:
+            keys.append("task_id")
+
+        available_non_tensor = set((getattr(batch, "non_tensor_batch", None) or {}).keys())
+        return batch.select(
+            batch_keys=self._present_keys(available, keys),
+            non_tensor_batch_keys=self._present_keys(available_non_tensor, ["uid"]),
+            meta_info_keys=self._select_train_rpc_meta_keys(batch),
+        )
+
+    def _select_multi_log_prob_rpc_batch(self, task_batches: dict[int, DataProto]) -> DataProto:
+        tensors = {}
+        non_tensors = {}
+        meta_info = {}
+        task_ids = []
+
+        for task_id, batch in task_batches.items():
+            if f"task{task_id}_input_ids" not in batch.batch.keys():
+                continue
+            task_ids.append(task_id)
+            selected = self._select_log_prob_rpc_batch(batch, task_id)
+            for key, value in selected.batch.items():
+                if key == "task_id":
+                    continue
+                out_key = key
+                if task_id == 2 and key == "task1_gen_imgs_pixel_values":
+                    out_key = "task2_task1_gen_imgs_pixel_values"
+                tensors[out_key] = value
+            for key, value in selected.non_tensor_batch.items():
+                non_tensors[key] = value
+            for key, value in selected.meta_info.items():
+                meta_info.setdefault(key, value)
+
+        meta_info["multi_task_log_prob_task_ids"] = task_ids
+        return DataProto.from_dict(tensors=tensors, non_tensors=non_tensors, meta_info=meta_info)
+
+    def _apply_rollout_corr_to_existing_old_log_prob(self, batch, task_id, metrics):
+        rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
+        if not (rollout_corr_config and rollout_corr_config.get("rollout_is", None) is not None):
+            return batch
+
+        from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
+
+        batch.batch["old_log_probs"] = batch.batch[f"task{task_id}_old_log_probs"]
+        batch.batch["rollout_log_probs"] = batch.batch[f"task{task_id}_rollout_log_probs"]
+        batch.batch["response_mask"] = batch.batch[f"task{task_id}_response_mask"]
+
+        batch, corr_metrics = compute_rollout_correction_and_add_to_batch(batch, rollout_corr_config)
+
+        batch.batch[f"task{task_id}_response_mask"] = batch.batch.pop("response_mask")
+        batch.batch[f"task{task_id}_old_log_probs"] = batch.batch.pop("old_log_probs")
+        batch.batch.pop("rollout_log_probs")
+        if "rollout_is_weights" in batch.batch:
+            batch.batch[f"task{task_id}_rollout_is_weights"] = batch.batch.pop("rollout_is_weights")
+
+        metrics.update({f"rollout_corr/task{task_id}/{k}": v for k, v in corr_metrics.items()})
+        return batch
+
+    def _compute_old_log_probs_for_task_batches(self, task_batches, metrics, timing_raw, local_trigger_step=None):
+        task_ids = [task_id for task_id in task_batches if f"task{task_id}_response_mask" in task_batches[task_id].batch.keys()]
+        if not task_ids:
+            return task_batches
+
+        with marked_timer("old_log_prob", timing_raw, color="blue"):
+            async_training = self.config.get("async_training", None)
+            rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
+            use_rollout_log_probs = bool(async_training and async_training.use_rollout_log_probs)
+            needs_recompute = (
+                not use_rollout_log_probs
+                or local_trigger_step is not None
+                or bool(rollout_corr_config and rollout_corr_config.get("rollout_is", None) is not None)
+            )
+
+            if needs_recompute:
+                def compute_multi_old_log_prob(selected_task_ids):
+                    log_prob_batch = self._select_multi_log_prob_rpc_batch(
+                        {tid: task_batches[tid] for tid in selected_task_ids}
+                    )
+                    return self.actor_rollout_wg.compute_multi_task_log_prob(log_prob_batch)
+
+                def compute_old_log_probs_by_task():
+                    grouped_task_ids = {}
+                    for task_id in task_ids:
+                        grouped_task_ids.setdefault(len(task_batches[task_id]), []).append(task_id)
+
+                    outputs_by_task = {}
+                    for selected_task_ids in grouped_task_ids.values():
+                        output = compute_multi_old_log_prob(selected_task_ids)
+                        for task_id in selected_task_ids:
+                            outputs_by_task[task_id] = output
+                    return outputs_by_task
+
+                if use_rollout_log_probs and local_trigger_step == 1:
+                    self.actor_rollout_wg.save_model_to_cpu(1)
+                    old_log_prob_by_task = compute_old_log_probs_by_task()
+                elif use_rollout_log_probs and local_trigger_step is not None:
+                    self.actor_rollout_wg.save_model_to_cpu(local_trigger_step)
+                    self.actor_rollout_wg.restore_model_from_cpu(1)
+                    old_log_prob_by_task = compute_old_log_probs_by_task()
+                    self.actor_rollout_wg.restore_model_from_cpu(local_trigger_step)
+                    self.actor_rollout_wg.clear_cpu_model(local_trigger_step)
+                else:
+                    old_log_prob_by_task = compute_old_log_probs_by_task()
+
+                for task_id in task_ids:
+                    old_log_prob = old_log_prob_by_task.get(task_id)
+                    if old_log_prob is None:
+                        continue
+                    gen_meta = {
+                        k: old_log_prob.meta_info[k] for k in old_log_prob.meta_info if k in self._TRAIN_RPC_META_KEYS
+                    }
+                    old_key = f"task{task_id}_old_log_probs"
+                    entropy_key = f"task{task_id}_entropys"
+                    if old_key not in old_log_prob.batch.keys():
+                        continue
+
+                    task_batch = task_batches[task_id]
+                    prompt_valid_rows = None
+                    prompt_original_response_mask = None
+                    validity_key = f"task{task_id}_prompt_valid_mask"
+                    if validity_key in old_log_prob.batch.keys():
+                        valid_rows = old_log_prob.batch[validity_key].to(dtype=torch.bool)
+                        if valid_rows.ndim != 1 or valid_rows.shape[0] != len(task_batch):
+                            raise ValueError(
+                                f"{validity_key} shape {tuple(valid_rows.shape)} does not match batch {len(task_batch)}"
+                            )
+                        response_key = f"task{task_id}_response_mask"
+                        response_mask = task_batch.batch[response_key]
+                        prompt_valid_rows = valid_rows.to(response_mask.device)
+                        prompt_original_response_mask = response_mask
+                        task_batch.batch[response_key] = (
+                            response_mask * valid_rows.to(response_mask.device).unsqueeze(-1)
+                        )
+                        task_batch.batch[validity_key] = valid_rows
+                        invalid_rows = int((~valid_rows).sum().item())
+                        metrics[f"training/task{task_id}_invalid_prompt_rows"] = invalid_rows
+                        metrics[f"training/task{task_id}_invalid_prompt_fraction"] = invalid_rows / max(len(task_batch), 1)
+                        if invalid_rows:
+                            invalid_indices = (~valid_rows).nonzero(as_tuple=False).view(-1).tolist()
+                            logger.warning(
+                                "task%s: excluding %s/%s truncated prompt rows before rollout correction; indices=%s",
+                                task_id, invalid_rows, len(task_batch), invalid_indices[:16],
+                            )
+
+                    if entropy_key in old_log_prob.batch.keys():
+                        entropys = old_log_prob.batch[entropy_key]
+                        response_masks = task_batch.batch[f"task{task_id}_response_mask"]
+                        loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
+                        entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
+                        metrics[f"actor/task{task_id}_old_entropy"] = entropy_agg.detach().item()
+
+                    task_old = DataProto.from_dict(tensors={old_key: old_log_prob.batch[old_key]}, meta_info=gen_meta)
+                    task_batch = task_batch.union(task_old)
+                    if use_rollout_log_probs:
+                        task_batch = self._apply_rollout_corr_to_existing_old_log_prob(task_batch, task_id, metrics)
+
+                    if f"task{task_id}_rollout_log_probs" in task_batch.batch.keys():
+                        from recipe.image_rl.debug_metrics import calculate_debug_metrics
+
+                        metrics.update(calculate_debug_metrics(task_batch, task_id=task_id))
+                    if prompt_valid_rows is not None:
+                        # Use this mask only for entropy/IS diagnostics. GRPO
+                        # still sees every rollout reward; DPActor reapplies the
+                        # validity mask immediately before computing actor loss.
+                        corrected_response_mask = task_batch.batch[response_key]
+                        task_batch.batch[response_key] = torch.where(
+                            prompt_valid_rows.unsqueeze(-1),
+                            corrected_response_mask,
+                            prompt_original_response_mask,
+                        )
+                    task_batches[task_id] = task_batch
+            else:
+                for task_id in task_ids:
+                    task_batch = task_batches[task_id]
+                    task_batch.batch[f"task{task_id}_old_log_probs"] = task_batch.batch[f"task{task_id}_rollout_log_probs"]
+                    task_batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+                    task_batch.meta_info["cfg_weight"] = getattr(self.config.actor_rollout_ref.rollout, "cfg_weight", 5.0)
+                    task_batches[task_id] = task_batch
+
+        return task_batches
+
+    def _compute_ref_log_probs_for_task_batches(self, task_batches, timing_raw):
+        if not self.use_reference_policy:
+            return task_batches
+
+        task_ids = [task_id for task_id in task_batches if f"task{task_id}_response_mask" in task_batches[task_id].batch.keys()]
+        if not task_ids:
+            return task_batches
+
+        with marked_timer("ref", timing_raw, color="olive"):
+            grouped_task_ids = {}
+            for task_id in task_ids:
+                grouped_task_ids.setdefault(len(task_batches[task_id]), []).append(task_id)
+
+            ref_log_prob_by_task = {}
+            for selected_task_ids in grouped_task_ids.values():
+                ref_batch = self._select_multi_log_prob_rpc_batch({tid: task_batches[tid] for tid in selected_task_ids})
+                if not self.ref_in_actor:
+                    ref_log_prob = self.ref_policy_wg.compute_multi_task_ref_log_prob(ref_batch)
+                else:
+                    ref_log_prob = self.actor_rollout_wg.compute_multi_task_ref_log_prob(ref_batch)
+                for task_id in selected_task_ids:
+                    ref_log_prob_by_task[task_id] = ref_log_prob
+
+            for task_id in task_ids:
+                ref_log_prob = ref_log_prob_by_task.get(task_id)
+                if ref_log_prob is None:
+                    continue
+                ref_key = f"task{task_id}_ref_log_prob"
+                if ref_key not in ref_log_prob.batch.keys():
+                    continue
+                task_ref = DataProto.from_dict(tensors={ref_key: ref_log_prob.batch[ref_key]})
+                task_batches[task_id] = task_batches[task_id].union(task_ref)
+
+        return task_batches
+
+    def _restore_reward_extra_infos_for_logging(self, batch: DataProto, task_id: int) -> dict:
+        """Expose nested task reward extras as legacy flat fields so existing
+        metric collectors and rollout dump code can see them.
+
+        Returns the nested reward-extra dict for convenience.
+        """
+        reward_extra_infos_dict = batch.meta_info.get(f"task{task_id}_reward_extra_info", {})
+        batch_size = len(batch)
+        for key, nested in list(batch.meta_info.items()):
+            if not (key.startswith("task") and key.endswith("_reward_extra_info")):
+                continue
+            if not isinstance(nested, dict) or not nested:
+                continue
+            for k, v in nested.items():
+                batch.meta_info[k] = v
+                try:
+                    arr = np.array(v, dtype=object)
+                except Exception:
+                    continue
+                if arr.ndim >= 1 and arr.shape[0] == batch_size:
+                    batch.non_tensor_batch[k] = arr
+        return reward_extra_infos_dict
+
+    def init_workers(self):
+        """Initialize distributed training workers using Ray backend.
+
+        Creates:
+        1. Ray resource pools from configuration
+        2. Worker groups for each role (actor, critic, etc.)
+        """
+        self._init_resource_pools()
+        self._create_worker_classes()
+        self._init_worker_groups()
+        self._init_models()
+        self._init_async_rollout_manager()
+
+    def _init_resource_pools(self):
+        self.resource_pool_manager.create_resource_pool()
+
+        self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
+
+    def _create_worker_classes(self):
+        self._create_actor_rollout_classes()
+        self._create_critic_class()
+        self._create_reference_policy_class()
+        self._create_reward_model_class()
+
+    def _create_actor_rollout_classes(self):
+        raise NotImplementedError
+
+    def _create_critic_class(self):
+        # create critic
+        if self.use_critic:
+            resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
+            critic_cfg = omega_conf_to_dataclass(self.config.critic)
+            critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=critic_cfg)
+            self.resource_pool_to_cls[resource_pool][str(Role.Critic)] = critic_cls
+
+    def _create_reference_policy_class(self):
+        # create reference policy if needed
+        if self.use_reference_policy:
+            resource_pool = self.resource_pool_manager.get_resource_pool(Role.RefPolicy)
+            ref_policy_cls = RayClassWithInitArgs(
+                self.role_worker_mapping[Role.RefPolicy],
+                config=self.config.actor_rollout_ref,
+                role=str(Role.RefPolicy),
+                # profile_option=self.config.trainer.npu_profile.options,
+            )
+            self.resource_pool_to_cls[resource_pool][str(Role.RefPolicy)] = ref_policy_cls
+
+    def _create_reward_model_class(self):
+        # create a reward model if reward_fn is None
+        if self.use_rm:
+            # we create a RM here
+            resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel)
+            rm_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.RewardModel], config=self.config.reward_model)
+            self.resource_pool_to_cls[resource_pool][str(Role.RewardModel)] = rm_cls
+
+    def _init_worker_groups(self):
+        # initialize WorkerGroup
+        # NOTE: if you want to use a different resource pool for each role, which can support different parallel size,
+        # you should not use `create_colocated_worker_cls`.
+        # Instead, directly pass different resource pool to different worker groups.
+        # See https://github.com/volcengine/verl/blob/master/examples/ray/tutorial.ipynb for more information.
+        all_wg = {}
+        wg_kwargs = {}  # Setting up kwargs for RayWorkerGroup
+        if OmegaConf.select(self.config.trainer, "ray_wait_register_center_timeout") is not None:
+            wg_kwargs["ray_wait_register_center_timeout"] = self.config.trainer.ray_wait_register_center_timeout
+        if OmegaConf.select(self.config.global_profiler, "steps") is not None:
+            wg_kwargs["profile_steps"] = OmegaConf.select(self.config.global_profiler, "steps")
+            # Only require nsight worker options when tool is nsys
+            if OmegaConf.select(self.config.global_profiler, "tool") == "nsys":
+                assert (
+                    OmegaConf.select(self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options")
+                    is not None
+                ), "worker_nsight_options must be set when using nsys with profile_steps"
+                wg_kwargs["worker_nsight_options"] = OmegaConf.to_container(
+                    OmegaConf.select(self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options")
+                )
+        wg_kwargs["device_name"] = self.device_name
+
+        for resource_pool, class_dict in self.resource_pool_to_cls.items():
+            worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
+            wg_dict = self.ray_worker_group_cls(
+                resource_pool=resource_pool,
+                ray_cls_with_init=worker_dict_cls,
+                **wg_kwargs,
+            )
+            spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
+            all_wg.update(spawn_wg)
+        self.all_wg = all_wg
+
+    def _init_models(self):
+        if self.use_critic:
+            self.critic_wg = self.all_wg[str(Role.Critic)]
+            self.critic_wg.init_model()
+
+        if self.use_reference_policy and not self.ref_in_actor:
+            self.ref_policy_wg = self.all_wg[str(Role.RefPolicy)]
+            self.ref_policy_wg.init_model()
+
+        if self.use_rm:
+            self.rm_wg = self.all_wg[str(Role.RewardModel)]
+            self.rm_wg.init_model()
+
+        # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
+        self.actor_rollout_wg = self.all_wg[str(Role.ActorRollout)]
+        self.actor_rollout_wg.init_model()
+
+    async def _init_async_rollout_manager(self):
+        # create async rollout manager and request scheduler
+        assert self.config.actor_rollout_ref.rollout.mode == "async"
+        from recipe.fully_async_policy_image_rl.agent_loop import FullyAsyncAgentLoopManager
+
+        self.async_rollout_mode = True
+        self.async_rollout_manager = await FullyAsyncAgentLoopManager.create(
+            config=self.config,
+            worker_group=self.rollout_wg,
+        )
+        num_servers = len(self.async_rollout_manager.server_handles)
+        self.server_token_q = asyncio.Queue()
+        for sid in range(num_servers):
+            self.server_token_q.put_nowait(sid)
+
+        self.server_applied_versions = [-1] * num_servers
+
+    async def _wait_server_idle(self, sid: int):
+        while True:
+            ref = self.async_rollout_manager.server_handles[sid].get_weight_update_status.remote()
+            st = await ref
+            if st.get("ongoing_generations", 0) == 0:
+                return
+            await asyncio.sleep(0.01)
+
+    async def _validate_async(self) -> dict:
+        """Perform asynchronous validation on the validation dataset.
+
+        This function uses a producer-processor-finalizer pipeline:
+        1. Producer: Reads validation batches and merges them for efficient generation
+        2. Processor: Dispatches generation tasks to available servers
+        3. Finalizer: Computes rewards and aggregates metrics
+
+        Returns:
+            dict: Validation metrics including per-task scores and sample generations
+        """
+        if self.async_rollout_manager is None:
+            await self._init_async_rollout_manager()
+
+        val_data_dir = self.config.trainer.get("validation_data_dir", "validation")
+
+        num_servers = len(self.async_rollout_manager.server_handles)
+        assert num_servers > 0
+
+        # Merge size (concat multiple val batches for batch generation)
+        val_rollout_prompt_size = int(self.config.async_training.get("val_rollout_prompt_size", 1))
+
+        # Task IDs: only compute rewards for these tasks; rollout runs 1..max(task_ids)
+        task_ids = list(self.config.actor_rollout_ref.actor.multi_task.get("task_ids", [1]))
+        max_rollout_task = max(task_ids)
+        rollout_task_ids = list(range(1, max_rollout_task + 1))
+        # When task_ids=[3], also compute reward for task2 (intermediate step needed for logging)
+        reward_task_ids = [2, 3] if task_ids == [3] else task_ids
+
+        # Limit finalize backlog (memory protection)
+        max_val_finalize_backlog = self.config.async_training.get("max_val_finalize_backlog_samples", None)
+        if max_val_finalize_backlog is None:
+            max_val_finalize_backlog = max(num_servers * val_rollout_prompt_size * 8, num_servers * 16)
+        max_val_finalize_backlog = int(max_val_finalize_backlog)
+
+        # Limit concurrent reward computation (resource protection)
+        max_val_reward_concurrency = int(
+            self.config.async_training.get("max_val_reward_concurrency", max(num_servers * 3, 8))
+        )
+        val_reward_sem = asyncio.Semaphore(max_val_reward_concurrency)
+
+        # Queues for pipeline stages
+        prepared_q = asyncio.Queue(maxsize=max(num_servers * 4, 8))
+        finalize_q = asyncio.Queue(maxsize=max(num_servers * 8, 16))
+
+        # Server tokens (validation-specific pool)
+        val_server_token_q = asyncio.Queue()
+        for sid in range(num_servers):
+            val_server_token_q.put_nowait(sid)
+
+        # Finalize budget tracking (controls memory usage)
+        finalize_cond = asyncio.Condition()
+        finalize_inflight = 0
+
+        async def _acquire_finalize_budget(n: int):
+            """Acquire budget slots to limit finalize queue memory usage."""
+            nonlocal finalize_inflight
+            async with finalize_cond:
+                while finalize_inflight + n > max_val_finalize_backlog:
+                    await finalize_cond.wait()
+                finalize_inflight += n
+
+        async def _release_finalize_budget(n: int):
+            """Release budget slots and notify waiting tasks."""
+            nonlocal finalize_inflight
+            async with finalize_cond:
+                finalize_inflight -= n
+                if finalize_inflight < 0:
+                    finalize_inflight = 0
+                finalize_cond.notify_all()
+
+        # Metric accumulators
+        task_reward_tensors = {1: [], 2: [], 3: []}
+        data_source_lst = []
+        sample_uids = []
+
+        all_reward_extra_infos_batches = []
+
+        # Sample data for logging
+        sample_prompts = []
+        sample_task1_gen_imgs = []
+        sample_task2_feedback_texts = []
+        sample_task3_regen_imgs = []
+        sample_task1_scores = []
+        sample_task2_scores = []
+        sample_task3_scores = []
+
+        async def _val_producer():
+            """Read validation batches and merge them for efficient generation."""
+            batch_list = []
+            batch_idx_list = []
+
+            for val_batch_idx, test_data in enumerate(self.val_dataloader):
+                test_batch = DataProto.from_single_dict(test_data)
+                test_batch.meta_info["validate"] = True
+
+                # Assign unique IDs to each sample
+                test_batch.non_tensor_batch["uid"] = np.array(
+                    [str(uuid.uuid4()) for _ in range(len(test_batch))],
+                    dtype=object,
+                )
+
+                batch_list.append(test_batch)
+                batch_idx_list.append(val_batch_idx)
+
+                if len(batch_list) >= val_rollout_prompt_size:
+                    merged_batch = DataProto.concat(batch_list)
+                    merged_gen_batch = self._get_gen_batch(merged_batch)
+                    merged_gen_batch.meta_info["rollout_task_ids"] = rollout_task_ids
+                    # `_get_gen_batch` drops meta_info; re-stamp validate so
+                    # the agent loop takes the is_validate branch instead of
+                    # the training turn loop.
+                    merged_gen_batch.meta_info["validate"] = True
+                    await prepared_q.put((merged_batch, merged_gen_batch, batch_idx_list))
+                    batch_list = []
+                    batch_idx_list = []
+
+            if batch_list:
+                merged_batch = DataProto.concat(batch_list)
+                merged_gen_batch = self._get_gen_batch(merged_batch)
+                merged_gen_batch.meta_info["rollout_task_ids"] = rollout_task_ids
+                merged_gen_batch.meta_info["validate"] = True
+                await prepared_q.put((merged_batch, merged_gen_batch, batch_idx_list))
+
+            # Send completion signal
+            await prepared_q.put("DONE")
+
+        async def _compute_val_reward_async(task_id: int, batch_result: DataProto, reward_tensor_dict: dict, reward_extra_infos: dict):
+            """Compute rewards for a specific task asynchronously."""
+            # Limit concurrent reward computations with semaphore
+            async with val_reward_sem:
+                try:
+                    from recipe.image_rl.reward import compute_reward_async
+
+                    # Launch async reward computation
+                    future = compute_reward_async.remote(
+                        data=batch_result,
+                        config=self.config,
+                        tokenizer=self.tokenizer,
+                        processor=self.processor,
+                        reward_fn=None,
+                        eval=False,
+                        task_id=task_id
+                    )
+
+                    # Wait for reward computation to complete
+                    reward_result = await asyncio.to_thread(ray.get, future)
+                    reward_tensor, reward_extra_infos_dict = reward_result
+
+                    # Move to CPU for memory stability
+                    reward_tensor_dict[task_id] = reward_tensor
+                    reward_extra_infos[task_id] = reward_extra_infos_dict
+                    return reward_result
+
+                except Exception as e:
+                    print(f"[Rollouter][RewardTask{task_id}] ERROR: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    # Set default values on error to prevent None propagation
+                    reward_tensor_dict[task_id] = torch.zeros((1, 1))
+                    reward_extra_infos[task_id] = {}
+                    return None
+
+
+        async def _val_generate(test_batch: DataProto, test_gen_batch: DataProto, server_index: int, budget_n: int, val_batch_idx_list):
+            """Generate sequences and launch reward tasks immediately via callback."""
+            token_released = False
+            enqueued = False
+
+            try:
+                reward_tensor_dict = {}
+                reward_extra_infos = {}
+                reward_tasks = []
+
+                def on_task_complete(task_id: int, batch_result: DataProto):
+                    # Only compute rewards for tasks we train on (task2 also computed when task_ids=[3])
+                    if int(task_id) not in reward_task_ids:
+                        return None
+                    # Launch reward task immediately when stage completes
+                    reward_task = asyncio.create_task(
+                        _compute_val_reward_async(int(task_id), batch_result, reward_tensor_dict, reward_extra_infos),
+                        name=f"val_reward_task{task_id}",
+                    )
+                    reward_tasks.append(reward_task)
+                    return reward_task
+
+                result_batch = await self.async_rollout_manager.generate_sequences_with_callback_on_server(
+                    test_gen_batch,
+                    server_index=server_index,
+                    on_task_complete=on_task_complete,
+                )
+
+                await self._wait_server_idle(server_index)
+
+                val_server_token_q.put_nowait(server_index)
+                token_released = True
+
+                await finalize_q.put(
+                    (test_batch, result_batch, reward_tensor_dict, reward_extra_infos, reward_tasks, budget_n, val_batch_idx_list)
+                )
+                enqueued = True
+
+            finally:
+                if not token_released:
+                    try:
+                        val_server_token_q.put_nowait(server_index)
+                    except Exception:
+                        pass
+                if not enqueued:
+                    await _release_finalize_budget(budget_n)
+
+        async def _val_processor():
+            """Read from prepared_q and continuously create generation tasks."""
+            gen_tasks = []
+
+            while True:
+                item = await prepared_q.get()
+                try:
+                    if item == "DONE":
+                        break
+
+                    test_batch, test_gen_batch, val_batch_idx_list = item
+                    bs = len(test_gen_batch)
+
+                    # Acquire finalize backlog budget (prevents memory overflow)
+                    await _acquire_finalize_budget(bs)
+
+                    # Acquire server token and create generation task
+                    sid = await val_server_token_q.get()
+                    task = asyncio.create_task(
+                        _val_generate(test_batch, test_gen_batch, sid, bs, val_batch_idx_list),
+                        name="val_generate",
+                    )
+                    gen_tasks.append(task)
+
+                finally:
+                    prepared_q.task_done()
+
+            # Wait for all generation tasks to complete
+            if gen_tasks:
+                results = await asyncio.gather(*gen_tasks, return_exceptions=True)
+                for r in results:
+                    if isinstance(r, Exception):
+                        raise r
+
+            # Send finalize completion signal
+            await finalize_q.put("DONE")
+
+        async def _val_finalize_worker():
+            """Gather rewards and aggregate metrics for logging."""
+            while True:
+                item = await finalize_q.get()
+                try:
+                    if item == "DONE":
+                        break
+
+                    test_batch, result_batch, reward_tensor_dict, reward_extra_infos, reward_tasks, budget_n, _ = item
+
+                    # Wait for all reward tasks and report both raised and caught failures.
+                    results = await asyncio.gather(*reward_tasks, return_exceptions=True)
+                    for reward_task, result in zip(reward_tasks, results):
+                        task_name = reward_task.get_name()
+                        if isinstance(result, Exception):
+                            print(
+                                f"[Validation][{task_name}] reward task exception: {result!r}",
+                                flush=True,
+                            )
+                        elif result is None:
+                            print(
+                                f"[Validation][{task_name}] reward task returned None",
+                                flush=True,
+                            )
+
+                    if 2 in reward_task_ids:
+                        missing = [task_id for task_id in (1, 2) if task_id not in reward_extra_infos]
+                        if missing:
+                            print(
+                                "[Validation][Task2Finalize] missing reward extras for "
+                                f"task_ids={missing}; zero fallback will be used",
+                                flush=True,
+                            )
+
+                    # Finalize task2 after all async reward tasks are done.
+                    # Rollout must not wait for reward, so the agent loop only
+                    # launches raw task2 reward; the no-edit decision target is
+                    # injected here from task1 validation reward.
+                    if 2 in reward_task_ids and 2 in reward_extra_infos:
+                        from recipe.image_rl.reward_function_fine_grained import finalize_task2_reward_extra_info
+
+                        raw_extras = reward_extra_infos.get(2, {}) or {}
+                        task1_extras = reward_extra_infos.get(1, {}) or {}
+                        task1_vqa = task1_extras.get("task1_vqa_reward")
+                        n_rows = len(result_batch)
+
+                        finalized_extras = {}
+                        rewards = []
+                        for row in range(n_rows):
+                            row_stage = {
+                                key: vals[row]
+                                for key, vals in raw_extras.items()
+                                if isinstance(vals, (list, np.ndarray)) and row < len(vals)
+                            }
+                            if isinstance(task1_vqa, (list, np.ndarray)) and row < len(task1_vqa) and task1_vqa[row] is not None:
+                                decision_vqa = float(task1_vqa[row])
+                                decision_source = "task1"
+                            else:
+                                decision_vqa = 0.0
+                                decision_source = "missing"
+
+                            vlm_reward, finalized_row = finalize_task2_reward_extra_info(
+                                row_stage,
+                                decision_vqa=decision_vqa,
+                                decision_source=decision_source,
+                            )
+                            rewards.append(float(finalized_row.get("task2_total_reward", vlm_reward)))
+                            for key, value in finalized_row.items():
+                                finalized_extras.setdefault(key, []).append(value)
+
+                        if "task2_response_mask" in result_batch.batch:
+                            response_mask = result_batch.batch["task2_response_mask"]
+                            reward_tensor = torch.zeros_like(response_mask, dtype=torch.float32)
+                            for row, reward in enumerate(rewards):
+                                valid_response_length = int(response_mask[row].sum().item())
+                                if valid_response_length > 0:
+                                    reward_tensor[row, valid_response_length - 1] = float(reward)
+                            reward_tensor_dict[2] = reward_tensor
+                            reward_extra_infos[2] = finalized_extras
+                    
+                    # Collect data
+                    batch_size = len(result_batch.non_tensor_batch['prompt'])
+                    
+                    # Collect UIDs
+                    uids = result_batch.non_tensor_batch["uid"].tolist()
+                    sample_uids.extend(uids)
+                    
+                    # Collect data sources
+                    data_source = result_batch.non_tensor_batch.get('data_source', ['unknown'] * batch_size)
+                    data_source_lst.extend(data_source)
+
+                    # Save in result batch (use reward_task_ids: includes task2 when task_ids=[3])
+                    for task_id in reward_task_ids:
+                        if task_id not in reward_tensor_dict:
+                            continue
+                        task_reward_tensor = reward_tensor_dict[task_id]
+                        result_batch.batch[f"task{task_id}_token_level_scores"] = task_reward_tensor
+
+                        task_reward_extra_info = reward_extra_infos.get(task_id, {})
+                        for k, v in task_reward_extra_info.items():
+                            if not hasattr(result_batch, "meta_info"):
+                                result_batch.meta_info = {}
+                            result_batch.meta_info[k] = v
+
+                    # No-edit masking: rows whose task2 emitted "No need to
+                    # generate feedback" didn't need task3. Zero the row and
+                    # place a single -100 sentinel at position 0 so per-row
+                    # `.sum(-1)` evaluates to exactly -100 (broadcasting -100
+                    # across every token would scale to -100*L in downstream
+                    # aggregation). response_mask is already zeroed in the
+                    # agent loop val branch.
+                    if 3 in reward_task_ids and "task3_token_level_scores" in result_batch.batch:
+                        from recipe.fully_async_policy_image_rl.agent_loop.agent_loop_hf import _is_edit_sample
+                        fb = result_batch.non_tensor_batch.get("task2_feedback_texts")
+                        if fb is not None:
+                            no_edit_idx = np.where(
+                                np.array([not _is_edit_sample(f) for f in fb])
+                            )[0]
+                            if len(no_edit_idx) > 0:
+                                t3_scores = result_batch.batch["task3_token_level_scores"]
+                                t3_scores[no_edit_idx] = 0
+                                t3_scores[no_edit_idx, 0] = -100
+
+                    # Extend with batch data
+                    batch_scores = {}
+                    batch_reward_extra_infos = defaultdict(list)
+
+                    prompts = result_batch.non_tensor_batch['prompt'].tolist()
+                    sample_prompts.extend(prompts)
+
+                    task1_gen_imgs_pil_list = result_batch.non_tensor_batch['task1_gen_imgs_pil_list']
+                    task1_gen_imgs_pil_list = [wandb.Image(gen_img, caption=prompts[i]) for i, gen_img in enumerate(task1_gen_imgs_pil_list)]
+                    sample_task1_gen_imgs.extend(task1_gen_imgs_pil_list)
+
+                    if 2 in reward_task_ids:
+                        task2_feedback_texts = result_batch.non_tensor_batch.get('task2_feedback_texts', [None] * len(prompts))
+                        if hasattr(task2_feedback_texts, 'tolist'):
+                            task2_feedback_texts = task2_feedback_texts.tolist()
+                        sample_task2_feedback_texts.extend(task2_feedback_texts)
+
+                    if 3 in task_ids:
+                        task3_regen_imgs_pil_list = result_batch.non_tensor_batch.get('task3_regen_imgs_pil_list')
+                        if task3_regen_imgs_pil_list is not None:
+                            task3_regen_imgs_pil_list = [wandb.Image(regen_img, caption=prompts[i]) for i, regen_img in enumerate(task3_regen_imgs_pil_list)]
+                            sample_task3_regen_imgs.extend(task3_regen_imgs_pil_list)
+
+                    # Note: If you skip _log_rollout_data process, need to change keys for dump
+                    # # Add all task scores
+                    # for tid in [1, 2, 3]:
+                    #     key = f"task{tid}_token_level_scores"
+                    #     if key in batch.batch:
+                    #         scores[f"task{tid}_scores"] = batch.batch[key].sum(-1).cpu().tolist()
+
+                    # Extend reward scores, infos for each task (use reward_task_ids: includes task2 when task_ids=[3])
+                    for task_id in reward_task_ids:
+                        if task_id not in reward_tensor_dict:
+                            continue
+                        task_reward_tensor = reward_tensor_dict[task_id]
+                        task_reward_tensors[task_id].append(task_reward_tensor)
+
+                        extra_info = reward_extra_infos.get(task_id, {})
+                        all_reward_extra_infos_batches.append(extra_info)
+
+                        # Compute per-sample scores
+                        per_sample_scores = task_reward_tensor.sum(-1).cpu().tolist()
+                        batch_scores[f"task{task_id}_scores"] = per_sample_scores
+
+                        for k, v in extra_info.items():
+                            batch_reward_extra_infos[k] = v
+
+                        if task_id == 1:
+                            sample_task1_scores.extend(per_sample_scores)
+                        elif task_id == 2:
+                            sample_task2_scores.extend(per_sample_scores)
+                        else:
+                            sample_task3_scores.extend(per_sample_scores)
+
+                    batch_size = len(prompts)
+                    current_v = getattr(self, "current_param_version", self.global_steps)
+                    v_list = [current_v] * batch_size
+                    
+                    is_last_step = self.global_steps >= self.total_training_steps
+                    # Dump validation generations if configured
+                    if (
+                        self.val_reward_fn is not None
+                        and self.config.trainer.test_freq > 0
+                        and (is_last_step or current_v % self.config.trainer.test_freq == 0)
+                    ):
+                        feedback_texts_to_dump = None
+                        if 2 in reward_task_ids:
+                            feedback_texts_to_dump = result_batch.non_tensor_batch.get('task2_feedback_texts')
+                            if feedback_texts_to_dump is not None and hasattr(feedback_texts_to_dump, 'tolist'):
+                                feedback_texts_to_dump = feedback_texts_to_dump.tolist()
+                        regen_imgs_to_dump = result_batch.non_tensor_batch.get('task3_regen_imgs_pil_list') if 3 in task_ids else None
+                        phases_to_dump = result_batch.non_tensor_batch.get("phase")
+                        if phases_to_dump is not None and hasattr(phases_to_dump, "tolist"):
+                            phases_to_dump = phases_to_dump.tolist()
+                        self._dump_generations(
+                            uid=result_batch.non_tensor_batch["uid"].tolist(),
+                            prompt_id=result_batch.non_tensor_batch["prompt_id"].tolist(),
+                            prompt=result_batch.non_tensor_batch["prompt"].tolist(),
+                            gen_imgs_pil_list=result_batch.non_tensor_batch.get('task1_gen_imgs_pil_list'),
+                            feedback_texts=feedback_texts_to_dump,
+                            regen_imgs_pil_list=regen_imgs_to_dump,
+                            gts_imgs=[item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in result_batch],
+                            summarizes=[item.non_tensor_batch.get("reward_model", {}).get("summary", None) for item in result_batch],
+                            gts_tuples=[item.non_tensor_batch.get("reward_model", {}).get("tuple", None) for item in result_batch],
+                            gts_vqas=[item.non_tensor_batch.get("reward_model", {}).get("vqa_question", None) for item in result_batch],
+                            scores=batch_scores,
+                            reward_extra_infos_dict=batch_reward_extra_infos,
+                            sample_versions=v_list,
+                            phases=phases_to_dump,
+                            dump_path=val_data_dir
+                            )
+
+                finally:
+                    if item != "DONE":
+                        await _release_finalize_budget(budget_n)
+                    finalize_q.task_done()
+
+        # Run all pipeline stages and wait for completion
+        producer_t = asyncio.create_task(_val_producer(), name="val_producer")
+        processor_t = asyncio.create_task(_val_processor(), name="val_processor")
+        finalize_t = asyncio.create_task(_val_finalize_worker(), name="val_finalize")
+
+        await producer_t
+        await prepared_q.join()
+
+        await processor_t
+        await finalize_q.join()
+
+        await finalize_t
+
+        # Prepare validation samples for logging
+        # validation_samples = list(zip(
+        #     sample_prompts,
+        #     sample_task1_gen_imgs,
+        #     sample_task2_feedback_texts,
+        #     sample_task3_regen_imgs,
+        #     sample_task1_scores,
+        #     sample_task2_scores,
+        #     sample_task3_scores
+        # ))
+
+        def _flatten_validation_infos(obj, out):
+            for key, value in obj.items():
+                if isinstance(value, dict):
+                    _flatten_validation_infos(value, out)
+                else:
+                    out[key] = value
+
+        # Flatten batched reward_extra_infos. Some entries are nested logging
+        # aliases such as `task3_task2_reward_extra_info -> {task2_*: [...]}`.
+        # Validation metric aggregation expects scalar/list-like values per key,
+        # so recursively flatten nested dicts before merging across batches.
+        reward_extra_infos_dict = {}
+        if all_reward_extra_infos_batches:
+            flattened_batches = []
+            all_keys = set()
+
+            for batch_infos in all_reward_extra_infos_batches:
+                flat_infos = {}
+                _flatten_validation_infos(batch_infos, flat_infos)
+                flattened_batches.append(flat_infos)
+                all_keys.update(flat_infos.keys())
+
+            for key in all_keys:
+                values = []
+                for batch_infos in flattened_batches:
+                    v = batch_infos.get(key, [])
+                    if not isinstance(v, list):
+                        # Single value - need to expand based on batch size.
+                        values.append(v)
+                    else:
+                        values.extend(v)
+                reward_extra_infos_dict[key] = values
+
+        # Compute metrics
+        data_sources = np.array(data_source_lst)
+        data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
+        
+        metric_dict = {}
+        for data_source, var2metric2val in data_src2var2metric2val.items():
+            core_var = "acc" if "acc" in var2metric2val else "reward"
+            for var_name, metric2val in var2metric2val.items():
+                n_max = max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys() if "@" in name], default=0)
+                for metric_name, metric_val in metric2val.items():
+                    if (
+                        (var_name == core_var)
+                        and any(metric_name.startswith(pfx) for pfx in ["mean", "maj", "best"])
+                        and (f"@{n_max}" in metric_name)
+                    ):
+                        metric_sec = "val-core"
+                    else:
+                        metric_sec = "val-aux"
+                    pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
+                    metric_dict[pfx] = metric_val
+        
+        return metric_dict
+
+    def fit(self):
+        """
+        The training loop of PPO.
+        The driver process only need to call the compute functions of the worker group through RPC
+        to construct the PPO dataflow.
+        The light-weight advantage computation is done on the driver process.
+        """
+        from omegaconf import OmegaConf
+
+        from recipe.image_rl.tracking import Tracking
+
+        logger = Tracking(
+            project_name=self.config.trainer.project_name,
+            experiment_name=self.config.trainer.experiment_name,
+            default_backend=self.config.trainer.logger,
+            config=OmegaConf.to_container(self.config, resolve=True),
+        )
+
+        self.global_steps = 0
+
+        # load checkpoint before doing anything
+        self._load_checkpoint()
+
+        # perform validation before training
+        # currently, we only support validation using the reward_function.
+        if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
+            if self.async_rollout_mode:
+                import asyncio
+                val_metrics = asyncio.run(self._validate_async())
+            else:
+                val_metrics = self._validate()
+            assert val_metrics, f"{val_metrics=}"
+            pprint(f"Initial validation metrics: {val_metrics}")
+            logger.log(data=val_metrics, step=self.global_steps)
+            if self.config.trainer.get("val_only", False):
+                return
+
+        if self.config.actor_rollout_ref.rollout.get("skip_rollout", False):
+            rollout_skip = RolloutSkip(self.config, self.actor_rollout_wg)
+            rollout_skip.wrap_generate_sequences()
+
+        # add tqdm
+        progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
+
+        # we start from step 1
+        self.global_steps += 1
+        last_val_metrics = None
+        self.max_steps_duration = 0
+
+        prev_step_profile = False
+        curr_step_profile = (
+            self.global_steps in self.config.global_profiler.steps
+            if self.config.global_profiler.steps is not None
+            else False
+        )
+        next_step_profile = False
+
+        for epoch in range(self.config.trainer.total_epochs):
+            for batch_dict in self.train_dataloader:
+                metrics = {}
+                timing_raw = {}
+
+                with marked_timer("start_profile", timing_raw):
+                    self._start_profiling(
+                        not prev_step_profile and curr_step_profile
+                        if self.config.global_profiler.profile_continuous_steps
+                        else curr_step_profile
+                    )
+
+                batch, gen_batch = self._prepare_generate_batch(batch_dict)
+
+                is_last_step = self.global_steps >= self.total_training_steps
+
+                with marked_timer("step", timing_raw):
+                    # generate a batch
+                    with marked_timer("gen", timing_raw, color="red"):
+                        if not self.async_rollout_mode:
+                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                        else:
+                            gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
+                        timing_raw.update(gen_batch_output.meta_info["timing"])
+                        gen_batch_output.meta_info.pop("timing", None)
+
+                    if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
+                        if self.reward_fn is None:
+                            raise ValueError("A reward_fn is required for REMAX advantage estimation.")
+
+                        with marked_timer("gen_max", timing_raw, color="purple"):
+                            gen_baseline_batch = deepcopy(gen_batch)
+                            gen_baseline_batch.meta_info["do_sample"] = False
+                            if not self.async_rollout_mode:
+                                gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
+                            else:
+                                gen_baseline_output = self.async_rollout_manager.generate_sequences(gen_baseline_batch)
+                            batch = batch.union(gen_baseline_output)
+                            reward_baseline_tensor = self.reward_fn(batch)
+                            reward_baseline_tensor = reward_baseline_tensor.sum(dim=-1)
+
+                            batch.pop(batch_keys=list(gen_baseline_output.batch.keys()))
+
+                            batch.batch["reward_baselines"] = reward_baseline_tensor
+
+                            del gen_baseline_batch, gen_baseline_output
+
+                    batch = self._post_generate_batch(batch, gen_batch_output, metrics)
+                    _task_ids = list(self.config.actor_rollout_ref.actor.multi_task.get("task_ids", [1]))
+                    for task_id in _task_ids:
+                        batch.batch["task_id"] = torch.tensor([task_id for _ in range(len(batch))], dtype=int)
+                        batch = self._process_batch_common(batch, metrics, timing_raw, local_trigger_step=None, task_id=task_id)
+                        # Remove universal keys from batch
+                        batch.pop(batch_keys=["task_id"])
+                    
+                    # update critic
+                    if self.use_critic:
+                        with marked_timer("update_critic", timing_raw, color="pink"):
+                            critic_output = self.critic_wg.update_critic(batch)
+                        critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
+                        metrics.update(critic_output_metrics)
+
+                    # implement critic warmup
+                    if self.config.trainer.critic_warmup <= self.global_steps:
+                        # update actor
+                        with marked_timer("update_actor", timing_raw, color="red"):
+                            batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+                            actor_output = self.actor_rollout_wg.update_actor(batch)
+                        actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                        metrics.update(actor_output_metrics)
+
+                    # Reward is already in batch from rollouter
+                    # Get reward_extra_infos_dict from meta_info if available
+                    reward_extra_infos_dict = batch.meta_info.get(f"task{task_id}_reward_extra_info", {})
+
+                    # Restore reward extras onto the batch so the existing
+                    # logging/metric collectors can see them again.
+                    if reward_extra_infos_dict:
+                        batch.non_tensor_batch.update(
+                            {k: np.array(v, dtype=object) for k, v in reward_extra_infos_dict.items()}
+                        )
+                        # `compute_data_metrics` / `compute_group_reward_metrics`
+                        # read scalar reward extras from flattened `meta_info`
+                        # keys such as `task1_vqa_reward`, not from the nested
+                        # `task{id}_reward_extra_info` dict.
+                        for k, v in reward_extra_infos_dict.items():
+                            batch.meta_info[k] = v
+
+                    # Log rollout generations if enabled (per task)
+                    rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+                    if self.config.trainer.rollout_freq > 0 and (
+                        self.global_steps % self.config.trainer.rollout_freq == 0 and rollout_data_dir
+                    ):
+                        self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
+
+                last_val_metrics = self._validate_metrics(is_last_step, last_val_metrics, metrics, timing_raw)
+                self._check_save_checkpoint(is_last_step, timing_raw)
+
+                with marked_timer("stop_profile", timing_raw):
+                    next_step_profile = (
+                        self.global_steps + 1 in self.config.global_profiler.steps
+                        if self.config.global_profiler.steps is not None
+                        else False
+                    )
+                    self._stop_profiling(
+                        curr_step_profile and not next_step_profile
+                        if self.config.global_profiler.profile_continuous_steps
+                        else curr_step_profile
+                    )
+                    prev_step_profile = curr_step_profile
+                    curr_step_profile = next_step_profile
+
+                self._collect_metrics(batch, epoch, metrics, timing_raw)
+                self._post_batch_processing(batch)
+
+                # TODO: make a canonical logger that supports various backend
+                logger.log(data=metrics, step=self.global_steps)
+
+                progress_bar.update(1)
+                self.global_steps += 1
+
+                if (
+                    hasattr(self.config.actor_rollout_ref.actor, "profiler")
+                    and self.config.actor_rollout_ref.actor.profiler.tool == "torch_memory"
+                ):
+                    self.actor_rollout_wg.dump_memory_snapshot(
+                        tag=f"post_update_step{self.global_steps}", sub_dir=f"step{self.global_steps}"
+                    )
+
+                if is_last_step:
+                    pprint(f"Final validation metrics: {last_val_metrics}")
+                    progress_bar.close()
+                    return
+
+    def _prepare_generate_batch(self, batch_dict):
+        batch: DataProto = DataProto.from_single_dict(batch_dict)
+
+        # add uid to batch
+        batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)
+
+        gen_batch = self._get_gen_batch(batch)
+
+        # pass global_steps to trace
+        gen_batch.meta_info["global_steps"] = self.global_steps
+        gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+        return batch, gen_batch
+
+    def _post_generate_batch(self, batch, gen_batch_output, metrics):
+        # repeat to align with repeated responses in rollout
+        batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+        batch = batch.union(gen_batch_output)
+
+        # if "response_mask" not in batch.batch.keys():
+        #     batch.batch["response_mask"] = compute_response_mask(batch)
+        # Balance the number of valid tokens across DP ranks.
+        # NOTE: This usually changes the order of data in the `batch`,
+        # which won't affect the advantage calculation (since it's based on uid),
+        # but might affect the loss calculation (due to the change of mini-batching).
+        # TODO: Decouple the DP balancing and mini-batching.
+
+        # compute global_valid tokens
+        batch.batch["attention_mask"] = batch.batch["task1_attention_mask"].sum(dim=-1) + batch.batch["task1_response_mask"].sum(dim=-1) \
+                                      + batch.batch["task2_attention_mask"].sum(dim=-1) + batch.batch["task2_response_mask"].sum(dim=-1) \
+                                      + batch.batch["task3_attention_mask"].sum(dim=-1) + batch.batch["task3_response_mask"].sum(dim=-1)
+        
+        if self.config.trainer.balance_batch:
+            self._balance_batch(batch, metrics=metrics)
+
+        # compute global_valid tokens
+        batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+
+        return batch
+
+    def _process_batch_common(
+        self,
+        batch,
+        metrics,
+        timing_raw,
+        local_trigger_step=None,
+        task_id: int = 1,
+        skip_old_log_prob: bool = False,
+        skip_reward: bool = False,
+        skip_ref_log_prob: bool = False,
+        skip_ref_values_adv: bool = False,
+    ):
+        # Compute reward if using reward model worker (use_rm)
+        # Otherwise reward is already computed in rollouter
+        if not skip_reward:
+            with marked_timer("reward", timing_raw, color="yellow"):
+                if self.use_rm:
+                    # Compute reward using reward model worker
+                    reward_tensor = self.rm_wg.compute_rm_score(batch)
+                    # Remove existing response_masks to allow overwriting with modified masks from reward computation
+                    _task_ids_cfg = list(self.config.actor_rollout_ref.actor.multi_task.get("task_ids", [1]))
+                    for tid in _task_ids_cfg:
+                        if f"task{tid}_response_mask" in batch.batch:
+                            batch.batch.pop(f"task{tid}_response_mask")
+                    batch = batch.union(reward_tensor)
+        
+        if not skip_old_log_prob:
+            with marked_timer("old_log_prob", timing_raw, color="blue"):
+
+                def compute_old_log_prob(batch):
+                    log_prob_batch = self._select_log_prob_rpc_batch(batch, task_id)
+                    old_log_prob = self.actor_rollout_wg.compute_log_prob(log_prob_batch)
+                    entropys = old_log_prob.batch[f"task{task_id}_entropys"]
+                    response_masks = batch.batch[f"task{task_id}_response_mask"]
+                    loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
+                    entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
+                    old_log_prob_metrics = {f"actor/task{task_id}_old_entropy": entropy_agg.detach().item()}
+                    metrics.update(old_log_prob_metrics)
+                    old_log_prob.batch.pop(f"task{task_id}_entropys")
+                    batch = batch.union(old_log_prob)
+                    if f"task{task_id}_rollout_log_probs" in batch.batch.keys():
+                        # TODO: we may want to add diff of probs too.
+                        from recipe.image_rl.debug_metrics import calculate_debug_metrics
+
+                        metrics.update(calculate_debug_metrics(batch, task_id=task_id))
+                    return batch
+
+                async_training = self.config.get("async_training", None)
+                if async_training and async_training.use_rollout_log_probs:
+                    # If local_triger_step == 1, load the training engine's parameters to the CPU
+                    #  and save a copy for subsequent MIS use.
+                    # If local_trigger_step == 2, 3, ..., restore the parameters of version 1 to calculate the old_log_prob,
+                    # then restore the parameters of the current version.
+                    if local_trigger_step == 1:
+                        self.actor_rollout_wg.save_model_to_cpu(1)
+                        batch = compute_old_log_prob(batch)
+                    elif local_trigger_step is not None:
+                        self.actor_rollout_wg.save_model_to_cpu(local_trigger_step)
+                        self.actor_rollout_wg.restore_model_from_cpu(1)
+                        batch = compute_old_log_prob(batch)
+                        self.actor_rollout_wg.restore_model_from_cpu(local_trigger_step)
+                        self.actor_rollout_wg.clear_cpu_model(local_trigger_step)
+                    else:
+                        batch = self._apply_old_log_probs_with_rollout_corr(
+                            batch, compute_old_log_prob, task_id, metrics
+                        )
+
+                else:
+                    batch = compute_old_log_prob(batch)
+
+        if skip_ref_values_adv:
+            return batch
+
+        if self.use_reference_policy and not skip_ref_log_prob:
+            # compute reference log_prob
+            with marked_timer("ref", timing_raw, color="olive"):
+                ref_batch = self._select_log_prob_rpc_batch(batch, task_id)
+                if not self.ref_in_actor:
+                    ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(ref_batch)
+                else:
+                    ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(ref_batch)
+                batch = batch.union(ref_log_prob)
+
+        # compute values
+        if self.use_critic:
+            with marked_timer("values", timing_raw, color="cyan"):
+                values = self.critic_wg.compute_values(batch)
+                batch = batch.union(values)
+
+        with marked_timer("adv", timing_raw, color="brown"):
+
+            # compute rewards. apply_kl_penalty if available
+            if self.config.algorithm.use_kl_in_reward:
+                batch, kl_metrics = apply_kl_penalty(
+                    batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty, task_id=task_id
+                )
+                metrics.update(kl_metrics)
+            else:
+                batch.batch[f"task{task_id}_token_level_rewards"] = batch.batch[f"task{task_id}_token_level_scores"]
+
+            # Compute rollout correction weights centrally (once per batch)
+            # This corrects for off-policy issues (policy mismatch, model staleness, etc.)
+            # Also computes off-policy diagnostic metrics (KL, PPL, etc.)
+            from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
+
+            rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
+            if rollout_corr_config is not None and "rollout_log_probs" in batch.batch:
+                batch, is_metrics = compute_rollout_correction_and_add_to_batch(batch, rollout_corr_config)
+                # IS and off-policy metrics already have rollout_corr/ prefix
+                metrics.update(is_metrics)
+
+            # compute advantages, executed on the driver process
+            norm_adv_by_std_in_grpo = self.config.algorithm.get(
+                "norm_adv_by_std_in_grpo", True
+            )  # GRPO adv normalization factor
+
+            batch = compute_advantage(
+                batch,
+                adv_estimator=self.config.algorithm.adv_estimator,
+                gamma=self.config.algorithm.gamma,
+                lam=self.config.algorithm.lam,
+                num_repeat=self.config.actor_rollout_ref.rollout.n,
+                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                config=self.config.algorithm,
+                task_id=task_id
+            )
+
+            # Phase1 now trains from MDP discounted returns already stored in
+            # task{id}_token_level_scores. Heuristic outcome rewards no longer
+            # replace MDP-return advantages.
+
+        return batch
+
+    def _apply_old_log_probs_with_rollout_corr(self, batch, compute_old_log_prob_fn, task_id, metrics):
+        """Assign old_log_probs with optional IS correction via algorithm.rollout_correction.
+
+        - If rollout_correction.rollout_is is set: recompute old_log_probs with current policy
+          and apply IS correction / rejection sampling.
+        - Otherwise: passthrough (rollout_log_probs -> old_log_probs directly).
+        """
+        rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
+        if rollout_corr_config and rollout_corr_config.get("rollout_is", None) is not None:
+            batch = compute_old_log_prob_fn(batch)
+
+            from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
+
+            # Alias task-prefixed keys to standard keys
+            batch.batch["old_log_probs"] = batch.batch[f"task{task_id}_old_log_probs"]
+            batch.batch["rollout_log_probs"] = batch.batch[f"task{task_id}_rollout_log_probs"]
+            batch.batch["response_mask"] = batch.batch[f"task{task_id}_response_mask"]
+
+            batch, corr_metrics = compute_rollout_correction_and_add_to_batch(batch, rollout_corr_config)
+
+            # Copy results back to task-prefixed keys
+            batch.batch[f"task{task_id}_response_mask"] = batch.batch.pop("response_mask")
+            batch.batch[f"task{task_id}_old_log_probs"] = batch.batch.pop("old_log_probs")
+            batch.batch.pop("rollout_log_probs")
+            if "rollout_is_weights" in batch.batch:
+                batch.batch[f"task{task_id}_rollout_is_weights"] = batch.batch.pop("rollout_is_weights")
+
+            metrics.update({f"rollout_corr/task{task_id}/{k}": v for k, v in corr_metrics.items()})
+        else:
+            batch.batch[f"task{task_id}_old_log_probs"] = batch.batch[f"task{task_id}_rollout_log_probs"]
+            batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+            batch.meta_info["cfg_weight"] = getattr(self.config.actor_rollout_ref.rollout, "cfg_weight", 5.0)
+
+        return batch
+
+    def _validate_metrics(self, is_last_step, last_val_metrics, metrics, timing_raw):
+        if (
+            self.val_reward_fn is not None
+            and self.config.trainer.test_freq > 0
+            and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
+        ):
+            with marked_timer("testing", timing_raw, color="green"):
+                if self.async_rollout_mode:
+                    import asyncio
+                    val_metrics: dict = asyncio.run(self._validate_async())
+                else:
+                    val_metrics: dict = self._validate()
+                if is_last_step:
+                    last_val_metrics = val_metrics
+            metrics.update(val_metrics)
+        return last_val_metrics
+
+    def _check_save_checkpoint(self, is_last_step, timing_raw):
+        # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
+        esi_close_to_expiration = should_save_ckpt_esi(
+            max_steps_duration=self.max_steps_duration,
+            redundant_time=self.config.trainer.esi_redundant_time,
+        )
+        # Check if the conditions for saving a checkpoint are met.
+        # The conditions include a mandatory condition (1) and
+        # one of the following optional conditions (2/3/4):
+        # 1. The save frequency is set to a positive value.
+        # 2. It's the last training step.
+        # 3. The current step number is a multiple of the save frequency.
+        # 4. The ESI(Elastic Server Instance)/training plan is close to expiration.
+        if self.config.trainer.save_freq > 0 and (
+            is_last_step or self.global_steps % self.config.trainer.save_freq == 0 or esi_close_to_expiration
+        ):
+            if esi_close_to_expiration:
+                print("Force saving checkpoint: ESI instance expiration approaching.")
+            with marked_timer("save_checkpoint", timing_raw, color="green"):
+                self._save_checkpoint()
+
+    def _collect_metrics(self, batch, epoch, metrics, timing_raw):
+        steps_duration = timing_raw["step"]
+        self.max_steps_duration = max(self.max_steps_duration, steps_duration)
+
+        # training metrics
+        metrics.update(
+            {
+                "training/global_step": self.global_steps,
+                "training/epoch": epoch,
+            }
+        )
+        _task_ids = list(self.config.actor_rollout_ref.actor.multi_task.get("task_ids", [1]))
+        for task_id in _task_ids:
+            batch.batch["task_id"] = torch.tensor([task_id for _ in range(len(batch))], dtype=int)
+            # collect metrics
+            metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+            metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+            metrics.update(compute_group_reward_metrics(batch=batch))
+            # Remove universal keys from batch
+            batch.pop(batch_keys=["task_id"])
+        # TODO: implement actual tflpo and theoretical tflpo
+        n_gpus = self.resource_pool_manager.get_n_gpus()
+        metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
+
+    def _post_batch_processing(self, batch: DataProto):
+        # this is experimental and may be changed/removed in the future in favor of a general-purpose one
+        if isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):
+            self.train_dataloader.sampler.update(batch=batch)
+
+        # this is experimental and may be changed/removed in the future
+        # in favor of a general-purpose data buffer pool
+        if hasattr(self.train_dataset, "on_batch_end"):
+            # The dataset may be changed after each training batch
+            self.train_dataset.on_batch_end(batch=batch)

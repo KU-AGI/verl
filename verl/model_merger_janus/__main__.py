@@ -41,6 +41,7 @@ torchrun --nproc_per_node 1 --nnodes 8 --node_rank ${RANK} -m verl.model_merger 
     --target_dir /path/to/merged_hf_model
 ```
 
+python -m verl.model_merger_janus merge --backend fsdp --local_dir --target_dir 
 
 For more details, please refer to documentation:
 https://verl.readthedocs.io/en/latest/advance/checkpoint.html#convert-fsdp-and-megatron-checkpoints-to-huggingface-format-model
